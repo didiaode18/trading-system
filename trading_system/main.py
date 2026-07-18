@@ -34,6 +34,7 @@ from risk.risk_control import (RiskState, risk_check, judge_market_strength,
                                 get_max_position_ratio, daily_risk_summary)
 from notify.wechat_notify import (notify_buy_signal, notify_sell_signal,
                                    notify_risk_alert, notify_daily_summary)
+from notify.email_notify import send_daily_report, send_risk_alert
 from output.condition_sheet import generate_condition_sheet, generate_simple_report
 
 # ============================================================
@@ -244,7 +245,20 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         # 发送摘要
         notify_daily_summary(text_report[:1500])
     else:
-        logger.info("  通知渠道未配置，跳过")
+        logger.info("  钉钉/企微通知渠道未配置，跳过")
+
+    # 发送邮件报告
+    if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+        try:
+            email_ok = send_daily_report(text_report, risk_summary, filtered_signals)
+            if email_ok:
+                logger.info("  邮件报告发送成功")
+            else:
+                logger.warning("  邮件报告发送失败")
+        except Exception as e:
+            logger.error(f"  邮件发送异常: {e}")
+    else:
+        logger.info("  邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过邮件发送")
 
     # ---- 完成 ----
     elapsed = (datetime.datetime.now() - start_time).total_seconds()

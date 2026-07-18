@@ -43,6 +43,17 @@ MA_SHORT = 20                    # 短期均线（20日）
 MA_MID = 60                      # 中期均线（60日）
 VOLUME_MA_PERIOD = 20            # 成交量均线周期
 
+# 新增技术指标参数
+RSI_PERIOD = 14                  # RSI周期
+RSI_OVERBOUGHT = 70              # RSI超买阈值
+RSI_OVERSOLD = 30                # RSI超卖阈值
+MACD_FAST = 12                   # MACD快线周期
+MACD_SLOW = 26                   # MACD慢线周期
+MACD_SIGNAL = 9                  # MACD信号线周期
+BOLL_PERIOD = 20                 # 布林带周期
+BOLL_STD = 2                     # 布林带标准差倍数
+ATR_PERIOD = 14                  # ATR周期
+
 # ============================================================
 # 四、买点参数
 # ============================================================
@@ -131,6 +142,15 @@ DATA_RETRY_INTERVAL = 2          # 重试间隔（秒）
 # 钉钉/企业微信通知（按需填写Webhook地址）
 DINGTALK_WEBHOOK = ""            # 钉钉机器人Webhook URL
 WECHAT_WORK_WEBHOOK = ""         # 企业微信机器人Webhook URL
+
+# ============================================================
+# 十二、邮件通知配置（QQ邮箱SMTP）
+# ============================================================
+EMAIL_SMTP_HOST = "smtp.qq.com"  # QQ邮箱SMTP服务器
+EMAIL_SMTP_PORT = 465            # SMTP端口（SSL）
+EMAIL_SENDER = ""                # 发件人QQ邮箱（如 563646039@qq.com）
+EMAIL_AUTH_CODE = ""             # QQ邮箱授权码（非QQ密码，需在QQ邮箱设置中开启SMTP获取）
+EMAIL_RECEIVER = "563646039@qq.com"  # 收件人邮箱
 
 # ============================================================
 # 十一、基准指数（用于判定行情强弱）

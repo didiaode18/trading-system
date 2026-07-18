@@ -30,12 +30,20 @@ logger = logging.getLogger(__name__)
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     计算所有技术指标，在原始DataFrame上增加列:
-    - ma20, ma60: 20日/60日均线
+    - ma5, ma10, ma20, ma60: 均线
     - vol_ma20: 20日成交量均线
     - ma20_slope: 20日均线斜率（向上/向下）
+    - rsi: RSI相对强弱指标
+    - macd_dif, macd_dea, macd_hist: MACD指标
+    - boll_upper, boll_mid, boll_lower: 布林带
+    - atr: 真实波幅
+    - ma_bullish: 均线多头排列标记
+    - vol_price_divergence: 量价背离标记
     - highest_since_buy: 持仓期间最高价（用于回落止盈）
     """
     df = df.copy()
+    df["ma5"] = df["close"].rolling(5).mean()
+    df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(config.MA_SHORT).mean()
     df["ma60"] = df["close"].rolling(config.MA_MID).mean()
     df["vol_ma20"] = df["volume"].rolling(config.VOLUME_MA_PERIOD).mean()
@@ -45,6 +53,51 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # 日内振幅
     df["intraday_range"] = (df["high"] - df["low"]) / df["close"].shift(1)
+
+    # ---- RSI ----
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta).where(delta < 0, 0.0)
+    avg_gain = gain.rolling(config.RSI_PERIOD).mean()
+    avg_loss = loss.rolling(config.RSI_PERIOD).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # ---- MACD ----
+    ema_fast = df["close"].ewm(span=config.MACD_FAST, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=config.MACD_SLOW, adjust=False).mean()
+    df["macd_dif"] = ema_fast - ema_slow
+    df["macd_dea"] = df["macd_dif"].ewm(span=config.MACD_SIGNAL, adjust=False).mean()
+    df["macd_hist"] = 2 * (df["macd_dif"] - df["macd_dea"])
+
+    # ---- 布林带 ----
+    df["boll_mid"] = df["close"].rolling(config.BOLL_PERIOD).mean()
+    boll_std = df["close"].rolling(config.BOLL_PERIOD).std()
+    df["boll_upper"] = df["boll_mid"] + config.BOLL_STD * boll_std
+    df["boll_lower"] = df["boll_mid"] - config.BOLL_STD * boll_std
+
+    # ---- ATR (Average True Range) ----
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift(1)).abs()
+    low_close = (df["low"] - df["close"].shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = true_range.rolling(config.ATR_PERIOD).mean()
+
+    # ---- 均线多头排列检测 (MA5 > MA10 > MA20 > MA60) ----
+    df["ma_bullish"] = (
+        (df["ma5"] > df["ma10"]) &
+        (df["ma10"] > df["ma20"]) &
+        (df["ma20"] > df["ma60"])
+    )
+
+    # ---- 量价背离检测（近5日价格新高但成交量萎缩）----
+    df["vol_price_divergence"] = False
+    for i in range(5, len(df)):
+        recent_5 = df.iloc[i-4:i+1]
+        price_new_high = recent_5["close"].iloc[-1] >= recent_5["close"].max()
+        vol_shrinking = recent_5["volume"].iloc[-1] < recent_5["volume"].mean() * 0.8
+        if price_new_high and vol_shrinking:
+            df.iloc[i, df.columns.get_loc("vol_price_divergence")] = True
 
     return df
 
@@ -132,12 +185,63 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
     buy_price = close  # 建议以收盘价附近买入
     stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
 
+    # ---- 新增指标增强确认 ----
+    confirmations = []
+    warnings_list = []
+
+    # RSI确认：RSI在超卖区域（<30）附近反弹是加分项
+    rsi_val = latest.get("rsi", 50)
+    if not pd.isna(rsi_val):
+        if rsi_val < config.RSI_OVERSOLD:
+            confirmations.append(f"RSI超卖({rsi_val:.0f})，反弹概率大")
+        elif rsi_val > config.RSI_OVERBOUGHT:
+            warnings_list.append(f"RSI超买({rsi_val:.0f})，追高风险")
+
+    # MACD金叉确认：DIF上穿DEA
+    macd_dif = latest.get("macd_dif", 0)
+    macd_dea = latest.get("macd_dea", 0)
+    if not pd.isna(macd_dif) and not pd.isna(macd_dea):
+        prev_dif = df_ind["macd_dif"].iloc[-2] if len(df_ind) > 1 else 0
+        prev_dea = df_ind["macd_dea"].iloc[-2] if len(df_ind) > 1 else 0
+        if not pd.isna(prev_dif) and not pd.isna(prev_dea):
+            if prev_dif <= prev_dea and macd_dif > macd_dea:
+                confirmations.append("MACD金叉")
+            elif macd_dif > macd_dea:
+                confirmations.append("MACD多头")
+            else:
+                warnings_list.append("MACD空头")
+
+    # 布林带下轨支撑确认
+    boll_lower = latest.get("boll_lower", 0)
+    if not pd.isna(boll_lower) and boll_lower > 0:
+        if low <= boll_lower * 1.01:  # 最低价触及布林带下轨附近
+            confirmations.append("触及布林带下轨支撑")
+
+    # 均线多头排列加分
+    if latest.get("ma_bullish", False):
+        confirmations.append("均线多头排列")
+
+    # 量价背离警告
+    if latest.get("vol_price_divergence", False):
+        warnings_list.append("量价背离（价升量缩）")
+
+    # 构建完整信号说明
+    extra_info = ""
+    if confirmations:
+        extra_info += " [确认: " + ", ".join(confirmations) + "]"
+    if warnings_list:
+        extra_info += " [警告: " + ". ".join(warnings_list) + "]"
+
     result.update({
         "signal": True,
         "buy_price": round(buy_price, 2),
         "support_price": round(ma20, 2),
         "stop_loss": round(stop_loss, 2),
-        "reason": f"缩量回踩20日线: 量比={vol_ratio:.2%}, MA20={ma20:.2f}, 最低={low:.2f}"
+        "rsi": round(rsi_val, 1) if not pd.isna(rsi_val) else None,
+        "macd_dif": round(macd_dif, 3) if not pd.isna(macd_dif) else None,
+        "macd_dea": round(macd_dea, 3) if not pd.isna(macd_dea) else None,
+        "atr": round(latest.get("atr", 0), 2) if not pd.isna(latest.get("atr", 0)) else None,
+        "reason": f"缩量回踩20日线: 量比={vol_ratio:.2%}, MA20={ma20:.2f}, 最低={low:.2f}{extra_info}"
     })
     return result
 
@@ -195,7 +299,7 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
         return result
 
     # ---- 2. 趋势破位：收盘跌破60日均线且60日均线拐头向下 ----
-    if not pd.isna(latest["ma60"]):
+    if not pd.isna(latest.get("ma60", None)):
         ma60_slope = df_ind["ma60"].diff(3).iloc[-1]
         if close < latest["ma60"] and ma60_slope < 0:
             result.update({
@@ -206,7 +310,37 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
             })
             return result
 
-    # ---- 3. 回落止盈：从最高点回落超过阈值 ----
+    # ---- 3. MACD死叉确认卖出 ----
+    macd_dif = latest.get("macd_dif", 0)
+    macd_dea = latest.get("macd_dea", 0)
+    if not pd.isna(macd_dif) and not pd.isna(macd_dea) and profit_pct > 0:
+        prev_dif = df_ind["macd_dif"].iloc[-2] if len(df_ind) > 1 else 0
+        prev_dea = df_ind["macd_dea"].iloc[-2] if len(df_ind) > 1 else 0
+        if not pd.isna(prev_dif) and not pd.isna(prev_dea):
+            if prev_dif >= prev_dea and macd_dif < macd_dea:
+                result.update({
+                    "signal": True,
+                    "sell_type": "macd_death_cross",
+                    "sell_price": round(close, 2),
+                    "reason": f"MACD死叉: DIF({macd_dif:.3f})下穿DEA({macd_dea:.3f}), 浮盈{profit_pct:.2%}"
+                })
+                return result
+
+    # ---- 4. RSI超买区域回落卖出 ----
+    rsi_val = latest.get("rsi", 50)
+    if not pd.isna(rsi_val) and rsi_val > config.RSI_OVERBOUGHT and profit_pct > 0.05:
+        # RSI从超买区域回落（当前RSI比前一天低）
+        prev_rsi = df_ind["rsi"].iloc[-2] if len(df_ind) > 1 else rsi_val
+        if not pd.isna(prev_rsi) and rsi_val < prev_rsi:
+            result.update({
+                "signal": True,
+                "sell_type": "rsi_overbought_reversal",
+                "sell_price": round(close, 2),
+                "reason": f"RSI超买回落: RSI={rsi_val:.0f}(前日{prev_rsi:.0f})从超买区回落, 浮盈{profit_pct:.2%}"
+            })
+            return result
+
+    # ---- 5. 回落止盈：从最高点回落超过阈值 ----
     drawdown_threshold = _get_drawdown_threshold(current_position)
     if highest > buy_price:  # 只有盈利过才启用回落止盈
         drawdown_from_high = (highest - close) / highest

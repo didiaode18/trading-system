@@ -354,6 +354,189 @@ def load_daily_data(code: str, conn: sqlite3.Connection = None,
     return df
 
 
+# ============================================================
+# 资金流向数据（通过akshare获取）
+# ============================================================
+
+def init_capital_flow_table(conn: sqlite3.Connection):
+    """初始化资金流向表"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS capital_flow (
+            code       TEXT    NOT NULL,
+            date       TEXT    NOT NULL,
+            main_net   REAL,           -- 主力净流入（万元）
+            super_net  REAL,           -- 超大单净流入（万元）
+            big_net    REAL,           -- 大单净流入（万元）
+            mid_net    REAL,           -- 中单净流入（万元）
+            small_net  REAL,           -- 小单净流入（万元）
+            PRIMARY KEY (code, date)
+        )
+    """)
+    conn.commit()
+
+
+def fetch_capital_flow_akshare(code: str, days: int = 30) -> pd.DataFrame:
+    """
+    通过akshare获取个股资金流向数据
+    
+    参数:
+        code: 股票代码（纯数字）
+        days: 获取天数
+    
+    返回:
+        DataFrame: date, main_net, super_net, big_net, mid_net, small_net
+    """
+    if not HAS_AKSHARE:
+        logger.warning("akshare未安装，无法获取资金流向")
+        return pd.DataFrame()
+
+    try:
+        end_date = datetime.date.today().strftime("%Y%m%d")
+        start_date = (datetime.date.today() - datetime.timedelta(days=days * 2)).strftime("%Y%m%d")
+
+        df = ak.stock_individual_fund_flow(
+            stock=code,
+            market="sh" if code.startswith("6") else "sz"
+        )
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 列名映射
+        col_map = {
+            "日期": "date",
+            "主力净流入-净额": "main_net",
+            "超大单净流入-净额": "super_net",
+            "大单净流入-净额": "big_net",
+            "中单净流入-净额": "mid_net",
+            "小单净流入-净额": "small_net"
+        }
+        df = df.rename(columns=col_map)
+
+        # 只保留需要的列
+        needed = ["date", "main_net", "super_net", "big_net", "mid_net", "small_net"]
+        available = [c for c in needed if c in df.columns]
+        df = df[available].tail(days)
+
+        # 转换数值
+        for col in available:
+            if col != "date":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df
+
+    except Exception as e:
+        logger.warning(f"[{code}] 资金流向获取失败: {e}")
+        return pd.DataFrame()
+
+
+def update_capital_flow(conn: sqlite3.Connection, code: str) -> int:
+    """
+    更新单只股票的资金流向数据到数据库
+    返回新增记录数
+    """
+    init_capital_flow_table(conn)
+
+    df = fetch_capital_flow_akshare(code)
+    if df.empty:
+        return 0
+
+    cursor = conn.cursor()
+    count = 0
+    for _, row in df.iterrows():
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO capital_flow
+                (code, date, main_net, super_net, big_net, mid_net, small_net)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (code, row["date"],
+                  row.get("main_net", 0), row.get("super_net", 0),
+                  row.get("big_net", 0), row.get("mid_net", 0),
+                  row.get("small_net", 0)))
+            count += 1
+        except Exception as e:
+            logger.error(f"[{code}] 资金流向写入失败: {e}")
+
+    conn.commit()
+    return count
+
+
+def load_capital_flow(code: str, conn: sqlite3.Connection = None,
+                      days: int = 10) -> pd.DataFrame:
+    """
+    从数据库加载资金流向数据
+    
+    返回:
+        DataFrame: date, main_net, super_net, big_net, mid_net, small_net
+    """
+    if conn is None:
+        conn = init_db()
+    init_capital_flow_table(conn)
+
+    query = """
+        SELECT date, main_net, super_net, big_net, mid_net, small_net
+        FROM capital_flow
+        WHERE code = ?
+        ORDER BY date DESC
+        LIMIT ?
+    """
+    df = pd.read_sql_query(query, conn, params=(code, days))
+    if df.empty:
+        return df
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def get_capital_flow_signal(code: str, conn: sqlite3.Connection = None) -> dict:
+    """
+    获取资金流向信号
+    
+    返回:
+        {
+            "signal": str,         # "positive"/"negative"/"neutral"
+            "main_net_avg": float, # 近5日主力净流入均值（万元）
+            "trend": str,          # "increasing"/"decreasing"
+            "reason": str
+        }
+    """
+    result = {
+        "signal": "neutral",
+        "main_net_avg": 0,
+        "trend": "neutral",
+        "reason": "无资金流向数据"
+    }
+
+    df = load_capital_flow(code, conn, days=10)
+    if df.empty:
+        return result
+
+    # 近5日主力净流入均值
+    recent = df.tail(5)
+    avg_main = recent["main_net"].mean()
+    result["main_net_avg"] = round(avg_main, 2)
+
+    # 信号判定
+    if avg_main > 500:  # 主力净流入超500万
+        result["signal"] = "positive"
+        result["reason"] = f"近5日主力净流入均值{avg_main:.0f}万元，资金积极流入"
+    elif avg_main < -500:  # 主力净流出超500万
+        result["signal"] = "negative"
+        result["reason"] = f"近5日主力净流入均值{avg_main:.0f}万元，资金持续流出"
+    else:
+        result["reason"] = f"近5日主力净流入均值{avg_main:.0f}万元，资金流向中性"
+
+    # 趋势判定
+    if len(df) >= 5:
+        first_half = df["main_net"].iloc[:5].mean()
+        second_half = df["main_net"].iloc[-5:].mean()
+        if second_half > first_half:
+            result["trend"] = "increasing"
+        elif second_half < first_half:
+            result["trend"] = "decreasing"
+
+    return result
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     print("=" * 50)

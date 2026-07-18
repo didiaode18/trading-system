@@ -175,7 +175,9 @@ def notify_sell_signal(code: str, name: str, sell_price: float,
     type_map = {
         "stop_loss": "止损",
         "drawdown_profit": "回落止盈",
-        "trend_break": "趋势破位"
+        "trend_break": "趋势破位",
+        "macd_death_cross": "MACD死叉",
+        "rsi_overbought_reversal": "RSI超买回落"
     }
     type_cn = type_map.get(sell_type, sell_type)
     today = datetime.date.today().strftime("%Y-%m-%d")
