@@ -108,7 +108,7 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
 
     cash = total_capital - total_market_value
     cash_ratio = cash / total_capital * 100
-    total_pnl_pct = total_pnl / total_cost * 100
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
     summary = {
         "total_capital": total_capital,
