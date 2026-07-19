@@ -36,6 +36,10 @@ from notify.wechat_notify import (notify_buy_signal, notify_sell_signal,
                                    notify_risk_alert, notify_daily_summary)
 from notify.email_notify import send_daily_report, send_risk_alert
 from output.condition_sheet import generate_condition_sheet, generate_simple_report
+from output.eastmoney_orders import send_eastmoney_orders_email
+from strategy.stock_screener import run_stock_screener, send_screener_email
+from strategy.portfolio_analyzer import analyze_portfolio, send_portfolio_email
+# 自动挂单功能已移除，条件单通过邮件推送（eastmoney_orders模块）
 
 # ============================================================
 # 日志配置
@@ -257,8 +261,54 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 logger.warning("  邮件报告发送失败")
         except Exception as e:
             logger.error(f"  邮件发送异常: {e}")
+
+        # 发送东方财富条件单邮件
+        try:
+            order_ok = send_eastmoney_orders_email(filtered_signals, holdings, data_dict)
+            if order_ok:
+                logger.info("  东方财富条件单邮件发送成功")
+            else:
+                logger.warning("  东方财富条件单邮件发送失败")
+        except Exception as e:
+            logger.error(f"  条件单邮件发送异常: {e}")
     else:
         logger.info("  邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过邮件发送")
+
+    # ---- Step 9: 盘后选股 + 发送选股报告 ----
+    logger.info("[Step 9] 盘后选股引擎...")
+    try:
+        screener_result = run_stock_screener(data_dict, holdings)
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            try:
+                screener_ok = send_screener_email(screener_result)
+                if screener_ok:
+                    logger.info(f"  选股报告邮件发送成功 ({screener_result['qualified_count']}只入选)")
+                else:
+                    logger.warning("  选股报告邮件发送失败")
+            except Exception as e:
+                logger.error(f"  选股邮件发送异常: {e}")
+        else:
+            logger.info("  邮箱未配置，跳过选股邮件发送")
+    except Exception as e:
+        logger.error(f"  选股引擎异常: {e}")
+
+    # ---- Step 10: 仓位管理与资金优化分析 ----
+    logger.info("[Step 10] 仓位管理分析...")
+    try:
+        portfolio_result = analyze_portfolio(holdings, data_dict)
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            try:
+                portfolio_ok = send_portfolio_email(portfolio_result)
+                if portfolio_ok:
+                    logger.info(f"  仓位分析邮件发送成功 ({len(portfolio_result['risk_alerts'])}项风险预警)")
+                else:
+                    logger.warning("  仓位分析邮件发送失败")
+            except Exception as e:
+                logger.error(f"  仓位分析邮件发送异常: {e}")
+        else:
+            logger.info("  邮箱未配置，跳过仓位分析邮件发送")
+    except Exception as e:
+        logger.error(f"  仓位分析异常: {e}")
 
     # ---- 完成 ----
     elapsed = (datetime.datetime.now() - start_time).total_seconds()

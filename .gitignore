@@ -62,3 +62,18 @@ holdings.json
 *.tmp
 *.bak
 output.txt
+run_output.txt
+
+# Screenshots (debug/temp)
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Generated reports
+**/output/*.html
+**/output/*.xlsx
+**/output/*.csv
+
+# Stock pool state
+stock_pool.json

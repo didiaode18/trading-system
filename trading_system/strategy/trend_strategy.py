@@ -128,24 +128,27 @@ def is_trend_up(df: pd.DataFrame) -> bool:
 
 def check_buy_signal(df: pd.DataFrame) -> dict:
     """
-    检查今日是否触发买入信号（买点1：缩量回踩20日线）
+    检查今日是否触发买入信号（买点1：缩量回踩关键支撑位）
     
     条件:
     1. 趋势向上（ma20向上 + 收盘价在ma20上方或附近）
     2. 缩量：今日成交量 < 20日均量 * (1 - 30%)
     3. 最低价触及20日线±1%
+    4. 排除放量下跌（当日跌幅>3%且量>均量1.5倍）
+    5. 回调不创新低（近10日最低价不低于前一波回调低点）
     
     返回:
         {
             "signal": True/False,
-            "buy_price": float,      # 建议买入价（今日收盘价附近）
-            "support_price": float,  # 支撑位价格（20日均线）
-            "stop_loss": float,      # 初始止损价
-            "reason": str            # 信号说明
+            "buy_price": float,
+            "support_price": float,
+            "stop_loss": float,
+            "reason": str,
+            "quality_score": int  # 信号质量评分0-100
         }
     """
     result = {"signal": False, "buy_price": None, "support_price": None,
-              "stop_loss": None, "reason": ""}
+              "stop_loss": None, "reason": "", "quality_score": 0}
 
     if len(df) < config.MA_MID:
         result["reason"] = "数据不足，无法计算均线"
@@ -160,10 +163,21 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
         return result
 
     ma20 = latest["ma20"]
+    ma60 = latest.get("ma60", None)
     close = latest["close"]
     low = latest["low"]
     volume = latest["volume"]
     vol_ma = latest["vol_ma20"]
+
+    # ---- 排除条件：放量下跌不接 ----
+    prev_close = df_ind["close"].iloc[-2] if len(df_ind) > 1 else close
+    day_change = (close - prev_close) / prev_close if prev_close > 0 else 0
+    reject_vol_ratio = getattr(config, 'REJECT_VOLUME_RATIO', 1.5)
+    reject_drop = getattr(config, 'REJECT_DROP_PCT', -0.03)
+    if not pd.isna(vol_ma) and vol_ma > 0:
+        if day_change < reject_drop and volume > vol_ma * reject_vol_ratio:
+            result["reason"] = f"放量下跌排除: 跌幅{day_change:.2%}且量>均量{reject_vol_ratio}倍"
+            return result
 
     # 条件1：缩量（成交量较20日均量萎缩30%以上）
     if pd.isna(vol_ma) or vol_ma == 0:
@@ -181,23 +195,51 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
         result["reason"] = f"最低价{low:.2f}未触及20日线{ma20:.2f}±{config.SUPPORT_TOUCH_PCT:.0%}"
         return result
 
+    # 条件3：回调不创新低（近10日最低价不低于前一波回调低点）
+    if len(df_ind) >= 20:
+        recent_10_low = df_ind["low"].iloc[-10:].min()
+        prev_wave_low = df_ind["low"].iloc[-20:-10].min()
+        if recent_10_low < prev_wave_low * 0.99:
+            result["reason"] = f"回调创新低排除: 近10日最低{recent_10_low:.2f} < 前波低{prev_wave_low:.2f}"
+            return result
+
     # 信号触发！
-    buy_price = close  # 建议以收盘价附近买入
+    buy_price = close
     stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
+
+    # ---- 信号质量评分（0-100）----
+    quality_score = 50  # 基础分
+
+    # 多支撑位重合加分（MA20/MA60/前期平台低点三者重合）
+    support_count = 1  # MA20肯定触及
+    if not pd.isna(ma60) and ma60 > 0:
+        if abs(low - ma60) / ma60 < 0.02:  # 触及MA60±2%
+            support_count += 1
+    # 前期平台低点（近20日最低价附近）
+    if len(df_ind) >= 20:
+        platform_low = df_ind["low"].iloc[-20:].min()
+        if abs(low - platform_low) / platform_low < 0.02:
+            support_count += 1
+    if support_count >= 3:
+        quality_score += 25  # 三支撑重合，最佳买点
+    elif support_count >= 2:
+        quality_score += 15  # 双支撑重合
 
     # ---- 新增指标增强确认 ----
     confirmations = []
     warnings_list = []
 
-    # RSI确认：RSI在超卖区域（<30）附近反弹是加分项
+    # RSI确认
     rsi_val = latest.get("rsi", 50)
     if not pd.isna(rsi_val):
         if rsi_val < config.RSI_OVERSOLD:
-            confirmations.append(f"RSI超卖({rsi_val:.0f})，反弹概率大")
+            confirmations.append(f"RSI超卖({rsi_val:.0f})")
+            quality_score += 10
         elif rsi_val > config.RSI_OVERBOUGHT:
-            warnings_list.append(f"RSI超买({rsi_val:.0f})，追高风险")
+            warnings_list.append(f"RSI超买({rsi_val:.0f})")
+            quality_score -= 10
 
-    # MACD金叉确认：DIF上穿DEA
+    # MACD金叉确认
     macd_dif = latest.get("macd_dif", 0)
     macd_dea = latest.get("macd_dea", 0)
     if not pd.isna(macd_dif) and not pd.isna(macd_dea):
@@ -206,31 +248,38 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
         if not pd.isna(prev_dif) and not pd.isna(prev_dea):
             if prev_dif <= prev_dea and macd_dif > macd_dea:
                 confirmations.append("MACD金叉")
+                quality_score += 10
             elif macd_dif > macd_dea:
                 confirmations.append("MACD多头")
+                quality_score += 5
             else:
                 warnings_list.append("MACD空头")
-
-    # 布林带下轨支撑确认
-    boll_lower = latest.get("boll_lower", 0)
-    if not pd.isna(boll_lower) and boll_lower > 0:
-        if low <= boll_lower * 1.01:  # 最低价触及布林带下轨附近
-            confirmations.append("触及布林带下轨支撑")
+                quality_score -= 5
 
     # 均线多头排列加分
     if latest.get("ma_bullish", False):
         confirmations.append("均线多头排列")
+        quality_score += 10
 
     # 量价背离警告
     if latest.get("vol_price_divergence", False):
-        warnings_list.append("量价背离（价升量缩）")
+        warnings_list.append("量价背离")
+        quality_score -= 5
+
+    # 缩量程度加分（越缩越好）
+    if vol_ratio < 0.5:
+        quality_score += 5  # 极度缩量
+
+    quality_score = max(0, min(100, quality_score))
 
     # 构建完整信号说明
     extra_info = ""
     if confirmations:
         extra_info += " [确认: " + ", ".join(confirmations) + "]"
     if warnings_list:
-        extra_info += " [警告: " + ". ".join(warnings_list) + "]"
+        extra_info += " [警告: " + ", ".join(warnings_list) + "]"
+    if support_count >= 2:
+        extra_info += f" [★{support_count}支撑重合]"
 
     result.update({
         "signal": True,
@@ -241,7 +290,117 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
         "macd_dif": round(macd_dif, 3) if not pd.isna(macd_dif) else None,
         "macd_dea": round(macd_dea, 3) if not pd.isna(macd_dea) else None,
         "atr": round(latest.get("atr", 0), 2) if not pd.isna(latest.get("atr", 0)) else None,
+        "quality_score": quality_score,
+        "buy_type": "回踩支撑",
         "reason": f"缩量回踩20日线: 量比={vol_ratio:.2%}, MA20={ma20:.2f}, 最低={low:.2f}{extra_info}"
+    })
+    return result
+
+
+def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
+    """
+    买点2：放量突破后回踩确认（趋势加速买点）
+    
+    条件:
+    1. 近10日内有放量突破（量>均量1.5倍 + 创20日新高）
+    2. 突破后缩量回踩（量缩至突破日50%以下）
+    3. 回踩不破突破位（收盘价 >= 突破日收盘价 * 0.99）
+    4. MA20仍向上
+    
+    适合: 主升浪阶段的龙头标的，爆发力强
+    """
+    result = {"signal": False, "buy_price": None, "support_price": None,
+              "stop_loss": None, "reason": "", "quality_score": 0}
+
+    if len(df) < config.MA_MID:
+        result["reason"] = "数据不足"
+        return result
+
+    df_ind = compute_indicators(df)
+    latest = df_ind.iloc[-1]
+
+    # 前提：MA20向上
+    if not is_trend_up(df_ind):
+        result["reason"] = "趋势不满足"
+        return result
+
+    lookback = getattr(config, 'BREAKOUT_LOOKBACK', 10)
+    vol_ratio_threshold = getattr(config, 'BREAKOUT_VOLUME_RATIO', 1.5)
+    pullback_vol = getattr(config, 'BREAKOUT_PULLBACK_VOL', 0.50)
+    hold_pct = getattr(config, 'BREAKOUT_HOLD_PCT', 0.99)
+
+    close = latest["close"]
+    volume = latest["volume"]
+    vol_ma = latest["vol_ma20"]
+
+    if pd.isna(vol_ma) or vol_ma == 0:
+        return result
+
+    # 在近10日内寻找放量突破日
+    breakout_day = None
+    for i in range(-lookback, -1):  # 从-10到-2（不含今天）
+        idx = len(df_ind) + i
+        if idx < 20:
+            continue
+        row = df_ind.iloc[idx]
+        # 突破条件：创20日新高 + 放量
+        high_20d_before = df_ind["high"].iloc[max(0, idx-20):idx].max()
+        if row["close"] > high_20d_before and row["volume"] > vol_ma * vol_ratio_threshold:
+            breakout_day = idx
+            break
+
+    if breakout_day is None:
+        result["reason"] = "近10日无放量突破"
+        return result
+
+    breakout_row = df_ind.iloc[breakout_day]
+    breakout_close = breakout_row["close"]
+    breakout_volume = breakout_row["volume"]
+
+    # 条件2：今日缩量回踩（量缩至突破日50%以下）
+    if volume > breakout_volume * pullback_vol:
+        result["reason"] = f"回踩未缩量: 今日量/突破日量={volume/breakout_volume:.2%}，需<{pullback_vol:.0%}"
+        return result
+
+    # 条件3：回踩不破突破位
+    if close < breakout_close * hold_pct:
+        result["reason"] = f"回踩破位: 收盘{close:.2f} < 突破位{breakout_close:.2f}*{hold_pct}"
+        return result
+
+    # 信号触发！
+    buy_price = close
+    stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
+
+    # 质量评分
+    quality_score = 55  # 突破回踩基础分略高于普通回踩
+    # 突破后缩量程度
+    shrink_ratio = volume / breakout_volume
+    if shrink_ratio < 0.3:
+        quality_score += 15  # 极度缩量
+    elif shrink_ratio < 0.4:
+        quality_score += 10
+
+    # MACD确认
+    macd_dif = latest.get("macd_dif", 0)
+    macd_dea = latest.get("macd_dea", 0)
+    if not pd.isna(macd_dif) and not pd.isna(macd_dea) and macd_dif > macd_dea:
+        quality_score += 10
+
+    # 均线多头
+    if latest.get("ma_bullish", False):
+        quality_score += 10
+
+    quality_score = max(0, min(100, quality_score))
+
+    result.update({
+        "signal": True,
+        "buy_price": round(buy_price, 2),
+        "support_price": round(breakout_close, 2),
+        "stop_loss": round(stop_loss, 2),
+        "quality_score": quality_score,
+        "buy_type": "突破回踩",
+        "reason": f"放量突破后回踩确认: 突破日收盘{breakout_close:.2f}, "
+                  f"回踩缩量{volume/breakout_volume:.0%}, MA20向上"
     })
     return result
 
@@ -253,20 +412,14 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
 def check_sell_signal(df: pd.DataFrame, buy_price: float,
                       current_position: dict = None) -> dict:
     """
-    检查是否触发卖出信号（止损 / 回落止盈）
+    检查是否触发卖出信号（V3.0升级版）
     
-    参数:
-        df: 日线数据
-        buy_price: 买入均价
-        current_position: 当前持仓信息 {"shares": int, "highest_price": float}
-    
-    返回:
-        {
-            "signal": True/False,
-            "sell_type": "stop_loss" / "drawdown_profit" / "trend_break" / None,
-            "sell_price": float,
-            "reason": str
-        }
+    卖出规则优先级:
+    1. 强制卖出: 单日放量大跌>8%（无条件离场）
+    2. 止损: 收盘价触发移动止损线
+    3. 趋势破位: 收盘跌破60日线+均线拐头+放量
+    4. MACD死叉: 盈利状态下DIF下穿DEA
+    5. 回落止盈: 从最高点回落超阈值
     """
     result = {"signal": False, "sell_type": None, "sell_price": None, "reason": ""}
 
@@ -275,8 +428,10 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
 
     df_ind = compute_indicators(df)
     latest = df_ind.iloc[-1]
+    prev = df_ind.iloc[-2] if len(df_ind) > 1 else latest
     close = latest["close"]
-    low = latest["low"]
+    volume = latest["volume"]
+    vol_ma = latest.get("vol_ma20", 0)
 
     # 当前浮盈比例
     profit_pct = (close - buy_price) / buy_price
@@ -286,6 +441,21 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
         highest = current_position["highest_price"]
     else:
         highest = df_ind["high"].max()
+
+    # ---- 0. 强制卖出: 单日放量大跌>8%（无条件离场）----
+    force_drop = getattr(config, 'FORCE_SELL_DROP_PCT', -0.08)
+    force_vol = getattr(config, 'FORCE_SELL_VOLUME_RATIO', 2.0)
+    if not pd.isna(prev["close"]) and prev["close"] > 0:
+        day_change = (close - prev["close"]) / prev["close"]
+        if not pd.isna(vol_ma) and vol_ma > 0:
+            if day_change <= force_drop and volume > vol_ma * force_vol:
+                result.update({
+                    "signal": True,
+                    "sell_type": "force_sell",
+                    "sell_price": round(close, 2),
+                    "reason": f"★强制卖出: 单日跌{day_change:.2%}且放量{volume/vol_ma:.1f}倍，资金出逃"
+                })
+                return result
 
     # ---- 1. 止损判定（仅收盘价触发）----
     stop_loss_price = compute_trailing_stop(buy_price, close)
@@ -298,17 +468,31 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
         })
         return result
 
-    # ---- 2. 趋势破位：收盘跌破60日均线且60日均线拐头向下 ----
+    # ---- 2. 趋势破位: 收盘跌破60日线+均线拐头+放量 → 立即卖出 ----
     if not pd.isna(latest.get("ma60", None)):
         ma60_slope = df_ind["ma60"].diff(3).iloc[-1]
-        if close < latest["ma60"] and ma60_slope < 0:
-            result.update({
-                "signal": True,
-                "sell_type": "trend_break",
-                "sell_price": round(close, 2),
-                "reason": f"趋势破位: 收盘跌破60日线且均线拐头向下"
-            })
-            return result
+        is_below_ma60 = close < latest["ma60"]
+        is_ma60_down = ma60_slope < 0
+        is_volume_up = (not pd.isna(vol_ma) and vol_ma > 0 and volume > vol_ma * 1.3)
+        if is_below_ma60 and is_ma60_down:
+            if is_volume_up:
+                # 放量破位 → 立即卖出
+                result.update({
+                    "signal": True,
+                    "sell_type": "trend_break",
+                    "sell_price": round(close, 2),
+                    "reason": f"★放量趋势破位: 跌破60日线+均线拐头+放量，立即离场"
+                })
+                return result
+            else:
+                # 缩量破位 → 也卖出（不等3天）
+                result.update({
+                    "signal": True,
+                    "sell_type": "trend_break",
+                    "sell_price": round(close, 2),
+                    "reason": f"趋势破位: 收盘跌破60日线且均线拐头向下"
+                })
+                return result
 
     # ---- 3. MACD死叉确认卖出 ----
     macd_dif = latest.get("macd_dif", 0)
@@ -326,23 +510,9 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
                 })
                 return result
 
-    # ---- 4. RSI超买区域回落卖出 ----
-    rsi_val = latest.get("rsi", 50)
-    if not pd.isna(rsi_val) and rsi_val > config.RSI_OVERBOUGHT and profit_pct > 0.05:
-        # RSI从超买区域回落（当前RSI比前一天低）
-        prev_rsi = df_ind["rsi"].iloc[-2] if len(df_ind) > 1 else rsi_val
-        if not pd.isna(prev_rsi) and rsi_val < prev_rsi:
-            result.update({
-                "signal": True,
-                "sell_type": "rsi_overbought_reversal",
-                "sell_price": round(close, 2),
-                "reason": f"RSI超买回落: RSI={rsi_val:.0f}(前日{prev_rsi:.0f})从超买区回落, 浮盈{profit_pct:.2%}"
-            })
-            return result
-
-    # ---- 5. 回落止盈：从最高点回落超过阈值 ----
+    # ---- 4. 回落止盈: 从最高点回落超阈值 ----
     drawdown_threshold = _get_drawdown_threshold(current_position)
-    if highest > buy_price:  # 只有盈利过才启用回落止盈
+    if highest > buy_price:
         drawdown_from_high = (highest - close) / highest
         if drawdown_from_high >= drawdown_threshold:
             result.update({
@@ -378,11 +548,11 @@ def compute_trailing_stop(buy_price: float, current_price: float) -> float:
     """
     根据当前浮盈计算移动止损价（止损只能上移、不能下移）
     
-    规则:
+    规则（V3.0优化版）:
     - 浮盈 < 5%:  维持初始止损（买入价 * (1-10%)）
-    - 浮盈 5%-15%: 止损上移到成本价（保本）
-    - 浮盈 15%-30%: 止损上移到盈利10%的位置
-    - 浮盈 > 30%: 止损上移到盈利20%的位置
+    - 浮盈 5%-15%: 止损上移到成本价+2%（覆盖手续费，避免白忙）
+    - 浮盈 15%-30%: 止损上移到盈利12%的位置（多锁2%利润）
+    - 浮盈 > 30%: 止损上移到盈利22%的位置（用部分利润换更大空间）
     """
     profit_pct = (current_price - buy_price) / buy_price
     initial_stop = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
@@ -393,12 +563,19 @@ def compute_trailing_stop(buy_price: float, current_price: float) -> float:
         if low <= profit_pct < high:
             if mode == "initial":
                 stop_price = initial_stop
+            elif mode == "cost_plus":
+                stop_price = buy_price * 1.02  # 保本+2%（覆盖手续费）
+            elif mode == "profit_12":
+                stop_price = buy_price * 1.12  # 锁定12%
+            elif mode == "profit_22":
+                stop_price = buy_price * 1.22  # 锁定22%
+            # 兼容旧版参数名
             elif mode == "cost":
-                stop_price = buy_price  # 保本线
+                stop_price = buy_price * 1.02
             elif mode == "profit_10":
-                stop_price = buy_price * (1 + 0.10)
+                stop_price = buy_price * 1.12
             elif mode == "profit_20":
-                stop_price = buy_price * (1 + 0.20)
+                stop_price = buy_price * 1.22
             break
 
     return round(stop_price, 2)
@@ -473,7 +650,16 @@ def generate_strategy_signal(df: pd.DataFrame, holding: dict = None) -> dict:
             result["signal_reason"] = f"[卖出] {sell_result['reason']}"
             return result
 
-        # 检查是否可以加第二批仓
+        # 铁则：浮亏持仓绝对不加仓（只有止损或观望两个选项）
+        if profit_pct < 0:
+            result["signal_reason"] = (
+                f"[浮亏持仓] 浮亏{profit_pct:.2%}, "
+                f"止损线={result['stop_loss_current']:.2f}, "
+                f"铁则:浮亏不加仓,到止损直接离场"
+            )
+            return result
+
+        # 检查是否可以加第二批仓（仅浮盈时允许）
         if not holding.get("first_batch_done") or holding.get("first_batch_done") == False:
             pass  # 第一批未建，不涉及加仓
         elif profit_pct >= config.MIN_PROFIT_TO_ADD:
@@ -489,15 +675,35 @@ def generate_strategy_signal(df: pd.DataFrame, holding: dict = None) -> dict:
             )
         return result
 
-    # ---- 未持仓：检查买入信号 ----
+    # ---- 未持仓：检查两类买点 ----
+    # 买点1: 缩量回踩关键支撑
     buy_result = check_buy_signal(df)
-    if buy_result["signal"]:
+    # 买点2: 放量突破后回踩确认
+    breakout_result = check_breakout_buy_signal(df)
+
+    # 选择最优信号（质量评分高的优先，两者都触发则取最高分）
+    best_result = None
+    if buy_result["signal"] and breakout_result["signal"]:
+        # 两类买点同时满足 → 最高优先级
+        best_result = buy_result if buy_result.get("quality_score", 0) >= breakout_result.get("quality_score", 0) else breakout_result
+        best_result["reason"] = f"★双买点共振: {buy_result['reason']} + {breakout_result['reason']}"
+        best_result["quality_score"] = min(100, max(buy_result.get("quality_score", 0), breakout_result.get("quality_score", 0)) + 15)
+    elif buy_result["signal"]:
+        best_result = buy_result
+    elif breakout_result["signal"]:
+        best_result = breakout_result
+
+    if best_result and best_result["signal"]:
         result["buy_signal"] = True
-        result["buy_price"] = buy_result["buy_price"]
-        result["stop_loss_initial"] = buy_result["stop_loss"]
-        result["stop_loss_current"] = buy_result["stop_loss"]
-        result["signal_reason"] = f"[买入] {buy_result['reason']}"
+        result["buy_price"] = best_result["buy_price"]
+        result["stop_loss_initial"] = best_result["stop_loss"]
+        result["stop_loss_current"] = best_result["stop_loss"]
+        result["quality_score"] = best_result.get("quality_score", 50)
+        result["buy_type"] = best_result.get("buy_type", "回踩支撑")
+        result["signal_reason"] = f"[买入] {best_result['reason']}"
     else:
+        result["quality_score"] = 0
+        result["buy_type"] = None
         result["signal_reason"] = f"[无信号] {buy_result['reason']}"
 
     return result

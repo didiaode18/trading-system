@@ -129,29 +129,12 @@ def get_max_position_ratio(market_strength: str) -> float:
 def risk_check(trade_plan: dict, risk_state: RiskState,
                market_strength: str = "normal") -> dict:
     """
-    交易信号风控校验（所有信号必须先过此函数）
+    交易信号风控校验（V3.0升级版，所有信号必须先过此函数）
     
-    参数:
-        trade_plan: 交易计划
-            {
-                "code": str,
-                "action": "buy" / "sell" / "add",
-                "price": float,
-                "shares": int,
-                "sector": str,
-                "stock_type": "龙头" / "弹性"
-            }
-        risk_state: 当前风控状态
-        market_strength: 行情强度
-    
-    返回:
-        {
-            "pass": bool,         # 是否通过风控
-            "level": str,         # "green" / "yellow" / "red"
-            "reasons": [str],     # 通过/拒绝原因列表
-            "adjusted_shares": int,  # 调整后的股数（可能被缩减）
-            "warnings": [str]     # 警告信息
-        }
+    新增检查:
+    - 持仓数量硬限制: <= 7只
+    - 单笔亏损达总资金2%无条件止损
+    - 浮亏持仓禁止加仓
     """
     result = {
         "pass": True,
@@ -176,6 +159,31 @@ def risk_check(trade_plan: dict, risk_state: RiskState,
     sector = trade_plan.get("sector", "")
     stock_type = trade_plan.get("stock_type", "龙头")
     amount = shares * price
+
+    # ---- 检查0: 持仓数量硬限制 ----
+    max_holdings = getattr(config, 'MAX_HOLDINGS', 7)
+    current_count = len(risk_state.current_positions)
+    if action == "buy" and code not in risk_state.current_positions:
+        if current_count >= max_holdings:
+            result["pass"] = False
+            result["level"] = "red"
+            result["reasons"].append(
+                f"持仓数量超限: 当前{current_count}只 >= 上限{max_holdings}只，禁止新开仓"
+            )
+            return result
+
+    # ---- 检查0.5: 浮亏持仓禁止加仓 ----
+    if action == "add" and code in risk_state.current_positions:
+        pos = risk_state.current_positions[code]
+        buy_p = pos.get("buy_price", 0)
+        cur_p = pos.get("current_price", buy_p)
+        if buy_p > 0 and cur_p < buy_p:
+            result["pass"] = False
+            result["level"] = "red"
+            result["reasons"].append(
+                f"铁则违反: {code}当前浮亏{(cur_p-buy_p)/buy_p:.2%}，绝对禁止加仓"
+            )
+            return result
 
     # ---- 检查1: 时间红线 ----
     now = datetime.datetime.now()

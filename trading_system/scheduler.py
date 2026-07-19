@@ -1,5 +1,5 @@
 """
-定时任务调度模块
+定时任务调度模块 V2.0
 ==================
 每个交易日自动运行交易分析流程并发送邮件报告
 
@@ -8,9 +8,17 @@
   python scheduler.py --install    # 安装为Windows任务计划（开机自启）
   python scheduler.py --uninstall  # 卸载Windows任务计划
 
-调度时间:
-  - 每个交易日 08:30 自动运行完整流程
+调度时间（建议）:
+  - 每个交易日 15:30 盘后分析（数据更新+信号扫描+条件单+选股+仓位分析）
+  - 每个交易日 08:00 盘前提醒（重发条件单，方便开盘前挂单）
+  - 每周五 16:00 周度仓位分析（单独发送）
   - 非交易日（周末/法定节假日）自动跳过
+
+邮件报告列表:
+  1. [条件单] 东方财富智能条件单 - 日期（提前挂单）
+  2. [CANSLIM选股] 日期 | 行业分布 | N只入选
+  3. [仓位分析] 资金优化方案 | N项风险预警
+  4. [交易系统] 每日报告 日期
 """
 
 import os
@@ -90,14 +98,14 @@ def next_trading_day(date: datetime.date = None) -> datetime.date:
 # ============================================================
 
 def run_daily_task():
-    """执行每日交易分析任务"""
+    """执行每日盘后分析任务（15:30运行）"""
     today = datetime.date.today()
 
     if not is_trading_day(today):
         logger.info(f"[{today}] 非交易日，跳过")
         return
 
-    logger.info(f"[{today}] 开始执行每日交易分析...")
+    logger.info(f"[{today}] 开始执行盘后分析...")
 
     try:
         # 调用main.py的完整流程
@@ -107,7 +115,7 @@ def run_daily_task():
         buy_count = sum(1 for _, s in signals if s.get("buy_signal"))
         sell_count = sum(1 for _, s in signals if s.get("sell_signal"))
 
-        logger.info(f"[{today}] 任务完成: {buy_count}个买入信号, {sell_count}个卖出信号")
+        logger.info(f"[{today}] 盘后分析完成: {buy_count}个买入信号, {sell_count}个卖出信号")
 
     except Exception as e:
         logger.error(f"[{today}] 任务执行失败: {e}", exc_info=True)
@@ -121,6 +129,144 @@ def run_daily_task():
             )
         except Exception:
             pass
+
+
+def run_morning_screener():
+    """竞价后选股报告（09:25运行）—— 集合竞价结束后发送前瞻性选股，盘中可操作"""
+    today = datetime.date.today()
+
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过竞价选股")
+        return
+
+    logger.info(f"[{today}] 竞价后选股（09:25）...")
+
+    try:
+        from data.data_loader import init_db, load_daily_data
+        from strategy.trend_strategy import compute_indicators
+        from strategy.stock_screener import run_stock_screener, send_screener_email
+        import json
+
+        conn = init_db()
+        # 加载数据（用前一日收盘数据 + 技术指标）
+        data_dict = {}
+        # 加载股票池 + 行业候选池的所有股票
+        all_codes = set(config.STOCK_POOL.keys())
+        sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+        for sector_info in sector_candidates.values():
+            all_codes.update(sector_info.get("stocks", {}).keys())
+        all_codes.add(config.BENCHMARK_INDEX)  # 沉深300指数
+
+        for code in all_codes:
+            df = load_daily_data(code, conn, days=120)
+            if not df.empty and len(df) >= config.MA_SHORT:
+                df = compute_indicators(df)
+                data_dict[code] = df
+
+        # 加载持仓
+        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings = {}
+        if os.path.exists(holdings_file):
+            with open(holdings_file, "r", encoding="utf-8") as f:
+                holdings = json.load(f)
+
+        # 运行选股引擎（前瞻性模式）
+        result = run_stock_screener(data_dict, holdings)
+
+        # 发送选股邮件
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            send_screener_email(result)
+            logger.info(f"[{today}] 竞价选股报告发送成功 ({result['qualified_count']}只入选)")
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"[{today}] 竞价选股失败: {e}", exc_info=True)
+
+
+def run_morning_reminder():
+    """盘前条件单提醒（08:00运行）—— 重发条件单邮件，方便开盘前挂单"""
+    today = datetime.date.today()
+
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过盘前提醒")
+        return
+
+    logger.info(f"[{today}] 盘前条件单提醒...")
+
+    try:
+        from data.data_loader import init_db, load_daily_data
+        from strategy.trend_strategy import compute_indicators, scan_all_stocks
+        from output.eastmoney_orders import send_eastmoney_orders_email
+        import json
+
+        conn = init_db()
+        # 加载数据
+        data_dict = {}
+        for code in config.STOCK_POOL:
+            df = load_daily_data(code, conn, days=120)
+            if not df.empty and len(df) >= config.MA_SHORT:
+                df = compute_indicators(df)
+                data_dict[code] = df
+
+        # 加载持仓
+        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings = {}
+        if os.path.exists(holdings_file):
+            with open(holdings_file, "r", encoding="utf-8") as f:
+                holdings = json.load(f)
+        for code, pos in holdings.items():
+            if code in data_dict and not data_dict[code].empty:
+                pos["current_price"] = data_dict[code].iloc[-1]["close"]
+
+        # 扫描信号
+        signals = scan_all_stocks(data_dict, holdings)
+
+        # 发送条件单邮件
+        send_eastmoney_orders_email(signals, holdings, data_dict)
+        logger.info(f"[{today}] 盘前条件单提醒发送成功")
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"[{today}] 盘前提醒失败: {e}", exc_info=True)
+
+
+def run_weekly_portfolio():
+    """每周五盘后仓位分析（16:00运行）"""
+    today = datetime.date.today()
+    if today.weekday() != 4:  # 只周五运行
+        return
+
+    logger.info(f"[{today}] 周度仓位分析...")
+    try:
+        from data.data_loader import init_db, load_daily_data
+        from strategy.trend_strategy import compute_indicators
+        from strategy.portfolio_analyzer import analyze_portfolio, send_portfolio_email
+        import json
+
+        conn = init_db()
+        data_dict = {}
+        for code in config.STOCK_POOL:
+            df = load_daily_data(code, conn, days=120)
+            if not df.empty and len(df) >= config.MA_SHORT:
+                df = compute_indicators(df)
+                data_dict[code] = df
+
+        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings = {}
+        if os.path.exists(holdings_file):
+            with open(holdings_file, "r", encoding="utf-8") as f:
+                holdings = json.load(f)
+        for code, pos in holdings.items():
+            if code in data_dict and not data_dict[code].empty:
+                pos["current_price"] = data_dict[code].iloc[-1]["close"]
+
+        result = analyze_portfolio(holdings, data_dict)
+        send_portfolio_email(result)
+        logger.info(f"[{today}] 周度仓位分析发送成功")
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"[{today}] 周度仓位分析失败: {e}", exc_info=True)
 
 
 def run_weekly_task():
@@ -151,27 +297,38 @@ def start_scheduler():
         return
 
     logger.info("=" * 50)
-    logger.info("  交易系统定时调度器")
+    logger.info("  交易系统定时调度器 V2.0")
     logger.info(f"  启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 50)
 
-    # 每个交易日 08:30 运行
-    schedule.every().day.at("08:30").do(run_daily_task)
+    # 每个交易日 15:30 盘后分析（数据更新+信号+条件单）
+    schedule.every().day.at("15:30").do(run_daily_task)
 
-    # 每周日 10:00 运行周度任务
+    # 每个交易日 09:25 竞价后选股（前瞻性选股报告，盘中可操作）
+    schedule.every().day.at("09:25").do(run_morning_screener)
+
+    # 每个交易日 08:00 盘前条件单提醒
+    schedule.every().day.at("08:00").do(run_morning_reminder)
+
+    # 每周五 16:00 周度仓位分析
+    schedule.every().friday.at("16:00").do(run_weekly_portfolio)
+
+    # 每周日 10:00 股票池更新提醒
     schedule.every().sunday.at("10:00").do(run_weekly_task)
 
     logger.info("调度器已启动，等待执行...")
-    logger.info(f"  每日任务: 08:30 (仅交易日)")
-    logger.info(f"  周度任务: 周日 10:00")
+    logger.info(f"  盘后分析: 每个交易日 15:30")
+    logger.info(f"  竞价选股: 每个交易日 09:25")
+    logger.info(f"  盘前提醒: 每个交易日 08:00")
+    logger.info(f"  仓位分析: 每周五 16:00")
+    logger.info(f"  周日提醒: 每周日 10:00")
 
     while True:
         schedule.run_pending()
 
-        # 如果当前不在交易时段且还没到明天08:30，可以休眠
+        # 非交易时段降低检查频率
         now = datetime.datetime.now()
         if now.hour >= 16 or (now.hour < 8):
-            # 非交易时段，每5分钟检查一次
             import time
             time.sleep(300)
         else:
