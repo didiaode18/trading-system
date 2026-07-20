@@ -1,0 +1,968 @@
+{
+  "stats": {
+    "total": 1080,
+    "win_count": 682,
+    "loss_count": 398,
+    "win_rate": 63.1,
+    "avg_win": 8.35,
+    "avg_loss": -7.0,
+    "max_win": 51.85,
+    "max_loss": -27.89,
+    "profit_factor": 1.19,
+    "expectancy": 2.7,
+    "cumulative": 2665074536715.33,
+    "avg_hold": 12.0,
+    "avg_hold_win": 11.1,
+    "avg_hold_loss": 13.6,
+    "max_consec_loss": 12,
+    "sell_stats": {
+      "止损": {
+        "count": 219,
+        "wins": 0,
+        "total": -2117.7399999999984
+      },
+      "回落止盈": {
+        "count": 349,
+        "wins": 319,
+        "total": 2225.3499999999985
+      },
+      "MACD死叉": {
+        "count": 127,
+        "wins": 101,
+        "total": 302.71
+      },
+      "阶梯止盈1": {
+        "count": 224,
+        "wins": 224,
+        "total": 2254.2599999999998
+      },
+      "趋势破位": {
+        "count": 115,
+        "wins": 2,
+        "total": -532.9499999999998
+      },
+      "强制卖出": {
+        "count": 11,
+        "wins": 3,
+        "total": -43.26999999999999
+      },
+      "阶梯止盈2": {
+        "count": 32,
+        "wins": 32,
+        "total": 824.19
+      },
+      "回测结束": {
+        "count": 3,
+        "wins": 1,
+        "total": -0.1200000000000001
+      }
+    },
+    "stock_stats": {
+      "002049 紫光国微": {
+        "count": 25,
+        "wins": 12,
+        "total": 62.26
+      },
+      "300014 亿纬锂能": {
+        "count": 25,
+        "wins": 17,
+        "total": 91.66000000000001
+      },
+      "300760 迈瑞医疗": {
+        "count": 17,
+        "wins": 7,
+        "total": -72.81
+      },
+      "300750 宁德时代": {
+        "count": 36,
+        "wins": 27,
+        "total": 177.49
+      },
+      "300033 同花顺": {
+        "count": 18,
+        "wins": 10,
+        "total": 38.11000000000001
+      },
+      "000661 长春高新": {
+        "count": 24,
+        "wins": 16,
+        "total": 69.02999999999999
+      },
+      "600276 恒瑞医药": {
+        "count": 19,
+        "wins": 10,
+        "total": -49.8
+      },
+      "600585 海螺水泥": {
+        "count": 8,
+        "wins": 2,
+        "total": -42.5
+      },
+      "601888 中国中免": {
+        "count": 22,
+        "wins": 18,
+        "total": 167.60000000000002
+      },
+      "601012 隆基绿能": {
+        "count": 27,
+        "wins": 22,
+        "total": 188.60999999999996
+      },
+      "002594 比亚迪": {
+        "count": 32,
+        "wins": 23,
+        "total": 210.28999999999996
+      },
+      "000858 五粮液": {
+        "count": 30,
+        "wins": 22,
+        "total": 154.22
+      },
+      "600030 中信证券": {
+        "count": 33,
+        "wins": 17,
+        "total": 164.34999999999997
+      },
+      "600584 长电科技": {
+        "count": 25,
+        "wins": 12,
+        "total": -44.879999999999995
+      },
+      "603501 韦尔股份": {
+        "count": 18,
+        "wins": 9,
+        "total": 29.050000000000004
+      },
+      "600031 三一重工": {
+        "count": 35,
+        "wins": 26,
+        "total": 176.24999999999997
+      },
+      "000568 泸州老窖": {
+        "count": 30,
+        "wins": 21,
+        "total": 129.76000000000002
+      },
+      "000333 美的集团": {
+        "count": 22,
+        "wins": 12,
+        "total": 25.539999999999992
+      },
+      "600887 伊利股份": {
+        "count": 22,
+        "wins": 13,
+        "total": 38.51
+      },
+      "000725 京东方A": {
+        "count": 23,
+        "wins": 10,
+        "total": -43.89
+      },
+      "300122 智飞生物": {
+        "count": 15,
+        "wins": 12,
+        "total": 75.56999999999998
+      },
+      "601688 华泰证券": {
+        "count": 25,
+        "wins": 14,
+        "total": 84.51
+      },
+      "300496 中科创达": {
+        "count": 11,
+        "wins": 3,
+        "total": -55.800000000000004
+      },
+      "000768 中航西飞": {
+        "count": 14,
+        "wins": 11,
+        "total": 46.72999999999999
+      },
+      "601899 紫金矿业": {
+        "count": 24,
+        "wins": 18,
+        "total": 56.5
+      },
+      "002415 海康威视": {
+        "count": 31,
+        "wins": 21,
+        "total": 51.370000000000005
+      },
+      "601166 兴业银行": {
+        "count": 27,
+        "wins": 19,
+        "total": 96.16999999999999
+      },
+      "002409 雅克科技": {
+        "count": 13,
+        "wins": 12,
+        "total": 61.14
+      },
+      "300124 汇川技术": {
+        "count": 19,
+        "wins": 15,
+        "total": 43.839999999999996
+      },
+      "600309 万华化学": {
+        "count": 25,
+        "wins": 18,
+        "total": 55.930000000000014
+      },
+      "002230 科大讯飞": {
+        "count": 30,
+        "wins": 20,
+        "total": 113.84
+      },
+      "600519 贵州茅台": {
+        "count": 19,
+        "wins": 7,
+        "total": -36.89
+      },
+      "601318 中国平安": {
+        "count": 28,
+        "wins": 15,
+        "total": 64.60000000000001
+      },
+      "600036 招商银行": {
+        "count": 27,
+        "wins": 19,
+        "total": 62.28
+      },
+      "600118 中国卫星": {
+        "count": 8,
+        "wins": 6,
+        "total": 25.87
+      },
+      "600760 中航沈飞": {
+        "count": 24,
+        "wins": 18,
+        "total": 121.60999999999999
+      },
+      "600893 航发动力": {
+        "count": 26,
+        "wins": 19,
+        "total": 78.33
+      },
+      "002460 赣锋锂业": {
+        "count": 28,
+        "wins": 25,
+        "total": 279.15999999999997
+      },
+      "601088 中国神华": {
+        "count": 20,
+        "wins": 10,
+        "total": 19.950000000000003
+      },
+      "603288 海天味业": {
+        "count": 5,
+        "wins": 2,
+        "total": -18.17
+      },
+      "603986 兆易创新": {
+        "count": 23,
+        "wins": 12,
+        "total": 9.629999999999999
+      },
+      "688012 中微公司": {
+        "count": 16,
+        "wins": 8,
+        "total": 2.740000000000005
+      },
+      "600900 长江电力": {
+        "count": 20,
+        "wins": 9,
+        "total": -11.760000000000002
+      },
+      "300347 泰格医药": {
+        "count": 7,
+        "wins": 5,
+        "total": 53.940000000000005
+      },
+      "002371 北方华创": {
+        "count": 26,
+        "wins": 12,
+        "total": -3.6400000000000023
+      },
+      "688981 中芯国际": {
+        "count": 20,
+        "wins": 12,
+        "total": 94.25999999999999
+      },
+      "002384 东山精密": {
+        "count": 16,
+        "wins": 10,
+        "total": -25.310000000000002
+      },
+      "300274 阳光电源": {
+        "count": 17,
+        "wins": 10,
+        "total": 59.0
+      },
+      "600150 中国船舶": {
+        "count": 20,
+        "wins": 12,
+        "total": 61.0
+      },
+      "688111 金山办公": {
+        "count": 5,
+        "wins": 2,
+        "total": -22.82
+      }
+    },
+    "industry_stats": {
+      "半导体": {
+        "count": 166,
+        "wins": 89,
+        "total": 210.56
+      },
+      "新能源": {
+        "count": 165,
+        "wins": 124,
+        "total": 1006.21
+      },
+      "医药": {
+        "count": 82,
+        "wins": 50,
+        "total": 75.93000000000004
+      },
+      "AI": {
+        "count": 114,
+        "wins": 71,
+        "total": 168.54000000000013
+      },
+      "建材": {
+        "count": 8,
+        "wins": 2,
+        "total": -42.5
+      },
+      "消费": {
+        "count": 128,
+        "wins": 83,
+        "total": 435.03000000000014
+      },
+      "金融": {
+        "count": 140,
+        "wins": 84,
+        "total": 471.9100000000002
+      },
+      "机械": {
+        "count": 35,
+        "wins": 26,
+        "total": 176.24999999999997
+      },
+      "家电": {
+        "count": 22,
+        "wins": 12,
+        "total": 25.539999999999992
+      },
+      "面板": {
+        "count": 23,
+        "wins": 10,
+        "total": -43.89
+      },
+      "军工": {
+        "count": 92,
+        "wins": 66,
+        "total": 333.54000000000013
+      },
+      "有色": {
+        "count": 24,
+        "wins": 18,
+        "total": 56.5
+      },
+      "化工": {
+        "count": 25,
+        "wins": 18,
+        "total": 55.930000000000014
+      },
+      "煤炭": {
+        "count": 20,
+        "wins": 10,
+        "total": 19.950000000000003
+      },
+      "电力": {
+        "count": 20,
+        "wins": 9,
+        "total": -11.760000000000002
+      },
+      "电子": {
+        "count": 16,
+        "wins": 10,
+        "total": -25.310000000000002
+      }
+    }
+  },
+  "deep_analysis": {
+    "yearly": {
+      "2020": {
+        "trades": 214,
+        "win_rate": 77.6,
+        "expectancy": 6.96,
+        "cumulative": 56764822.15
+      },
+      "2021": {
+        "trades": 163,
+        "win_rate": 55.2,
+        "expectancy": 0.5,
+        "cumulative": 19.3
+      },
+      "2022": {
+        "trades": 121,
+        "win_rate": 62.8,
+        "expectancy": 2.64,
+        "cumulative": 1303.51
+      },
+      "2023": {
+        "trades": 131,
+        "win_rate": 42.7,
+        "expectancy": -1.67,
+        "cumulative": -92.57
+      },
+      "2024": {
+        "trades": 172,
+        "win_rate": 63.4,
+        "expectancy": 3.43,
+        "cumulative": 14009.6
+      },
+      "2025": {
+        "trades": 222,
+        "win_rate": 68.5,
+        "expectancy": 2.8,
+        "cumulative": 22273.68
+      },
+      "2026": {
+        "trades": 57,
+        "win_rate": 57.9,
+        "expectancy": 0.54,
+        "cumulative": 19.61
+      }
+    },
+    "losing": {
+      "count": 398,
+      "by_sell_type": {
+        "止损": 219,
+        "回落止盈": 30,
+        "趋势破位": 113,
+        "强制卖出": 8,
+        "MACD死叉": 26,
+        "回测结束": 2
+      },
+      "by_industry": {
+        "半导体": 77,
+        "新能源": 41,
+        "金融": 56,
+        "AI": 43,
+        "机械": 9,
+        "医药": 32,
+        "消费": 45,
+        "建材": 6,
+        "军工": 26,
+        "面板": 13,
+        "有色": 6,
+        "家电": 10,
+        "煤炭": 10,
+        "电力": 11,
+        "电子": 6,
+        "化工": 7
+      },
+      "avg_loss": -6.995050251256281,
+      "max_loss": -27.89,
+      "avg_hold_days": 13.56030150753769
+    },
+    "winning": {
+      "count": 682,
+      "by_sell_type": {
+        "MACD死叉": 101,
+        "阶梯止盈1": 224,
+        "回落止盈": 319,
+        "阶梯止盈2": 32,
+        "强制卖出": 3,
+        "趋势破位": 2,
+        "回测结束": 1
+      },
+      "avg_win": 8.352580645161291,
+      "max_win": 51.85,
+      "avg_hold_days": 11.082111436950147
+    },
+    "hold_days": {
+      "1-5天": {
+        "count": 289,
+        "win_rate": 64.0,
+        "expectancy": 2.35
+      },
+      "6-10天": {
+        "count": 300,
+        "win_rate": 68.0,
+        "expectancy": 3.22
+      },
+      "11-20天": {
+        "count": 345,
+        "win_rate": 64.6,
+        "expectancy": 3.16
+      },
+      "21-30天": {
+        "count": 92,
+        "win_rate": 55.4,
+        "expectancy": 2.81
+      },
+      "30天+": {
+        "count": 54,
+        "win_rate": 35.2,
+        "expectancy": -1.54
+      }
+    },
+    "sell_types": {
+      "止损": {
+        "count": 219,
+        "win_rate": 0.0,
+        "expectancy": -9.67,
+        "avg_profit": -9.670045662100456
+      },
+      "回落止盈": {
+        "count": 349,
+        "win_rate": 91.4,
+        "expectancy": 6.38,
+        "avg_profit": 6.376361031518624
+      },
+      "MACD死叉": {
+        "count": 127,
+        "win_rate": 79.5,
+        "expectancy": 2.38,
+        "avg_profit": 2.383543307086614
+      },
+      "阶梯止盈1": {
+        "count": 224,
+        "win_rate": 100.0,
+        "expectancy": 10.06,
+        "avg_profit": 10.063660714285714
+      },
+      "趋势破位": {
+        "count": 115,
+        "win_rate": 1.7,
+        "expectancy": -4.63,
+        "avg_profit": -4.634347826086955
+      },
+      "强制卖出": {
+        "count": 11,
+        "win_rate": 27.3,
+        "expectancy": -3.93,
+        "avg_profit": -3.9336363636363627
+      },
+      "阶梯止盈2": {
+        "count": 32,
+        "win_rate": 100.0,
+        "expectancy": 25.76,
+        "avg_profit": 25.7559375
+      },
+      "回测结束": {
+        "count": 3,
+        "win_rate": 33.3,
+        "expectancy": -0.04,
+        "avg_profit": -0.040000000000000036
+      }
+    },
+    "industry": {
+      "半导体": {
+        "count": 166,
+        "win_rate": 53.6,
+        "expectancy": 1.27,
+        "cumulative": 224.47
+      },
+      "新能源": {
+        "count": 165,
+        "win_rate": 75.2,
+        "expectancy": 6.1,
+        "cumulative": 833417.51
+      },
+      "医药": {
+        "count": 82,
+        "win_rate": 61.0,
+        "expectancy": 0.93,
+        "cumulative": 42.44
+      },
+      "AI": {
+        "count": 114,
+        "win_rate": 62.3,
+        "expectancy": 1.48,
+        "cumulative": 255.21
+      },
+      "建材": {
+        "count": 8,
+        "win_rate": 25.0,
+        "expectancy": -5.31,
+        "cumulative": -36.19
+      },
+      "消费": {
+        "count": 128,
+        "win_rate": 64.8,
+        "expectancy": 3.4,
+        "cumulative": 4187.47
+      },
+      "金融": {
+        "count": 140,
+        "win_rate": 60.0,
+        "expectancy": 3.37,
+        "cumulative": 5183.83
+      },
+      "机械": {
+        "count": 35,
+        "win_rate": 74.3,
+        "expectancy": 5.04,
+        "cumulative": 370.97
+      },
+      "家电": {
+        "count": 22,
+        "win_rate": 54.5,
+        "expectancy": 1.16,
+        "cumulative": 22.94
+      },
+      "面板": {
+        "count": 23,
+        "win_rate": 43.5,
+        "expectancy": -1.91,
+        "cumulative": -38.55
+      },
+      "军工": {
+        "count": 92,
+        "win_rate": 71.7,
+        "expectancy": 3.63,
+        "cumulative": 1815.7
+      },
+      "有色": {
+        "count": 24,
+        "win_rate": 75.0,
+        "expectancy": 2.35,
+        "cumulative": 65.09
+      },
+      "化工": {
+        "count": 25,
+        "win_rate": 72.0,
+        "expectancy": 2.24,
+        "cumulative": 66.4
+      },
+      "煤炭": {
+        "count": 20,
+        "win_rate": 50.0,
+        "expectancy": 1.0,
+        "cumulative": 15.5
+      },
+      "电力": {
+        "count": 20,
+        "win_rate": 45.0,
+        "expectancy": -0.59,
+        "cumulative": -13.23
+      },
+      "电子": {
+        "count": 16,
+        "win_rate": 62.5,
+        "expectancy": -1.58,
+        "cumulative": -28.2
+      }
+    },
+    "streak": {
+      "max_consecutive_loss": 12
+    }
+  },
+  "stock_results": {
+    "002371": {
+      "name": "北方华创",
+      "industry": "半导体",
+      "trades": 26,
+      "data_days": 1585
+    },
+    "002409": {
+      "name": "雅克科技",
+      "industry": "半导体",
+      "trades": 13,
+      "data_days": 1585
+    },
+    "600584": {
+      "name": "长电科技",
+      "industry": "半导体",
+      "trades": 25,
+      "data_days": 1580
+    },
+    "603986": {
+      "name": "兆易创新",
+      "industry": "半导体",
+      "trades": 23,
+      "data_days": 1585
+    },
+    "002049": {
+      "name": "紫光国微",
+      "industry": "半导体",
+      "trades": 25,
+      "data_days": 1574
+    },
+    "688981": {
+      "name": "中芯国际",
+      "industry": "半导体",
+      "trades": 20,
+      "data_days": 1451
+    },
+    "603501": {
+      "name": "韦尔股份",
+      "industry": "半导体",
+      "trades": 18,
+      "data_days": 1585
+    },
+    "688012": {
+      "name": "中微公司",
+      "industry": "半导体",
+      "trades": 16,
+      "data_days": 1576
+    },
+    "300750": {
+      "name": "宁德时代",
+      "industry": "新能源",
+      "trades": 36,
+      "data_days": 1585
+    },
+    "002594": {
+      "name": "比亚迪",
+      "industry": "新能源",
+      "trades": 32,
+      "data_days": 1585
+    },
+    "601012": {
+      "name": "隆基绿能",
+      "industry": "新能源",
+      "trades": 27,
+      "data_days": 1585
+    },
+    "300274": {
+      "name": "阳光电源",
+      "industry": "新能源",
+      "trades": 17,
+      "data_days": 1585
+    },
+    "002460": {
+      "name": "赣锋锂业",
+      "industry": "新能源",
+      "trades": 28,
+      "data_days": 1585
+    },
+    "300014": {
+      "name": "亿纬锂能",
+      "industry": "新能源",
+      "trades": 25,
+      "data_days": 1585
+    },
+    "002230": {
+      "name": "科大讯飞",
+      "industry": "AI",
+      "trades": 30,
+      "data_days": 1585
+    },
+    "300033": {
+      "name": "同花顺",
+      "industry": "AI",
+      "trades": 18,
+      "data_days": 1585
+    },
+    "002415": {
+      "name": "海康威视",
+      "industry": "AI",
+      "trades": 31,
+      "data_days": 1585
+    },
+    "300496": {
+      "name": "中科创达",
+      "industry": "AI",
+      "trades": 11,
+      "data_days": 1585
+    },
+    "688111": {
+      "name": "金山办公",
+      "industry": "AI",
+      "trades": 5,
+      "data_days": 1585
+    },
+    "300124": {
+      "name": "汇川技术",
+      "industry": "AI",
+      "trades": 19,
+      "data_days": 1585
+    },
+    "600118": {
+      "name": "中国卫星",
+      "industry": "军工",
+      "trades": 8,
+      "data_days": 1585
+    },
+    "600760": {
+      "name": "中航沈飞",
+      "industry": "军工",
+      "trades": 24,
+      "data_days": 1585
+    },
+    "600893": {
+      "name": "航发动力",
+      "industry": "军工",
+      "trades": 26,
+      "data_days": 1584
+    },
+    "000768": {
+      "name": "中航西飞",
+      "industry": "军工",
+      "trades": 14,
+      "data_days": 1585
+    },
+    "600150": {
+      "name": "中国船舶",
+      "industry": "军工",
+      "trades": 20,
+      "data_days": 1570
+    },
+    "600519": {
+      "name": "贵州茅台",
+      "industry": "消费",
+      "trades": 19,
+      "data_days": 1585
+    },
+    "000858": {
+      "name": "五粮液",
+      "industry": "消费",
+      "trades": 30,
+      "data_days": 1585
+    },
+    "603288": {
+      "name": "海天味业",
+      "industry": "消费",
+      "trades": 5,
+      "data_days": 1585
+    },
+    "000568": {
+      "name": "泸州老窖",
+      "industry": "消费",
+      "trades": 30,
+      "data_days": 1585
+    },
+    "600887": {
+      "name": "伊利股份",
+      "industry": "消费",
+      "trades": 22,
+      "data_days": 1585
+    },
+    "300760": {
+      "name": "迈瑞医疗",
+      "industry": "医药",
+      "trades": 17,
+      "data_days": 1585
+    },
+    "600276": {
+      "name": "恒瑞医药",
+      "industry": "医药",
+      "trades": 19,
+      "data_days": 1585
+    },
+    "300347": {
+      "name": "泰格医药",
+      "industry": "医药",
+      "trades": 7,
+      "data_days": 1585
+    },
+    "000661": {
+      "name": "长春高新",
+      "industry": "医药",
+      "trades": 24,
+      "data_days": 1585
+    },
+    "300122": {
+      "name": "智飞生物",
+      "industry": "医药",
+      "trades": 15,
+      "data_days": 1585
+    },
+    "601318": {
+      "name": "中国平安",
+      "industry": "金融",
+      "trades": 28,
+      "data_days": 1585
+    },
+    "600036": {
+      "name": "招商银行",
+      "industry": "金融",
+      "trades": 27,
+      "data_days": 1585
+    },
+    "601166": {
+      "name": "兴业银行",
+      "industry": "金融",
+      "trades": 27,
+      "data_days": 1585
+    },
+    "600030": {
+      "name": "中信证券",
+      "industry": "金融",
+      "trades": 33,
+      "data_days": 1579
+    },
+    "601688": {
+      "name": "华泰证券",
+      "industry": "金融",
+      "trades": 25,
+      "data_days": 1585
+    },
+    "000725": {
+      "name": "京东方A",
+      "industry": "面板",
+      "trades": 23,
+      "data_days": 1585
+    },
+    "002384": {
+      "name": "东山精密",
+      "industry": "电子",
+      "trades": 16,
+      "data_days": 1585
+    },
+    "601899": {
+      "name": "紫金矿业",
+      "industry": "有色",
+      "trades": 24,
+      "data_days": 1585
+    },
+    "600309": {
+      "name": "万华化学",
+      "industry": "化工",
+      "trades": 25,
+      "data_days": 1585
+    },
+    "601888": {
+      "name": "中国中免",
+      "industry": "消费",
+      "trades": 22,
+      "data_days": 1585
+    },
+    "600900": {
+      "name": "长江电力",
+      "industry": "电力",
+      "trades": 20,
+      "data_days": 1574
+    },
+    "601088": {
+      "name": "中国神华",
+      "industry": "煤炭",
+      "trades": 20,
+      "data_days": 1575
+    },
+    "600031": {
+      "name": "三一重工",
+      "industry": "机械",
+      "trades": 35,
+      "data_days": 1585
+    },
+    "000333": {
+      "name": "美的集团",
+      "industry": "家电",
+      "trades": 22,
+      "data_days": 1585
+    },
+    "600585": {
+      "name": "海螺水泥",
+      "industry": "建材",
+      "trades": 8,
+      "data_days": 1585
+    }
+  }
+}
