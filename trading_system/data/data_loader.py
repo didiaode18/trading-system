@@ -297,9 +297,29 @@ def update_stock_to_db(conn: sqlite3.Connection, code: str) -> int:
     return count
 
 
-def batch_update_all(conn: sqlite3.Connection = None) -> dict:
+def get_all_candidate_codes() -> list:
+    """
+    汇总所有需要拉取数据的股票代码（去重）
+    来源: STOCK_POOL + SECTOR_CANDIDATES + BENCHMARK_INDEX
+    """
+    codes = set(config.STOCK_POOL.keys())
+    # 从 SECTOR_CANDIDATES 中提取所有候选股
+    sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+    for sector_name, sector_info in sector_candidates.items():
+        stocks = sector_info.get("stocks", {})
+        codes.update(stocks.keys())
+    # 加入基准指数
+    codes.add(config.BENCHMARK_INDEX)
+    return sorted(codes)
+
+
+def batch_update_all(conn: sqlite3.Connection = None, full_pool: bool = True) -> dict:
     """
     批量更新所有股票池中的日线数据
+    参数:
+        conn: 数据库连接
+        full_pool: True=更新全部候选股(STOCK_POOL+SECTOR_CANDIDATES)
+                   False=仅更新STOCK_POOL
     返回: {code: 新增记录数}
     """
     if conn is None:
@@ -310,8 +330,13 @@ def batch_update_all(conn: sqlite3.Connection = None) -> dict:
         _bs_login()
 
     results = {}
-    codes = list(config.STOCK_POOL.keys())
-    codes.append(config.BENCHMARK_INDEX)
+    if full_pool:
+        codes = get_all_candidate_codes()
+    else:
+        codes = list(config.STOCK_POOL.keys())
+        codes.append(config.BENCHMARK_INDEX)
+
+    logger.info(f"数据更新范围: {len(codes)}只股票")
 
     for code in codes:
         try:

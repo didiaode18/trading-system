@@ -152,22 +152,28 @@ def check_market_direction(data_dict: dict) -> dict:
 # 一'、个股硬性筛选（6个硬性标准，不通过直接跳过）
 # ============================================================
 
-def hard_filter(df: pd.DataFrame, code: str) -> dict:
+def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
     """
-    个股硬性筛选（全部满足才能进入核心股票池）
+    个股硬性筛选（支持强势/弱势两种模式）
     
-    6个硬性标准:
-    1. 趋势合格: 股价站稳MA20 + MA20向上 + MA60不能明确向下
+    强势模式（6个硬性标准）:
+    1. 趋势合格: 股价站稳MA20 + MA20向上
     2. 流动性充足: 日均成交额 >= 8亿
     3. 股性稳定: 近30日单日振幅>10%的天数 <= 3天
     4. 无放量暴跌: 近5日无单日跌幅>8%且放量
-    5. 不在黑名单: 非下降通道（MA20/MA60全部向下）
-    6. 回调不创新低: 近期回调不能跌破前一波低点
+    5. 不在黑名单: 非下降通道
+    6. 回调不创新低
+    
+    弱势模式（放宽条件，选相对强势股）:
+    1. 不要求MA20向上，改为"MA20跌幅收窄"或"近5日企稳"
+    2. 不要求收盘价在MA20上方，改为"距MA20偏离度最小"
+    3. 保留流动性、暴跌、下降通道等底线筛选
     
     返回:
-        {"pass": bool, "reason": str, "details": dict}
+        {"pass": bool, "reason": str, "details": dict, "weak_score": float}
     """
-    result = {"pass": True, "reason": "", "details": {}}
+    result = {"pass": True, "reason": "", "details": {}, "weak_score": 0}
+    is_weak_market = market_state in ("down", "weak", "neutral")
     
     if len(df) < 60:
         result["pass"] = False
@@ -177,7 +183,7 @@ def hard_filter(df: pd.DataFrame, code: str) -> dict:
     latest = df.iloc[-1]
     close = latest["close"]
     
-    # ---- 1. 趋势合格 ----
+    # ---- 1. 趋势判定 ----
     ma20 = latest.get("ma20", None)
     ma60 = latest.get("ma60", None)
     ma20_slope = latest.get("ma20_slope", None)
@@ -187,25 +193,93 @@ def hard_filter(df: pd.DataFrame, code: str) -> dict:
         result["reason"] = "均线数据不足"
         return result
     
-    # MA20必须向上
-    if ma20_slope <= 0:
-        result["pass"] = False
-        result["reason"] = f"MA20向下(斜率{ma20_slope:.4f})，趋势不合格"
-        return result
-    
-    # 收盘价必须在MA20上方
-    if close < ma20:
-        result["pass"] = False
-        result["reason"] = f"收盘价{close:.2f}跌破MA20({ma20:.2f})"
-        return result
-    
-    # MA60不能明确向下
-    if not pd.isna(ma60):
-        ma60_slope = df["ma60"].diff(5).iloc[-1] if len(df) >= 65 else 0
-        if not pd.isna(ma60_slope) and ma60_slope < 0 and close < ma60:
+    if is_weak_market:
+        # === 弱势行情宽松模式 ===
+        weak_score = 0
+        
+        # 计算MA20斜率变化（跌幅是否收窄）
+        if len(df) >= 25:
+            ma20_slope_prev = df["ma20"].diff(3).iloc[-4] if not pd.isna(df["ma20"].diff(3).iloc[-4]) else 0
+            slope_improving = ma20_slope > ma20_slope_prev  # 斜率在改善
+        else:
+            slope_improving = False
+        
+        # 近5日企稳判定：连续2日不创新低
+        if len(df) >= 6:
+            recent_5_low = df["low"].iloc[-5:].min()
+            prev_5_low = df["low"].iloc[-10:-5].min() if len(df) >= 10 else recent_5_low
+            is_stabilizing = recent_5_low >= prev_5_low * 0.98
+        else:
+            is_stabilizing = False
+        
+        # 距MA20偏离度（越小越好）
+        dist_to_ma20 = (close - ma20) / ma20 if ma20 > 0 else -1
+        
+        # 弱势模式评分
+        if close > ma20:
+            weak_score += 30  # 仍在MA20上方，很强
+        elif dist_to_ma20 > -0.05:
+            weak_score += 20  # 距MA20不超过5%
+        elif dist_to_ma20 > -0.10:
+            weak_score += 10  # 距MA20不超过10%
+        
+        if slope_improving:
+            weak_score += 20  # MA20跌幅收窄
+        if ma20_slope > 0:
+            weak_score += 15  # MA20仍然向上
+        if is_stabilizing:
+            weak_score += 20  # 近5日企稳
+        
+        # 近5日涨跌幅（相对强度）
+        if len(df) >= 6:
+            change_5d = (close / df["close"].iloc[-6] - 1) * 100
+            if change_5d > 0:
+                weak_score += 15
+            elif change_5d > -3:
+                weak_score += 8
+        
+        result["weak_score"] = weak_score
+        
+        # 弱势模式底线：不能是明确下降通道
+        if not pd.isna(ma60):
+            ma60_slope = df["ma60"].diff(5).iloc[-1] if len(df) >= 65 else 0
+            if not pd.isna(ma60_slope) and ma20_slope < 0 and ma60_slope < 0 and close < ma60:
+                # MA20/MA60全部向下且股价在MA60下方 → 明确下降通道，即使弱势也不选
+                if dist_to_ma20 < -0.15:  # 偏离MA20超过15%，太弱
+                    result["pass"] = False
+                    result["reason"] = f"明确下降通道且偏离MA20达{dist_to_ma20:.1%}"
+                    return result
+        
+        # 弱势模式通过条件：weak_score >= 25
+        if weak_score < 25:
             result["pass"] = False
-            result["reason"] = f"MA60向下且股价在MA60下方，中期趋势走坏"
+            result["reason"] = f"弱势评分{weak_score}分不足25分，相对强度太弱"
             return result
+        
+        result["reason"] = f"弱势模式通过(评分{weak_score})"
+    else:
+        # === 强势行情严格模式（原逻辑）===
+        # MA20必须向上
+        if ma20_slope <= 0:
+            result["pass"] = False
+            result["reason"] = f"MA20向下(斜率{ma20_slope:.4f})，趋势不合格"
+            return result
+        
+        # 收盘价必须在MA20上方
+        if close < ma20:
+            result["pass"] = False
+            result["reason"] = f"收盘价{close:.2f}跌破MA20({ma20:.2f})"
+            return result
+        
+        # MA60不能明确向下
+        if not pd.isna(ma60):
+            ma60_slope = df["ma60"].diff(5).iloc[-1] if len(df) >= 65 else 0
+            if not pd.isna(ma60_slope) and ma60_slope < 0 and close < ma60:
+                result["pass"] = False
+                result["reason"] = f"MA60向下且股价在MA60下方，中期趋势走坏"
+                return result
+        
+        result["reason"] = "硬性筛选通过"
     
     # ---- 2. 流动性充足: 日均成交额 >= 8亿 ----
     min_amount = getattr(config, 'MIN_DAILY_AMOUNT', 8e8)
@@ -246,15 +320,14 @@ def hard_filter(df: pd.DataFrame, code: str) -> dict:
                     result["reason"] = f"近5日有放量暴跌(跌{day_change:.2%}且量>{crash_vol_ratio}倍)，资金出逃"
                     return result
     
-    # ---- 5. 不在下降通道 ----
-    if not pd.isna(ma60) and not pd.isna(ma20_slope):
+    # ---- 5. 不在下降通道（强势模式严格检查）----
+    if not is_weak_market and not pd.isna(ma60) and not pd.isna(ma20_slope):
         ma60_slope = df["ma60"].diff(5).iloc[-1] if len(df) >= 65 else 0
         if not pd.isna(ma60_slope) and ma20_slope < 0 and ma60_slope < 0:
             result["pass"] = False
             result["reason"] = "MA20/MA60全部向下，明确下降通道"
             return result
     
-    result["reason"] = "硬性筛选通过"
     return result
 
 
@@ -284,7 +357,7 @@ def filter_strong_sectors(data_dict: dict, lookback: int = 20) -> dict:
     for code, df in data_dict.items():
         if code == "000300":
             continue
-        info = config.STOCK_POOL.get(code, {})
+        info = config.get_stock_info(code)
         sector = info.get("赛道", "其他")
         if len(df) < lookback + 5:
             continue
@@ -727,7 +800,7 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     """
     latest = df.iloc[-1]
     current_price = latest["close"]
-    stock_info = config.STOCK_POOL.get(code, {})
+    stock_info = config.get_stock_info(code)
     stock_type = stock_info.get("类型", "龙头")
 
     # ATR
@@ -746,7 +819,18 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     ma60 = latest.get("ma60", current_price)
 
     # ---- 买点价格 ----
-    aggressive_buy = round(current_price * 1.005, 2)
+    # 激进买点：根据信号类型决定
+    # - 突破/动量类信号：现价+0.5%（追入）
+    # - 回踩/缩量类信号：现价（直接买入，不应高于现价）
+    signals_list = factor_result.get("signals", [])
+    is_pullback_signal = any(
+        s for s in signals_list
+        if "回踩" in s or "缩量" in s or "超卖" in s or "均值回归" in s
+    )
+    if is_pullback_signal:
+        aggressive_buy = round(current_price, 2)  # 回踩信号：激进买点=现价
+    else:
+        aggressive_buy = round(current_price * 1.005, 2)  # 突破/动量：现价+0.5%
 
     # 稳健买点：MA5和MA10的较高者附近
     if not pd.isna(ma5) and not pd.isna(ma10):
@@ -783,13 +867,17 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     final_stop = min(final_stop, round(current_price * 0.95, 2))  # 最多5%以内
 
     # ---- 分批建仓方案 ----
+    # 使用可用资金（而非总资金）计算实际可买股数
+    available_cash = getattr(config, 'AVAILABLE_CASH', config.TOTAL_CAPITAL * 0.5)
     total_capital = config.TOTAL_CAPITAL
     # 大盘仓位限制
     market_limit = market_info.get("position_limit_ratio", 1.0) if market_info else 1.0
+    # 实际可用 = min(可用资金, 总资金*仓位限制)
+    effective_capital = min(available_cash, total_capital * market_limit)
 
     # 第一批40%试仓
     first_ratio = 0.4
-    first_max_amount = total_capital * first_ratio * market_limit
+    first_max_amount = effective_capital * first_ratio
     first_shares = int(first_max_amount / moderate_buy / 100) * 100
     if first_shares == 0:
         first_shares = 100
@@ -798,7 +886,7 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     # 第二批60%加仓（浮盈≥3%后）
     add_price = round(moderate_buy * 1.03, 2)  # 浮盈3%的加仓触发价
     second_ratio = 0.6
-    second_max_amount = total_capital * second_ratio * market_limit
+    second_max_amount = effective_capital * second_ratio
     second_shares = int(second_max_amount / add_price / 100) * 100
     if second_shares == 0:
         second_shares = 100
@@ -819,7 +907,7 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
 
     return {
         "code": code,
-        "name": stock_info.get("名称", code),
+        "name": stock_info.get("名称", config.get_stock_name(code)),
         "sector": stock_info.get("赛道", ""),
         "type": stock_type,
         "current_price": round(current_price, 2),
@@ -917,18 +1005,20 @@ def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
 def run_stock_screener(data_dict: dict, holdings: dict = None,
                        min_score: float = None, max_stocks: int = None) -> dict:
     """
-    运行完整选股流程（全赛道版）
+    运行完整选股流程（全赛道版 + 弱势行情支持）
     
     改进:
     - 支持全行业选股，不局限于半导体
     - 根据行业强弱动态分配名额
-    - 每个行业有独立配额，避免过度集中
+    - 弱势行情输出"观察池"（相对强势股）
+    - 结合持仓行业集中度调整配额
+    - 新增持仓诊断输出
     
     参数:
         data_dict: {code: DataFrame} 股票数据（含技术指标）
         holdings: 当前持仓
-        min_score: 最低入选分数（默认取config.SCREENER_CONFIG）
-        max_stocks: 最多入选股票数（默认取config.SCREENER_CONFIG）
+        min_score: 最低入选分数
+        max_stocks: 最多入选股票数
     """
     # 从配置读取参数
     screener_cfg = getattr(config, 'SCREENER_CONFIG', {})
@@ -939,53 +1029,84 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     max_per_sector = screener_cfg.get("max_stocks_per_sector", 3)
     
     scan_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    logger.info(f"[选股引擎V2] 开始运行（全赛道模式），候选股票 {len(data_dict)} 只")
+    logger.info(f"[选股引擎V3] 开始运行（全赛道+弱势模式），候选股票 {len(data_dict)} 只")
 
     # M因子：大盘方向判断
-    logger.info("[选股引擎V2] M因子: 大盘方向判断...")
+    logger.info("[选股引擎V3] M因子: 大盘方向判断...")
     market_info = check_market_direction(data_dict)
-    if not market_info["can_buy"]:
-        logger.warning(f"[选股引擎V2] 大盘处于{market_info['market_state']}状态，不建议买入")
+    market_state = market_info["market_state"]
+    logger.info(f"  大盘状态: {market_state} | 可买入: {market_info['can_buy']}")
 
     # 第一步：赛道筛选
-    logger.info("[选股引擎V2] Step 1: 赛道筛选...")
+    logger.info("[选股引擎V3] Step 1: 赛道筛选...")
     sector_result = filter_strong_sectors(data_dict)
     logger.info(f"  强势赛道: {sector_result['strong']}")
     logger.info(f"  弱势赛道: {sector_result['weak']}")
     
-    # 行业配额动态分配
+    # 行业配额动态分配（结合持仓集中度调整）
     sector_quotas = allocate_sector_quotas(sector_result, max_stocks)
+    # 根据持仓行业集中度降低已重仓行业配额
+    if holdings:
+        holdings_sector_amount = defaultdict(float)
+        for code, pos in holdings.items():
+            sector = pos.get("sector", "")
+            shares = pos.get("shares", 0)
+            price = pos.get("current_price", pos.get("buy_price", 0))
+            holdings_sector_amount[sector] += shares * price
+        total_capital = config.TOTAL_CAPITAL
+        for sector_name, amount in holdings_sector_amount.items():
+            ratio = amount / total_capital if total_capital > 0 else 0
+            if ratio > 0.15:  # 单行业持仓超15%，降低配额
+                for q_sector in sector_quotas:
+                    if any(s in q_sector or q_sector in s for s in [sector_name]):
+                        sector_quotas[q_sector] = max(1, sector_quotas[q_sector] - 1)
+                        logger.info(f"  持仓集中调整: {q_sector}配额-1（已持仓{ratio:.1%}）")
     logger.info(f"  行业配额: {sector_quotas}")
 
     # 第二步：硬性筛选 + CANSLIM多因子打分
     logger.info("[选股引擎V3] Step 2: 硬性筛选 + CANSLIM多因子打分...")
     candidates = []
+    watch_list = []  # 观察池（弱势行情下相对强势但未达买入标准的）
     filtered_count = 0
+    
     for code, df in data_dict.items():
         if code == "000300":
             continue
-        stock_info = config.STOCK_POOL.get(code, {})
+        # 从STOCK_POOL或SECTOR_CANDIDATES中查找股票信息（统一查找）
+        stock_info = config.get_stock_info(code)
         
-        # 确定该股票属于哪个行业（从SECTOR_CANDIDATES中查找）
+        # 确定该股票属于哪个行业
         sector_name = _find_stock_sector(code, stock_info)
 
-        # ---- 硬性筛选（不通过直接跳过）----
-        hf_result = hard_filter(df, code)
+        # ---- 硬性筛选（传入market_state）----
+        hf_result = hard_filter(df, code, market_state)
         if not hf_result["pass"]:
             filtered_count += 1
-            logger.info(f"  {code} {stock_info.get('名称', '')}: [硬性筛选不通过] {hf_result['reason']}")
+            # 弱势行情下，将评分较高的失败股放入观察池
+            if market_state in ("down", "weak", "neutral") and hf_result.get("weak_score", 0) >= 15:
+                watch_list.append({
+                    "code": code,
+                    "name": stock_info.get("名称", code),
+                    "sector": stock_info.get("赛道", sector_name),
+                    "sector_group": sector_name,
+                    "weak_score": hf_result["weak_score"],
+                    "reason": hf_result["reason"],
+                    "current_price": round(df["close"].iloc[-1], 2),
+                })
+            logger.info(f"  {code} {stock_info.get('名称', '')}: [筛选不通过] {hf_result['reason']}")
             continue
 
         factor_result = canslim_score(df, code, data_dict)
         candidates.append({
             "code": code,
             "sector": stock_info.get("赛道", "其他"),
-            "sector_group": sector_name,  # 行业分组
+            "sector_group": sector_name,
             "score": factor_result["total_score"],
             "factors": factor_result["factors"],
             "signals": factor_result.get("signals", []),
             "reason": factor_result["reason"],
             "rps_rank": factor_result.get("rps_rank", 0),
+            "weak_score": hf_result.get("weak_score", 0),
             "df": df
         })
         logger.info(f"  {code} {stock_info.get('名称', '')}: {factor_result['total_score']}分 "
@@ -997,22 +1118,25 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
                     f"| {factor_result['reason']}")
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    # 观察池按weak_score排序
+    watch_list.sort(key=lambda x: x["weak_score"], reverse=True)
+    watch_list = watch_list[:5]  # 最多5只
 
     # 第三步：按行业配额选股 + 计算买点
-    logger.info("[选股引擎V2] Step 3: 行业均衡选股 + 计算买点...")
+    logger.info("[选股引擎V3] Step 3: 行业均衡选股 + 计算买点...")
     stock_pool = []
-    sector_selected_count = defaultdict(int)  # 各行业已选数量
+    sector_selected_count = defaultdict(int)
+    
+    # 弱势行情下降低最低分数要求
+    effective_min_score = min_score if market_state == "up" else max(30, min_score - 15)
     
     for cand in candidates:
         if len(stock_pool) >= max_stocks:
             break
-        if cand["score"] < min_score:
+        if cand["score"] < effective_min_score:
             continue
         # 跳过已持仓股票
         if holdings and cand["code"] in holdings:
-            continue
-        # 大盘下跌时不推荐买入
-        if not market_info["can_buy"]:
             continue
         
         # 行业配额检查
@@ -1021,7 +1145,6 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
         if sector_selected_count[sector_group] >= quota:
             logger.info(f"  跳过 {cand['code']}: {sector_group}配额已满({quota})")
             continue
-        # 单行业上限
         if sector_selected_count[sector_group] >= max_per_sector:
             continue
 
@@ -1032,23 +1155,30 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
             "reason": cand["reason"],
             "rps_rank": cand["rps_rank"],
         }, market_info)
-        buy_plan["sector_group"] = sector_group  # 添加行业分组信息
+        buy_plan["sector_group"] = sector_group
+        buy_plan["is_watch"] = not market_info["can_buy"]  # 大盘下跌时标记为观察
         stock_pool.append(buy_plan)
         sector_selected_count[sector_group] += 1
-        logger.info(f"  入选: {buy_plan['code']} {buy_plan['name']} [{sector_group}] | "
+        status = "观察" if not market_info["can_buy"] else "入选"
+        logger.info(f"  {status}: {buy_plan['code']} {buy_plan['name']} [{sector_group}] | "
                     f"评分{buy_plan['factor_score']} | 买点{buy_plan['moderate_buy']} | "
                     f"止损{buy_plan['stop_loss']}(-{buy_plan['stop_loss_pct']}%) | "
                     f"首批{buy_plan['first_shares']}股+加仓{buy_plan['second_shares']}股")
 
     # 行业分布统计
-    logger.info(f"[选股引擎V2] 完成: {len(stock_pool)}只入选 / {len(candidates)}只候选")
+    logger.info(f"[选股引擎V3] 完成: {len(stock_pool)}只入选 / {len(candidates)}只候选 / {len(watch_list)}只观察")
     logger.info(f"  行业分布: {dict(sector_selected_count)}")
+
+    # 持仓诊断
+    holdings_diagnosis = diagnose_holdings(holdings, data_dict) if holdings else []
 
     return {
         "market_info": market_info,
         "sector_analysis": sector_result,
         "sector_quotas": sector_quotas,
         "stock_pool": stock_pool,
+        "watch_list": watch_list,
+        "holdings_diagnosis": holdings_diagnosis,
         "scan_time": scan_time,
         "total_candidates": len(candidates),
         "qualified_count": len(stock_pool),
@@ -1067,6 +1197,126 @@ def _find_stock_sector(code: str, stock_info: dict) -> str:
             return sector_name
     # 未找到，用原始赛道名
     return stock_info.get("赛道", "其他")
+
+
+def _find_stock_info_from_candidates(code: str) -> dict:
+    """
+    从SECTOR_CANDIDATES中查找股票信息
+    返回: {"名称": xxx, "赛道": xxx, "类型": xxx}
+    """
+    sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+    for sector_name, sector_info in sector_candidates.items():
+        stocks = sector_info.get("stocks", {})
+        if code in stocks:
+            info = stocks[code]
+            return {
+                "名称": info.get("名称", code),
+                "赛道": info.get("细分", sector_name),
+                "类型": info.get("类型", "龙头"),
+            }
+    return {"名称": code, "赛道": "其他", "类型": "弹性"}
+
+
+# ============================================================
+# 持仓诊断模块
+# ============================================================
+
+def diagnose_holdings(holdings: dict, data_dict: dict) -> list:
+    """
+    对当前持仓进行诊断，给出持有/减仓/止损建议
+    
+    诊断维度:
+    1. 浮盈浮亏状态
+    2. 趋势是否破位（跌破MA20/MA60）
+    3. 止损位距离
+    4. 行业集中度风险
+    
+    返回: [{"code", "name", "action", "reason", "profit_pct", ...}]
+    """
+    if not holdings:
+        return []
+    
+    results = []
+    total_capital = config.TOTAL_CAPITAL
+    
+    for code, pos in holdings.items():
+        shares = pos.get("shares", 0)
+        buy_price = pos.get("buy_price", 0)
+        sector = pos.get("sector", "")
+        stock_type = pos.get("stock_type", "龙头")
+        
+        # 获取当前价格
+        df = data_dict.get(code)
+        if df is not None and not df.empty:
+            current_price = df["close"].iloc[-1]
+        else:
+            current_price = pos.get("current_price", buy_price)
+        
+        profit_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0
+        market_value = shares * current_price
+        position_ratio = market_value / total_capital if total_capital > 0 else 0
+        
+        diagnosis = {
+            "code": code,
+            "name": config.get_stock_name(code),
+            "sector": sector,
+            "shares": shares,
+            "buy_price": round(buy_price, 3),
+            "current_price": round(current_price, 2),
+            "profit_pct": round(profit_pct * 100, 2),
+            "market_value": round(market_value, 0),
+            "position_ratio": round(position_ratio * 100, 2),
+            "action": "持有",
+            "reason": "",
+            "stop_loss_price": 0,
+        }
+        
+        # 计算止损位
+        from strategy.trend_strategy import compute_trailing_stop
+        stop_loss = compute_trailing_stop(buy_price, current_price)
+        diagnosis["stop_loss_price"] = stop_loss
+        
+        # 诊断逻辑
+        if df is not None and not df.empty and len(df) >= 20:
+            ma20 = df["close"].rolling(20).mean().iloc[-1]
+            ma60 = df["close"].rolling(60).mean().iloc[-1] if len(df) >= 60 else None
+            
+            # 浮亏超过10% + 跌破MA20 → 建议减仓
+            if profit_pct < -0.10 and current_price < ma20:
+                diagnosis["action"] = "减仓"
+                diagnosis["reason"] = f"浮亏{profit_pct:.1%}且跌破MA20({ma20:.2f})，趋势走坏，建议减仓50%止损"
+            # 浮亏超过15% → 强烈建议止损
+            elif profit_pct < -0.15:
+                diagnosis["action"] = "止损"
+                diagnosis["reason"] = f"浮亏{profit_pct:.1%}超过15%红线，建议无条件止损离场"
+            # 跌破MA60 → 中期趋势走坏
+            elif ma60 and current_price < ma60 and profit_pct < 0:
+                diagnosis["action"] = "减仓"
+                diagnosis["reason"] = f"跌破MA60({ma60:.2f})且浮亏，中期趋势走坏，建议减仓"
+            # 浮盈状态
+            elif profit_pct > 0:
+                if current_price < ma20:
+                    diagnosis["action"] = "止盈减仓"
+                    diagnosis["reason"] = f"浮盈{profit_pct:.1%}但跌破MA20，建议止盈减仓1/3"
+                else:
+                    diagnosis["action"] = "持有"
+                    diagnosis["reason"] = f"浮盈{profit_pct:.1%}，趋势正常，继续持有，止损上移至{stop_loss:.2f}"
+            else:
+                diagnosis["action"] = "观望"
+                diagnosis["reason"] = f"浮亏{profit_pct:.1%}，尚未触发止损，观望等待，止损位{stop_loss:.2f}"
+        else:
+            if profit_pct < -0.15:
+                diagnosis["action"] = "止损"
+                diagnosis["reason"] = f"浮亏{profit_pct:.1%}超过15%，建议止损"
+            else:
+                diagnosis["action"] = "观望"
+                diagnosis["reason"] = f"浮亏{profit_pct:.1%}，数据不足无法判断趋势"
+        
+        results.append(diagnosis)
+    
+    # 按浮亏程度排序（亏损最多的排前面）
+    results.sort(key=lambda x: x["profit_pct"])
+    return results
 
 
 # ============================================================

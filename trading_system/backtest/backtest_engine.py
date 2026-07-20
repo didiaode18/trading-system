@@ -218,7 +218,7 @@ class BacktestEngine:
                     buy_price = signal.get("buy_price", price_dict.get(code, 0))
                     stop_loss = signal.get("stop_loss_initial", buy_price * 0.9)
                     if buy_price > 0:
-                        stock_type = config.STOCK_POOL.get(code, {}).get("类型", "龙头")
+                        stock_type = config.get_stock_info(code).get("类型", "龙头")
                         batch = calc_first_batch(buy_price, stop_loss, stock_type, self.initial_capital)
                         if batch["pass_risk"] and batch["shares"] > 0:
                             self._execute_buy(code, buy_price, batch["shares"], date)

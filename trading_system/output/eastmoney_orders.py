@@ -283,7 +283,7 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
         data_df: 技术指标DataFrame（可选，用于ATR/支撑位计算）
     """
     orders = []
-    stock_info = config.STOCK_POOL.get(code, {})
+    stock_info = config.get_stock_info(code)
     name = stock_info.get("名称", code)
     stock_type = stock_info.get("类型", "龙头")
     sector = stock_info.get("赛道", "")
@@ -440,7 +440,7 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
         [order_dict, ...] 条件单列表
     """
     orders = []
-    stock_info = config.STOCK_POOL.get(code, {})
+    stock_info = config.get_stock_info(code)
     name = stock_info.get("名称", code)
     stock_type = stock_info.get("类型", "龙头")
 

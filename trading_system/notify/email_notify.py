@@ -215,7 +215,7 @@ def send_daily_report(text_report: str, risk_summary: str,
         # 信号明细表格
         table_html = '<table><tr><th>代码</th><th>名称</th><th>信号</th><th>价格</th><th>止损</th><th>说明</th></tr>'
         for code, sig in signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             if sig.get("sell_signal"):
                 row_class = "sell"
                 signal_type = '<span class="text-red">卖出</span>'
@@ -475,7 +475,7 @@ def send_comprehensive_daily_report(
                     <tr><th>代码</th><th>名称</th><th>信号</th><th>价格</th><th>质量分</th><th>说明</th></tr>
 """
         for code, sig in signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             quality = sig.get("quality_score", 0)
             q_class = "q-high" if quality >= 70 else ("q-mid" if quality >= 55 else "q-low")
             

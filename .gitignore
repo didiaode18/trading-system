@@ -77,3 +77,13 @@ run_output.txt
 
 # Stock pool state
 stock_pool.json
+
+# Data cache (auto-generated)
+trading_system/data/*_cache.json
+trading_system/data/*.db
+
+# Trade logs (contains personal trading data)
+trading_system/output/trade_logs/
+
+# AICoding workspace
+.aicoding-chat-workspace

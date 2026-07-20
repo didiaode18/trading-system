@@ -1,18 +1,22 @@
 """
-高胜率A股交易操作系统 V2.0 - 主程序入口
+高胜率A股交易操作系统 V3.0 - 主程序入口
 =========================================
 每日一键运行流程:
   1. 增量更新所有股票池日线数据
-  2. 判定当前行情强度（强势/震荡/弱势）
-  3. 扫描所有股票池，生成买卖信号
+  2. 大盘状态智能识别（多特征融合）
+  3. 扫描所有股票池，生成买卖信号（趋势+均值回归+多周期共振）
   4. 所有信号过风控校验
-  5. 输出条件单Excel + 文本报告
-  6. 发送钉钉/企微通知（如已配置）
+  5. 组合风险管理（相关性/HHI/VaR/再平衡）
+  6. 基本面自动分析（PE/ROE/资金流）
+  7. 输出条件单Excel + 文本报告
+  8. 发送通知（邮件/企微/钉钉）
+  9. 交易日志记录 + 绩效归因
 
 使用方式:
-  python main.py              # 完整运行（更新数据+生成信号+输出Excel）
-  python main.py --no-update  # 跳过数据更新（使用已有数据）
-  python main.py --report     # 仅输出文本报告（不生成Excel）
+  python main.py              # 完整运行
+  python main.py --no-update  # 跳过数据更新
+  python main.py --report     # 仅输出文本报告
+  python main.py --monitor    # 启动盘中监控模式
 """
 
 import os
@@ -27,7 +31,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 import config
-from data.data_loader import init_db, batch_update_all, load_daily_data
+from data.data_loader import init_db, batch_update_all, load_daily_data, get_all_candidate_codes
 from strategy.trend_strategy import generate_strategy_signal, scan_all_stocks, compute_indicators
 from strategy.position import calc_first_batch
 from risk.risk_control import (RiskState, risk_check, judge_market_strength,
@@ -39,7 +43,16 @@ from output.condition_sheet import generate_condition_sheet, generate_simple_rep
 from output.eastmoney_orders import send_eastmoney_orders_email
 from strategy.stock_screener import run_stock_screener, send_screener_email
 from strategy.portfolio_analyzer import analyze_portfolio, send_portfolio_email
-# 自动挂单功能已移除，条件单通过邮件推送（eastmoney_orders模块）
+from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
+# V3.0 新增模块
+from strategy.portfolio_risk import PortfolioRiskManager, send_risk_report_email
+from strategy.fundamental import FundamentalAnalyzer
+from strategy.mean_reversion import MeanReversionStrategy
+from strategy.multi_timeframe import MultiTimeframeAnalyzer
+from strategy.capital_flow import CapitalFlowAnalyzer
+from strategy.market_regime import MarketRegimeDetector
+from strategy.trade_journal import TradeJournal
+from strategy.trend_forecast import TrendForecaster, send_forecast_email
 
 # ============================================================
 # 日志配置
@@ -107,17 +120,17 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     """
     start_time = datetime.datetime.now()
     logger.info("=" * 60)
-    logger.info(f"  高胜率A股交易操作系统 V2.0")
+    logger.info(f"  高胜率A股交易操作系统 V3.0")
     logger.info(f"  运行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
-    # ---- Step 1: 更新数据 ----
+    # ---- Step 1: 更新数据（全候选池）----
     conn = None
     if not skip_update:
-        logger.info("[Step 1] 增量更新行情数据...")
+        logger.info("[Step 1] 增量更新行情数据（全候选池）...")
         try:
             conn = init_db()
-            results = batch_update_all(conn)
+            results = batch_update_all(conn, full_pool=True)
             success = sum(1 for v in results.values() if v >= 0)
             total = len(results)
             logger.info(f"  数据更新完成: {success}/{total} 只成功")
@@ -132,16 +145,17 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         logger.info("[Step 1] 跳过数据更新（--no-update）")
         conn = init_db()
 
-    # ---- Step 2: 加载数据并判定行情强度 ----
+    # ---- Step 2: 加载数据并判定行情强度（全候选池）----
     logger.info("[Step 2] 加载数据，判定行情强度...")
     data_dict = {}
-    for code in config.STOCK_POOL:
+    # 加载所有候选股数据（STOCK_POOL + SECTOR_CANDIDATES）
+    all_codes = get_all_candidate_codes()
+    for code in all_codes:
         df = load_daily_data(code, conn, days=120)
         if not df.empty and len(df) >= config.MA_SHORT:
             df = compute_indicators(df)
             data_dict[code] = df
-        else:
-            logger.warning(f"  {code}: 数据不足，跳过")
+    logger.info(f"  成功加载 {len(data_dict)} 只股票数据（候选池共{len(all_codes)}只）")
 
     # 加载基准指数判定行情
     benchmark_df = load_daily_data(config.BENCHMARK_INDEX, conn, days=120)
@@ -153,6 +167,34 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 
     max_pos = get_max_position_ratio(market_strength)
     logger.info(f"  行情强度: {market_strength} | 仓位上限: {max_pos:.0%}")
+
+    # ---- Step 2.5: 大盘状态智能识别（V3.0新增）----
+    market_regime_result = None
+    if getattr(config, 'STRATEGY_CONFIG', {}).get('market_regime', {}).get('enabled', True):
+        logger.info("[Step 2.5] 大盘状态智能识别...")
+        try:
+            detector = MarketRegimeDetector()
+            if not benchmark_df.empty and len(benchmark_df) >= 60:
+                benchmark_with_indicators = compute_indicators(benchmark_df)
+                market_regime_result = detector.detect(benchmark_with_indicators)
+                logger.info(f"  {market_regime_result['detail']}")
+                # 用智能识别结果覆盖简单判断
+                regime_state = market_regime_result["state"]
+                if regime_state == "BULL":
+                    market_strength = "strong"
+                elif regime_state == "BEAR":
+                    market_strength = "weak"
+                else:
+                    market_strength = "normal"
+                max_pos = get_max_position_ratio(market_strength)
+                # 输出策略建议
+                advice = detector.get_strategy_advice(market_regime_result)
+                logger.info(f"  主策略: {advice['primary_strategy']}")
+                logger.info(f"  仓位范围: {advice['position_range'][0]:.0%}-{advice['position_range'][1]:.0%}")
+            else:
+                logger.info("  基准数据不足，跳过大盘状态识别")
+        except Exception as e:
+            logger.warning(f"  大盘状态识别异常: {e}")
 
     # ---- Step 3: 加载持仓 ----
     logger.info("[Step 3] 加载当前持仓...")
@@ -178,11 +220,44 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     add_count = sum(1 for _, s in signals if s.get("add_position"))
     logger.info(f"  信号统计: 买入{buy_count}只, 卖出{sell_count}只, 加仓{add_count}只")
 
+    # ---- Step 5.5: 多策略引擎（V3.0新增）----
+    mr_signals = []
+    mtf_results = []
+    strategy_cfg = getattr(config, 'STRATEGY_CONFIG', {})
+
+    # 多周期共振分析
+    if strategy_cfg.get('multi_timeframe', {}).get('enabled', True):
+        logger.info("[Step 5.5a] 多周期共振分析...")
+        try:
+            mtf = MultiTimeframeAnalyzer()
+            mtf_results = mtf.batch_analyze(data_dict, holdings)
+            strong_resonance = [r for r in mtf_results if r["resonance_score"] >= 4 and not r.get("in_holdings")]
+            if strong_resonance:
+                logger.info(f"  强共振(≥4分): {len(strong_resonance)}只")
+                for r in strong_resonance[:5]:
+                    logger.info(f"    {r['code']} {r['name']}: {r['detail']}")
+        except Exception as e:
+            logger.warning(f"  多周期分析异常: {e}")
+
+    # 均值回归策略（弱势/震荡市启用）
+    if strategy_cfg.get('mean_reversion', {}).get('enabled', True) and market_strength != "strong":
+        logger.info("[Step 5.5b] 均值回归策略扫描...")
+        try:
+            mr = MeanReversionStrategy()
+            mr_signals = mr.scan_reversion_signals(data_dict, market_strength, holdings)
+            if mr_signals:
+                logger.info(f"  发现{len(mr_signals)}个反弹信号:")
+                for sig in mr_signals[:3]:
+                    logger.info(f"    {sig['code']} {sig['name']}: "
+                               f"强度{sig['signal_strength']}/5 | {sig['reason']}")
+        except Exception as e:
+            logger.warning(f"  均值回归扫描异常: {e}")
+
     # ---- Step 6: 信号过风控 ----
     logger.info("[Step 6] 信号风控校验...")
     filtered_signals = []
     for code, sig in signals:
-        stock_info = config.STOCK_POOL.get(code, {})
+        stock_info = config.get_stock_info(code)
         if sig.get("buy_signal"):
             # 计算仓位
             buy_p = sig["buy_price"]
@@ -238,7 +313,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     logger.info("[Step 8] 发送通知...")
     if config.DINGTALK_WEBHOOK or config.WECHAT_WORK_WEBHOOK:
         for code, sig in filtered_signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             if sig.get("buy_signal") and sig.get("position", {}).get("pass_risk"):
                 notify_buy_signal(code, name, sig["buy_price"],
                                   sig.get("stop_loss_initial", 0),
@@ -274,15 +349,54 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     else:
         logger.info("  邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过邮件发送")
 
-    # ---- Step 9: 盘后选股 + 发送选股报告 ----
-    logger.info("[Step 9] 盘后选股引擎...")
+    # ---- Step 9: 盘后选股 + 全市场扫描 + 持仓诊断 ----
+    logger.info("[Step 9] 盘后选股引擎（全赛道+弱势模式）...")
     try:
+        # 全市场动态扫描，发现强势股补充候选池
+        logger.info("  [市场扫描] 尝试全市场动态扫描...")
+        try:
+            scan_result = scan_market_hot_stocks(total_max=15)
+            if scan_result["success"]:
+                new_codes = merge_scan_results_to_pool(scan_result, set(data_dict.keys()))
+                # 拉取新发现股票的历史数据
+                for code in new_codes[:10]:  # 最多追加10只
+                    try:
+                        df_new = load_daily_data(code, conn, days=120)
+                        if not df_new.empty and len(df_new) >= config.MA_SHORT:
+                            df_new = compute_indicators(df_new)
+                            data_dict[code] = df_new
+                    except Exception:
+                        pass
+                logger.info(f"  动态扫描完成，新增{len(new_codes)}只候选股")
+            else:
+                logger.info("  全市场扫描未成功（可能非交易时间），使用已有候选池")
+        except Exception as e:
+            logger.warning(f"  市场扫描异常: {e}，继续使用已有候选池")
+
+        # 运行选股引擎（传入全部data_dict + 持仓）
         screener_result = run_stock_screener(data_dict, holdings)
+        
+        # 输出持仓诊断结果
+        if screener_result.get("holdings_diagnosis"):
+            logger.info("  === 持仓诊断 ===")
+            for diag in screener_result["holdings_diagnosis"]:
+                logger.info(f"  {diag['code']} {diag['name']}: "
+                           f"[{diag['action']}] 浮盈{diag['profit_pct']:+.1f}% | "
+                           f"{diag['reason']}")
+        
+        # 输出观察池
+        if screener_result.get("watch_list"):
+            logger.info(f"  === 观察池（{len(screener_result['watch_list'])}只）===")
+            for w in screener_result["watch_list"]:
+                logger.info(f"  {w['code']} {w['name']} [{w['sector']}]: "
+                           f"弱势评分{w['weak_score']} | {w['reason']}")
+        
         if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
             try:
                 screener_ok = send_screener_email(screener_result)
                 if screener_ok:
-                    logger.info(f"  选股报告邮件发送成功 ({screener_result['qualified_count']}只入选)")
+                    logger.info(f"  选股报告邮件发送成功 ({screener_result['qualified_count']}只入选, "
+                               f"{len(screener_result.get('watch_list', []))}只观察)")
                 else:
                     logger.warning("  选股报告邮件发送失败")
             except Exception as e:
@@ -310,9 +424,104 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.error(f"  仓位分析异常: {e}")
 
+    # ---- Step 11: 组合风险管理（V3.0新增）----
+    logger.info("[Step 11] 组合风险管理（相关性/HHI/VaR/再平衡）...")
+    try:
+        prm = PortfolioRiskManager(data_dict, holdings)
+        risk_report = prm.full_risk_report()
+        logger.info(f"  风险评分: {risk_report['risk_score']}/100 ({risk_report['overall_level']})")
+        if risk_report['alerts']:
+            for alert in risk_report['alerts'][:3]:
+                logger.warning(f"  [{alert['level']}] {alert['type']}: {alert['detail']}")
+        if risk_report['rebalance']['actions']:
+            logger.info(f"  再平衡建议: {len(risk_report['rebalance']['actions'])}项")
+            for act in risk_report['rebalance']['actions'][:3]:
+                logger.info(f"    [{act['action']}] {act['name']} {act['shares']}股 | {act['reason']}")
+        # 发送风控报告邮件
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            try:
+                send_risk_report_email(risk_report)
+                logger.info("  组合风控报告邮件发送成功")
+            except Exception as e:
+                logger.warning(f"  风控报告邮件发送失败: {e}")
+    except Exception as e:
+        logger.error(f"  组合风控分析异常: {e}")
+
+    # ---- Step 12: 基本面+资金流分析（V3.0新增）----
+    logger.info("[Step 12] 基本面与资金流分析...")
+    try:
+        # 资金流向分析
+        cfa = CapitalFlowAnalyzer()
+        flow_report = cfa.full_analysis(list(holdings.keys()) + list(config.STOCK_POOL.keys())[:5])
+        if flow_report.get('northbound', {}).get('success'):
+            logger.info(f"  北向资金: {flow_report['northbound']['signal']}")
+        if flow_report.get('sector_flow', {}).get('success'):
+            logger.info(f"  热门行业: {', '.join(flow_report['sector_flow']['hot_sectors'])}")
+
+        # 基本面分析（只对持仓+重点股）
+        fa = FundamentalAnalyzer()
+        key_codes = list(holdings.keys()) + list(config.STOCK_POOL.keys())[:5]
+        fund_scores = fa.batch_update_fundamentals(key_codes[:10])
+        if fund_scores:
+            logger.info("  基本面评分:")
+            for code, score in sorted(fund_scores.items(),
+                                      key=lambda x: x[1].get('total_score', 0), reverse=True)[:5]:
+                name = config.get_stock_name(code)
+                logger.info(f"    {code} {name}: {score.get('detail', 'N/A')}")
+    except Exception as e:
+        logger.warning(f"  基本面/资金流分析异常: {e}")
+
+    # ---- Step 13: 交易日志+绩效归因（V3.0新增）----
+    logger.info("[Step 13] 交易日志与绩效归因...")
+    try:
+        journal = TradeJournal()
+        # 记录每日净值
+        total_mv = sum(
+            pos.get("shares", 0) * pos.get("current_price", pos.get("buy_price", 0))
+            for pos in holdings.values()
+        )
+        total_value = config.TOTAL_CAPITAL
+        cash = total_value - total_mv
+        journal.record_daily_nav(total_value, cash)
+
+        # 绩效报告
+        perf = journal.performance_report(
+            days=getattr(config, 'JOURNAL_CONFIG', {}).get('performance_days', 90)
+        )
+        if perf.get('total_trades', 0) > 0:
+            logger.info(f"  {perf['detail']}")
+        else:
+            logger.info("  暂无历史交易记录，将自动记录后续信号")
+    except Exception as e:
+        logger.warning(f"  交易日志异常: {e}")
+
+    # ---- Step 14: 持仓趋势预测分析（V3.1新增）----
+    if getattr(config, 'FORECAST_ENABLED', True):
+        logger.info("[Step 14] 持仓趋势预测分析...")
+        try:
+            forecaster = TrendForecaster()
+            forecast_results = forecaster.batch_analyze(data_dict, holdings)
+            if forecast_results:
+                # 输出摘要
+                for r in forecast_results:
+                    score = r["composite"]["total_score"]
+                    logger.info(f"  {r['code']} {r['name']}: {score:.0f}分 [{r['composite']['rating']}] "
+                               f"| {r['advice']['action']} | 时间: {r['advice']['timing']['best_time']}")
+                # 发送邮件
+                if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+                    forecast_ok = send_forecast_email(forecast_results)
+                    if forecast_ok:
+                        logger.info(f"  趋势预测邮件发送成功 ({len(forecast_results)}只)")
+                    else:
+                        logger.warning("  趋势预测邮件发送失败")
+            else:
+                logger.info("  无有效持仓数据，跳过预测")
+        except Exception as e:
+            logger.error(f"  趋势预测分析异常: {e}")
+
     # ---- 完成 ----
     elapsed = (datetime.datetime.now() - start_time).total_seconds()
-    logger.info(f"\n[DONE] 全流程完成，耗时 {elapsed:.1f} 秒")
+    logger.info(f"\n[DONE] V3.0全流程完成，耗时 {elapsed:.1f} 秒")
     logger.info(f"  日志文件: {log_file}")
 
     if conn:
@@ -326,15 +535,30 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V2.0")
+    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V3.0")
     parser.add_argument("--no-update", action="store_true",
                         help="跳过数据更新，使用已有数据")
     parser.add_argument("--report", action="store_true",
                         help="仅输出文本报告，不生成Excel")
+    parser.add_argument("--monitor", action="store_true",
+                        help="启动盘中实时监控模式")
     args = parser.parse_args()
 
     try:
-        run_daily_pipeline(skip_update=args.no_update, report_only=args.report)
+        if args.monitor:
+            # 盘中监控模式
+            from strategy.intraday_monitor import IntradayMonitor
+            holdings = load_holdings()
+            for code, pos in holdings.items():
+                pos["name"] = config.get_stock_name(code)
+                if "stop_loss" not in pos:
+                    pos["stop_loss"] = pos["buy_price"] * (1 - config.INITIAL_STOP_LOSS_PCT)
+            monitor_cfg = getattr(config, 'MONITOR_CONFIG', {})
+            monitor = IntradayMonitor(holdings, poll_interval=monitor_cfg.get('poll_interval', 60))
+            logger.info("启动盘中监控模式 (Ctrl+C退出)...")
+            monitor.start()
+        else:
+            run_daily_pipeline(skip_update=args.no_update, report_only=args.report)
     except KeyboardInterrupt:
         print("\n[中断] 用户取消")
     except Exception as e:

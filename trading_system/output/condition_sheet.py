@@ -62,7 +62,7 @@ def generate_condition_sheet(signals: list, output_dir: str = None,
     # 构建数据
     rows = []
     for code, sig in signals:
-        stock_info = config.STOCK_POOL.get(code, {})
+        stock_info = config.get_stock_info(code)
         name = stock_info.get("名称", code)
         sector = stock_info.get("赛道", "")
         stock_type = stock_info.get("类型", "龙头")
@@ -230,14 +230,14 @@ def generate_simple_report(signals: list) -> str:
     if sell_signals:
         lines.append(">>> 卖出信号（优先处理）:")
         for code, sig in sell_signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             lines.append(f"  {code} {name}: 卖出价 {sig.get('sell_price', '-')} | {sig.get('signal_reason', '')}")
         lines.append("")
 
     if buy_signals:
         lines.append(">>> 买入信号:")
         for code, sig in buy_signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             lines.append(f"  {code} {name}: 买入价 {sig.get('buy_price', '-')} | "
                         f"止损 {sig.get('stop_loss_initial', '-')} | {sig.get('signal_reason', '')}")
         lines.append("")
@@ -245,14 +245,14 @@ def generate_simple_report(signals: list) -> str:
     if add_signals:
         lines.append(">>> 加仓信号:")
         for code, sig in add_signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             lines.append(f"  {code} {name}: {sig.get('signal_reason', '')}")
         lines.append("")
 
     if watch_signals:
         lines.append(">>> 观望（无信号）:")
         for code, sig in watch_signals:
-            name = config.STOCK_POOL.get(code, {}).get("名称", code)
+            name = config.get_stock_name(code)
             lines.append(f"  {code} {name}: {sig.get('signal_reason', '')}")
         lines.append("")
 

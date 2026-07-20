@@ -78,7 +78,7 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
         sector_values[sector]["count"] += 1
         sector_values[sector]["stocks"].append({
             "code": code,
-            "name": config.STOCK_POOL.get(code, {}).get("名称", code),
+            "name": config.get_stock_name(code),
             "shares": shares,
             "buy_price": buy_price,
             "current_price": current_price,
@@ -90,7 +90,7 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
 
         position_analysis.append({
             "code": code,
-            "name": config.STOCK_POOL.get(code, {}).get("名称", code),
+            "name": config.get_stock_name(code),
             "sector": sector,
             "type": stock_type,
             "shares": shares,

@@ -62,7 +62,7 @@ def analyze_sector_rotation(data_dict: dict,
     # 收集各赛道的股票数据
     sector_stocks = defaultdict(list)
     for code, df in data_dict.items():
-        stock_info = config.STOCK_POOL.get(code, {})
+        stock_info = config.get_stock_info(code)
         sector = stock_info.get("赛道", "其他")
         if len(df) >= lookback_days:
             sector_stocks[sector].append(df)
@@ -183,7 +183,7 @@ def get_sector_recommendation(code: str,
             "recommendation": str
         }
     """
-    stock_info = config.STOCK_POOL.get(code, {})
+    stock_info = config.get_stock_info(code)
     sector = stock_info.get("赛道", "其他")
     details = rotation_result.get("sector_details", {}).get(sector, {})
 

@@ -160,6 +160,41 @@ def risk_check(trade_plan: dict, risk_state: RiskState,
     stock_type = trade_plan.get("stock_type", "龙头")
     amount = shares * price
 
+    # ---- 检查-1: 满仓禁止加仓（情绪化交易防护，最高优先级）----
+    full_threshold = getattr(config, 'FULL_POSITION_THRESHOLD', 0.90)
+    near_full = getattr(config, 'NEAR_FULL_POSITION', 0.80)
+    current_position_ratio = risk_state.get_position_ratio()
+    available_cash = getattr(config, 'AVAILABLE_CASH', 0)
+
+    # 硬性规则：仓位>=90% 或 可用资金不足 → 绝对禁止任何买入
+    if current_position_ratio >= full_threshold:
+        result["pass"] = False
+        result["level"] = "red"
+        result["reasons"].append(
+            f"★满仓禁止: 当前仓位{current_position_ratio:.1%} >= {full_threshold:.0%}红线，"
+            f"绝对禁止买入/加仓（情绪化交易防护）"
+        )
+        return result
+
+    # 可用资金不足 → 禁止买入
+    if available_cash < amount and available_cash < price * 100:
+        result["pass"] = False
+        result["level"] = "red"
+        result["reasons"].append(
+            f"资金不足: 可用{available_cash:.0f}元 < 最低买入{price*100:.0f}元，禁止买入"
+        )
+        return result
+
+    # 仓位>=80% → 禁止新开仓（只允许已持仓的减仓操作）
+    if current_position_ratio >= near_full and code not in risk_state.current_positions:
+        result["pass"] = False
+        result["level"] = "red"
+        result["reasons"].append(
+            f"仓位过高: 当前{current_position_ratio:.1%} >= {near_full:.0%}，"
+            f"禁止新开仓（只允许减仓）"
+        )
+        return result
+
     # ---- 检查0: 持仓数量硬限制 ----
     max_holdings = getattr(config, 'MAX_HOLDINGS', 7)
     current_count = len(risk_state.current_positions)
@@ -347,7 +382,7 @@ def daily_risk_summary(risk_state: RiskState, market_strength: str) -> str:
     ]
 
     for code, pos in risk_state.current_positions.items():
-        name = config.STOCK_POOL.get(code, {}).get("名称", code)
+        name = config.get_stock_name(code)
         shares = pos.get("shares", 0)
         buy_p = pos.get("buy_price", 0)
         cur_p = pos.get("current_price", buy_p)

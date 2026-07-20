@@ -731,10 +731,12 @@ def scan_all_stocks(data_dict: dict, holdings: dict = None) -> list:
     for code, df in data_dict.items():
         if df.empty or len(df) < config.MA_MID:
             continue
+        if code == config.BENCHMARK_INDEX:  # 跳过基准指数
+            continue
         holding = holdings.get(code)
         sig = generate_strategy_signal(df, holding)
         sig["code"] = code
-        sig["name"] = config.STOCK_POOL.get(code, {}).get("名称", code)
+        sig["name"] = config.get_stock_name(code)
         signals.append((code, sig))
 
     # 排序：卖出信号优先，其次买入信号
