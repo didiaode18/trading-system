@@ -1,15 +1,15 @@
 """
-东方财富智能条件单生成模块（V3 - 双轨止盈版）
+东方财富智能条件单生成模块（V6.0 - 双轨止盈优化版）
 ===============================================
 根据策略信号，生成东方财富APP可直接填写的智能条件单
 提前一天盘前发送到邮箱，开盘即可照着填单
 
-V3 改进:
-- 双轨止盈体系: 第一轨阶梯止盈(8%卖1/3, 20%再卖1/3) + 第二轨回落止盈(底仓)
-- 止损升级: 龙头8%/弹性10% + 移动止损只上移不下移 + 仅收盘价触发
+V6.0 优化（基于312笔回测网格搜索）:
+- 双轨止盈: 阶梯止盈(10%卖1/3, 20%再卖1/3) + 回落止盈(龙头7%/赛道6%/弹性5%)
+- 止损: 龙头10%/弹性12% + 移动止损只上移不下移 + 仅收盘价触发
 - 强制卖出: 单日放量大跌>8%无条件离场
-- 时间红线: 醒目标注禁止开仓时段
-- 信号质量评分: 条件单按优先级排序
+- 时间止损: 持仓超45天且浮盈<3%则卖出
+- 关闭MACD死叉卖出和趋势破位卖出（回测证明假信号太多）
 
 东方财富条件单类型对应:
 - 定价买入: 价格跌到目标价自动买入
@@ -108,8 +108,8 @@ def _calculate_smart_stop_loss(code: str, holding: dict, sig: dict, data_df=None
             estimated_atr = current_price * avg_range / 100
             atr_stop = round(current_price - atr_multiplier * estimated_atr, 2)
         else:
-            # 最后兜底：用固定百分比（龙头8%，弹性12%）
-            fallback_pct = 0.08 if stock_type == "龙头" else 0.12
+            # 最后兖底：用固定百分比（V6.0: 龙头10%，弹性12%）
+            fallback_pct = 0.10 if stock_type == "龙头" else 0.12
             atr_stop = round(current_price * (1 - fallback_pct), 2)
     
     result["atr_stop"] = atr_stop
@@ -228,7 +228,7 @@ def _calculate_realistic_take_profit(code: str, holding: dict, data_df=None) -> 
     
     # 如果已有目标不足3档，补充固定涨幅目标
     default_targets = [
-        (round(buy_price * 1.08, 2), 1/3, "成本+8%"),
+        (round(buy_price * 1.10, 2), 1/3, "成本+10%"),
         (round(buy_price * 1.15, 2), 1/3, "成本+15%"),
         (round(buy_price * 1.25, 2), 1/3, "成本+25%"),
     ]
@@ -265,16 +265,17 @@ def _get_drawdown_pct(stock_type: str, sector: str = "") -> float:
 
 def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) -> list:
     """
-    为每个持仓生成完整的条件单组合（V3.0 双轨止盈版）
+    为每个持仓生成完整的条件单组合（V6.0 双轨止盈优化版）
     
     双轨止盈体系:
-    - 第一轨（阶梯止盈）: 浮盈8%→卖1/3, 浮盈20%→再卖1/3
-    - 第二轨（回落止盈）: 剩余1/3底仓→高点回落5%/4%/3%卖出
+    - 第一轨（阶梯止盈）: 浮盈10%→卖1/3, 浮盈20%→再卖1/3
+    - 第二轨（回落止盈）: 剩余1/3底仓→高点回落7%/6%/5%卖出
     
     止损体系:
-    - 初始止损: 龙头8% / 弹性10%
+    - 初始止损: 龙头10% / 弹性12%
     - 移动止损: 每日盘后更新（只上移不下移）
     - 仅收盘价触发，盘中跳水不割
+    - 时间止损: 持仓超45天且浮盈<3%则卖出
     
     参数:
         code: 股票代码
@@ -304,8 +305,8 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
     stop_loss = stop_info["stop_loss"]
 
     # ---- 1. 止损条件单（定价卖出）- 最高优先级 ----
-    # 初始止损: 龙头8% / 弹性10%
-    initial_stop_pct = getattr(config, 'INITIAL_STOP_LOSS_LOW', 0.08) if stock_type == "龙头" else getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)
+    # V6.0: 初始止损 龙头10% / 弹性10%
+    initial_stop_pct = getattr(config, 'INITIAL_STOP_LOSS_LOW', 0.10) if stock_type == "龙头" else getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)
     initial_stop_price = round(buy_price * (1 - initial_stop_pct), 2)
     # 取移动止损和初始止损中更高的（只上移不下移）
     final_stop = max(stop_loss, initial_stop_price) if stop_loss > 0 else initial_stop_price
@@ -648,8 +649,8 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
                 <li>打开东方财富APP → 交易 → <b>智能条件单</b></li>
                 <li>按从上到下顺序设置，<span style="color:#FF4D4F;font-weight:bold">红色=紧急止损</span>优先</li>
                 <li><b>止损单</b>：触发价=止损价，委托价=触发价×0.99，仅收盘价触发</li>
-                <li><b>阶梯止盈</b>：第1档成本+8%卖1/3，第2档成本+20%再卖1/3</li>
-                <li><b>回落卖出</b>：底仓1/3，龙头回落5%/赛道4%/弹性3%触发</li>
+                <li><b>阶梯止盈</b>：第1档成本+10%卖1/3，第2档成本+20%再卖1/3</li>
+                <li><b>回落卖出</b>：底仓1/3，龙头回落7%/赛道6%/弹性5%触发</li>
                 <li><b>定价买入</b>：触发价=目标价，委托价=触发价×1.01</li>
                 <li>每只股票设置完止损+阶梯止盈+回落卖出后再设下一只</li>
             </ol>
@@ -755,7 +756,8 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
 # 三、发送条件单邮件
 # ============================================================
 
-def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict: dict = None) -> bool:
+def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict: dict = None,
+                                news_risk: dict = None) -> bool:
     """
     生成并发送东方财富条件单邮件
     
@@ -763,6 +765,7 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
         signals: 策略信号列表
         holdings: 持仓数据
         data_dict: 技术指标数据
+        news_risk: 新闻风险扫描结果（仅预警，不影响信号）
     
     返回: 是否发送成功
     """
@@ -775,6 +778,17 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
 
     subject = f"[条件单] 东方财富智能条件单 - {next_trade_day}（提前挂单）"
     html_content = generate_eastmoney_orders(signals, holdings, data_dict)
+
+    # 追加新闻/政策风险预警板块（仅供参考，非交易信号）
+    if news_risk:
+        try:
+            from strategy.news_monitor import generate_news_alert_html
+            news_html = generate_news_alert_html(news_risk)
+            if news_html:
+                # 插入到</body>之前
+                html_content = html_content.replace("</body>", news_html + "\n</body>")
+        except Exception:
+            pass
 
     return send_email(subject, html_content)
 

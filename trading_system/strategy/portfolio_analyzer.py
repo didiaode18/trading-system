@@ -236,62 +236,71 @@ def generate_optimization(position_analysis: list, sector_allocation: list,
     semi_value = sum(sa["value"] for sa in sector_allocation if sa["sector"] in semi_sectors)
     semi_ratio = semi_value / total_capital
 
-    # ---- 具体操作建议 ----
+    # ---- 具体操作建议（动态生成，基于实际持仓）----
+    priority = 1
 
-    # 1. 雅克科技：深度亏损-25%，建议止损
-    yake = next((p for p in position_analysis if p["code"] == "002409"), None)
-    if yake and yake["pnl_pct"] < -20:
-        sell_shares = yake["shares"]
-        recover = sell_shares * yake["current_price"]
+    # 规则1: 深度亏损(>20%)的股票 → 果断止损
+    deep_loss_positions = sorted(
+        [p for p in position_analysis if p["pnl_pct"] < -20],
+        key=lambda x: x["pnl_pct"]
+    )
+    for pos in deep_loss_positions:
+        sell_shares = pos["shares"]
+        recover = sell_shares * pos["current_price"]
         actions.append({
             "action": "止损卖出",
-            "code": "002409",
-            "name": "雅克科技",
-            "detail": f"浮亏{yake['pnl_pct']:.1f}%，已超20%止损线",
+            "code": pos["code"],
+            "name": pos["name"],
+            "detail": f"浮亏{pos['pnl_pct']:.1f}%，已超20%止损线",
             "shares": sell_shares,
             "recover_amount": round(recover, 0),
-            "priority": 1,
+            "priority": priority,
             "reason": "深度亏损股优先止损，避免亏损扩大"
         })
+        priority += 1
 
-    # 2. 北方华创：单股仓位26.7%超标，建议减半
-    bfhc = next((p for p in position_analysis if p["code"] == "002371"), None)
-    if bfhc and bfhc["position_ratio"] > 20:
-        # 减至12%左右
-        target_shares = int(total_capital * 0.12 / bfhc["current_price"] / 100) * 100
-        sell_shares = bfhc["shares"] - target_shares
+    # 规则2: 单股仓位超15% → 减仓至12%
+    overweight_positions = sorted(
+        [p for p in position_analysis if p["position_ratio"] > 15 and p["code"] not in [a["code"] for a in actions]],
+        key=lambda x: -x["position_ratio"]
+    )
+    for pos in overweight_positions:
+        target_shares = int(total_capital * 0.12 / pos["current_price"] / 100) * 100
+        sell_shares = pos["shares"] - target_shares
         if sell_shares > 0:
-            recover = sell_shares * bfhc["current_price"]
+            recover = sell_shares * pos["current_price"]
             actions.append({
                 "action": "减仓",
-                "code": "002371",
-                "name": "北方华创",
-                "detail": f"仓位{bfhc['position_ratio']:.1f}%超标，减至~12%",
+                "code": pos["code"],
+                "name": pos["name"],
+                "detail": f"仓位{pos['position_ratio']:.1f}%超标，减至~12%",
                 "shares": sell_shares,
                 "recover_amount": round(recover, 0),
-                "priority": 2,
+                "priority": priority,
                 "reason": "单股仓位过重，降低集中度风险"
             })
+            priority += 1
 
-    # 3. 长电科技：亏损-12.6%，建议减仓
-    cdkt = next((p for p in position_analysis if p["code"] == "600584"), None)
-    if cdkt and cdkt["pnl_pct"] < -10:
-        sell_shares = int(cdkt["shares"] * 0.5 / 100) * 100  # 减半
+    # 规则3: 中度亏损(10%-20%) → 减半仓位
+    mid_loss_positions = sorted(
+        [p for p in position_analysis if -20 <= p["pnl_pct"] < -10 and p["code"] not in [a["code"] for a in actions]],
+        key=lambda x: x["pnl_pct"]
+    )
+    for pos in mid_loss_positions:
+        sell_shares = int(pos["shares"] * 0.5 / 100) * 100
         if sell_shares > 0:
-            recover = sell_shares * cdkt["current_price"]
+            recover = sell_shares * pos["current_price"]
             actions.append({
                 "action": "减仓",
-                "code": "600584",
-                "name": "长电科技",
-                "detail": f"浮亏{cdkt['pnl_pct']:.1f}%，减半仓位",
+                "code": pos["code"],
+                "name": pos["name"],
+                "detail": f"浮亏{pos['pnl_pct']:.1f}%，减半仓位",
                 "shares": sell_shares,
                 "recover_amount": round(recover, 0),
-                "priority": 3,
+                "priority": priority,
                 "reason": "亏损较大，减半控制风险"
             })
-
-    # 4. 中国卫星：亏损-5.8%，可持有但关注
-    zgwx = next((p for p in position_analysis if p["code"] == "600118"), None)
+            priority += 1
 
     # 计算优化后的预期仓位
     total_recover = sum(a["recover_amount"] for a in actions)
@@ -595,11 +604,21 @@ def generate_portfolio_html(result: dict) -> str:
         <div class="guide" style="background:#FFF7E6;border-color:#FFD591">
             <h3 style="color:#D46B08">分批减仓执行建议</h3>
             <ol style="margin:5px 0;padding-left:20px;line-height:1.8">
-                <li><b>第一步</b>：优先止损雅克科技（浮亏>20%），回笼约13万元</li>
-                <li><b>第二步</b>：北方华创减半仓位，回笼约10万元</li>
-                <li><b>第三步</b>：长电科技减半，回笼约5万元</li>
-                <li><b>第四步</b>：现金比例恢复至15%后，等待新的买入信号</li>
-                <li><b>第五步</b>：新资金优先配置军工赛道（当前仅17%，目标20%）</li>
+"""
+    # 动态生成减仓步骤（基于实际持仓的actions）
+    step_labels = ["第一步", "第二步", "第三步", "第四步", "第五步", "第六步", "第七步", "第八步"]
+    if opt["actions"]:
+        for i, act in enumerate(opt["actions"]):
+            label = step_labels[i] if i < len(step_labels) else f"第{i+1}步"
+            recover_wan = act["recover_amount"] / 10000
+            html += f'                <li><b>{label}</b>：{act["action"]}{act["name"]}（{act["detail"]}），回笼约{recover_wan:.1f}万元</li>\n'
+        # 最后追加现金恢复提示
+        next_label = step_labels[len(opt["actions"])] if len(opt["actions"]) < len(step_labels) else f"第{len(opt['actions'])+1}步"
+        html += f'                <li><b>{next_label}</b>：现金比例恢复至{opt["new_cash_ratio"]:.0f}%后，等待新的买入信号</li>\n'
+    else:
+        html += '                <li>当前持仓风险可控，暂无减仓建议，保持观察</li>\n'
+
+    html += """
             </ol>
         </div>
 

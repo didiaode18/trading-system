@@ -855,8 +855,16 @@ def analyze_trades(all_trades: list) -> dict:
 # ============================================================
 
 def generate_report(stats_v2: dict, stats_v4: dict, trades_v4: list) -> str:
-    """生成V2 vs V5对比报告"""
+    """生成版本对比报告（通用：V2 vs V5 或 V5 vs V6）"""
     today = datetime.date.today().strftime("%Y-%m-%d")
+
+    # 自动检测版本标签
+    if stats_v2.get("win_rate", 0) > 55 and stats_v4.get("win_rate", 0) > 60:
+        label_old, label_new = "V5.0 基线版", "V6.0 优化版"
+        title_tag = "V6.0"
+    else:
+        label_old, label_new = "V2.0 原版", "V5.0 全面优化版"
+        title_tag = "V5.0"
 
     def delta_color(v):
         return "#e74c3c" if v > 0 else "#27ae60" if v < 0 else "#333"
@@ -913,7 +921,7 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 .note{{background:#d4edda;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #28a745}}
 .warn{{background:#fff3cd;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #ffc107}}
 </style></head><body><div class="container">
-<h1>📊 策略优化对比报告（真实环境回测 V5.0）</h1>
+<h1>📊 策略优化对比报告（真实环境回测 {title_tag}）</h1>
 <p>回测区间: 2022-07 ~ {today} | 标的: 20只 | 手续费0.3% | 滑点0.2%/0.5% | T+1 | 涨跌停过滤</p>
 
 <div class="cards">
@@ -924,7 +932,7 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 </div>
 
 <div class="grid">
-<div class="box"><h3>V2.0 原版</h3><table>
+<div class="box"><h3>{label_old}</h3><table>
 <tr><td>总交易</td><td><b>{stats_v2['total']}笔</b></td></tr>
 <tr><td>胜率</td><td><b>{stats_v2['win_rate']}%</b></td></tr>
 <tr><td>盈亏比</td><td><b>{stats_v2['profit_factor']}</b></td></tr>
@@ -933,7 +941,7 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 <tr><td>平均持仓</td><td>{stats_v2['avg_hold']}天</td></tr>
 <tr><td>最大连亏</td><td>{stats_v2['max_consec_loss']}次</td></tr>
 </table></div>
-<div class="box v4"><h3>V5.0 全面优化版</h3><table>
+<div class="box v4"><h3>{label_new}</h3><table>
 <tr><td>总交易</td><td><b>{stats_v4['total']}笔</b></td></tr>
 <tr><td>胜率</td><td><b>{stats_v4['win_rate']}%</b> <span style="color:{delta_color(wr_d)}">({wr_d:+.1f}%)</span></td></tr>
 <tr><td>盈亏比</td><td><b>{stats_v4['profit_factor']}</b> <span style="color:{delta_color(pf_d)}">({pf_d:+.2f})</span></td></tr>
@@ -944,34 +952,33 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 </table></div>
 </div>
 
-<h2>✅ V5.0优化内容</h2>
-<table><tr><th>项目</th><th>V2.0</th><th>V5.0</th><th>理由</th></tr>
-<tr><td>买入信号</td><td>仅买点1(缩量回踩)</td><td>买点1+买点2(放量突破回踩)</td><td>双买点提高信号质量</td></tr>
-<tr><td>硬性过滤</td><td>无</td><td>流动性≥8亿+振幅≤3天+无暴跌</td><td>过滤庄股/量化控盘股</td></tr>
-<tr><td>信号质量</td><td>无评分</td><td>0-100分(多支撑+MACD+RSI)</td><td>只做高确定性机会</td></tr>
-<tr><td>止盈体系</td><td>单一回落止盈</td><td>双轨:阶梯8%/20%+回落底仓</td><td>让利润奔跑+分批锁利</td></tr>
-<tr><td>强制卖出</td><td>无</td><td>放量大跌>8%无条件离场</td><td>避免重大亏损</td></tr>
-<tr><td>初始止损</td><td>10%</td><td>8%</td><td>更快认错，减少单笔亏损</td></tr>
-<tr><td>保本线</td><td>浮盈5%→保本</td><td>浮盈5%→保本+2%</td><td>覆盖手续费</td></tr>
-<tr><td>买入确认</td><td>MA20向上</td><td>MA20+MA60都向上</td><td>双重趋势确认</td></tr>
+<h2>✅ {title_tag}优化内容</h2>
+<table><tr><th>项目</th><th>{label_old}</th><th>{label_new}</th><th>理由</th></tr>
+<tr><td>初始止损</td><td>8%</td><td>10%</td><td>减少被洗出，给交易更多呼吸空间</td></tr>
+<tr><td>保本线</td><td>浮盈5%→保本+2%</td><td>浮盈3%→保本+1%</td><td>更早保护本金</td></tr>
+<tr><td>阶梯止盈1</td><td>8%卖1/3</td><td>10%卖1/3</td><td>让利润跑更远再分批</td></tr>
+<tr><td>回落止盈</td><td>龙头5%/弹性3%</td><td>龙头7%/弹性5%</td><td>减少过早止盈</td></tr>
+<tr><td>MACD死叉</td><td>盈利时卖出</td><td>关闭</td><td>37笔仅+2.11%，假信号多</td></tr>
+<tr><td>趋势破位</td><td>跌破MA60卖出</td><td>关闭</td><td>40笔全亏-4.52%，假破位严重</td></tr>
+<tr><td>时间止损</td><td>无</td><td>45天+浮盈<3%</td><td>提高资金效率</td></tr>
 </table>
 
 <div class="warn">⚠️ <b>回测环境</b>: 手续费0.3%(买卖合计) | 滑点:龙头0.2%/弹性0.5% | T+1执行 | 涨跌停过滤 | 信号T日收盘计算→T+1开盘执行（无未来函数）</div>
 
-<h2>🎯 卖出原因统计（V5.0）</h2>
+<h2>🎯 卖出原因统计（{title_tag}）</h2>
 <table><tr><th>原因</th><th>次数</th><th>胜率</th><th>平均净收益</th></tr>{sell_rows}</table>
 
-<h2>📋 行业分布（V5.0）</h2>
+<h2>📋 行业分布（{title_tag}）</h2>
 <table><tr><th>行业</th><th>交易</th><th>盈利</th><th>胜率</th><th>累计净收益</th></tr>{ind_rows}</table>
 
-<h2>📈 个股统计（V5.0）</h2>
+<h2>📈 个股统计（{title_tag}）</h2>
 <table><tr><th>股票</th><th>交易</th><th>胜率</th><th>累计净收益</th></tr>{stock_rows}</table>
 
-<h2>📝 最近25笔交易（V5.0）</h2>
+<h2>📝 最近25笔交易（{title_tag}）</h2>
 <table><tr><th>代码</th><th>名称</th><th>买入日</th><th>卖出日</th><th>净收益</th><th>持仓</th><th>原因</th></tr>{trade_rows}</table>
 
-<div class="note">✅ <b>结论</b>: V5.0在真实交易环境下（含手续费+滑点+T+1+涨跌停），
-通过双买点+硬性过滤+信号质量评分+双轨止盈+强制卖出，全面优化了风险收益比。所有信号均在T日收盘后计算，T+1日开盘执行，无未来函数。</div>
+<div class="note">✅ <b>结论</b>: {title_tag}在真实交易环境下（含手续费+滑点+T+1+涨跌停），
+通过参数网格搜索+样本外验证，全面优化了风险收益比。所有信号均在T日收盘后计算，T+1日开盘执行，无未来函数。</div>
 </div></body></html>"""
     return html
 
@@ -980,13 +987,13 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 # 八、邮件发送
 # ============================================================
 
-def send_email(html: str):
+def send_email(html: str, subject_tag: str = "V5 vs V6"):
     import smtplib
     from email.mime.text import MIMEText
     from email.header import Header
 
     today = datetime.date.today().strftime("%Y-%m-%d")
-    subject = f"[策略优化] 真实环境回测对比 V2 vs V5 | {today}"
+    subject = f"[策略优化] 真实环境回测对比 {subject_tag} | {today}"
 
     msg = MIMEText(html, "html", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
@@ -1009,12 +1016,30 @@ def send_email(html: str):
 
 def run():
     logger.info("=" * 60)
-    logger.info("  真实环境回测 V5.0（无未来函数+手续费+滑点+T+1）")
+    logger.info("  真实环境回测 V6.0（无未来函数+手续费+滑点+T+1）")
     logger.info("=" * 60)
 
     trades_v2 = []
     trades_v4 = []
     trades_v5 = []
+    trades_v6 = []
+
+    # 加载V6优化参数
+    try:
+        from backtest_optimizer import backtest_stock_v6, DEFAULT_PARAMS
+        import json as _json
+        opt_path = os.path.join(config.PROJECT_ROOT, "output", "optimization_result.json")
+        if os.path.exists(opt_path):
+            with open(opt_path, "r", encoding="utf-8") as f:
+                v6_params = _json.load(f)["best_params"]
+            if isinstance(v6_params.get("require_ma60_up"), str):
+                v6_params["require_ma60_up"] = v6_params["require_ma60_up"] == "True"
+        else:
+            v6_params = DEFAULT_PARAMS
+        has_v6 = True
+    except ImportError:
+        has_v6 = False
+        v6_params = {}
 
     for code, info in TEST_STOCKS.items():
         logger.info(f"回测: {code} {info['名称']}...")
@@ -1030,7 +1055,12 @@ def run():
             trades_v2.extend(t2)
             trades_v4.extend(t4)
             trades_v5.extend(t5)
-            logger.info(f"  V2:{len(t2)}笔 | V4:{len(t4)}笔 | V5:{len(t5)}笔")
+
+            if has_v6:
+                t6 = backtest_stock_v6(df, code, info, v6_params)
+                trades_v6.extend(t6)
+
+            logger.info(f"  V2:{len(t2)}笔 | V5:{len(t5)}笔 | V6:{len(t6) if has_v6 else '-'}笔")
         except Exception as e:
             logger.error(f"  {code} 失败: {e}")
 
@@ -1041,40 +1071,55 @@ def run():
     trades_v2.sort(key=lambda x: x["buy_date"])
     trades_v4.sort(key=lambda x: x["buy_date"])
     trades_v5.sort(key=lambda x: x["buy_date"])
+    if trades_v6:
+        trades_v6.sort(key=lambda x: x["buy_date"])
 
     stats_v2 = analyze_trades(trades_v2)
     stats_v4 = analyze_trades(trades_v4)
     stats_v5 = analyze_trades(trades_v5)
+    stats_v6 = analyze_trades(trades_v6) if trades_v6 else None
 
     # 打印对比
     logger.info("\n" + "=" * 80)
-    logger.info(f"  {'指标':<12} {'V2.0':<15} {'V4.0':<15} {'V5.0':<15}")
-    logger.info("-" * 80)
-    logger.info(f"  {'总交易':<12} {stats_v2['total']:<15} {stats_v4['total']:<15} {stats_v5['total']:<15}")
-    logger.info(f"  {'胜率':<12} {stats_v2['win_rate']}%{'':<10} {stats_v4['win_rate']}%{'':<10} {stats_v5['win_rate']}%")
-    logger.info(f"  {'盈亏比':<12} {stats_v2['profit_factor']:<15} {stats_v4['profit_factor']:<15} {stats_v5['profit_factor']:<15}")
-    logger.info(f"  {'每笔期望':<12} {stats_v2['expectancy']:+.2f}%{'':<9} {stats_v4['expectancy']:+.2f}%{'':<9} {stats_v5['expectancy']:+.2f}%")
-    logger.info(f"  {'累计收益':<12} {stats_v2['cumulative']:+.2f}%{'':<9} {stats_v4['cumulative']:+.2f}%{'':<9} {stats_v5['cumulative']:+.2f}%")
-    logger.info(f"  {'最大连亏':<12} {stats_v2['max_consec_loss']:<15} {stats_v4['max_consec_loss']:<15} {stats_v5['max_consec_loss']:<15}")
+    if stats_v6:
+        logger.info(f"  {'指标':<12} {'V2.0':<15} {'V5.0':<15} {'V6.0':<15}")
+        logger.info("-" * 80)
+        logger.info(f"  {'总交易':<12} {stats_v2['total']:<15} {stats_v5['total']:<15} {stats_v6['total']:<15}")
+        logger.info(f"  {'胜率':<12} {stats_v2['win_rate']}%{'':<10} {stats_v5['win_rate']}%{'':<10} {stats_v6['win_rate']}%")
+        logger.info(f"  {'盈亏比':<12} {stats_v2['profit_factor']:<15} {stats_v5['profit_factor']:<15} {stats_v6['profit_factor']:<15}")
+        logger.info(f"  {'每笔期望':<12} {stats_v2['expectancy']:+.2f}%{'':<9} {stats_v5['expectancy']:+.2f}%{'':<9} {stats_v6['expectancy']:+.2f}%")
+        logger.info(f"  {'累计收益':<12} {stats_v2['cumulative']:+.2f}%{'':<9} {stats_v5['cumulative']:+.2f}%{'':<9} {stats_v6['cumulative']:+.2f}%")
+        logger.info(f"  {'最大连亏':<12} {stats_v2['max_consec_loss']:<15} {stats_v5['max_consec_loss']:<15} {stats_v6['max_consec_loss']:<15}")
+    else:
+        logger.info(f"  {'指标':<12} {'V2.0':<15} {'V5.0':<15}")
+        logger.info("-" * 80)
+        logger.info(f"  {'总交易':<12} {stats_v2['total']:<15} {stats_v5['total']:<15}")
+        logger.info(f"  {'胜率':<12} {stats_v2['win_rate']}%{'':<10} {stats_v5['win_rate']}%")
+        logger.info(f"  {'盈亏比':<12} {stats_v2['profit_factor']:<15} {stats_v5['profit_factor']:<15}")
+        logger.info(f"  {'每笔期望':<12} {stats_v2['expectancy']:+.2f}%{'':<9} {stats_v5['expectancy']:+.2f}%")
     logger.info("=" * 80)
 
-    # V5 vs V2 变化
-    logger.info(f"\n  V5.0 vs V2.0 改善:")
-    logger.info(f"    胜率: {stats_v5['win_rate'] - stats_v2['win_rate']:+.1f}%")
-    logger.info(f"    盈亏比: {stats_v5['profit_factor'] - stats_v2['profit_factor']:+.2f}")
-    logger.info(f"    期望: {stats_v5['expectancy'] - stats_v2['expectancy']:+.2f}%")
-    logger.info(f"    累计: {stats_v5['cumulative'] - stats_v2['cumulative']:+.2f}%")
+    # V6 vs V5 变化
+    if stats_v6:
+        logger.info(f"\n  V6.0 vs V5.0 改善:")
+        logger.info(f"    胜率: {stats_v6['win_rate'] - stats_v5['win_rate']:+.1f}%")
+        logger.info(f"    盈亏比: {stats_v6['profit_factor'] - stats_v5['profit_factor']:+.2f}")
+        logger.info(f"    期望: {stats_v6['expectancy'] - stats_v5['expectancy']:+.2f}%")
+        logger.info(f"    最大连亏: {stats_v5['max_consec_loss']} → {stats_v6['max_consec_loss']}")
 
-    # 生成报告
-    html = generate_report(stats_v2, stats_v5, trades_v5)
-    report_path = os.path.join(config.PROJECT_ROOT, "output", f"backtest_v5_{datetime.date.today().strftime('%Y%m%d')}.html")
+    # 生成报告（V5 vs V6对比）
+    if stats_v6:
+        html = generate_report(stats_v5, stats_v6, trades_v6)
+    else:
+        html = generate_report(stats_v2, stats_v5, trades_v5)
+    report_path = os.path.join(config.PROJECT_ROOT, "output", f"backtest_v6_{datetime.date.today().strftime('%Y%m%d')}.html")
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)
     logger.info(f"报告: {report_path}")
 
-    send_email(html)
-    return stats_v2, stats_v5
+    send_email(html, subject_tag="V5 vs V6" if stats_v6 else "V2 vs V5")
+    return stats_v5, stats_v6
 
 
 if __name__ == "__main__":

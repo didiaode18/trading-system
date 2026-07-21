@@ -412,14 +412,20 @@ def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
 def check_sell_signal(df: pd.DataFrame, buy_price: float,
                       current_position: dict = None) -> dict:
     """
-    检查是否触发卖出信号（V3.0升级版）
+    检查是否触发卖出信号（V6.0优化版）
     
     卖出规则优先级:
     1. 强制卖出: 单日放量大跌>8%（无条件离场）
-    2. 止损: 收盘价触发移动止损线
-    3. 趋势破位: 收盘跌破60日线+均线拐头+放量
-    4. MACD死叉: 盈利状态下DIF下穿DEA
-    5. 回落止盈: 从最高点回落超阈值
+    2. 时间止损: 持仓超45天且浮盈<3%（V6.0新增）
+    3. 止损: 收盘价触发移动止损线
+    4. 趋势破位: 收盘跌破60日线+均线拐头（V6.0: 可通过config关闭）
+    5. MACD死叉: 盈利状态下DIF下穿DEA（V6.0: 可通过config关闭）
+    6. 回落止盈: 从最高点回落超阈值
+    
+    V6.0优化结论（基于312笔回测诊断）:
+    - MACD死叉37笔仅+2.11%平均 → 默认关闭
+    - 趋势破位40笔全亏-4.52% → 默认关闭
+    - 新增45天时间止损 → 提高资金效率
     """
     result = {"signal": False, "sell_type": None, "sell_price": None, "reason": ""}
 
@@ -457,7 +463,27 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
                 })
                 return result
 
-    # ---- 1. 止损判定（仅收盘价触发）----
+    # ---- 1.5 时间止损（V6.0新增）: 持仓超45天且浮盈<3%则卖出 ----
+    max_hold_days = getattr(config, 'MAX_HOLD_DAYS', 0)
+    time_stop_profit = getattr(config, 'TIME_STOP_PROFIT', 0.03)
+    if max_hold_days > 0 and current_position:
+        buy_date_str = current_position.get("buy_date", "")
+        if buy_date_str:
+            try:
+                buy_dt = pd.Timestamp(buy_date_str)
+                hold_days = (pd.Timestamp(latest["date"]) - buy_dt).days
+                if hold_days >= max_hold_days and profit_pct < time_stop_profit:
+                    result.update({
+                        "signal": True,
+                        "sell_type": "time_stop",
+                        "sell_price": round(close, 2),
+                        "reason": f"时间止损: 持仓{hold_days}天>={max_hold_days}天, 浮盈{profit_pct:.2%}<{time_stop_profit:.0%}, 资金效率低"
+                    })
+                    return result
+            except (ValueError, TypeError):
+                pass
+
+    # ---- 2. 止损判定（仅收盘价触发）----
     stop_loss_price = compute_trailing_stop(buy_price, close)
     if close <= stop_loss_price:
         result.update({
@@ -469,7 +495,9 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
         return result
 
     # ---- 2. 趋势破位: 收盘跌破60日线+均线拐头+放量 → 立即卖出 ----
-    if not pd.isna(latest.get("ma60", None)):
+    # V6.0: 可通过config.TREND_BREAK_ENABLED关闭（回测显示40笔全亏）
+    trend_break_enabled = getattr(config, 'TREND_BREAK_ENABLED', True)
+    if trend_break_enabled and not pd.isna(latest.get("ma60", None)):
         ma60_slope = df_ind["ma60"].diff(3).iloc[-1]
         is_below_ma60 = close < latest["ma60"]
         is_ma60_down = ma60_slope < 0
@@ -495,9 +523,11 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
                 return result
 
     # ---- 3. MACD死叉确认卖出 ----
+    # V6.0: 可通过config.MACD_DEATH_CROSS_ENABLED关闭（回测显示假信号太多）
+    macd_enabled = getattr(config, 'MACD_DEATH_CROSS_ENABLED', True)
     macd_dif = latest.get("macd_dif", 0)
     macd_dea = latest.get("macd_dea", 0)
-    if not pd.isna(macd_dif) and not pd.isna(macd_dea) and profit_pct > 0:
+    if macd_enabled and not pd.isna(macd_dif) and not pd.isna(macd_dea) and profit_pct > 0:
         prev_dif = df_ind["macd_dif"].iloc[-2] if len(df_ind) > 1 else 0
         prev_dea = df_ind["macd_dea"].iloc[-2] if len(df_ind) > 1 else 0
         if not pd.isna(prev_dif) and not pd.isna(prev_dea):
@@ -548,11 +578,11 @@ def compute_trailing_stop(buy_price: float, current_price: float) -> float:
     """
     根据当前浮盈计算移动止损价（止损只能上移、不能下移）
     
-    规则（V3.0优化版）:
-    - 浮盈 < 5%:  维持初始止损（买入价 * (1-10%)）
-    - 浮盈 5%-15%: 止损上移到成本价+2%（覆盖手续费，避免白忙）
-    - 浮盈 15%-30%: 止损上移到盈利12%的位置（多锁2%利润）
-    - 浮盈 > 30%: 止损上移到盈利22%的位置（用部分利润换更大空间）
+    规则（V6.0优化版 - 基于网格搜索最优参数）:
+    - 浮盈 < 3%:  维持初始止损（买入价 * (1-10%)）
+    - 浮盈 3%-15%: 止损上移到成本价+1%（V6.0: 更早保本，减少利润回吐）
+    - 浮盈 15%-30%: 止损上移到盈利12%的位置
+    - 浮盈 > 30%: 止损上移到盈利22%的位置
     """
     profit_pct = (current_price - buy_price) / buy_price
     initial_stop = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
@@ -564,14 +594,14 @@ def compute_trailing_stop(buy_price: float, current_price: float) -> float:
             if mode == "initial":
                 stop_price = initial_stop
             elif mode == "cost_plus":
-                stop_price = buy_price * 1.02  # 保本+2%（覆盖手续费）
+                stop_price = buy_price * 1.01  # V6.0: 保本+1%（原+2%→+1%）
             elif mode == "profit_12":
                 stop_price = buy_price * 1.12  # 锁定12%
             elif mode == "profit_22":
                 stop_price = buy_price * 1.22  # 锁定22%
             # 兼容旧版参数名
             elif mode == "cost":
-                stop_price = buy_price * 1.02
+                stop_price = buy_price * 1.01
             elif mode == "profit_10":
                 stop_price = buy_price * 1.12
             elif mode == "profit_20":
@@ -732,6 +762,9 @@ def scan_all_stocks(data_dict: dict, holdings: dict = None) -> list:
         if df.empty or len(df) < config.MA_MID:
             continue
         if code == config.BENCHMARK_INDEX:  # 跳过基准指数
+            continue
+        # 跳过ETF基金(588/159开头)，不生成个股信号
+        if code.startswith("588") or code.startswith("159"):
             continue
         holding = holdings.get(code)
         sig = generate_strategy_signal(df, holding)

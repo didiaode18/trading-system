@@ -13,6 +13,7 @@ import time
 import datetime
 import logging
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +48,12 @@ def _to_baostock_code(code: str) -> str:
     002371 -> sz.002371
     600584 -> sh.600584
     000300 -> sh.000300 (沪深300指数)
+    588000 -> sh.588000 (科创50ETF)
+    159205 -> sz.159205 (创业东财ETF)
     """
     if code.startswith("sh.") or code.startswith("sz."):
         return code
-    if code.startswith("6") or code.startswith("9") or code == "000300":
+    if code.startswith("6") or code.startswith("9") or code.startswith("5") or code == "000300":
         return f"sh.{code}"
     else:
         return f"sz.{code}"
@@ -256,9 +259,92 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
 # 增量更新到数据库
 # ============================================================
 
+def _validate_data_quality(conn: sqlite3.Connection, code: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    数据质量验证：过滤明显异常的数据行
+    
+    检测规则:
+    1. 成交量异常低（< 历史均量的2%）且价格大幅变动（>5%）→ 疑似数据源错误
+    2. 单日跌幅超过11%（A股主板涨跌停±10%，留1%容差）→ 疑似前复权计算错误
+    3. 价格为0或负数 → 无效数据
+    
+    返回: 过滤后的DataFrame
+    """
+    if df.empty or len(df) == 0:
+        return df
+    
+    # 获取历史平均成交量（最近20天）
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT volume FROM daily_kline 
+        WHERE code=? AND volume > 0 
+        ORDER BY date DESC LIMIT 20
+    """, (code,))
+    hist_volumes = [row[0] for row in cursor.fetchall()]
+    avg_volume = sum(hist_volumes) / len(hist_volumes) if hist_volumes else 0
+    
+    valid_rows = []
+    removed = []
+    
+    for idx, row in df.iterrows():
+        vol = row.get("volume", 0) or 0
+        close = row.get("close", 0) or 0
+        open_price = row.get("open", 0) or 0
+        
+        # 规则0: 价格无效
+        if close <= 0 or open_price <= 0:
+            removed.append(f"{row['date']}: 价格无效(close={close})")
+            continue
+        
+        # 规则1: 成交量异常低 + 价格大幅变动
+        if avg_volume > 0 and vol > 0:
+            vol_ratio = vol / avg_volume
+            if vol_ratio < 0.02:  # 成交量不足均量2%
+                # 检查价格变动（与前一天收盘对比）
+                if valid_rows:
+                    prev_close = valid_rows[-1]["close"]
+                else:
+                    # 从数据库取前一天收盘价
+                    cursor.execute("""
+                        SELECT close FROM daily_kline 
+                        WHERE code=? ORDER BY date DESC LIMIT 1
+                    """, (code,))
+                    prev_row = cursor.fetchone()
+                    prev_close = prev_row[0] if prev_row else close
+                
+                if prev_close > 0:
+                    price_change = abs(close - prev_close) / prev_close
+                    if price_change > 0.05:  # 价格变动>5%
+                        removed.append(
+                            f"{row['date']}: 量价异常(vol={vol:.0f}, "
+                            f"均量比={vol_ratio:.3f}, 跌幅={price_change:.1%})")
+                        continue
+        
+        # 规则2: 单日跌幅超11%（非ST/非新股）
+        if valid_rows:
+            prev_close = valid_rows[-1]["close"]
+            if prev_close > 0:
+                daily_change = (close - prev_close) / prev_close
+                if daily_change < -0.11:
+                    removed.append(
+                        f"{row['date']}: 单日跌幅{daily_change:.1%}超限(可能前复权错误)")
+                    continue
+        
+        valid_rows.append(row)
+    
+    if removed:
+        logger.warning(f"[{code}] 数据质量验证: 过滤{len(removed)}条异常数据")
+        for r in removed:
+            logger.warning(f"  {r}")
+    
+    if not valid_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(valid_rows)
+
+
 def update_stock_to_db(conn: sqlite3.Connection, code: str) -> int:
     """
-    增量更新单只股票到数据库
+    增量更新单只股票到数据库（含数据质量验证 + 批量写入）
     返回新增记录数
     """
     last_date = get_last_update_date(conn, code)
@@ -276,18 +362,28 @@ def update_stock_to_db(conn: sqlite3.Connection, code: str) -> int:
     if df.empty:
         return 0
 
+    # 数据质量验证：过滤异常数据
+    df = _validate_data_quality(conn, code, df)
+    if df.empty:
+        logger.warning(f"[{code}] 所有新数据未通过质量验证，跳过更新")
+        return 0
+
+    # 批量写入（executemany替代逐行INSERT，性能提升10x+）
     cursor = conn.cursor()
-    count = 0
-    for _, row in df.iterrows():
-        try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO daily_kline (code, date, open, close, high, low, volume, amount)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (code, row["date"], row["open"], row["close"], row["high"],
-                  row["low"], row["volume"], row.get("amount", 0)))
-            count += 1
-        except Exception as e:
-            logger.error(f"[{code}] 写入失败: {e}")
+    rows = [
+        (code, row["date"], row["open"], row["close"], row["high"],
+         row["low"], row["volume"], row.get("amount", 0))
+        for _, row in df.iterrows()
+    ]
+    try:
+        cursor.executemany("""
+            INSERT OR REPLACE INTO daily_kline (code, date, open, close, high, low, volume, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        count = len(rows)
+    except Exception as e:
+        logger.error(f"[{code}] 批量写入失败: {e}")
+        return -1
 
     latest = df["date"].max()
     cursor.execute("""
@@ -295,6 +391,158 @@ def update_stock_to_db(conn: sqlite3.Connection, code: str) -> int:
     """, (code, latest))
     conn.commit()
     return count
+
+
+def repair_stock_data(code: str, days_back: int = 5) -> int:
+    """
+    修复单只股票的近期异常数据
+    
+    操作:
+    1. 删除最近N天的数据
+    2. 重新从数据源拉取（含质量验证）
+    
+    参数:
+        code: 股票代码
+        days_back: 回退天数（默认5天）
+    
+    返回: 重新写入的记录数
+    """
+    conn = init_db()
+    cursor = conn.cursor()
+    
+    # 计算回退日期
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+    
+    # 删除最近N天数据
+    cursor.execute("DELETE FROM daily_kline WHERE code=? AND date>?", (code, cutoff))
+    deleted = cursor.rowcount
+    
+    # 更新last_update为cutoff之前
+    cursor.execute("""
+        SELECT MAX(date) FROM daily_kline WHERE code=? AND date<=?
+    """, (code, cutoff))
+    row = cursor.fetchone()
+    new_last = row[0] if row and row[0] else None
+    if new_last:
+        cursor.execute("INSERT OR REPLACE INTO last_update (code, last_date) VALUES (?, ?)",
+                      (code, new_last))
+    else:
+        cursor.execute("DELETE FROM last_update WHERE code=?", (code,))
+    conn.commit()
+    
+    logger.info(f"[{code}] 修复: 删除{deleted}条近期数据, 回退到{new_last}")
+    
+    # 重新拉取
+    count = update_stock_to_db(conn, code)
+    logger.info(f"[{code}] 修复完成: 重新写入{count}条记录")
+    conn.close()
+    return count
+
+
+# ============================================================
+# 盘后多源校验（确保收盘价准确）
+# ============================================================
+
+def validate_close_prices(codes: list = None, tolerance: float = 0.02) -> dict:
+    """
+    盘后收盘价交叉校验：对比DB中最新收盘价与实时行情API
+    
+    原理:
+      盘后运行，用腾讯行情API获取当日收盘价，与DB中最新数据对比
+      偏差超过tolerance(2%)的标记为可疑，尝试用akshare数据修复
+    
+    参数:
+        codes: 要校验的股票代码列表（默认用STOCK_POOL）
+        tolerance: 允许偏差比例（默认2%）
+    
+    返回: {code: {"status": "ok"/"mismatch"/"fixed", "db_price": x, "real_price": y}}
+    """
+    if codes is None:
+        codes = list(config.STOCK_POOL.keys())
+    
+    # 获取实时行情（盘后即为收盘价）
+    try:
+        from data.realtime import fetch_realtime_batch
+        realtime = fetch_realtime_batch(codes)
+    except Exception as e:
+        logger.warning(f"多源校验: 实时行情获取失败: {e}")
+        return {}
+    
+    if not realtime:
+        return {}
+    
+    conn = init_db()
+    cursor = conn.cursor()
+    results = {}
+    
+    for code in codes:
+        if code not in realtime:
+            continue
+        
+        real_price = realtime[code].get("price", 0)
+        if real_price <= 0:
+            continue
+        
+        # 查询DB中最新收盘价
+        cursor.execute("""
+            SELECT close, date FROM daily_kline 
+            WHERE code=? ORDER BY date DESC LIMIT 1
+        """, (code,))
+        row = cursor.fetchone()
+        if not row:
+            continue
+        
+        db_price, db_date = row[0], row[1]
+        deviation = abs(db_price - real_price) / real_price
+        
+        if deviation <= tolerance:
+            results[code] = {"status": "ok", "db_price": db_price, "real_price": real_price}
+        else:
+            logger.warning(
+                f"[{code}] 收盘价偏差{deviation:.1%}: DB={db_price:.2f}({db_date}) vs 实时={real_price:.2f}")
+            
+            # 尝试用akshare修复当日数据
+            fixed = False
+            if HAS_AKSHARE:
+                try:
+                    today_str = datetime.date.today().strftime("%Y-%m-%d")
+                    df = fetch_stock_daily_akshare(code, start_date=today_str, end_date=today_str)
+                    if not df.empty:
+                        ak_close = float(df.iloc[-1]["close"])
+                        ak_deviation = abs(ak_close - real_price) / real_price
+                        if ak_deviation < deviation:  # akshare更接近实时价
+                            cursor.execute("""
+                                INSERT OR REPLACE INTO daily_kline (code, date, open, close, high, low, volume, amount)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (code, today_str, float(df.iloc[-1]["open"]),
+                                  ak_close, float(df.iloc[-1]["high"]),
+                                  float(df.iloc[-1]["low"]), float(df.iloc[-1]["volume"]),
+                                  float(df.iloc[-1].get("amount", 0))))
+                            cursor.execute("""
+                                INSERT OR REPLACE INTO last_update (code, last_date) VALUES (?, ?)
+                            """, (code, today_str))
+                            conn.commit()
+                            fixed = True
+                            logger.info(f"[{code}] 已用akshare修复: {db_price:.2f} -> {ak_close:.2f}")
+                except Exception as e:
+                    logger.debug(f"[{code}] akshare修复失败: {e}")
+            
+            results[code] = {
+                "status": "fixed" if fixed else "mismatch",
+                "db_price": db_price,
+                "real_price": real_price,
+                "deviation": f"{deviation:.1%}",
+            }
+    
+    conn.close()
+    
+    # 统计
+    mismatch_count = sum(1 for v in results.values() if v["status"] == "mismatch")
+    fixed_count = sum(1 for v in results.values() if v["status"] == "fixed")
+    if mismatch_count or fixed_count:
+        logger.info(f"多源校验完成: {fixed_count}只已修复, {mismatch_count}只仍偏差")
+    
+    return results
 
 
 def get_all_candidate_codes() -> list:
@@ -310,48 +558,131 @@ def get_all_candidate_codes() -> list:
         codes.update(stocks.keys())
     # 加入基准指数
     codes.add(config.BENCHMARK_INDEX)
+    # 过滤创业板(300)和科创板(688)，用户无交易权限
+    codes = {c for c in codes if not c.startswith("300") and not c.startswith("688")}
     return sorted(codes)
 
 
-def batch_update_all(conn: sqlite3.Connection = None, full_pool: bool = True) -> dict:
+def _update_single_akshare(code: str) -> int:
     """
-    批量更新所有股票池中的日线数据
+    单只股票akshare更新（线程安全，用于并行拉取）
+    每个线程独立连接数据库，避免SQLite并发问题
+    返回: 新增记录数，失败返回-1
+    """
+    try:
+        conn = sqlite3.connect(config.DB_PATH, timeout=30)
+        last_date = get_last_update_date(conn, code)
+        start_date = None
+        if last_date:
+            next_day = datetime.datetime.strptime(last_date, "%Y-%m-%d") + datetime.timedelta(days=1)
+            start_date = next_day.strftime("%Y-%m-%d")
+
+        end_date = datetime.date.today().strftime("%Y-%m-%d")
+        if start_date and start_date > end_date:
+            conn.close()
+            return 0
+
+        # 用akshare拉取
+        df = fetch_stock_daily_akshare(code, start_date=start_date, end_date=end_date)
+        if df.empty:
+            conn.close()
+            return 0
+
+        # 数据质量验证
+        df = _validate_data_quality(conn, code, df)
+        if df.empty:
+            conn.close()
+            return 0
+
+        # 批量写入
+        cursor = conn.cursor()
+        rows = [
+            (code, row["date"], row["open"], row["close"], row["high"],
+             row["low"], row["volume"], row.get("amount", 0))
+            for _, row in df.iterrows()
+        ]
+        cursor.executemany("""
+            INSERT OR REPLACE INTO daily_kline (code, date, open, close, high, low, volume, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        latest = df["date"].max()
+        cursor.execute("INSERT OR REPLACE INTO last_update (code, last_date) VALUES (?, ?)",
+                       (code, latest))
+        conn.commit()
+        conn.close()
+        return len(rows)
+    except Exception as e:
+        logger.debug(f"[{code}] akshare并行拉取失败: {e}")
+        return -1
+
+
+def batch_update_all(conn: sqlite3.Connection = None, full_pool: bool = True,
+                     max_workers: int = 5) -> dict:
+    """
+    批量更新所有股票池中的日线数据（并行优化版）
+    
+    策略:
+      Phase 1: akshare并行拉取（max_workers个线程）
+      Phase 2: 失败的用baostock顺序补拉
+    
     参数:
-        conn: 数据库连接
-        full_pool: True=更新全部候选股(STOCK_POOL+SECTOR_CANDIDATES)
-                   False=仅更新STOCK_POOL
+        conn: 数据库连接（仅用于baostock补拉阶段）
+        full_pool: True=更新全部候选股, False=仅更新STOCK_POOL
+        max_workers: 并行线程数（默认5）
     返回: {code: 新增记录数}
     """
     if conn is None:
         conn = init_db()
 
-    # 确保 baostock 登录
-    if HAS_BAOSTOCK:
-        _bs_login()
-
-    results = {}
     if full_pool:
         codes = get_all_candidate_codes()
     else:
         codes = list(config.STOCK_POOL.keys())
-        codes.append(config.BENCHMARK_INDEX)
+        if config.BENCHMARK_INDEX not in codes:
+            codes.append(config.BENCHMARK_INDEX)
 
-    logger.info(f"数据更新范围: {len(codes)}只股票")
+    logger.info(f"数据更新范围: {len(codes)}只股票 (并行度={max_workers})")
+    results = {}
 
-    for code in codes:
-        try:
-            logger.info(f"正在更新 {code} ...")
-            count = update_stock_to_db(conn, code)
-            results[code] = count
-            logger.info(f"[{code}] 新增 {count} 条记录")
-            time.sleep(1)  # baostock 不需要太长间隔
-        except Exception as e:
-            logger.error(f"[{code}] 更新失败: {e}")
+    # Phase 1: akshare并行拉取
+    if HAS_AKSHARE:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_update_single_akshare, code): code
+                       for code in codes}
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    results[code] = future.result()
+                except Exception:
+                    results[code] = -1
+
+        success_count = sum(1 for v in results.values() if v >= 0)
+        logger.info(f"  akshare并行完成: {success_count}/{len(codes)}只成功")
+    else:
+        # 无akshare，全部标记为失败，由baostock补拉
+        for code in codes:
             results[code] = -1
 
-    # 登出 baostock
-    if HAS_BAOSTOCK:
+    # Phase 2: baostock补拉失败的
+    failed = [c for c, v in results.items() if v < 0]
+    if failed and HAS_BAOSTOCK:
+        logger.info(f"  baostock补拉: {len(failed)}只...")
+        _bs_login()
+        for code in failed:
+            try:
+                count = update_stock_to_db(conn, code)
+                results[code] = count
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"  [{code}] baostock补拉失败: {e}")
+                results[code] = -1
         _bs_logout()
+
+    # 统计
+    success = sum(1 for v in results.values() if v > 0)
+    no_change = sum(1 for v in results.values() if v == 0)
+    fail = sum(1 for v in results.values() if v < 0)
+    logger.info(f"  更新结果: {success}只新增, {no_change}只无变化, {fail}只失败")
 
     return results
 

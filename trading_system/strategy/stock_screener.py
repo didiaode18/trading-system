@@ -357,6 +357,12 @@ def filter_strong_sectors(data_dict: dict, lookback: int = 20) -> dict:
     for code, df in data_dict.items():
         if code == "000300":
             continue
+        # 过滤创业板(300)和科创板(688)
+        if code.startswith("300") or code.startswith("688"):
+            continue
+        # 过滤ETF基金(588/159开头)，不参与个股筛选
+        if code.startswith("588") or code.startswith("159"):
+            continue
         info = config.get_stock_info(code)
         sector = info.get("赛道", "其他")
         if len(df) < lookback + 5:
@@ -1003,22 +1009,25 @@ def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
 # ============================================================
 
 def run_stock_screener(data_dict: dict, holdings: dict = None,
-                       min_score: float = None, max_stocks: int = None) -> dict:
+                       min_score: float = None, max_stocks: int = None,
+                       news_risk: dict = None) -> dict:
     """
     运行完整选股流程（全赛道版 + 弱势行情支持）
     
     改进:
     - 支持全行业选股，不局限于半导体
     - 根据行业强弱动态分配名额
-    - 弱势行情输出"观察池"（相对强势股）
+    - 弱势行情输出“观察池”（相对强势股）
     - 结合持仓行业集中度调整配额
     - 新增持仓诊断输出
+    - 新闻风险过滤（level>=2排除候选）
     
     参数:
         data_dict: {code: DataFrame} 股票数据（含技术指标）
         holdings: 当前持仓
         min_score: 最低入选分数
         max_stocks: 最多入选股票数
+        news_risk: 新闻风险扫描结果（仅用于过滤，不产生信号）
     """
     # 从配置读取参数
     screener_cfg = getattr(config, 'SCREENER_CONFIG', {})
@@ -1072,6 +1081,21 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     for code, df in data_dict.items():
         if code == "000300":
             continue
+        # 过滤创业板(300)和科创板(688)，用户无交易权限
+        if code.startswith("300") or code.startswith("688"):
+            continue
+        # 过滤ETF基金(588/159开头)，不参与个股筛选
+        if code.startswith("588") or code.startswith("159"):
+            continue
+        # 新闻风险过滤（level>=2 排除候选，仅做选股过滤不产生信号）
+        if news_risk and getattr(config, 'NEWS_FILTER_IN_SCREENER', False):
+            nr = news_risk.get(code, {})
+            if nr.get("level", 0) >= 2:
+                top_alert = nr.get("alerts", [{}])[0]
+                logger.info(f"  {code} {nr.get('name', '')}: [新闻过滤] "
+                           f"{top_alert.get('title', '')[:30]}")
+                filtered_count += 1
+                continue
         # 从STOCK_POOL或SECTOR_CANDIDATES中查找股票信息（统一查找）
         stock_info = config.get_stock_info(code)
         

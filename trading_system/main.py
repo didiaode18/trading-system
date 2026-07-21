@@ -25,6 +25,7 @@ import argparse
 import datetime
 import logging
 import json
+import pandas as pd
 
 # 确保项目根目录在sys.path中
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -72,9 +73,47 @@ logger = logging.getLogger("main")
 
 
 # ============================================================
+# 首次运行自动检测（可迁移性）
+# ============================================================
+def _is_db_empty() -> bool:
+    """检查数据库是否为空（无任何股票数据）"""
+    if not os.path.exists(config.DB_PATH):
+        return True
+    try:
+        import sqlite3
+        conn = sqlite3.connect(config.DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM daily_kline")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count == 0
+    except Exception:
+        return True
+
+
+def _auto_bootstrap():
+    """首次运行自动初始化：创建目录 + 拉取历史数据"""
+    logger.info("检测到首次运行，自动初始化数据...")
+    logger.info("  拉取历史行情数据（约需3-5分钟）...")
+    try:
+        conn = init_db()
+        results = batch_update_all(conn, full_pool=True)
+        success = sum(1 for v in results.values() if v > 0)
+        logger.info(f"  初始化完成: {success}/{len(results)}只股票数据就绪")
+        conn.close()
+    except Exception as e:
+        logger.error(f"  自动初始化失败: {e}")
+        logger.info("  请手动运行: python setup.py")
+
+
+if _is_db_empty():
+    _auto_bootstrap()
+
+
+# ============================================================
 # 持仓数据加载（从本地JSON文件读取）
 # ============================================================
-HOLDINGS_FILE = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+HOLDINGS_FILE = config.get_holdings_file()
 
 def load_holdings() -> dict:
     """
@@ -91,6 +130,8 @@ def load_holdings() -> dict:
         }
     }
     """
+    global HOLDINGS_FILE
+    HOLDINGS_FILE = config.get_holdings_file()
     if not os.path.exists(HOLDINGS_FILE):
         logger.info("未找到holdings.json，默认空仓")
         return {}
@@ -106,8 +147,30 @@ def load_holdings() -> dict:
 
 def save_holdings(holdings: dict):
     """保存持仓数据"""
+    global HOLDINGS_FILE
+    HOLDINGS_FILE = config.get_holdings_file()
     with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(holdings, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# 指标计算缓存（避免同一运行周期内重复计算）
+# ============================================================
+_indicator_cache = {}  # {code: (last_date, df)}
+
+def compute_indicators_cached(code: str, df: pd.DataFrame) -> pd.DataFrame:
+    """带缓存的指标计算：同一(code, last_date)不重复计算"""
+    if df.empty:
+        return df
+    last_date = df.iloc[-1]["date"] if "date" in df.columns else ""
+    cache_key = code
+    if cache_key in _indicator_cache:
+        cached_date, cached_df = _indicator_cache[cache_key]
+        if cached_date == last_date and len(cached_df) == len(df):
+            return cached_df
+    result = compute_indicators(df)
+    _indicator_cache[cache_key] = (last_date, result)
+    return result
 
 
 # ============================================================
@@ -141,6 +204,17 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                     logger.warning(f"    {code}: 更新失败")
         except Exception as e:
             logger.error(f"  数据更新异常: {e}")
+
+        # 盘后多源校验：确保收盘价准确
+        try:
+            from data.data_loader import validate_close_prices
+            validation = validate_close_prices(list(config.STOCK_POOL.keys()))
+            mismatch = sum(1 for v in validation.values() if v["status"] == "mismatch")
+            fixed = sum(1 for v in validation.values() if v["status"] == "fixed")
+            if mismatch or fixed:
+                logger.info(f"  多源校验: {fixed}只已修复, {mismatch}只仍偏差")
+        except Exception as e:
+            logger.debug(f"  多源校验跳过: {e}")
     else:
         logger.info("[Step 1] 跳过数据更新（--no-update）")
         conn = init_db()
@@ -153,7 +227,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     for code in all_codes:
         df = load_daily_data(code, conn, days=120)
         if not df.empty and len(df) >= config.MA_SHORT:
-            df = compute_indicators(df)
+            df = compute_indicators_cached(code, df)
             data_dict[code] = df
     logger.info(f"  成功加载 {len(data_dict)} 只股票数据（候选池共{len(all_codes)}只）")
 
@@ -210,6 +284,19 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     risk_state = RiskState()
     risk_state.total_capital = config.TOTAL_CAPITAL
     risk_state.update_positions(holdings)
+
+    # ---- Step 4.5: 新闻/政策风险扫描（仅预警，不产生信号）----
+    news_risk = {}
+    if getattr(config, 'NEWS_MONITOR_ENABLED', False):
+        logger.info("[Step 4.5] 新闻/政策风险扫描...")
+        try:
+            from strategy.news_monitor import scan_news_risk
+            scan_codes = list(holdings.keys()) + list(data_dict.keys())
+            news_risk = scan_news_risk(scan_codes, holdings)
+            alert_count = sum(1 for v in news_risk.values() if v["level"] >= 2)
+            logger.info(f"  扫描{len(scan_codes)}只, 风险预警{alert_count}只")
+        except Exception as e:
+            logger.warning(f"  新闻扫描异常(不影响主流程): {e}")
 
     # ---- Step 5: 扫描所有股票，生成信号 ----
     logger.info("[Step 5] 扫描股票池，生成交易信号...")
@@ -339,7 +426,8 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 
         # 发送东方财富条件单邮件
         try:
-            order_ok = send_eastmoney_orders_email(filtered_signals, holdings, data_dict)
+            order_ok = send_eastmoney_orders_email(filtered_signals, holdings, data_dict,
+                                                    news_risk=news_risk)
             if order_ok:
                 logger.info("  东方财富条件单邮件发送成功")
             else:
@@ -373,8 +461,8 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         except Exception as e:
             logger.warning(f"  市场扫描异常: {e}，继续使用已有候选池")
 
-        # 运行选股引擎（传入全部data_dict + 持仓）
-        screener_result = run_stock_screener(data_dict, holdings)
+        # 运行选股引擎（传入全部data_dict + 持仓 + 新闻风险）
+        screener_result = run_stock_screener(data_dict, holdings, news_risk=news_risk)
         
         # 输出持仓诊断结果
         if screener_result.get("holdings_diagnosis"):

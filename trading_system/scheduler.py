@@ -167,7 +167,7 @@ def run_morning_screener():
                 data_dict[code] = df
 
         # 加载持仓
-        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings_file = config.get_holdings_file()
         holdings = {}
         if os.path.exists(holdings_file):
             with open(holdings_file, "r", encoding="utf-8") as f:
@@ -205,7 +205,7 @@ def run_morning_reminder():
         conn = init_db()
 
         # 加载持仓
-        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings_file = config.get_holdings_file()
         holdings = {}
         if os.path.exists(holdings_file):
             with open(holdings_file, "r", encoding="utf-8") as f:
@@ -266,8 +266,8 @@ def run_morning_reminder():
             if buy_price <= 0:
                 continue
 
-            # 止损：买入价下方8%（龙头）或10%（弹性）
-            stop_pct = 0.08 if stock_type == "龙头" else 0.10
+            # V6.0止损：买入价下方10%（龙头）或12%（弹性）
+            stop_pct = 0.10 if stock_type == "龙头" else 0.12
             stop_loss = round(buy_price * (1 - stop_pct), 2)
 
             # 计算首批买入股数
@@ -326,8 +326,21 @@ def run_morning_reminder():
 
         logger.info(f"  候选{len(buy_candidates)}只，推荐前{buy_count}只买入条件单")
 
-        # 发送条件单邮件
-        send_eastmoney_orders_email(signals, holdings, data_dict)
+        # 新闻/政策风险扫描（仅预警，不影响信号）
+        news_risk = {}
+        if getattr(config, 'NEWS_MONITOR_ENABLED', False):
+            try:
+                from strategy.news_monitor import scan_news_risk
+                scan_codes = list(holdings.keys()) + list(data_dict.keys())
+                news_risk = scan_news_risk(scan_codes, holdings)
+                alert_count = sum(1 for v in news_risk.values() if v["level"] >= 2)
+                if alert_count > 0:
+                    logger.info(f"  新闻风险预警: {alert_count}只")
+            except Exception as e:
+                logger.warning(f"  新闻扫描异常(不影响主流程): {e}")
+
+        # 发送条件单邮件（附带新闻预警）
+        send_eastmoney_orders_email(signals, holdings, data_dict, news_risk=news_risk)
         logger.info(f"[{today}] 盘前条件单提醒发送成功"
                    f"（持仓{len(holdings)}只 + 买入推荐，共{len(signals)}条信号）")
 
@@ -354,7 +367,7 @@ def run_forecast_morning():
 
         conn = init_db()
         # 加载持仓
-        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings_file = config.get_holdings_file()
         holdings = {}
         if os.path.exists(holdings_file):
             with open(holdings_file, "r", encoding="utf-8") as f:
@@ -409,7 +422,7 @@ def run_forecast_afternoon():
         batch_update_all(conn, full_pool=False)
 
         # 加载持仓
-        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings_file = config.get_holdings_file()
         holdings = {}
         if os.path.exists(holdings_file):
             with open(holdings_file, "r", encoding="utf-8") as f:
@@ -463,7 +476,7 @@ def run_weekly_portfolio():
                 df = compute_indicators(df)
                 data_dict[code] = df
 
-        holdings_file = os.path.join(os.path.dirname(PROJECT_ROOT), "holdings.json")
+        holdings_file = config.get_holdings_file()
         holdings = {}
         if os.path.exists(holdings_file):
             with open(holdings_file, "r", encoding="utf-8") as f:
@@ -498,7 +511,71 @@ def run_weekly_task():
 
 
 # ============================================================
-# 三、调度器
+# 三、盘中监控（后台线程）
+# ============================================================
+
+_monitor_thread = None
+_monitor_instance = None
+
+
+def start_intraday_monitor():
+    """启动盘中监控（后台线程）"""
+    global _monitor_thread, _monitor_instance
+    import threading
+
+    today = datetime.date.today()
+    if not is_trading_day(today):
+        return
+
+    if _monitor_thread and _monitor_thread.is_alive():
+        logger.info("[盘中监控] 已在运行中")
+        return
+
+    # 加载持仓
+    holdings_file = config.get_holdings_file()
+    holdings = {}
+    if os.path.exists(holdings_file):
+        import json
+        with open(holdings_file, "r", encoding="utf-8") as f:
+            holdings = json.load(f)
+
+    if not holdings:
+        logger.info("[盘中监控] 无持仓，跳过监控")
+        return
+
+    # 补充必要字段
+    for code, pos in holdings.items():
+        pos["name"] = config.get_stock_name(code)
+        if "stop_loss" not in pos:
+            pos["stop_loss"] = pos["buy_price"] * (1 - config.INITIAL_STOP_LOSS_PCT)
+
+    monitor_cfg = getattr(config, 'MONITOR_CONFIG', {})
+    poll_interval = monitor_cfg.get('poll_interval', 30)
+
+    from strategy.intraday_monitor import IntradayMonitor
+    _monitor_instance = IntradayMonitor(holdings, poll_interval=poll_interval)
+
+    def _run_monitor():
+        logger.info(f"[盘中监控] 后台线程启动 (监控{len(holdings)}只, 间隔{poll_interval}秒)")
+        _monitor_instance.start()
+        logger.info("[盘中监控] 后台线程结束")
+
+    _monitor_thread = threading.Thread(target=_run_monitor, daemon=True, name="IntradayMonitor")
+    _monitor_thread.start()
+    logger.info(f"[盘中监控] 已启动 (09:30-15:00, {len(holdings)}只持仓)")
+
+
+def stop_intraday_monitor():
+    """停止盘中监控"""
+    global _monitor_instance
+    if _monitor_instance:
+        _monitor_instance.stop()
+        _monitor_instance = None
+        logger.info("[盘中监控] 已停止")
+
+
+# ============================================================
+# 四、调度器
 # ============================================================
 
 def start_scheduler():
@@ -542,6 +619,11 @@ def start_scheduler():
     logger.info(f"  盘前提醒: 每个交易日 08:00")
     logger.info(f"  仓位分析: 每周五 16:00")
     logger.info(f"  周日提醒: 每周日 10:00")
+    logger.info(f"  盘中监控: 每个交易日 09:30-15:00 (每30秒)")
+
+    # 盘中监控（后台线程）
+    schedule.every().day.at("09:30").do(start_intraday_monitor)
+    schedule.every().day.at("15:01").do(stop_intraday_monitor)
 
     while True:
         schedule.run_pending()

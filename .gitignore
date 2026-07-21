@@ -81,6 +81,11 @@ stock_pool.json
 # Data cache (auto-generated)
 trading_system/data/*_cache.json
 trading_system/data/*.db
+trading_system/data/*.pkl
+
+# Generated optimization results
+trading_system/output/optimization_result.json
+trading_system/output/validation_result.json
 
 # Trade logs (contains personal trading data)
 trading_system/output/trade_logs/

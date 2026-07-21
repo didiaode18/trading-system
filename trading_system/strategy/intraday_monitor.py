@@ -269,58 +269,39 @@ class IntradayMonitor:
     # ============================================================
 
     def _get_realtime_quotes(self, codes: list) -> dict:
-        """获取实时行情"""
-        if not HAS_AKSHARE or not codes:
+        """获取实时行情（精准批量接口，不再拉取全市场）"""
+        if not codes:
             return {}
 
         try:
-            # 使用akshare获取实时行情
-            df = ak.stock_zh_a_spot_em()
-            if df is None or df.empty:
-                return {}
-
-            # 标准化
-            col_map = {
-                "代码": "code", "名称": "name", "最新价": "price",
-                "涨跌幅": "change_pct", "振幅": "amplitude",
-                "最高": "high", "最低": "low", "今开": "open",
-            }
-            df = df.rename(columns=col_map)
-
+            from data.realtime import fetch_realtime_batch
+            raw = fetch_realtime_batch(codes)
+            # 转换为监控模块期望的格式
             quotes = {}
-            for code in codes:
-                row = df[df["code"] == code]
-                if not row.empty:
-                    r = row.iloc[0]
-                    quotes[code] = {
-                        "price": float(r.get("price", 0)),
-                        "change_pct": float(r.get("change_pct", 0)),
-                        "amplitude": float(r.get("amplitude", 0)),
-                        "high": float(r.get("high", 0)),
-                        "low": float(r.get("low", 0)),
-                        "open": float(r.get("open", 0)),
-                    }
+            for code, info in raw.items():
+                quotes[code] = {
+                    "price": info.get("price", 0),
+                    "change_pct": info.get("change_pct", 0),
+                    "amplitude": info.get("amplitude", 0),
+                    "high": info.get("high", 0),
+                    "low": info.get("low", 0),
+                    "open": info.get("open", 0),
+                }
             return quotes
-
         except Exception as e:
             logger.debug(f"[盘中监控] 行情获取失败: {e}")
             return {}
 
     def _get_index_quote(self) -> dict:
-        """获取大盘指数行情"""
-        if not HAS_AKSHARE:
-            return {}
+        """获取大盘指数行情（腾讯API精准获取）"""
         try:
-            df = ak.stock_zh_index_spot_em()
-            if df is None or df.empty:
-                return {}
-            # 找沪深300
-            for _, row in df.iterrows():
-                if "300" in str(row.get("代码", "")) or "沪深300" in str(row.get("名称", "")):
-                    return {
-                        "price": float(row.get("最新价", 0)),
-                        "change_pct": float(row.get("涨跌幅", 0)),
-                    }
+            from data.realtime import fetch_index_realtime
+            result = fetch_index_realtime("000300")
+            if result:
+                return {
+                    "price": result.get("price", 0),
+                    "change_pct": result.get("change_pct", 0),
+                }
             return {}
         except Exception:
             return {}
