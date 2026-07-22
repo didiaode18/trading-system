@@ -212,18 +212,18 @@ def send_daily_report(text_report: str, risk_summary: str,
             "type": "text"
         })
 
-        # 信号明细表格
-        table_html = '<table><tr><th>代码</th><th>名称</th><th>信号</th><th>价格</th><th>止损</th><th>说明</th></tr>'
+        # 信号明细表格（V7.1: 增加共识方向+主力评分+置信度列）
+        table_html = '<table><tr><th>代码</th><th>名称</th><th>信号</th><th>价格</th><th>止损</th><th>共识</th><th>主力</th><th>说明</th></tr>'
         for code, sig in signals:
             name = config.get_stock_name(code)
             if sig.get("sell_signal"):
                 row_class = "sell"
                 signal_type = '<span class="text-red">卖出</span>'
-                price = sig.get("sell_price", "-")
+                price = sig.get("sell_price") or "-"
             elif sig.get("buy_signal"):
                 row_class = "buy"
                 signal_type = '<span class="text-green">买入</span>'
-                price = sig.get("buy_price", "-")
+                price = sig.get("buy_price") or "-"
             elif sig.get("add_position"):
                 row_class = ""
                 signal_type = '<span class="text-orange">加仓</span>'
@@ -233,10 +233,35 @@ def send_daily_report(text_report: str, risk_summary: str,
                 signal_type = "观望"
                 price = "-"
 
-            stop_loss = sig.get("stop_loss_initial", sig.get("stop_loss_current", "-"))
-            reason = sig.get("signal_reason", "")[:60]
+            # V7.1: 所有字段统一兜底，杜绝None显示
+            stop_loss = sig.get("stop_loss_current") or sig.get("stop_loss_initial") or "-"
+            reason = sig.get("signal_reason") or "观望: 未触发任何买卖条件"
+            reason = reason[:60]
+            # 格式化数字
+            if price != "-" and price is not None:
+                try:
+                    price = f"{float(price):.2f}"
+                except (ValueError, TypeError):
+                    price = "-"
+            else:
+                price = "-"
+            if stop_loss != "-" and stop_loss is not None:
+                try:
+                    stop_loss = f"{float(stop_loss):.2f}"
+                except (ValueError, TypeError):
+                    stop_loss = "-"
+            else:
+                stop_loss = "-"
 
-            table_html += f'<tr class="{row_class}"><td>{code}</td><td>{name}</td><td>{signal_type}</td><td>{price}</td><td>{stop_loss}</td><td>{reason}</td></tr>'
+            # V7.1: 共识方向 + 主力评分
+            consensus = sig.get("consensus", {})
+            consensus_dir = consensus.get("direction", "-") if consensus else "-"
+            consensus_conf = consensus.get("confidence", 0) if consensus else 0
+            consensus_str = f"{consensus_dir}({consensus_conf}%)" if consensus_dir != "-" else "-"
+            manip_score = sig.get("manipulation_score", "-")
+            manip_str = f"{manip_score}" if manip_score != "-" else "-"
+
+            table_html += f'<tr class="{row_class}"><td>{code}</td><td>{name}</td><td>{signal_type}</td><td>{price}</td><td>{stop_loss}</td><td>{consensus_str}</td><td>{manip_str}</td><td>{reason}</td></tr>'
         table_html += '</table>'
 
         sections.append({

@@ -314,9 +314,21 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
     if final_stop >= current_price:
         final_stop = round(current_price * 0.97, 2)
 
-    stop_label = "定价卖出（止损）"
-    stop_notes = (f"{stop_info['method']} | 成本{buy_price:.2f} | 浮盈{profit_pct:.1%} | "
-                  f"仅收盘价触发，盘中跳水不割")
+    # V7.1: 软止损模式 - 下移3%给缓冲空间，避免被洗盘触发
+    anti_wash = getattr(config, 'ANTI_WASH_CONFIG', {})
+    soft_stop_mode = anti_wash.get("soft_stop_mode", True)
+    soft_stop_buffer = anti_wash.get("soft_stop_buffer", 0.03)  # 3%缓冲
+    
+    if soft_stop_mode:
+        display_stop = round(final_stop * (1 - soft_stop_buffer), 2)  # 显示下移后的价格
+        stop_label = "定价卖出（软止损预警）"
+        stop_notes = (f"{stop_info['method']} | 成本{buy_price:.2f} | 浮盈{profit_pct:.1%} | "
+                      f"软止损模式: 触发后请人工确认 | 原止损{final_stop:.2f}下移{soft_stop_buffer:.0%}缓冲")
+    else:
+        display_stop = final_stop
+        stop_label = "定价卖出（止损）"
+        stop_notes = (f"{stop_info['method']} | 成本{buy_price:.2f} | 浮盈{profit_pct:.1%} | "
+                      f"仅收盘价触发，盘中跳水不割")
     
     if stop_info["is_breached"]:
         stop_label = "定价卖出（⚠️已破止损）"
@@ -327,10 +339,11 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
         "order_type_cn": stop_label,
         "code": code,
         "name": name,
-        "trigger_price": final_stop,
-        "order_price": round(final_stop * 0.99, 2),
+        "trigger_price": display_stop,
+        "order_price": round(display_stop * 0.99, 2),
         "shares": shares,
-        "condition_desc": f"收盘价 <= {final_stop:.2f} 时，卖出全部 {shares} 股（仅收盘价触发）",
+        "condition_desc": f"收盘价 <= {display_stop:.2f} 时，卖出全部 {shares} 股" + 
+                          ("（软止损: 触发后请人工确认）" if soft_stop_mode else "（仅收盘价触发）"),
         "priority": 1,
         "notes": stop_notes,
         "category": "stop_loss"

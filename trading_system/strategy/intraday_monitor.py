@@ -52,7 +52,7 @@ except ImportError:
 
 
 class IntradayMonitor:
-    """盘中实时监控器"""
+    """盘中实时监控器（V7.1: 反洗盘保护版）"""
 
     def __init__(self, holdings: dict = None, poll_interval: int = 60):
         """
@@ -74,6 +74,20 @@ class IntradayMonitor:
         self.MARKET_DROP_PCT = -0.015      # 大盘急跌阈值
         self.PROFIT_TARGET_ALERT = True    # 止盈提醒
         self.AMPLITUDE_ALERT_PCT = 0.08    # 振幅预警(8%)
+
+        # V7.1: 反洗盘保护配置
+        anti_wash = getattr(config, 'ANTI_WASH_CONFIG', {})
+        self.BUFFER_MINUTES = anti_wash.get("buffer_minutes", 15)        # 触及止损后等待分钟
+        self.BUFFER_CONFIRM_PCT = anti_wash.get("buffer_confirm_pct", 0.01)  # 确认阈值
+        self.V_REVERSAL_PCT = anti_wash.get("v_reversal_pct", 0.05)    # V反保护阈值(5%)
+        self.VOLUME_SPIKE_RATIO = anti_wash.get("volume_spike_ratio", 2.0)  # 放量判定
+        self.VOLUME_SPIKE_EXTRA = anti_wash.get("volume_spike_extra", 0.03)  # 放量额外放宽
+        self.SOFT_STOP_MODE = anti_wash.get("soft_stop_mode", True)    # 软止损模式
+
+        # V7.1: 状态跟踪
+        self.stop_loss_first_touch = {}  # {code: datetime} 首次触及止损时间
+        self.day_lows = {}               # {code: float} 当日最低价
+        self.day_volumes = {}            # {code: float} 当日成交量
 
     # ============================================================
     # 一、启动监控
@@ -160,27 +174,144 @@ class IntradayMonitor:
                 "time": datetime.datetime.now().isoformat()
             }
 
-            # ---- 检查1: 止损位触发 ----
+            # V7.1: 更新当日最低价（用于V反保护）
+            day_low = quote.get("low", current_price)
+            if code not in self.day_lows or day_low < self.day_lows[code]:
+                self.day_lows[code] = day_low
+
+            # ---- 检查1: 止损位触发（V7.1: 反洗盘保护）----
             if self.STOP_LOSS_ALERT and current_price <= stop_loss:
-                alert_key = f"{today}_{code}_stop_loss"
-                if alert_key not in self.alerts_sent:
-                    alert = {
-                        "level": "critical",
-                        "type": "止损触发",
-                        "code": code,
-                        "name": name,
-                        "current_price": current_price,
-                        "stop_loss": stop_loss,
-                        "buy_price": buy_price,
-                        "loss_pct": round((current_price / buy_price - 1) * 100, 2),
-                        "message": f"⚠️ {name}({code}) 已跌破止损位！"
-                                  f"现价{current_price:.2f} ≤ 止损{stop_loss:.2f} | "
-                                  f"浮亏{(current_price/buy_price-1)*100:.1f}% | 建议立即止损",
-                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                    }
-                    alerts.append(alert)
-                    self.alerts_sent.add(alert_key)
-                    self._send_alert(alert)
+                now = datetime.datetime.now()
+
+                # V7.1 保护1: 放量急跌检测（主力洗盘概率大）
+                volume = quote.get("volume", 0)
+                avg_volume = holding.get("avg_volume", 0)
+                is_volume_spike = (avg_volume > 0 and volume > avg_volume * self.VOLUME_SPIKE_RATIO)
+
+                if is_volume_spike:
+                    # 放量急跌: 放宽止损线
+                    adjusted_stop = stop_loss * (1 - self.VOLUME_SPIKE_EXTRA)
+                    if current_price > adjusted_stop:
+                        alert_key = f"{today}_{code}_wash_warning"
+                        if alert_key not in self.alerts_sent:
+                            alert = {
+                                "level": "warning",
+                                "type": "疑似洗盘",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "stop_loss": stop_loss,
+                                "message": f"⚡ {name}({code}) 放量急跌触及止损，疑似主力洗盘 | "
+                                          f"量比{volume/avg_volume:.1f}倍 | 已放宽止损至{adjusted_stop:.2f} | 建议观望",
+                                "time": now.strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            self.alerts_sent.add(alert_key)
+                            self._send_alert(alert)
+                        continue  # 不触发止损
+
+                # V7.1 保护2: V型反转保护
+                if code in self.day_lows and self.day_lows[code] > 0:
+                    rebound_pct = (current_price - self.day_lows[code]) / self.day_lows[code]
+                    if rebound_pct > self.V_REVERSAL_PCT:
+                        alert_key = f"{today}_{code}_v_reversal"
+                        if alert_key not in self.alerts_sent:
+                            alert = {
+                                "level": "info",
+                                "type": "V反保护",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "message": f"🔄 {name}({code}) 从日内低点{self.day_lows[code]:.2f}反弹{rebound_pct:.1%} | "
+                                          f"V反保护启动，暂停止损触发",
+                                "time": now.strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            self.alerts_sent.add(alert_key)
+                            self._send_alert(alert)
+                        # 重置首次触及时间
+                        self.stop_loss_first_touch.pop(code, None)
+                        continue  # 不触发止损
+
+                # V7.1 保护3: 缓冲确认机制
+                if code not in self.stop_loss_first_touch:
+                    # 首次触及: 记录时间，发出预警
+                    self.stop_loss_first_touch[code] = now
+                    alert_key = f"{today}_{code}_stop_pending"
+                    if alert_key not in self.alerts_sent:
+                        alert = {
+                            "level": "warning",
+                            "type": "止损预警(待确认)",
+                            "code": code,
+                            "name": name,
+                            "current_price": current_price,
+                            "stop_loss": stop_loss,
+                            "buy_price": buy_price,
+                            "loss_pct": round((current_price / buy_price - 1) * 100, 2),
+                            "message": f"⚠️ {name}({code}) 触及止损位！"
+                                      f"现价{current_price:.2f} ≤ 止损{stop_loss:.2f} | "
+                                      f"等待{self.BUFFER_MINUTES}分钟确认 | "
+                                      f"{'软止损模式:仅预警' if self.SOFT_STOP_MODE else '硬止损模式'}",
+                            "time": now.strftime("%H:%M:%S"),
+                        }
+                        alerts.append(alert)
+                        self.alerts_sent.add(alert_key)
+                        self._send_alert(alert)
+                    continue  # 等待缓冲期
+
+                # 检查缓冲期是否到期
+                first_touch = self.stop_loss_first_touch[code]
+                elapsed_minutes = (now - first_touch).total_seconds() / 60
+
+                if elapsed_minutes >= self.BUFFER_MINUTES:
+                    # 缓冲期到: 确认止损
+                    confirm_price = stop_loss * (1 - self.BUFFER_CONFIRM_PCT)
+                    if current_price <= confirm_price:
+                        alert_key = f"{today}_{code}_stop_confirmed"
+                        if alert_key not in self.alerts_sent:
+                            alert = {
+                                "level": "critical",
+                                "type": "止损确认",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "stop_loss": stop_loss,
+                                "buy_price": buy_price,
+                                "loss_pct": round((current_price / buy_price - 1) * 100, 2),
+                                "buffer_minutes": round(elapsed_minutes, 1),
+                                "message": f"🚨 {name}({code}) 止损确认！"
+                                          f"现价{current_price:.2f} 持续低于止损{stop_loss:.2f} "
+                                          f"超过{elapsed_minutes:.0f}分钟 | "
+                                          f"浮亏{(current_price/buy_price-1)*100:.1f}% | "
+                                          f"{'建议人工确认后止损' if self.SOFT_STOP_MODE else '建议立即止损'}",
+                                "time": now.strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            self.alerts_sent.add(alert_key)
+                            self._send_alert(alert)
+                    else:
+                        # 价格回升，重置缓冲
+                        self.stop_loss_first_touch.pop(code, None)
+                else:
+                    # 缓冲期中: 发出进度提示
+                    remaining = self.BUFFER_MINUTES - elapsed_minutes
+                    alert_key = f"{today}_{code}_stop_buffering_{int(elapsed_minutes // 5)}"
+                    if alert_key not in self.alerts_sent:
+                        alert = {
+                            "level": "info",
+                            "type": "止损缓冲中",
+                            "code": code,
+                            "name": name,
+                            "current_price": current_price,
+                            "message": f"⏳ {name}({code}) 止损缓冲中，还需{remaining:.0f}分钟确认 | "
+                                      f"现价{current_price:.2f}",
+                            "time": now.strftime("%H:%M:%S"),
+                        }
+                        alerts.append(alert)
+                        self.alerts_sent.add(alert_key)
+            else:
+                # 价格回升到止损线上方: 重置缓冲状态
+                self.stop_loss_first_touch.pop(code, None)
 
             # ---- 检查2: 急跌预警 ----
             change_pct = quote.get("change_pct", 0)

@@ -653,6 +653,24 @@ class TrendForecaster:
             buy_price = holding.get("buy_price", current_price)
             stop_price = max(stop_price, buy_price * 0.90)
 
+        # V7.1: 计算置信度百分比
+        # 基于评分强度 + 趋势/动量一致性
+        score_strength = abs(score - 50) / 50  # 0~1
+        trend_momentum_agree = 1 if (trend["score"] > 0 and momentum["score"] > 0) or \
+                                    (trend["score"] < 0 and momentum["score"] < 0) else 0.5
+        confidence_pct = int(50 + score_strength * 35 + trend_momentum_agree * 10)
+        confidence_pct = max(30, min(95, confidence_pct))
+
+        # V7.1: 结构化操作建议
+        action_ratio = ""  # 减仓比例
+        if "减仓" in action:
+            if score < 25:
+                action_ratio = "全部"
+            elif score < 35:
+                action_ratio = "1/2"
+            else:
+                action_ratio = "1/3"
+
         return {
             "action": action,
             "detail": detail,
@@ -663,6 +681,11 @@ class TrendForecaster:
             "risk_reward_ratio": round(
                 abs(target_price - current_price) / max(abs(current_price - stop_price), 0.01), 1
             ),
+            # V7.1: 新增结构化字段
+            "confidence_pct": confidence_pct,
+            "action_ratio": action_ratio,
+            "key_price": round(stop_price, 2),  # 关键价位(止损价)
+            "structured_advice": f"{action}({confidence_pct}%)" + (f" 减{action_ratio}" if action_ratio else ""),
         }
 
     def _calc_best_timing(self, trend, momentum, levels, score) -> dict:

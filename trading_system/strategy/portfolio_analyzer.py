@@ -33,9 +33,14 @@ logger = logging.getLogger(__name__)
 # 一、仓位分析
 # ============================================================
 
-def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
+def analyze_portfolio(holdings: dict, data_dict: dict = None, consensus_results: dict = None) -> dict:
     """
     全面分析当前持仓的资金管理与仓位分配
+    
+    参数:
+        holdings: 持仓字典
+        data_dict: 技术指标数据
+        consensus_results: V7.1 多空共识结果 {code: consensus_dict}
     
     返回:
         {
@@ -47,6 +52,8 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
             "target_allocation": {...}, # 目标仓位配置
         }
     """
+    if consensus_results is None:
+        consensus_results = {}
     total_capital = config.TOTAL_CAPITAL
     total_market_value = 0
     total_cost = 0
@@ -101,6 +108,10 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
             "position_ratio": round(position_ratio, 2),
+            # V7.1: 添加共识方向
+            "consensus_direction": consensus_results.get(code, {}).get("direction", "-"),
+            "consensus_action": consensus_results.get(code, {}).get("action", "-"),
+            "consensus_confidence": consensus_results.get(code, {}).get("confidence", 0),
         })
 
     # 按仓位占比排序
@@ -177,21 +188,33 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None) -> dict:
                 "suggestion": f"建议将{sa['sector']}仓位降至{sector_max:.0f}%以内"
             })
 
-    # 4. 深度亏损预警
+    # 4. 深度亏损预警（V7.1: 引用共识方向）
     for pos in position_analysis:
+        consensus_dir = pos.get("consensus_direction", "-")
+        consensus_action = pos.get("consensus_action", "-")
+        
         if pos["pnl_pct"] < -20:
-            risk_alerts.append({
-                "level": "critical",
-                "type": "深度亏损",
-                "detail": f"{pos['name']}浮亏{pos['pnl_pct']:.1f}%（{pos['pnl']:,.0f}元），已超过20%止损线",
-                "suggestion": "建议立即止损或至少减半仓位，避免亏损进一步扩大"
-            })
+            # 检查共识是否认为有反弹机会
+            if "多" in consensus_dir or "洗盘" in consensus_action:
+                risk_alerts.append({
+                    "level": "warning",
+                    "type": "深度亏损(共识看多)",
+                    "detail": f"{pos['name']}浮亏{pos['pnl_pct']:.1f}%（{pos['pnl']:,.0f}元），但共识方向[{consensus_dir}]认为有反弹机会",
+                    "suggestion": f"共识建议: {consensus_action} | 可等待反弹减仓，但需设置硬止损"
+                })
+            else:
+                risk_alerts.append({
+                    "level": "critical",
+                    "type": "深度亏损",
+                    "detail": f"{pos['name']}浮亏{pos['pnl_pct']:.1f}%（{pos['pnl']:,.0f}元），已超过20%止损线",
+                    "suggestion": "建议立即止损或至少减半仓位，避免亏损进一步扩大"
+                })
         elif pos["pnl_pct"] < -10:
             risk_alerts.append({
                 "level": "warning",
                 "type": "较大亏损",
-                "detail": f"{pos['name']}浮亏{pos['pnl_pct']:.1f}%（{pos['pnl']:,.0f}元）",
-                "suggestion": "密切关注，若继续下跌触及-15%应果断止损"
+                "detail": f"{pos['name']}浮亏{pos['pnl_pct']:.1f}%（{pos['pnl']:,.0f}元）| 共识:{consensus_dir}",
+                "suggestion": f"密切关注，共识建议[{consensus_action}]，若继续下跌触及-15%应果断止损"
             })
 
     # 5. 持仓过于分散

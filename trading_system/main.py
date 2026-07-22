@@ -54,6 +54,9 @@ from strategy.capital_flow import CapitalFlowAnalyzer
 from strategy.market_regime import MarketRegimeDetector
 from strategy.trade_journal import TradeJournal
 from strategy.trend_forecast import TrendForecaster, send_forecast_email
+# V7.1 新增模块
+from strategy.anti_manipulation import AntiManipulationAnalyzer
+from strategy.consensus import batch_consensus
 
 # ============================================================
 # 日志配置
@@ -305,7 +308,56 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     buy_count = sum(1 for _, s in signals if s.get("buy_signal"))
     sell_count = sum(1 for _, s in signals if s.get("sell_signal"))
     add_count = sum(1 for _, s in signals if s.get("add_position"))
-    logger.info(f"  信号统计: 买入{buy_count}只, 卖出{sell_count}只, 加仓{add_count}只")
+    wash_warnings = sum(1 for _, s in signals if s.get("wash_trading_warning"))
+    logger.info(f"  信号统计: 买入{buy_count}只, 卖出{sell_count}只, 加仓{add_count}只, 洗盘预警{wash_warnings}只")
+
+    # ---- Step 5.1: 反主力操控分析（V7.1新增）----
+    logger.info("[Step 5.1] 反主力操控分析...")
+    manipulation_results = {}
+    try:
+        manip_analyzer = AntiManipulationAnalyzer()
+        # 只对持仓股和重点股分析
+        manip_codes = list(holdings.keys()) + [code for code, _ in signals[:10]]
+        for code in set(manip_codes):
+            if code in data_dict and not data_dict[code].empty:
+                holding = holdings.get(code)
+                manipulation_results[code] = manip_analyzer.analyze(code, data_dict[code], holding)
+        
+        # 统计洗盘/诱多/诱空
+        wash_count = sum(1 for r in manipulation_results.values() if r.get("wash_trading"))
+        bull_trap_count = sum(1 for r in manipulation_results.values() if r.get("bull_trap"))
+        bear_trap_count = sum(1 for r in manipulation_results.values() if r.get("bear_trap"))
+        logger.info(f"  分析{len(manipulation_results)}只 | 疑似洗盘:{wash_count} 诱多:{bull_trap_count} 诱空:{bear_trap_count}")
+        
+        # 将主力评分添加到信号中
+        for code, sig in signals:
+            if code in manipulation_results:
+                sig["manipulation_score"] = manipulation_results[code].get("manipulation_score", 50)
+                sig["manipulation_detail"] = manipulation_results[code].get("detail", "")
+    except Exception as e:
+        logger.warning(f"  反主力分析异常: {e}")
+
+    # ---- Step 5.2: 多空共识计算（V7.1新增）----
+    logger.info("[Step 5.2] 多空共识计算...")
+    consensus_results = {}
+    try:
+        consensus_results = batch_consensus(
+            data_dict, holdings, signals,
+            forecast_results=None,  # 预测结果在Step14后更新
+            manipulation_results=manipulation_results
+        )
+        # 将共识结果添加到信号中
+        for code, sig in signals:
+            if code in consensus_results:
+                sig["consensus"] = consensus_results[code]
+        
+        # 统计共识方向
+        bullish = sum(1 for r in consensus_results.values() if "多" in r.get("direction", ""))
+        bearish = sum(1 for r in consensus_results.values() if "空" in r.get("direction", ""))
+        conflict = sum(1 for r in consensus_results.values() if r.get("conflict"))
+        logger.info(f"  共识统计: 看多{bullish} 看空{bearish} 分歧{conflict}")
+    except Exception as e:
+        logger.warning(f"  共识计算异常: {e}")
 
     # ---- Step 5.5: 多策略引擎（V3.0新增）----
     mr_signals = []
@@ -494,10 +546,10 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.error(f"  选股引擎异常: {e}")
 
-    # ---- Step 10: 仓位管理与资金优化分析 ----
+    # ---- Step 10: 仓位管理与资金优化分析（V7.1: 引用共识）----
     logger.info("[Step 10] 仓位管理分析...")
     try:
-        portfolio_result = analyze_portfolio(holdings, data_dict)
+        portfolio_result = analyze_portfolio(holdings, data_dict, consensus_results)
         if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
             try:
                 portfolio_ok = send_portfolio_email(portfolio_result)

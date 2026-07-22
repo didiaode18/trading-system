@@ -20,6 +20,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
+try:
+    from strategy.anti_manipulation import analyze_manipulation
+    HAS_ANTI_MANIP = True
+except ImportError:
+    HAS_ANTI_MANIP = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -672,16 +678,47 @@ def generate_strategy_signal(df: pd.DataFrame, holding: dict = None) -> dict:
         # 当前移动止损
         result["stop_loss_current"] = compute_trailing_stop(buy_price, current_price)
 
-        # 检查卖出信号
+        # 检查卖出信号（V7.1: 集成反洗盘检测）
         sell_result = check_sell_signal(df, buy_price, holding)
         if sell_result["signal"]:
+            # V7.1: 反洗盘检测 - 非强制卖出时检查是否主力洗盘
+            sell_reason = sell_result.get("reason", "")
+            is_force_sell = "强制" in sell_reason or "放量大跌" in sell_reason
+            
+            if not is_force_sell and HAS_ANTI_MANIP:
+                try:
+                    manip = analyze_manipulation(latest.get("code", ""), df, holding)
+                    result["manipulation_score"] = manip.get("manipulation_score", 50)
+                    result["manipulation_detail"] = manip.get("detail", "")
+                    
+                    # 疑似洗盘: 降级卖出信号为预警
+                    if manip.get("wash_trading") and manip.get("manipulation_score", 0) >= 60:
+                        result["sell_signal"] = False  # 不触发卖出
+                        result["signal_reason"] = (
+                            f"[预警-疑似洗盘] {sell_reason} | "
+                            f"[反洗盘] 量价背离显示主力洗盘概率{manip['manipulation_score']}%, "
+                            f"建议观望而非止损 | {manip.get('suggestion', '')}"
+                        )
+                        result["wash_trading_warning"] = True
+                        return result
+                except Exception as e:
+                    logger.debug(f"反洗盘检测异常: {e}")
+            
+            # 正常卖出信号
             result["sell_signal"] = True
             result["sell_price"] = sell_result["sell_price"]
-            result["signal_reason"] = f"[卖出] {sell_result['reason']}"
+            result["signal_reason"] = f"[卖出] {sell_reason}"
             return result
 
         # 铁则：浮亏持仓绝对不加仓（只有止损或观望两个选项）
         if profit_pct < 0:
+            # V7.1: 添加主力评分
+            if HAS_ANTI_MANIP:
+                try:
+                    manip = analyze_manipulation(latest.get("code", ""), df, holding)
+                    result["manipulation_score"] = manip.get("manipulation_score", 50)
+                except Exception:
+                    pass
             result["signal_reason"] = (
                 f"[浮亏持仓] 浮亏{profit_pct:.2%}, "
                 f"止损线={result['stop_loss_current']:.2f}, "
@@ -734,7 +771,7 @@ def generate_strategy_signal(df: pd.DataFrame, holding: dict = None) -> dict:
     else:
         result["quality_score"] = 0
         result["buy_type"] = None
-        result["signal_reason"] = f"[无信号] {buy_result['reason']}"
+        result["signal_reason"] = f"[观望] {buy_result.get('reason', '未触发任何买卖条件')}"
 
     return result
 
