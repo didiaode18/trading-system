@@ -217,11 +217,19 @@ def get_stock_info(code: str) -> dict:
     return {"名称": code, "赛道": "其他", "类型": "弹性"}
 
 # ============================================================
-# 三、趋势与均线参数
+# 三、趋势与均线参数（中线趋势跟踪 V2.0）
 # ============================================================
 MA_SHORT = 20                    # 短期均线（20日）
 MA_MID = 60                      # 中期均线（60日）
 VOLUME_MA_PERIOD = 20            # 成交量均线周期
+
+# --- 中线趋势跟踪核心参数（V2.0新增）---
+# 系统唯一周期定位: 3日-4周中线波段
+MIN_HOLD_DAYS = 3                # 最短持仓天数（3天）
+MAX_HOLD_DAYS_MID = 20           # 最长持仓天数（4周=20个交易日）
+MIN_RISK_REWARD_RATIO = 2.5      # 开仓最低盈亏比（不达标直接拦截）
+TREND_MA_BULLISH_REQUIRED = True  # 开仓必须均线多头排列(close>MA20>MA60)
+RPS_MIN_THRESHOLD = 70           # 60日相对强度最低阈值（跑赢大盘）
 
 # 新增技术指标参数
 RSI_PERIOD = 14                  # RSI周期
@@ -279,8 +287,8 @@ FORCE_SELL_DROP_PCT = -0.08      # 单日跌幅>8%
 FORCE_SELL_VOLUME_RATIO = 2.0    # 且量>均量2倍 → 无条件离场
 
 # V6.0新增: 时间止损（持仓超期且浮盈不足则卖出，提高资金效率）
-MAX_HOLD_DAYS = 45               # 最大持仓天数（0=不限制）
-TIME_STOP_PROFIT = 0.03          # 超期且浮盈<3%则卖出
+MAX_HOLD_DAYS = 20               # 最大持仓天数（中线波段4周=20交易日）
+TIME_STOP_PROFIT = 0.05          # 超期且浮盈<5%则卖出（中线标准提高）
 
 # V6.0新增: 卖出逻辑开关（基于回测诊断结论）
 # 诊断: MACD死叉37笔仅+2.11%平均，趋势破位40笔全亏-4.52%
@@ -318,6 +326,11 @@ DAILY_LOSS_LIMIT_2 = 0.03        # 单日亏损>=3%: 清非主线弱势仓，总
 
 # 周度熔断
 WEEKLY_LOSS_LIMIT = 0.08         # 单周亏损>=8%: 全仓降至3成以下，强制休息1周
+
+# --- 交易成本参数（回测必扣）---
+COMMISSION_RATE = 0.0003         # 佣金万3（买卖双边）
+STAMP_TAX_RATE = 0.001           # 印花税千1（卖出单边）
+MIN_COMMISSION = 5.0             # 最低佣金5元
 
 # 行情强度判定（用于动态调整总仓位）
 MARKET_STRONG_MAX = 0.90         # 强势行情最大仓位90%
@@ -520,4 +533,71 @@ PAPER_TRADING_CONFIG = {
     "graduation_days": 20,              # 毕业所需天数
     "min_sharpe": 1.0,                  # 毕业最低夏普
     "max_drawdown": 0.10,               # 毕业最大回撤
+}
+
+# ============================================================
+# 二十二、操盘密码系统配置 V2.0（自适应趋势策略引擎）
+# ============================================================
+CAOPAN_CONFIG = {
+    # --- 控盘生命线（自适应双均线趋势通道）---
+    "life_line_fast": 10,              # LL1基准周期 EMA10（快线）
+    "life_line_slow": 30,              # LL2基准周期 EMA30（慢线）
+    "adaptive_enabled": True,          # 是否启用自适应周期调整
+    "atr_period": 14,                  # ATR计算周期
+    "atr_lookback": 60,                # ATR历史分位回看周期
+    "atr_high_pct": 0.80,              # ATR>80%分位 → 周期拉长20%
+    "atr_low_pct": 0.20,               # ATR<20%分位 → 周期缩短20%
+    "adaptive_stretch": 0.20,          # 周期调整幅度±20%
+
+    # --- 乖离率分级交易指引 ---
+    "deviation_overbought": 0.10,      # 偏离>10%: 超买区，减仓1/2
+    "deviation_high": 0.05,            # 偏离5%~10%: 偏高区，减仓1/3
+    "deviation_normal": 0.05,          # 偏离-5%~5%: 正常区间，持有
+    "deviation_oversold": -0.10,       # 偏离<-10%: 超卖区，仅强上升可低吸
+
+    # --- DK买卖点（三重共振确认）---
+    "dk_volume_confirm_ratio": 1.0,    # 金叉量能确认: 当日量≥20日均量×1.0（放量加分，非必须）
+    "dk_volume_ma_period": 20,         # 量能均线周期
+    "dk_false_signal_days": 2,         # 假信号回检窗口（金叉后N日跌破LL2）
+    "dk_consecutive_inflow": 3,        # 主力连续净流入天数
+    "dk_min_strength_medium": 45,      # 中信号最低强度（从50降至45）
+    "dk_min_strength_strong": 65,      # 强信号最低强度（从70降至65）
+    "dk_pullback_entry": True,         # 启用回踩LL1入场（D点后等回踩）
+    "dk_pullback_days": 5,             # D点后N日内回踩LL1视为有效入场
+
+    # --- 资金监控（多维验证）---
+    "fund_flow_method": "estimate",    # "akshare" / "estimate"
+    "large_order_ratio": 0.20,         # 大单占比阈值
+    "fund_flow_ma_period": 5,          # 资金流均线周期
+    "fund_min_layers_confirm": 2,      # 最少N层同向才确认有效
+    "fund_divergence_days": 3,         # 背离判定连续天数
+    "fund_mild_build_days": 3,         # 温和建仓最少连续天数
+
+    # --- 市场环境自适应 ---
+    "market_cross_freq_threshold": 5,  # 20日内穿越生命线次数≥N → 震荡市（从4放宽至5）
+    "market_vol_period": 20,           # 波动率计算周期
+    "oscillation_auto_shield": True,   # 震荡市自动屏蔽DK信号
+
+    # --- 盈亏比硬门槛 ---
+    "min_risk_reward": 1.5,            # 最低盈亏比（从2.5降至1.5，增加交易机会）
+    "stop_loss_below_ll2": 0.02,       # 止损位: LL2下方2%（从3%收紧至2%）
+    "max_risk_atr_mult": 2.0,          # 最大风险不超过2倍ATR（防止止损太远）
+    "rr_position_scale": True,         # 盈亏比联动仓位
+
+    # --- 多周期共振 ---
+    "weekly_trend_required": True,     # 周线趋势必须同向
+    "weekly_ma_period": 10,            # 周线均线周期
+
+    # --- 回测参数 ---
+    "backtest_years": 3,
+    "backtest_commission": 0.0003,
+    "backtest_stamp_tax": 0.001,
+    "backtest_slippage": 0.001,
+    "backtest_train_ratio": 0.70,      # 训练集70% / 验证集30%
+
+    # --- 参数优化网格 ---
+    "optimize_grid": {
+        "life_line_fast": [8, 10, 13, 15, 20],
+        "life_line_slow": [25, 30, 34, 40, 50, 60],
+    },
 }

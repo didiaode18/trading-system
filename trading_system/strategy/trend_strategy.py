@@ -1,14 +1,16 @@
 """
-核心趋势策略函数
+核心趋势策略函数 V2.0（中线趋势跟踪）
 =================
-基于「高胜率A股交易操作系统V2.0」规则，输入日线DataFrame，输出买卖信号
+系统唯一周期定位: 3日-4周中线波段
 
-核心规则:
-- 趋势判定：20日均线向上 + 收盘价站稳20日均线 -> 允许开仓
-- 买点：缩量回踩20日线（量缩30%+，最低价触及20日线±1%）
-- 止损：买入价下方10%，仅收盘价触发
-- 移动止损：按浮盈分档上移
-- 止盈：双轨制（阶梯目标 + 回落止盈）
+核心规则（V2.0重构）:
+- 开仓必须: 收盘价站稳MA20 且 MA20在MA60上方（均线多头排列）
+- 空头趋势标的一律禁止生成买入信号，从根源杜绝逆势抄底
+- 强制盈亏比准入: 潜在上涨空间/初始止损亏损 ≥ 2.5:1
+- 止损: 买入价下方10%，仅收盘价触发
+- 移动止损: 按浮盈分档上移
+- 止盈: 双轨制（阶梯目标 + 回落止盈）
+- 持仓周期: 3天-4周，超期且浮盈不足则卖出
 """
 
 import pandas as pd
@@ -110,27 +112,67 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def is_trend_up(df: pd.DataFrame) -> bool:
     """
-    判定中期上升趋势是否成立:
-    1. 20日均线向上（斜率>0）
-    2. 收盘价站稳20日均线上方
-    3. 60日均线存在且未明确向下（可选增强条件）
+    判定中期上升趋势是否成立（V2.0强化版）:
+    1. 收盘价站稳MA20上方
+    2. MA20在MA60上方（均线多头排列）
+    3. MA20斜率向上（3日比较）
+    
+    空头排列（close<MA20<MA60）一律返回False，禁止生成买入信号
     """
     if len(df) < config.MA_MID:
         return False
 
     latest = df.iloc[-1]
-    # 条件1: 20日均线向上
-    if pd.isna(latest["ma20_slope"]) or latest["ma20_slope"] <= 0:
+    close = latest["close"]
+    ma20 = latest.get("ma20", None)
+    ma60 = latest.get("ma60", None)
+
+    if pd.isna(ma20) or pd.isna(ma60):
         return False
-    # 条件2: 收盘价在20日均线上方
-    if latest["close"] < latest["ma20"]:
+
+    # 核心条件: 收盘价 > MA20 > MA60（均线多头排列）
+    if not (close > ma20 and ma20 > ma60):
         return False
+
+    # 辅助条件: MA20斜率向上
+    ma20_slope = latest.get("ma20_slope", 0)
+    if pd.isna(ma20_slope) or ma20_slope <= 0:
+        return False
+
     return True
 
 
 # ============================================================
 # 二、买点信号判定
 # ============================================================
+
+def _calc_risk_reward(buy_price: float, stop_loss: float, df: pd.DataFrame) -> tuple:
+    """
+    计算盈亏比（V2.0新增）
+    目标价 = 近60日最高价 或 买入价+ATR*3（取较高者）
+    盈亏比 = (目标价 - 买入价) / (买入价 - 止损价)
+    
+    返回: (risk_reward, target_price)
+    """
+    if buy_price <= 0 or stop_loss <= 0 or buy_price <= stop_loss:
+        return 0, 0
+    
+    risk = buy_price - stop_loss  # 每股风险
+    
+    # 目标价: 近60日最高价 或 ATR*3上涨空间
+    recent_high = df["high"].iloc[-60:].max() if len(df) >= 60 else df["high"].max()
+    atr = df["atr"].iloc[-1] if "atr" in df.columns and not pd.isna(df["atr"].iloc[-1]) else buy_price * 0.03
+    atr_target = buy_price + atr * 3  # ATR*3上涨目标
+    target_price = max(recent_high, atr_target)
+    
+    # 如果目标价低于买入价，用ATR*3
+    if target_price <= buy_price:
+        target_price = atr_target
+    
+    reward = target_price - buy_price  # 每股潜在收益
+    risk_reward = reward / risk if risk > 0 else 0
+    
+    return round(risk_reward, 2), round(target_price, 2)
 
 def check_buy_signal(df: pd.DataFrame) -> dict:
     """
@@ -213,6 +255,14 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
     buy_price = close
     stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
 
+    # ---- 强制盈亏比准入检查（V2.0核心规则）----
+    risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.5)
+    if risk_reward < min_rr:
+        result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
+                           f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")
+        return result
+
     # ---- 信号质量评分（0-100）----
     quality_score = 50  # 基础分
 
@@ -292,13 +342,15 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
         "buy_price": round(buy_price, 2),
         "support_price": round(ma20, 2),
         "stop_loss": round(stop_loss, 2),
+        "target_price": target_price,
+        "risk_reward": risk_reward,
         "rsi": round(rsi_val, 1) if not pd.isna(rsi_val) else None,
         "macd_dif": round(macd_dif, 3) if not pd.isna(macd_dif) else None,
         "macd_dea": round(macd_dea, 3) if not pd.isna(macd_dea) else None,
         "atr": round(latest.get("atr", 0), 2) if not pd.isna(latest.get("atr", 0)) else None,
         "quality_score": quality_score,
         "buy_type": "回踩支撑",
-        "reason": f"缩量回踩20日线: 量比={vol_ratio:.2%}, MA20={ma20:.2f}, 最低={low:.2f}{extra_info}"
+        "reason": f"缩量回踩20日线: 量比={vol_ratio:.2%}, MA20={ma20:.2f}, 盈亏比={risk_reward:.1f}:1{extra_info}"
     })
     return result
 
@@ -377,6 +429,14 @@ def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
     buy_price = close
     stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
 
+    # ---- 强制盈亏比准入检查（V2.0核心规则）----
+    risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.5)
+    if risk_reward < min_rr:
+        result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
+                           f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")
+        return result
+
     # 质量评分
     quality_score = 55  # 突破回踩基础分略高于普通回踩
     # 突破后缩量程度
@@ -403,10 +463,12 @@ def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
         "buy_price": round(buy_price, 2),
         "support_price": round(breakout_close, 2),
         "stop_loss": round(stop_loss, 2),
+        "target_price": target_price,
+        "risk_reward": risk_reward,
         "quality_score": quality_score,
         "buy_type": "突破回踩",
-        "reason": f"放量突破后回踩确认: 突破日收盘{breakout_close:.2f}, "
-                  f"回踩缩量{volume/breakout_volume:.0%}, MA20向上"
+        "reason": f"放量突破后回踩确认: 突破位{breakout_close:.2f}, "
+                  f"盈亏比={risk_reward:.1f}:1, MA20向上"
     })
     return result
 

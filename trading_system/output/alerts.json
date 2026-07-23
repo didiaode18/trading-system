@@ -1,0 +1,167 @@
+{
+  "date": "2026-07-24",
+  "today": [
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "科创50 获利盘骤降17%! (54%→37%) 主力可能出货",
+      "code": "588000",
+      "name": "科创50",
+      "time": "01:37:30"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "豪威集团 获利盘骤降27%! (33%→7%) 主力可能出货",
+      "code": "603501",
+      "name": "豪威集团",
+      "time": "01:37:30"
+    },
+    {
+      "type": "fund_outflow",
+      "level": "warning",
+      "icon": "💸",
+      "msg": "豪威集团 资金大幅流出! 评分20分 | 资金共振看空",
+      "code": "603501",
+      "name": "豪威集团",
+      "time": "01:37:30"
+    },
+    {
+      "type": "oversold",
+      "level": "info",
+      "icon": "❄️",
+      "msg": "巨人网络 超卖! 乖离率-10.5% < -8.0%",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:37:30"
+    },
+    {
+      "type": "stop_loss",
+      "level": "critical",
+      "icon": "🚨",
+      "msg": "巨人网络 触及止损线! 亏损-18.7% (成本31.082 现价25.260)",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:37:30"
+    },
+    {
+      "type": "limit_down",
+      "level": "critical",
+      "icon": "💥",
+      "msg": "巨人网络 跌停! -9.9%",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:37:30"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "巨人网络 获利盘骤降21%! (23%→2%) 主力可能出货",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:37:30"
+    },
+    {
+      "type": "oversold",
+      "level": "info",
+      "icon": "❄️",
+      "msg": "华天科技 超卖! 乖离率-11.3% < -8.0%",
+      "code": "002185",
+      "name": "华天科技",
+      "time": "01:37:30"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "华天科技 获利盘骤降16%! (38%→21%) 主力可能出货",
+      "code": "002185",
+      "name": "华天科技",
+      "time": "01:37:30"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "科创50 获利盘骤降17%! (54%→37%) 主力可能出货",
+      "code": "588000",
+      "name": "科创50",
+      "time": "01:44:52"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "豪威集团 获利盘骤降27%! (33%→7%) 主力可能出货",
+      "code": "603501",
+      "name": "豪威集团",
+      "time": "01:44:52"
+    },
+    {
+      "type": "fund_outflow",
+      "level": "warning",
+      "icon": "💸",
+      "msg": "豪威集团 资金大幅流出! 评分20分 | 资金共振看空",
+      "code": "603501",
+      "name": "豪威集团",
+      "time": "01:44:52"
+    },
+    {
+      "type": "oversold",
+      "level": "info",
+      "icon": "❄️",
+      "msg": "巨人网络 超卖! 乖离率-10.5% < -8.0%",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:44:52"
+    },
+    {
+      "type": "stop_loss",
+      "level": "critical",
+      "icon": "🚨",
+      "msg": "巨人网络 触及止损线! 亏损-18.7% (成本31.082 现价25.260)",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:44:52"
+    },
+    {
+      "type": "limit_down",
+      "level": "critical",
+      "icon": "💥",
+      "msg": "巨人网络 跌停! -9.9%",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:44:52"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "巨人网络 获利盘骤降21%! (23%→2%) 主力可能出货",
+      "code": "002558",
+      "name": "巨人网络",
+      "time": "01:44:52"
+    },
+    {
+      "type": "oversold",
+      "level": "info",
+      "icon": "❄️",
+      "msg": "华天科技 超卖! 乖离率-11.3% < -8.0%",
+      "code": "002185",
+      "name": "华天科技",
+      "time": "01:44:52"
+    },
+    {
+      "type": "chip_panic",
+      "level": "warning",
+      "icon": "📉",
+      "msg": "华天科技 获利盘骤降16%! (38%→21%) 主力可能出货",
+      "code": "002185",
+      "name": "华天科技",
+      "time": "01:44:52"
+    }
+  ]
+}

@@ -15,6 +15,9 @@
   python run.py backtest      # 运行策略回测
   python run.py screen        # 全赛道选股扫描
   python run.py status        # 查看系统状态与持仓概览
+  python run.py caopan        # 操盘密码分析（图表+信号）
+  python run.py caopan --backtest  # 操盘密码策略3年回测
+  python run.py caopan --scan      # 全市场批量扫描推荐
 
 快捷方式:
   python run.py               # 等同于 python run.py report
@@ -68,6 +71,10 @@ COMMANDS = {
         "script": os.path.join("trading_system", "main.py"),
         "desc": "全赛道选股扫描",
     },
+    "caopan": {
+        "script": "caopan_runner.py",
+        "desc": "操盘密码分析（DK信号+控盘生命线+主力监控）",
+    },
 }
 
 
@@ -91,12 +98,15 @@ def print_help():
 ║    setup      环境初始化                                   ║
 ║    backtest   策略回测                                     ║
 ║    screen     全赛道选股扫描                               ║
+║    caopan     操盘密码分析（DK信号+生命线+资金流）        ║
 ║    status     系统状态与持仓概览                           ║
 ║                                                            ║
 ║  选项:                                                     ║
 ║    --test     测试模式（trade命令专用）                    ║
 ║    --once     单次执行（auto命令专用）                     ║
 ║    --setup    配置指南（auto命令专用）                     ║
+║    --backtest 3年回测（caopan命令专用）                    ║
+║    --scan     全市场扫描（caopan命令专用）                 ║
 ║    -h/--help  显示帮助                                     ║
 ║                                                            ║
 ║  典型工作流:                                               ║

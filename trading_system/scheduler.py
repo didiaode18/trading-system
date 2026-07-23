@@ -424,9 +424,9 @@ def run_forecast_afternoon():
 
 
 def run_weekly_portfolio():
-    """每周五盘后周度回顾（16:00运行）—— 合并原仓位分析+V9.0模块"""
+    """每周六周策略报告（10:00运行）—— 合并原仓位分析+V9.0模块"""
     today = datetime.date.today()
-    if today.weekday() != 4:  # 只周五运行
+    if today.weekday() != 5:  # 只周六运行
         return
 
     logger.info(f"[{today}] 周度回顾...")
@@ -569,8 +569,8 @@ def start_scheduler():
     # 每个交易日 19:00 条件单（统一发送，方便提前挂单）
     schedule.every().day.at("19:00").do(run_morning_reminder)
 
-    # 每周五 16:00 周度回顾
-    schedule.every().friday.at("16:00").do(run_weekly_portfolio)
+    # 每周六 10:00 周策略报告
+    schedule.every().saturday.at("10:00").do(run_weekly_portfolio)
 
     # 每周日 10:00 股票池更新提醒
     schedule.every().sunday.at("10:00").do(run_weekly_task)
@@ -579,7 +579,7 @@ def start_scheduler():
     logger.info(f"  盘前作战计划: 每个交易日 08:30")
     logger.info(f"  盘后综合日报: 每个交易日 15:30")
     logger.info(f"  条件单: 每个交易日 19:00")
-    logger.info(f"  周度回顾: 每周五 16:00")
+    logger.info(f"  周策略报告: 每周六 10:00")
     logger.info(f"  周日提醒: 每周日 10:00")
     logger.info(f"  盘中监控: 每个交易日 09:30-15:00")
 
@@ -611,7 +611,7 @@ SCHEDULED_TASKS = [
     ("TradingSystem_Screener",        "09:25", "--run-screener",         "竞价后选股报告"),
     ("TradingSystem_Daily",           "15:30", "--run-once",             "盘后完整分析"),
     ("TradingSystem_ForecastPM",      "15:35", "--run-forecast-pm",      "盘后趋势预测"),
-    ("TradingSystem_Weekly",          "16:00", "--run-weekly",           "周五仓位分析"),
+    ("TradingSystem_Weekly",          "10:00", "--run-weekly",           "周六周策略报告"),
 ]
 
 

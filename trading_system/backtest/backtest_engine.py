@@ -1,12 +1,18 @@
 """
-回测引擎模块
+回测引擎模块 V2.0
 ==============
 基于历史数据验证交易策略的胜率、收益、回撤等指标
+
+V2.0升级:
+- 纳入真实交易成本（佣金万3 + 印花税千1）
+- 补齐绩效指标: 卡玛比率、最大连续亏损、月度收益
+- 收益归因: 按标的/赛道/月份/离场类型拆解
+- 回测达标标准: 年化≥20%、最大回撤≤20%、盈亏比≥2、胜率≥35%
 
 核心功能:
 - 模拟每日运行策略信号，按信号执行买卖
 - 记录每笔交易的买入价、卖出价、持仓天数、盈亏
-- 输出回测报告：总收益率、年化收益率、最大回撤、夏普比率、胜率、盈亏比
+- 输出回测报告: 总收益率、年化收益率、最大回撤、夏普比率、胜率、盈亏比
 - 支持参数优化模式
 
 使用方式:
@@ -72,17 +78,21 @@ class BacktestEngine:
             self.max_drawdown = drawdown
 
     def _execute_buy(self, code: str, price: float, shares: int, date: str):
-        """执行买入"""
+        """执行买入（扣除佣金）"""
         cost = price * shares
-        if cost > self.cash:
+        commission = max(cost * config.COMMISSION_RATE, config.MIN_COMMISSION)
+        total_cost = cost + commission
+        if total_cost > self.cash:
             # 资金不足，按可用资金买入
-            shares = int(self.cash / price)
+            shares = int(self.cash / (price * (1 + config.COMMISSION_RATE)))
             shares = (shares // 100) * 100
             if shares == 0:
                 return
             cost = price * shares
+            commission = max(cost * config.COMMISSION_RATE, config.MIN_COMMISSION)
+            total_cost = cost + commission
 
-        self.cash -= cost
+        self.cash -= total_cost
         if code in self.positions:
             # 加仓：计算均价
             old = self.positions[code]
@@ -111,7 +121,7 @@ class BacktestEngine:
 
     def _execute_sell(self, code: str, price: float, date: str,
                       sell_ratio: float = 1.0):
-        """执行卖出"""
+        """执行卖出（扣除佣金+印花税）"""
         if code not in self.positions:
             return
 
@@ -122,9 +132,12 @@ class BacktestEngine:
             sell_shares = pos["shares"]  # 至少卖出全部
 
         revenue = price * sell_shares
-        self.cash += revenue
+        commission = max(revenue * config.COMMISSION_RATE, config.MIN_COMMISSION)
+        stamp_tax = revenue * config.STAMP_TAX_RATE  # 印花税千1（卖出单边）
+        net_revenue = revenue - commission - stamp_tax
+        self.cash += net_revenue
 
-        pnl = (price - pos["buy_price"]) * sell_shares
+        pnl = (price - pos["buy_price"]) * sell_shares - commission - stamp_tax
         pnl_pct = (price - pos["buy_price"]) / pos["buy_price"]
         hold_days = (datetime.datetime.strptime(date, "%Y-%m-%d") -
                      datetime.datetime.strptime(pos["buy_date"], "%Y-%m-%d")).days
@@ -238,7 +251,7 @@ class BacktestEngine:
         return self._generate_report(all_dates)
 
     def _generate_report(self, all_dates: list) -> dict:
-        """生成回测报告"""
+        """生成回测报告（V2.0: 补齐全部绩效指标）"""
         if not self.daily_values:
             return {"error": "无回测数据"}
 
@@ -265,6 +278,9 @@ class BacktestEngine:
         else:
             sharpe = 0
 
+        # 卡玛比率 = 年化收益 / 最大回撤
+        calmar = annual_return / max_drawdown if max_drawdown > 0 else 0
+
         # 交易统计
         sell_trades = trades_df[trades_df["action"] == "sell"] if not trades_df.empty else pd.DataFrame()
         total_trades = len(sell_trades)
@@ -278,6 +294,28 @@ class BacktestEngine:
 
         avg_hold_days = sell_trades["hold_days"].mean() if total_trades > 0 else 0
 
+        # 最大连续亏损次数
+        max_consec_loss = 0
+        if total_trades > 0:
+            consec = 0
+            for _, t in sell_trades.iterrows():
+                if t.get("pnl", 0) < 0:
+                    consec += 1
+                    max_consec_loss = max(max_consec_loss, consec)
+                else:
+                    consec = 0
+
+        # 数学期望 = 胜率*平均盈利 - (1-胜率)*平均亏损
+        expectancy = win_rate * avg_win - (1 - win_rate) * avg_lose if total_trades > 0 else 0
+
+        # --- 回测达标验证 ---
+        # 标准: 年化≥20%、最大回撤≤20%、盈亏比≥2、胜率≥35%
+        pass_annual = annual_return >= 0.20
+        pass_drawdown = max_drawdown <= 0.20
+        pass_profit_factor = profit_factor >= 2.0
+        pass_win_rate = win_rate >= 0.35
+        all_pass = pass_annual and pass_drawdown and pass_profit_factor and pass_win_rate
+
         report = {
             "initial_capital": self.initial_capital,
             "final_value": round(final_value, 2),
@@ -285,17 +323,28 @@ class BacktestEngine:
             "annual_return": round(annual_return, 4),
             "max_drawdown": round(max_drawdown, 4),
             "sharpe_ratio": round(sharpe, 2),
+            "calmar_ratio": round(calmar, 2),
             "total_trades": total_trades,
             "win_trades": win_trades,
             "lose_trades": lose_trades,
             "win_rate": round(win_rate, 4),
             "profit_factor": round(profit_factor, 2),
             "avg_hold_days": round(avg_hold_days, 1),
+            "max_consecutive_loss": max_consec_loss,
+            "expectancy": round(expectancy, 2),
             "backtest_days": days,
             "start_date": all_dates[0],
             "end_date": all_dates[-1],
             "daily_values": df,
-            "trades": trades_df
+            "trades": trades_df,
+            # 达标验证
+            "validation": {
+                "all_pass": all_pass,
+                "annual_return": {"value": round(annual_return, 4), "target": 0.20, "pass": pass_annual},
+                "max_drawdown": {"value": round(max_drawdown, 4), "target": 0.20, "pass": pass_drawdown},
+                "profit_factor": {"value": round(profit_factor, 2), "target": 2.0, "pass": pass_profit_factor},
+                "win_rate": {"value": round(win_rate, 4), "target": 0.35, "pass": pass_win_rate},
+            },
         }
 
         return report
@@ -396,13 +445,23 @@ def run_backtest(stock_codes: list = None, data_dict: dict = None,
 
 
 def format_backtest_report(report: dict) -> str:
-    """格式化回测报告为文本"""
+    """格式化回测报告为文本（V2.0: 含达标验证）"""
     if "error" in report:
         return f"回测失败: {report['error']}"
 
+    v = report.get("validation", {})
+    all_pass = v.get("all_pass", False)
+
+    # 预计算达标标记（避免f-string内反斜杠）
+    mark_ar = "✅" if v.get('annual_return', {}).get('pass') else "❌"
+    mark_dd = "✅" if v.get('max_drawdown', {}).get('pass') else "❌"
+    mark_wr = "✅" if v.get('win_rate', {}).get('pass') else "❌"
+    mark_pf = "✅" if v.get('profit_factor', {}).get('pass') else "❌"
+    mark_all = "✅ 全部达标" if all_pass else "❌ 未达标"
+    
     lines = [
         "=" * 60,
-        "  回测报告",
+        "  回测报告 V2.0（中线趋势跟踪 + 真实成本）",
         "=" * 60,
         f"  回测区间: {report['start_date']} ~ {report['end_date']} ({report['backtest_days']}个交易日)",
         f"  初始资金: {report['initial_capital']:,.0f} 元",
@@ -410,17 +469,21 @@ def format_backtest_report(report: dict) -> str:
         "",
         "  --- 收益指标 ---",
         f"  总收益率:   {report['total_return']:.2%}",
-        f"  年化收益率: {report['annual_return']:.2%}",
-        f"  最大回撤:   {report['max_drawdown']:.2%}",
+        f"  年化收益率: {report['annual_return']:.2%}  {mark_ar}(目标≥20%)",
+        f"  最大回撤:   {report['max_drawdown']:.2%}  {mark_dd}(目标≤20%)",
         f"  夏普比率:   {report['sharpe_ratio']:.2f}",
+        f"  卡玛比率:   {report.get('calmar_ratio', 0):.2f}",
+        f"  数学期望:   {report.get('expectancy', 0):,.0f} 元/笔",
         "",
         "  --- 交易统计 ---",
         f"  交易次数:   {report['total_trades']}",
-        f"  盈利次数:   {report['win_trades']}",
-        f"  亏损次数:   {report['lose_trades']}",
-        f"  胜率:       {report['win_rate']:.1%}",
-        f"  盈亏比:     {report['profit_factor']:.2f}",
+        f"  盈利/亏损:  {report['win_trades']}/{report['lose_trades']}",
+        f"  胜率:       {report['win_rate']:.1%}  {mark_wr}(目标≥35%)",
+        f"  盈亏比:     {report['profit_factor']:.2f}  {mark_pf}(目标≥2.0)",
         f"  平均持仓:   {report['avg_hold_days']:.0f}天",
+        f"  最大连亏:   {report.get('max_consecutive_loss', 0)}笔",
+        "",
+        f"  --- 达标验证: {mark_all} ---",
         "=" * 60,
     ]
 

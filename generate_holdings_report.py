@@ -30,6 +30,8 @@ from notify.email_notify import send_email
 from data.realtime import fetch_realtime_batch
 from data.data_loader import fetch_stock_daily_baostock, _bs_logout
 from strategy.recommend_engine import run_recommendation, generate_trading_plan
+from strategy.caopan_signal import CaopanEngine
+from output.caopan_chart import generate_caopan_chart
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -39,11 +41,10 @@ now = datetime.datetime.now().strftime("%H:%M:%S")
 # ============================================================
 holdings_list = [
     {"code": "588000", "名称": "科创50", "赛道": "指数ETF"},
-    {"code": "001309", "名称": "德明利", "赛道": "存储芯片"},
-    {"code": "002558", "名称": "巨人网络", "赛道": "游戏"},
-    {"code": "600036", "名称": "招商银行", "赛道": "银行"},
+    {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片"},
     {"code": "159205", "名称": "创业东财", "赛道": "指数ETF"},
     {"code": "002185", "名称": "华天科技", "赛道": "半导体封测"},
+    {"code": "000858", "名称": "五粮液", "赛道": "白酒"},
 ]
 
 # 主模式参数
@@ -304,6 +305,7 @@ print(f"[行情] 成功获取 {len(quotes)} 只")
 # ============================================================
 print(f"\n[技术] 正在获取历史K线并计算技术指标...")
 tech_analysis = {}
+hist_dataframes = {}  # 保存历史K线数据（供操盘密码分析用）
 
 for item in holdings_list:
     code = item["code"]
@@ -312,6 +314,7 @@ for item in holdings_list:
         df = fetch_stock_daily_baostock(code, start_date=start)
         if not df.empty and len(df) >= 30:
             df = compute_indicators(df)
+            hist_dataframes[code] = df  # 保存原始数据
             rt_price = quotes.get(code, {}).get("price", 0)
             tech_analysis[code] = analyze_technical(df, rt_price)
             comp = tech_analysis[code].get("composite", 0)
@@ -692,6 +695,63 @@ if recommendations:
         html += '</table>'
 else:
     html += '<div class="alert alert-warning">⛔ 当前无符合五层筛选标准的推荐标的。候选池均处于弱势或盈亏比不达标，建议空仓等待。</div>'
+
+# ---- 操盘密码分析板块 V2.0 ----
+html += '<h2>五、操盘密码分析 V2.0（自适应趋势+三重DK+多维资金+盈亏比门槛）</h2>'
+html += '<div class="alert alert-info">🔑 超越付费软件 | 自适应生命线(EMA10+EMA30) + 三重共振DK + 5级趋势 + 盈亏比硬门槛 + 周线共振 + 震荡市自动屏蔽</div>'
+
+try:
+    caopan_engine = CaopanEngine()
+    caopan_results = []
+    for code, h in holdings.items():
+        name = h["名称"]
+        df_hist = hist_dataframes.get(code)
+        if df_hist is not None and len(df_hist) >= 60:
+            cr = caopan_engine.analyze(df_hist, code=code, name=name)
+            if "error" not in cr:
+                caopan_results.append(cr)
+
+    if caopan_results:
+        html += '<table><tr><th>标的</th><th>趋势(5级)</th><th>LL1/LL2</th><th>乖离率</th><th>DK信号</th><th>盈亏比</th><th>市场环境</th><th>操作建议</th></tr>'
+        for cr in caopan_results:
+            trend = cr.get('trend_desc', '')
+            tl = cr.get('trend_level', 3)
+            trend_color = {5:'#e53935',4:'#ff7043',3:'#ff9800',2:'#66bb6a',1:'#4caf50'}.get(tl, '#333')
+            dk = cr.get('dk_signal') or '无'
+            dk_grade = cr.get('dk_grade', '')
+            dk_filtered = cr.get('dk_filtered', False)
+            dk_color = '#e53935' if dk == 'D' and not dk_filtered else '#4caf50' if dk == 'K' and not dk_filtered else '#999'
+            dk_text = f'{dk}({cr["dk_strength"]}分/{dk_grade})' + ('[过滤]' if dk_filtered else '')
+            action = cr.get('action_suggestion', {})
+            rr = cr.get('risk_reward', {})
+            env = cr.get('market_env', {})
+            dev_action = cr.get('deviation_action', '')
+            html += f'<tr><td><b>{cr["name"]}</b>({cr["code"]})</td>'
+            html += f'<td style="color:{trend_color};font-weight:bold">{trend}({tl}级)</td>'
+            html += f'<td><span style="color:#f5a623">{cr["ll_fast"]:.2f}{cr["ll_fast_direction"]}</span>/<span style="color:#9c27b0">{cr["ll_slow"]:.2f}{cr["ll_slow_direction"]}</span></td>'
+            html += f'<td>{cr["deviation_pct"]:.1f}% <span style="font-size:10px;color:#888">{dev_action}</span></td>'
+            html += f'<td style="color:{dk_color};font-weight:bold">{dk_text}</td>'
+            html += f'<td style="color:{"#4caf50" if rr.get("passed") else "#f44336"}">{rr.get("risk_reward_1",0):.1f}:1</td>'
+            html += f'<td>{env.get("mode","")}</td>'
+            html += f'<td>{action.get("desc", "观望")}</td></tr>'
+        html += '</table>'
+
+        # 趋势降级预警
+        downgrades = [cr for cr in caopan_results if cr.get('trend_level', 3) <= 2]
+        if downgrades:
+            html += '<div class="alert alert-danger">🚨 趋势降级预警: ' + ', '.join([f'{cr["name"]}({cr["trend_desc"]})' for cr in downgrades]) + ' → 建议清仓/禁止加仓</div>'
+
+        # 生成图表
+        caopan_dir = os.path.join(config.PROJECT_ROOT, 'output', 'caopan')
+        os.makedirs(caopan_dir, exist_ok=True)
+        for cr in caopan_results:
+            chart_path = os.path.join(caopan_dir, f'caopan_{cr["code"]}_{today.replace("-","")}.html')
+            generate_caopan_chart(cr, output_path=chart_path)
+        html += f'<div style="font-size:11px;color:#666;margin-top:5px">📊 详细图表: output/caopan/ 目录（K线+自适应生命线+三重DK标记+资金流+乖离率+市场环境）</div>'
+    else:
+        html += '<div class="alert alert-warning">数据不足，无法生成操盘密码分析</div>'
+except Exception as e:
+    html += f'<div class="alert alert-warning">操盘密码分析异常: {e}</div>'
 
 # ---- footer ----
 html += f"""

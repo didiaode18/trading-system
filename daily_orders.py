@@ -32,6 +32,7 @@ from notify.email_notify import send_email
 from data.realtime import fetch_realtime_batch
 from data.data_loader import fetch_stock_daily_baostock, _bs_logout
 from strategy.recommend_engine import run_recommendation, generate_trading_plan
+from risk.risk_control import RiskGate, RISK_CONFIG
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -41,23 +42,18 @@ tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-
 # 当前持仓（从券商截图更新，只需代码+名称+持仓数量+成本价）
 # ============================================================
 holdings_list = [
-    {"code": "588000", "名称": "科创50", "赛道": "指数ETF", "数量": 170100, "成本": 1.978},
-    {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片", "数量": 700, "成本": 98.643},
-    {"code": "002558", "名称": "巨人网络", "赛道": "游戏", "数量": 1000, "成本": 25.647},
-    {"code": "159205", "名称": "创业东财", "赛道": "指数ETF", "数量": 1500, "成本": 1.301},
-    {"code": "002185", "名称": "华天科技", "赛道": "半导体封测", "数量": 1100, "成本": 14.500},
-    {"code": "000858", "名称": "五粮液", "赛道": "白酒", "数量": 300, "成本": 73.530},
-    {"code": "001309", "名称": "德明利", "赛道": "存储芯片", "数量": 100, "成本": 453.135},
-    {"code": "002415", "名称": "海康威视", "赛道": "AI视觉", "数量": 1500, "成本": 35.530},
-    {"code": "600036", "名称": "招商银行", "赛道": "银行", "数量": 1200, "成本": 38.820},
-    {"code": "601012", "名称": "隆基绿能", "赛道": "光伏", "数量": 600, "成本": 12.520},
+    {"code": "588000", "名称": "科创50", "赛道": "指数ETF", "数量": 318100, "成本": 1.953},
+    {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片", "数量": 800, "成本": 97.530},
+    {"code": "002558", "名称": "巨人网络", "赛道": "游戏", "数量": 1200, "成本": 31.082},
+    {"code": "159205", "名称": "创业东财", "赛道": "指数ETF", "数量": 1100, "成本": 1.759},
+    {"code": "002185", "名称": "华天科技", "赛道": "半导体封测", "数量": 100, "成本": -0.164},
 ]
 
 # 主模式参数
 STOP_LOSS_PCT = 0.08       # 固定止损: 最新价跌8%
 DRAWDOWN_FROM_HIGH = 0.05  # 高点回落5%触发
 REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
-TOTAL_CAPITAL = 710000     # 总资金
+TOTAL_CAPITAL = 424000     # 总资金
 MAX_DAILY_TRADES = 3       # 每日最大交易笔数
 MAX_SINGLE_POSITION = 0.25 # 单只最大仓位25%
 
@@ -109,12 +105,21 @@ def compute_indicators(df):
 
 
 # ============================================================
-# 条件单生成逻辑
+# 条件单生成逻辑 V2（精简版：1必挂+1可选，趋势决定类型）
 # ============================================================
 def generate_condition_orders(holding, df, realtime_price):
     """
-    为单只持仓生成次日条件单
-    返回: list of order dicts
+    为单只持仓生成次日条件单（V2精简版）
+
+    规则:
+      - 所有持仓统一标配: 1张止损单(必挂) + 1张止盈单(可选)
+      - 止损三档自动匹配:
+          浮亏/浮盈<5%: 初始止损 = 成本×0.9
+          浮盈5%~15%: 保本止损 = 成本价
+          浮盈>15%: 移动止盈 = 阶段高点回落5%
+      - 多头趋势: 止损单 + 回落卖出止盈单
+      - 空头趋势: 只允许止损单，禁止任何买入/加仓，强制给出清仓建议
+      - 默认14:50尾盘触发，过滤盘中杂波
     """
     orders = []
     code = holding["code"]
@@ -126,127 +131,171 @@ def generate_condition_orders(holding, df, realtime_price):
     latest = df.iloc[-1]
     ma20 = latest.get("ma20", price)
     ma60 = latest.get("ma60", price)
-    atr = latest.get("atr", price * 0.025)
-    if pd.isna(atr) or atr <= 0:
-        atr = price * 0.025
     if pd.isna(ma20):
         ma20 = price
+    if pd.isna(ma60):
+        ma60 = price
 
-    # 判断趋势
-    trend_up = price > ma20 and (not pd.isna(ma60) and price > ma60)
-    trend_down = price < ma20
+    # 判断趋势方向
+    is_bullish = price > ma20 and ma20 > ma60  # 均线多头排列
+    is_bearish = price < ma20  # 空头趋势
 
-    # ---- 条件单1: 定价止损（必挂，20天有效）----
-    stop_loss_price = round(price * (1 - STOP_LOSS_PCT), 3)
+    # 计算浮盈率
+    pnl_pct = (price / cost - 1) * 100 if cost > 0 else 0
+
+    # ================================================================
+    # 止损单（必挂）—— 三档自动匹配
+    # ================================================================
+    if pnl_pct < 5:
+        # 第一档: 初始止损 = 成本×0.9（成本下10%）
+        stop_price = round(cost * 0.9, 3)
+        stop_type = "初始止损"
+        stop_note = f"浮盈{pnl_pct:.1f}%<5%，初始止损=成本{cost:.3f}×90%"
+    elif pnl_pct < 15:
+        # 第二档: 保本止损 = 成本价（保证不亏本金）
+        stop_price = round(cost, 3)
+        stop_type = "保本止损"
+        stop_note = f"浮盈{pnl_pct:.1f}%(5%~15%)，保本止损=成本价{cost:.3f}"
+    else:
+        # 第三档: 移动止盈 = 阶段高点回落5%
+        recent_high = df["high"].iloc[-20:].max() if len(df) >= 20 else price
+        stop_price = round(recent_high * 0.95, 3)
+        stop_type = "移动止盈"
+        stop_note = f"浮盈{pnl_pct:.1f}%>15%，移动止盈=20日高{recent_high:.3f}回落5%"
+
+    # 止损单不能高于当前价（否则立即触发）
+    if stop_price >= price:
+        stop_price = round(price * 0.95, 3)
+        stop_note += f"（调整: 止损≥现价，改为现价×95%）"
+
     orders.append({
-        "类型": "定价卖出",
+        "类型": f"止损单({stop_type})",
         "优先级": "★★★必挂",
         "证券代码": code,
         "证券名称": name,
         "方向": "卖出",
-        "触发价": stop_loss_price,
+        "触发价": stop_price,
+        "触发时间": "14:50",
         "数量": qty,
         "有效期": "20个交易日",
-        "说明": f"最新价{price:.3f}×92%={stop_loss_price:.3f}，跌破即走，不犹豫",
+        "说明": stop_note,
     })
 
-    # ---- 条件单2: 时间条件单（14:50尾盘确认，10天）----
-    # 如果趋势向下，14:50时若仍低于MA20则卖出
-    if trend_down:
-        time_price = round(min(price, ma20) * 0.998, 3)
+    # ================================================================
+    # 按趋势方向决定第二张条件单
+    # ================================================================
+    if is_bullish:
+        # 多头趋势: 回落卖出止盈单（保护利润）
+        drawdown_price = round(price * (1 - DRAWDOWN_FROM_HIGH), 3)
         orders.append({
-            "类型": "时间条件单",
+            "类型": "回落止盈",
+            "优先级": "★★建议",
+            "证券代码": code,
+            "证券名称": name,
+            "方向": "卖出",
+            "触发价": drawdown_price,
+            "监控方式": f"日高回落{int(DRAWDOWN_FROM_HIGH*100)}%",
+            "触发时间": "盘中实时",
+            "数量": qty,
+            "有效期": "10个交易日",
+            "说明": f"多头持有，从最高点回落5%({drawdown_price:.3f})锁定利润",
+        })
+    else:
+        # 空头趋势: 禁止任何买入/加仓，强制给出减仓/清仓建议
+        orders.append({
+            "类型": "强制减仓",
             "优先级": "★★★必挂",
             "证券代码": code,
             "证券名称": name,
             "方向": "卖出",
-            "触发价": time_price,
+            "触发价": round(price * 0.998, 3),
             "触发时间": "14:50",
-            "数量": qty,
-            "有效期": "10个交易日",
-            "说明": f"趋势偏弱，14:50若≤{time_price:.3f}(MA20附近)则尾盘清仓",
+            "数量": qty if is_bearish and pnl_pct < -10 else max(qty // 2, 100),
+            "有效期": "5个交易日",
+            "说明": f"空头趋势(价格<MA20)，浮盈{pnl_pct:.1f}%，"
+                    f"{'14:50清仓' if pnl_pct < -10 else '14:50减仓1/2'}，禁止补仓",
         })
-
-    # ---- 条件单3: 回落卖出（保护利润，10天）----
-    # 从日内最高回落5%触发
-    drawdown_price = round(price * (1 - DRAWDOWN_FROM_HIGH), 3)
-    orders.append({
-        "类型": "回落卖出",
-        "优先级": "★★建议",
-        "证券代码": code,
-        "证券名称": name,
-        "方向": "卖出",
-        "触发价": drawdown_price,
-        "监控方式": f"日高回落{int(DRAWDOWN_FROM_HIGH*100)}%",
-        "数量": qty,
-        "有效期": "10个交易日",
-        "说明": f"若冲高后从最高点回落5%（约{drawdown_price:.3f}），锁定利润离场",
-    })
-
-    # ---- 条件单4: 反弹买入（仅趋势向上时，5天）----
-    if trend_up and not pd.isna(ma20):
-        rebound_price = round(ma20 * (1 + REBOUND_FROM_LOW), 3)
-        buy_qty = min(int(TOTAL_CAPITAL * 0.05 / price / 100) * 100, 500)
-        if buy_qty >= 100:
-            orders.append({
-                "类型": "反弹买入",
-                "优先级": "★可选",
-                "证券代码": code,
-                "证券名称": name,
-                "方向": "买入",
-                "触发价": rebound_price,
-                "数量": buy_qty,
-                "有效期": "5个交易日",
-                "说明": f"回踩MA20({ma20:.3f})后反弹2%确认支撑有效，小仓补入{buy_qty}股",
-            })
 
     return orders
 
 
 # ============================================================
-# 风控检查
+# 持仓健康度巡检（四级分类 + 处置方案）
 # ============================================================
-def risk_check(holdings_with_price):
-    """风控检查，返回预警列表"""
-    alerts = []
-    total_value = sum(h["市值"] for h in holdings_with_price)
-
+def health_inspection(holdings_with_price, all_data):
+    """
+    持仓风险四级巡检，返回按紧急程度排序的结果
+    等级: 危险 > 预警 > 关注 > 健康
+    """
+    gate = RiskGate(total_capital=TOTAL_CAPITAL)
+    # 构建 RiskGate 需要的 holdings dict
+    holdings_dict = {}
     for h in holdings_with_price:
-        ratio = h["市值"] / total_value * 100 if total_value > 0 else 0
-        h["仓位占比"] = ratio
+        code = h["code"]
+        df = all_data.get(code)
+        ma20 = df["ma20"].iloc[-1] if df is not None and not pd.isna(df["ma20"].iloc[-1]) else h["price"]
+        ma60 = df["ma60"].iloc[-1] if df is not None and not pd.isna(df["ma60"].iloc[-1]) else h["price"]
+        stock_type = "etf" if h.get("赛道") == "指数ETF" else "stock"
+        holdings_dict[code] = {
+            "name": h["名称"],
+            "cost": h["成本"],
+            "price": h["price"],
+            "shares": h["数量"],
+            "sector": h["赛道"],
+            "type": stock_type,
+            "ma20": ma20,
+            "ma60": ma60,
+        }
+    results = gate.inspect_holdings(holdings_dict)
 
-        # 单只超25%
-        if ratio > MAX_SINGLE_POSITION * 100:
-            alerts.append({
-                "级别": "🔴严重",
-                "内容": f"{h['名称']}({h['code']})仓位{ratio:.1f}%超限(>{MAX_SINGLE_POSITION*100:.0f}%)，"
-                        f"必须减仓至{MAX_SINGLE_POSITION*100:.0f}%以下！"
-                        f"建议明日减仓{int((ratio - MAX_SINGLE_POSITION*100) / 100 * total_value / h['price'] / 100) * 100}股",
-            })
-        elif ratio > 15:
-            alerts.append({
-                "级别": "🟡警告",
-                "内容": f"{h['名称']}({h['code']})仓位{ratio:.1f}%偏高(>15%)，注意分散",
-            })
+    # 为危险/预警级标的生成具体调仓方案
+    for r in results:
+        code = r["code"]
+        h = next((x for x in holdings_with_price if x["code"] == code), None)
+        if not h:
+            continue
+        price = h["price"]
+        qty = h["数量"]
+        cost = h["成本"]
+        pnl_pct = r["pnl_pct"]
 
-        # 浮亏超10%
-        pnl_pct = (h["price"] / h["成本"] - 1) * 100 if h["成本"] > 0 else 0
-        if pnl_pct < -10:
-            alerts.append({
-                "级别": "🔴严重",
-                "内容": f"{h['名称']}浮亏{pnl_pct:.1f}%超-10%红线！明日必须执行止损，不允许补仓！",
-            })
+        # 仓位超标 → 计算减仓方案
+        if r["over_limit"] and r["reduce_shares"] > 0:
+            reduce_qty = r["reduce_shares"]
+            # 分批减仓: 分2档
+            batch1 = (reduce_qty // 2 // 100) * 100
+            batch2 = reduce_qty - batch1
+            r["reduce_plan"] = {
+                "total_reduce": reduce_qty,
+                "batch1": {"shares": batch1, "price": round(price * 0.998, 3), "note": "第一档: 开盘即挂"},
+                "batch2": {"shares": batch2, "price": round(price * 0.995, 3), "note": "第二档: 反弹到MA5附近"},
+                "target_ratio": r["position_ratio"] - (reduce_qty * price / TOTAL_CAPITAL * 100),
+            }
+        else:
+            r["reduce_plan"] = None
 
-    # 总仓位检查
-    cash_ratio = (TOTAL_CAPITAL - total_value) / TOTAL_CAPITAL * 100
-    if cash_ratio < 5:
-        alerts.append({
-            "级别": "🔴严重",
-            "内容": f"可用资金仅{cash_ratio:.1f}%（几乎满仓），完全丧失机动性！"
-                    f"必须减仓至少20%释放资金",
-        })
+        # 危险级 → 清仓条件单参数
+        if r["level"] == "危险":
+            r["clear_order"] = {
+                "direction": "卖出",
+                "shares": qty,
+                "trigger_price": round(price * 0.998, 3),
+                "trigger_time": "14:50",
+                "note": f"浮亏{pnl_pct:.1f}%，无条件清仓",
+            }
+        elif r["level"] == "预警":
+            reduce_qty = max(qty // 2 // 100 * 100, 100)
+            r["clear_order"] = {
+                "direction": "卖出",
+                "shares": reduce_qty,
+                "trigger_price": round(price * 0.998, 3),
+                "trigger_time": "14:50",
+                "note": f"空头趋势+浮亏{pnl_pct:.1f}%，反弹减仓{reduce_qty}股",
+            }
+        else:
+            r["clear_order"] = None
 
-    return alerts
+    return results
 
 
 # ============================================================
@@ -311,11 +360,14 @@ for h in holdings_list:
         "change_pct": rt.get("change_pct", 0),
     })
 
-# 4. 风控检查
-print(f"\n[风控] 检查仓位风险...")
-risk_alerts = risk_check(holdings_with_price)
-for alert in risk_alerts:
-    print(f"  {alert['级别']} {alert['内容']}")
+# 4. 持仓健康度巡检（四级分类）
+print(f"\n[巡检] 持仓健康度四级分类...")
+health_results = health_inspection(holdings_with_price, all_data)
+for r in health_results:
+    icon = {"危险": "🔴", "预警": "🟠", "关注": "🟡", "健康": "🟢"}.get(r["level"], "⚪")
+    print(f"  {icon} {r['name']}({r['code']}): {r['level']} | 浮盈{r['pnl_pct']:+.1f}% | {r['action']}")
+    if r["over_limit"]:
+        print(f"     ⚠️ 仓位{r['position_ratio']:.1f}%超标，建议减仓{r['reduce_shares']}股")
 
 # 5. 生成条件单
 print(f"\n[条件单] 生成次日操作计划...")
@@ -368,14 +420,41 @@ tr:hover {{ background: #f5f5f5; }}
 <p style="color:#666;font-size:12px">生成时间: {today} {now} | 总资金: {TOTAL_CAPITAL:,.0f}元 | 持仓{len(holdings_list)}只</p>
 """
 
+# ---- 持仓健康度报告（优先级: 危险>预警>关注>健康）----
+html += '<h2>🏥 持仓健康度巡检报告</h2>'
+level_colors = {"危险": "#e53935", "预警": "#ff9800", "关注": "#ffc107", "健康": "#4caf50"}
+level_bg = {"危险": "#ffebee", "预警": "#fff3e0", "关注": "#fffde7", "健康": "#e8f5e9"}
+for r in health_results:
+    lv = r["level"]
+    color = level_colors.get(lv, "#333")
+    bg = level_bg.get(lv, "#f5f5f5")
+    icon = {"危险": "🔴", "预警": "🟠", "关注": "🟡", "健康": "🟢"}.get(lv, "⚪")
+    html += f'<div class="alert" style="background:{bg};border-left:4px solid {color};margin:8px 0">'
+    html += f'<b>{icon} [{lv}] {r["name"]}({r["code"]})</b> '
+    html += f'| 浮盈<b style="color:{"#e53935" if r["pnl_pct"]<0 else "#4caf50"}">{r["pnl_pct"]:+.1f}%</b> '
+    html += f'| 仓位{r["position_ratio"]:.1f}% '
+    html += f'| <b>建议: {r["action"]}</b>'
+    # 仓位超标调仓方案
+    if r.get("reduce_plan"):
+        rp = r["reduce_plan"]
+        html += f'<br><small>📉 调仓方案: 减仓{rp["total_reduce"]}股至{rp["target_ratio"]:.1f}% '
+        html += f'| 第一档{rp["batch1"]["shares"]}股@{rp["batch1"]["price"]:.3f}({rp["batch1"]["note"]}) '
+        html += f'| 第二档{rp["batch2"]["shares"]}股@{rp["batch2"]["price"]:.3f}({rp["batch2"]["note"]})</small>'
+    # 清仓/减仓条件单
+    if r.get("clear_order"):
+        co = r["clear_order"]
+        html += f'<br><small>📝 条件单: {co["direction"]} {co["shares"]}股 @ {co["trigger_price"]:.3f} '
+        html += f'触发时间{co["trigger_time"]} | {co["note"]}</small>'
+    html += '</div>'
+
 # ---- 风控预警 ----
-html += '<h2>⚠️ 风控预警</h2>'
-if risk_alerts:
-    for alert in risk_alerts:
-        cls = "alert-danger" if "严重" in alert["级别"] else "alert-warning"
-        html += f'<div class="alert {cls}">{alert["级别"]} {alert["内容"]}</div>'
-else:
-    html += '<div class="alert alert-success">✅ 仓位风控正常</div>'
+html += '<h2>⚠️ 风控状态</h2>'
+gate = RiskGate(total_capital=TOTAL_CAPITAL)
+total_mv = sum(h["市值"] for h in holdings_with_price)
+cash_ratio = (TOTAL_CAPITAL - total_mv) / TOTAL_CAPITAL * 100
+html += f'<div class="alert alert-info">总仓位: {total_mv/TOTAL_CAPITAL*100:.1f}% | 现金: {cash_ratio:.1f}% | '
+html += f'ETF上限{RISK_CONFIG["etf_max_ratio"]*100:.0f}% | 个股上限{RISK_CONFIG["stock_max_ratio"]*100:.0f}% | '
+html += f'赛道上限{RISK_CONFIG["sector_max_ratio"]*100:.0f}%</div>'
 
 # ---- 纪律锁 ----
 html += '<h2>🔒 操作纪律锁（铁律，不可违反）</h2>'
@@ -423,8 +502,8 @@ html += '<table><tr><th>代码</th><th>名称</th><th>数量</th><th>成本</th>
 for h in sorted(holdings_with_price, key=lambda x: x["市值"], reverse=True):
     pnl = (h["price"] / h["成本"] - 1) * 100 if h["成本"] > 0 else 0
     pnl_color = "#e53935" if pnl < 0 else "#4caf50"
-    ratio = h.get("仓位占比", 0)
-    ratio_color = "#e53935" if ratio > 25 else ("#ff9800" if ratio > 15 else "#333")
+    ratio = h["市值"] / TOTAL_CAPITAL * 100 if TOTAL_CAPITAL > 0 else 0
+    ratio_color = "#e53935" if ratio > 20 else ("#ff9800" if ratio > 15 else "#333")
 
     # 趋势判断
     code = h["code"]

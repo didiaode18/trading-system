@@ -635,10 +635,20 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
         l5["score"] * 0.25
     )
 
-    # 通过条件: 综合分>=55 且 盈亏比>=2.0 且 趋势分>=40
-    passed = (total_score >= 55 and
-              l5["risk_reward"] >= 2.0 and
-              l4["score"] >= 40)
+    # 通过条件（分级 + 趋势硬门槛）:
+    # 硬规则: 空头排列（收盘价<MA20<MA60）直接进排除池，连观察池都不进
+    # A级推荐: 综合分>=55 且 盈亏比>=2.5 且 趋势分>=50 且 多头排列
+    # B级推荐: 综合分>=50 且 盈亏比>=2.0 且 趋势分>=40
+    is_bearish = l4["score"] < 20  # 趋势分极低 = 空头排列
+    passed_a = (total_score >= 55 and
+                l5["risk_reward"] >= 2.5 and
+                l4["score"] >= 50 and
+                not is_bearish)
+    passed_b = (total_score >= 50 and
+                l5["risk_reward"] >= 2.0 and
+                l4["score"] >= 40 and
+                not is_bearish)
+    passed = passed_a or passed_b
 
     # 推荐逻辑（2-3条核心理由）
     reasons = []
@@ -661,6 +671,7 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
 
     return {
         "pass": passed,
+        "grade": "A" if passed_a else ("B" if passed_b else "C"),
         "code": code,
         "name": name,
         "sector": sector,
@@ -683,19 +694,32 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
 
 
 # ============================================================
-# 批量推荐：扫描候选池，输出TOP N交易计划
+# 批量推荐：扫描候选池，输出三级股票池
 # ============================================================
-def run_recommendation(candidate_data: list, top_n: int = 3) -> dict:
+def run_recommendation(candidate_data: list, top_n: int = 8) -> dict:
     """
-    批量运行推荐引擎
+    批量运行推荐引擎 V2（三级池分级 + 操盘密码DK信号加分）
+
+    三级池:
+      核心池: 全部筛选通过 + 盈亏比≥2.5 + 买点已到，可直接建仓，数量≤8
+      观察池: 基本面趋势达标，但买点未到/估值偏高，等待回调，数量≤15
+      排除池: 空头趋势、踩雷、基本面差，永久禁止开仓
 
     参数:
         candidate_data: [{"code", "name", "sector", "type", "df", "realtime_price", "realtime_change"}]
-        top_n: 输出前N只
+        top_n: 核心池上限
 
     返回:
-        {"recommended": [...], "watchlist": [...], "rejected": [...]}
+        {"recommended": [...], "watchlist": [...], "excluded": [...], "rejected_count", "total_scanned"}
     """
+    # 加载操盘密码引擎（DK信号加分）
+    try:
+        from strategy.caopan_signal import CaopanEngine
+        caopan_engine = CaopanEngine()
+        caopan_available = True
+    except Exception:
+        caopan_available = False
+
     results = []
 
     for item in candidate_data:
@@ -709,20 +733,94 @@ def run_recommendation(candidate_data: list, top_n: int = 3) -> dict:
             realtime_change=item.get("realtime_change", 0),
             fund_data=item.get("fund_data"),
         )
+
+        # 操盘密码V2.0信号融合（5级趋势+三重DK+资金模式）
+        if caopan_available and item.get("df") is not None and len(item["df"]) >= 60:
+            try:
+                cr = caopan_engine.analyze(item["df"], code=item["code"], name=item["name"])
+                if "error" not in cr:
+                    dk = cr.get("dk_signal")
+                    dk_strength = cr.get("dk_strength", 0)
+                    dk_grade = cr.get("dk_grade", "")
+                    dk_filtered = cr.get("dk_filtered", False)
+                    trend_level = cr.get("trend_level", 3)
+                    fund_pattern = cr.get("fund_pattern", "normal")
+                    top_div = cr.get("top_divergence", False)
+
+                    # 趋势层硬性门槛: 下跌趋势一票否决
+                    if trend_level <= 2:
+                        plan["total_score"] = max(0, plan.get("total_score", 0) - 30)
+                        plan["caopan_bonus"] = f"下跌趋势{trend_level}级否决"
+                    # 有效D点强信号加分
+                    elif dk == "D" and not dk_filtered and dk_grade in ("strong", "medium"):
+                        bonus = 15 if dk_grade == "strong" else 10
+                        plan["total_score"] = min(100, plan.get("total_score", 0) + bonus)
+                        plan["caopan_bonus"] = f"{dk_grade}D点+{bonus}"
+                    # K点信号减分
+                    elif dk == "K" and not dk_filtered:
+                        plan["total_score"] = max(0, plan.get("total_score", 0) - 15)
+                        plan["caopan_bonus"] = f"K点-15"
+                    # 上升趋势+主力连续流入
+                    elif trend_level >= 4 and cr.get("main_flow_streak", 0) >= 3:
+                        plan["total_score"] = min(100, plan.get("total_score", 0) + 8)
+                        plan["caopan_bonus"] = f"上升{trend_level}级+主力{cr['main_flow_streak']}日流入"
+                    # 资金模式加分/减分
+                    if fund_pattern == "mild_build":
+                        plan["total_score"] = min(100, plan.get("total_score", 0) + 5)
+                    elif fund_pattern == "fake":
+                        plan["total_score"] = max(0, plan.get("total_score", 0) - 20)
+                        plan["caopan_bonus"] = "对倒骗线-20"
+                    # 顶背离减分
+                    if top_div:
+                        plan["total_score"] = max(0, plan.get("total_score", 0) - 20)
+                        plan["caopan_bonus"] = "顶背离-20"
+
+                    plan["caopan_trend"] = cr.get("trend_desc", "")
+                    plan["caopan_trend_level"] = trend_level
+                    plan["caopan_dk"] = dk
+            except Exception:
+                pass
+
         results.append(plan)
 
-    # 分类
-    recommended = [r for r in results if r["pass"] and r.get("plan")]
-    watchlist = [r for r in results if not r["pass"] and r["total_score"] >= 40]
-    rejected = [r for r in results if r["total_score"] < 40]
+    # 三级分类
+    # 核心池: 通过全部筛选 + 盈亏比≥2.5 + 多头趋势
+    core_pool = []
+    # 观察池: 综合分≥45 但买点未到/盈亏比不足
+    watch_pool = []
+    # 排除池: 空头趋势、踩雷、评分过低
+    excluded_pool = []
+
+    for r in results:
+        if r["pass"] and r.get("plan"):
+            # 核心池额外门槛: 盈亏比≥2.5 + 必须多头排列
+            rr = r["plan"].get("risk_reward", 0)
+            l4_score = r["layers"]["L4_趋势"]["score"]
+            if rr >= 2.5 and l4_score >= 50:
+                core_pool.append(r)
+            elif rr >= 1.5:
+                # 盈亏比达标但买点未完美，进观察池
+                r["watch_reason"] = f"盈亏比{rr:.1f}(未达2.5)" if rr < 2.5 else f"趋势分{l4_score}(未达50)"
+                watch_pool.append(r)
+            else:
+                r["watch_reason"] = f"盈亏比{rr:.1f}不足"
+                watch_pool.append(r)
+        elif r["total_score"] >= 45:
+            # 观察池: 基本面趋势达标，买点未到
+            r["watch_reason"] = f"综合分{r['total_score']}，买点未到/估值偏高"
+            watch_pool.append(r)
+        else:
+            # 排除池
+            excluded_pool.append(r)
 
     # 排序
-    recommended.sort(key=lambda x: x["total_score"], reverse=True)
-    watchlist.sort(key=lambda x: x["total_score"], reverse=True)
+    core_pool.sort(key=lambda x: x["total_score"], reverse=True)
+    watch_pool.sort(key=lambda x: x["total_score"], reverse=True)
 
     return {
-        "recommended": recommended[:top_n],
-        "watchlist": watchlist[:5],
-        "rejected_count": len(rejected),
+        "recommended": core_pool[:top_n],       # 核心池 ≤8只
+        "watchlist": watch_pool[:15],           # 观察池 ≤15只
+        "excluded": excluded_pool,              # 排除池
+        "rejected_count": len(excluded_pool),
         "total_scanned": len(results),
     }
