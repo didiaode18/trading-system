@@ -427,6 +427,88 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         else:
             filtered_signals.append((code, sig))
 
+    # ---- Step 6.5: V9.0 智能增强层 ----
+    logger.info("[Step 6.5] V9.0智能增强（Meta-Label + 事件日历 + 筹码 + 波动率）...")
+
+    # 6.5a: Meta-Labeling 信号二级过滤
+    try:
+        from strategy.meta_label import apply_meta_label
+        # 构建板块信息映射
+        sector_info_map = {}
+        try:
+            from strategy.stock_screener import screen_strong_sectors
+            sector_result = screen_strong_sectors(data_dict)
+            for s in sector_result.get("sectors", []):
+                for code_s in data_dict:
+                    info = config.get_stock_info(code_s)
+                    if info.get("赛道", "") == s["sector"]:
+                        sector_info_map[code_s] = s
+        except Exception:
+            pass
+
+        filtered_signals, meta_results = apply_meta_label(
+            filtered_signals, data_dict,
+            market_info={"market_state": market_strength, "confidence": 0.6},
+            sector_info_map=sector_info_map
+        )
+        logger.info(f"  [Meta-Label] 过滤后保留{len(filtered_signals)}个信号")
+    except Exception as e:
+        logger.warning(f"  Meta-Label异常(不影响主流程): {e}")
+
+    # 6.5b: 事件日历风控
+    try:
+        from strategy.event_calendar import EventCalendar
+        event_cal = EventCalendar()
+        buy_codes = [c for c, s in filtered_signals if s.get("buy_signal")]
+        if buy_codes:
+            event_risks = event_cal.batch_check(buy_codes, days_ahead=10)
+            for code, risk in event_risks.items():
+                if risk["block_buy"]:
+                    # 降级为观察
+                    for i, (c, s) in enumerate(filtered_signals):
+                        if c == code and s.get("buy_signal"):
+                            s["buy_signal"] = False
+                            s["signal_reason"] += f" [事件风控: {risk['suggestion']}]"
+                            logger.info(f"  [事件日历] {code} 买入被阻止: {risk['suggestion']}")
+                            break
+    except Exception as e:
+        logger.warning(f"  事件日历异常(不影响主流程): {e}")
+
+    # 6.5c: 筹码分布分析（写入信号供条件单参考）
+    try:
+        from strategy.chip_distribution import ChipAnalyzer
+        chip_analyzer = ChipAnalyzer()
+        for code, sig in filtered_signals:
+            if code in data_dict and len(data_dict[code]) >= 30:
+                chip = chip_analyzer.analyze(data_dict[code])
+                sig["chip_score"] = chip["chip_score"]
+                sig["chip_signals"] = chip["signals"]
+                sig["trapped_ratio"] = chip["trapped_ratio"]
+                # 套牢盘>70%的买入信号降级
+                if sig.get("buy_signal") and chip["trapped_ratio"] > 0.70:
+                    sig["signal_reason"] += f" [筹码预警: 套牢盘{chip['trapped_ratio']:.0%}]"
+    except Exception as e:
+        logger.warning(f"  筹码分析异常(不影响主流程): {e}")
+
+    # 6.5d: 波动率目标仓位缩放
+    _vol_info_for_digest = {}
+    try:
+        from position.vol_target import VolTargetManager
+        vtm = VolTargetManager(target_vol=0.15)
+        vol_result = vtm.calc_position_scale(
+            data_dict, holdings,
+            market_info={"market_state": market_strength}
+        )
+        logger.info(f"  [波动率] regime={vol_result['vol_regime']} | "
+                    f"缩放={vol_result['scale']:.2f} | {vol_result['recommendation']}")
+        # 将缩放因子写入信号
+        for code, sig in filtered_signals:
+            sig["vol_scale"] = vol_result["scale"]
+        # 收集到综合日报（在digest_data初始化前先用局部变量存储）
+        _vol_info_for_digest = vol_result
+    except Exception as e:
+        logger.warning(f"  波动率目标异常(不影响主流程): {e}")
+
     # ---- Step 7: 输出报告 ----
     logger.info("[Step 7] 生成报告...")
 
@@ -448,8 +530,23 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         except Exception as e:
             logger.error(f"  Excel生成失败: {e}")
 
-    # ---- Step 8: 发送通知 ----
-    logger.info("[Step 8] 发送通知...")
+    # ---- Step 8: 发送通知 + 收集综合日报数据 ----
+    logger.info("[Step 8] 发送通知 + 收集综合日报数据...")
+
+    # 初始化综合日报数据收集器（中线波段版）
+    digest_data = {
+        "holdings": holdings,
+        "data_dict": data_dict,
+        "signals": filtered_signals,
+        "holdings_count": list(holdings.keys()),
+        "market": {
+            "market_state": market_strength,
+            "strength": market_regime_result.get("state", "") if market_regime_result else "",
+            "suggested_position": max_pos,
+        },
+        "vol_info": _vol_info_for_digest,
+    }
+
     if config.DINGTALK_WEBHOOK or config.WECHAT_WORK_WEBHOOK:
         for code, sig in filtered_signals:
             name = config.get_stock_name(code)
@@ -465,29 +562,22 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     else:
         logger.info("  钉钉/企微通知渠道未配置，跳过")
 
-    # 发送邮件报告
-    if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-        try:
-            email_ok = send_daily_report(text_report, risk_summary, filtered_signals)
-            if email_ok:
-                logger.info("  邮件报告发送成功")
-            else:
-                logger.warning("  邮件报告发送失败")
-        except Exception as e:
-            logger.error(f"  邮件发送异常: {e}")
-
-        # 发送东方财富条件单邮件
-        try:
-            order_ok = send_eastmoney_orders_email(filtered_signals, holdings, data_dict,
-                                                    news_risk=news_risk)
-            if order_ok:
-                logger.info("  东方财富条件单邮件发送成功")
-            else:
-                logger.warning("  东方财富条件单邮件发送失败")
-        except Exception as e:
-            logger.error(f"  条件单邮件发送异常: {e}")
-    else:
-        logger.info("  邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过邮件发送")
+    # 条件单邮件不再在15:30发送（统一由scheduler 19:00发送）
+    # 但仍执行信号衰减计算（供综合日报展示）
+    try:
+        from strategy.signal_decay import SignalDecayManager
+        decay_mgr = SignalDecayManager()
+        expired_count = 0
+        for code, sig in filtered_signals:
+            freshness = decay_mgr.evaluate_freshness(sig)
+            sig["signal_freshness"] = freshness["decay_factor"]
+            sig["signal_valid"] = freshness["is_valid"]
+            if not freshness["is_valid"]:
+                expired_count += 1
+        digest_data["v9_summary"] = digest_data.get("v9_summary", {})
+        digest_data["v9_summary"]["expired_signals"] = expired_count
+    except Exception:
+        pass
 
     # ---- Step 9: 盘后选股 + 全市场扫描 + 持仓诊断 ----
     logger.info("[Step 9] 盘后选股引擎（全赛道+弱势模式）...")
@@ -531,18 +621,10 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 logger.info(f"  {w['code']} {w['name']} [{w['sector']}]: "
                            f"弱势评分{w['weak_score']} | {w['reason']}")
         
-        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            try:
-                screener_ok = send_screener_email(screener_result)
-                if screener_ok:
-                    logger.info(f"  选股报告邮件发送成功 ({screener_result['qualified_count']}只入选, "
-                               f"{len(screener_result.get('watch_list', []))}只观察)")
-                else:
-                    logger.warning("  选股报告邮件发送失败")
-            except Exception as e:
-                logger.error(f"  选股邮件发送异常: {e}")
-        else:
-            logger.info("  邮箱未配置，跳过选股邮件发送")
+        # 收集选股结果到综合日报（不再单独发邮件）
+        digest_data["screener"] = screener_result
+        logger.info(f"  选股完成: {screener_result['qualified_count']}只入选, "
+                   f"{len(screener_result.get('watch_list', []))}只观察")
     except Exception as e:
         logger.error(f"  选股引擎异常: {e}")
 
@@ -550,17 +632,11 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     logger.info("[Step 10] 仓位管理分析...")
     try:
         portfolio_result = analyze_portfolio(holdings, data_dict, consensus_results)
-        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            try:
-                portfolio_ok = send_portfolio_email(portfolio_result)
-                if portfolio_ok:
-                    logger.info(f"  仓位分析邮件发送成功 ({len(portfolio_result['risk_alerts'])}项风险预警)")
-                else:
-                    logger.warning("  仓位分析邮件发送失败")
-            except Exception as e:
-                logger.error(f"  仓位分析邮件发送异常: {e}")
-        else:
-            logger.info("  邮箱未配置，跳过仓位分析邮件发送")
+        # 收集到综合日报
+        digest_data["portfolio"] = portfolio_result.get("summary", {})
+        digest_data["portfolio"]["risk_alerts"] = portfolio_result.get("risk_alerts", [])
+        digest_data["portfolio"]["optimization"] = portfolio_result.get("optimization", {})
+        logger.info(f"  仓位分析完成 ({len(portfolio_result['risk_alerts'])}项风险预警)")
     except Exception as e:
         logger.error(f"  仓位分析异常: {e}")
 
@@ -577,13 +653,8 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             logger.info(f"  再平衡建议: {len(risk_report['rebalance']['actions'])}项")
             for act in risk_report['rebalance']['actions'][:3]:
                 logger.info(f"    [{act['action']}] {act['name']} {act['shares']}股 | {act['reason']}")
-        # 发送风控报告邮件
-        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            try:
-                send_risk_report_email(risk_report)
-                logger.info("  组合风控报告邮件发送成功")
-            except Exception as e:
-                logger.warning(f"  风控报告邮件发送失败: {e}")
+        # 收集到综合日报
+        digest_data["risk_report"] = risk_report
     except Exception as e:
         logger.error(f"  组合风控分析异常: {e}")
 
@@ -647,17 +718,60 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                     score = r["composite"]["total_score"]
                     logger.info(f"  {r['code']} {r['name']}: {score:.0f}分 [{r['composite']['rating']}] "
                                f"| {r['advice']['action']} | 时间: {r['advice']['timing']['best_time']}")
-                # 发送邮件
-                if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-                    forecast_ok = send_forecast_email(forecast_results)
-                    if forecast_ok:
-                        logger.info(f"  趋势预测邮件发送成功 ({len(forecast_results)}只)")
-                    else:
-                        logger.warning("  趋势预测邮件发送失败")
+                # 收集到综合日报
+                digest_data["forecast"] = forecast_results
             else:
                 logger.info("  无有效持仓数据，跳过预测")
         except Exception as e:
             logger.error(f"  趋势预测分析异常: {e}")
+
+    # ---- Step 15: 发送盘后综合日报（合并原6封邮件为1封）----
+    logger.info("[Step 15] 发送盘后综合日报...")
+    if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+        try:
+            # 补充市场数据（北向资金/热门板块）
+            try:
+                cfa = CapitalFlowAnalyzer()
+                flow_report = cfa.full_analysis(list(holdings.keys())[:3])
+                if flow_report.get('northbound', {}).get('success'):
+                    digest_data["market"]["northbound"] = flow_report['northbound']
+                if flow_report.get('sector_flow', {}).get('success'):
+                    digest_data["market"]["hot_sectors"] = flow_report['sector_flow'].get('hot_sectors', [])
+            except Exception:
+                pass
+
+            # 补充V9.0摘要
+            v9 = digest_data.get("v9_summary", {})
+            # Meta-Label统计
+            meta_stats = {"execute": 0, "observe": 0, "reject": 0}
+            for code, sig in filtered_signals:
+                meta = sig.get("meta_label", {})
+                action = meta.get("action", "")
+                if action in meta_stats:
+                    meta_stats[action] += 1
+            if any(meta_stats.values()):
+                v9["meta_label"] = meta_stats
+            # 波动率
+            try:
+                vol_info = digest_data.get("vol_info", {})
+                if vol_info:
+                    v9["vol_scale"] = vol_info.get("scale")
+                    v9["vol_regime"] = vol_info.get("vol_regime", "")
+                    v9["recommendation"] = vol_info.get("recommendation", "")
+            except Exception:
+                pass
+            digest_data["v9_summary"] = v9
+
+            from output.daily_digest import send_daily_digest
+            digest_ok = send_daily_digest(digest_data)
+            if digest_ok:
+                logger.info("  盘后综合日报发送成功")
+            else:
+                logger.warning("  盘后综合日报发送失败")
+        except Exception as e:
+            logger.error(f"  综合日报发送异常: {e}")
+    else:
+        logger.info("  邮箱未配置，跳过综合日报发送")
 
     # ---- 完成 ----
     elapsed = (datetime.datetime.now() - start_time).total_seconds()

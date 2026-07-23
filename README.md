@@ -1,3 +1,263 @@
+# 高胜率A股交易操作系统 V7.0
+
+> 中线波段(3天-4周) · 条件单驱动 · 五层选股 · 纪律自动化
+> 数据源: baostock + 腾讯行情API | 输出: 邮件报告 + QMT自动执行
+
+---
+
+## 系统定位
+
+个人量化交易辅助决策系统，解决核心痛点：**管不住手，让情绪毁掉策略**。
+
+- 盘后自动生成完整交易计划（条件单 + 技术分析 + 推荐标的）
+- 盘中通过QMT自动执行，彻底消除人为干预
+- 五层选股引擎确保推荐标的质量（排雷→赛道→基本面→趋势→买点）
+- 风控硬约束：每日≤3笔、单只≤25%、现金≥10%、单笔风险≤2%
+
+---
+
+## 工程结构
+
+```
+trading-system/
+│
+├── run.py                        # 统一CLI入口（python run.py <command>）
+├── daily_orders.py               # 每日条件单生成器（盘后运行）
+├── generate_holdings_report.py   # 盘后综合分析报告（技术面+推荐）
+├── qmt_trader.py                 # QMT自动交易执行器（盘中运行）
+├── auto_scheduler.py             # 自动化调度守护进程
+├── setup.py                      # 环境初始化
+├── holdings.json                 # 当前持仓数据（手动维护）
+├── requirements.txt              # Python依赖
+│
+└── trading_system/               # 核心包
+    ├── __init__.py               # 包说明 + 版本号
+    ├── config.py                 # 全局配置（参数中心）
+    ├── main.py                   # 主程序（盘后完整分析流程）
+    ├── scheduler.py              # Windows定时任务管理
+    │
+    ├── data/                     # 数据层
+    │   ├── data_loader.py        #   历史K线（baostock前复权）
+    │   └── realtime.py           #   实时行情（腾讯API + 东方财富备源）
+    │
+    ├── strategy/                 # 策略层
+    │   ├── trend_strategy.py     #   核心趋势策略（双买点+双轨止盈）
+    │   ├── trend_forecast.py     #   持仓趋势预测（6维度评分）
+    │   ├── recommend_engine.py   #   ★五层量化推荐引擎
+    │   ├── stock_screener.py     #   CANSLIM全赛道选股
+    │   ├── multi_timeframe.py    #   多周期共振
+    │   ├── sector_rotation.py    #   板块轮动
+    │   ├── pool_manager.py       #   股票池管理
+    │   ├── position.py           #   ATR动态仓位
+    │   ├── portfolio_analyzer.py #   仓位分析
+    │   ├── portfolio_risk.py     #   组合风险（相关性/HHI/VaR）
+    │   ├── capital_flow.py       #   资金流向（北向/主力）
+    │   ├── fundamental.py        #   基本面（PE/ROE/增速）
+    │   ├── market_regime.py      #   大盘状态（HMM三状态）
+    │   ├── anti_manipulation.py  #   反洗盘保护
+    │   ├── consensus.py          #   多空共识信号
+    │   ├── signal_decay.py       #   信号衰减模型
+    │   ├── meta_label.py         #   元标签（信号质量）
+    │   ├── chip_distribution.py  #   筹码分布
+    │   ├── event_calendar.py     #   事件日历
+    │   ├── news_monitor.py       #   新闻风控
+    │   ├── intraday_monitor.py   #   盘中监控
+    │   └── trade_journal.py      #   交易日志
+    │
+    ├── risk/                     # 风控层
+    │   └── risk_control.py       #   熔断/仓位/强制卖出/移动止损V3
+    │
+    ├── output/                   # 输出层
+    │   ├── eastmoney_orders.py   #   条件单（东方财富格式）
+    │   ├── condition_sheet.py    #   条件单表格
+    │   ├── daily_digest.py       #   盘后日报（6大面板）
+    │   ├── morning_brief.py      #   晨间简报
+    │   └── weekly_review.py      #   周度仓位分析
+    │
+    ├── notify/                   # 通知层
+    │   ├── email_notify.py       #   邮件（QQ SMTP + HTML）
+    │   └── wechat_notify.py      #   企业微信（备用）
+    │
+    ├── backtest/                 # 回测层
+    │   ├── engine.py             #   事件驱动回测引擎
+    │   ├── broker.py             #   模拟撮合（T+1/滑点/手续费）
+    │   ├── metrics.py            #   绩效指标（夏普/Calmar/Sortino）
+    │   ├── walk_forward.py       #   滚动窗口防过拟合
+    │   ├── monte_carlo.py        #   蒙特卡洛模拟
+    │   └── report.py             #   HTML可视化报告
+    │
+    ├── factors/                  # 因子层
+    │   ├── momentum.py           #   动量因子
+    │   ├── technical.py          #   技术因子
+    │   ├── volume.py             #   量能因子
+    │   ├── composite.py          #   复合因子
+    │   └── ic_monitor.py         #   IC监控
+    │
+    ├── position/                 # 仓位层
+    │   ├── kelly.py              #   Kelly公式
+    │   ├── risk_parity.py        #   风险平价
+    │   ├── vol_target.py         #   波动率目标
+    │   ├── pyramid.py            #   金字塔加仓
+    │   └── black_litterman.py    #   BL模型
+    │
+    ├── quant/                    # 量化层
+    │   ├── engine.py             #   多因子引擎
+    │   ├── factors.py            #   因子库
+    │   ├── portfolio.py          #   组合优化
+    │   ├── risk_manager.py       #   风险管理
+    │   └── performance.py        #   绩效归因
+    │
+    ├── ml/                       # 机器学习
+    │   ├── features.py           #   特征工程
+    │   ├── predictor.py          #   预测模型
+    │   ├── trainer.py            #   训练器
+    │   └── monitor.py            #   模型监控
+    │
+    ├── execution/                # 执行层
+    │   ├── twap.py               #   TWAP算法
+    │   └── slippage_tracker.py   #   滑点追踪
+    │
+    ├── monitor/                  # 监控层
+    │   └── intraday_monitor.py   #   盘中实时预警
+    │
+    └── attribution/              # 归因层
+        ├── alpha_beta.py         #   Alpha/Beta分解
+        ├── barra.py              #   Barra多因子归因
+        └── trade_log.py          #   交易记录分析
+```
+
+---
+
+## 快速开始
+
+### 环境要求
+- Python 3.10+
+- Windows（定时任务/QMT）
+
+### 安装
+```bash
+pip install -r requirements.txt
+python setup.py          # 初始化环境
+```
+
+### 配置
+编辑 `trading_system/config.py`：
+```python
+TOTAL_CAPITAL = 710_000       # 总资金
+EMAIL_SENDER = "your@qq.com"  # QQ邮箱
+EMAIL_AUTH_CODE = "xxxx"      # SMTP授权码
+```
+
+编辑 `holdings.json`（当前持仓）：
+```json
+{
+  "588000": {"shares": 170100, "buy_price": 1.978, "sector": "指数ETF"},
+  "600036": {"shares": 1200, "buy_price": 38.82, "sector": "银行"}
+}
+```
+
+---
+
+## 命令一览
+
+```bash
+python run.py report     # 盘后综合分析报告
+python run.py orders     # 生成次日条件单
+python run.py trade      # QMT盘中自动交易
+python run.py auto       # 全自动调度（常驻）
+python run.py status     # 系统状态检查
+python run.py backtest   # 策略回测
+python run.py screen     # 全赛道选股
+```
+
+---
+
+## 每日工作流
+
+| 时间 | 命令 | 输出 |
+|------|------|------|
+| 15:30 | `python run.py orders` | 次日条件单（邮件+JSON） |
+| 15:35 | `python run.py report` | 综合分析报告（技术+推荐） |
+| 09:25 | `python run.py trade` | 盘中自动执行条件单 |
+| 全天 | `python run.py auto` | 一键全自动（替代上面3个） |
+
+---
+
+## 五层选股引擎
+
+推荐标的必须通过全部五层筛选，输出完整交易计划：
+
+| 层级 | 功能 | 核心指标 |
+|------|------|----------|
+| L1 排雷 | 一票否决 | ST/流动性<3亿/庄股/暴跌 |
+| L2 赛道 | 行业景气 | 60日RPS/均线多头/MA20斜率 |
+| L3 基本面 | 安全垫 | ROE≥8%/增速≥20%/估值分位 |
+| L4 趋势 | 核心驱动 | MA系统/MACD/RSI/量能结构 |
+| L5 买点 | 盈亏比 | 回踩支撑/盈亏比≥2.5:1/仓位 |
+
+输出格式（可直接挂条件单）：
+- 买入区间 + 止损价 + 目标位(T1/T2) + 建议仓位 + 风险提示
+
+---
+
+## 条件单体系
+
+| 类型 | 触发规则 | 有效期 |
+|------|----------|--------|
+| 定价止损 | 最新价×92%（主模式，不依赖成本） | 20天 |
+| 时间条件单 | 14:50尾盘+价格≤MA20 | 10天 |
+| 回落卖出 | 日高回落5% | 10天 |
+| 反弹买入 | 日低反弹2%（MA20支撑确认） | 5天 |
+
+---
+
+## 风控硬约束
+
+- 每日最多交易 **3笔**
+- 单只仓位 **≤25%**
+- 总仓位 **≤90%**（现金≥10%）
+- 单笔风险 **≤总资金2%**
+- 单日亏损>5% → **熔断**
+- 放量大跌>8% → **无条件离场**
+
+---
+
+## QMT自动交易（可选）
+
+### 开通条件
+- 东方财富账户资产≥50万
+- 联系客户经理申请QMT权限
+
+### 配置步骤
+1. 下载QMT客户端，以"独立交易"模式登录
+2. 从QMT安装目录复制 `xtquant` 到 Python `site-packages/`
+3. 修改 `qmt_trader.py` 中的 `QMT_CONFIG`
+4. 运行 `python run.py trade --test` 验证连接
+
+---
+
+## 技术栈
+
+| 类别 | 技术 |
+|------|------|
+| 语言 | Python 3.10+ |
+| 数据源 | baostock(历史K线) + 腾讯行情API(实时) + akshare(备用) |
+| 数据处理 | pandas / numpy / scipy |
+| 机器学习 | scikit-learn (HMM/聚类) |
+| 交易接口 | xtquant (miniQMT) |
+| 通知 | QQ邮箱SMTP / 企业微信 |
+| 调度 | Windows Task Scheduler / 内置守护进程 |
+
+---
+
+## 版本历史
+
+| 版本 | 核心变更 |
+|------|----------|
+| V7.0 | 五层选股引擎 + QMT自动交易 + 条件单生成器 + 统一CLI |
+| V6.0 | 全赛道选股 + 6维度趋势预测 + 定时任务体系 |
+| V5.0 | 双买点体系 + 双轨止盈 + 移动止损V3 |
+| V2.0 | 基础框架（数据+策略+风控+通知） |
 # 高胜率A股交易操作系统 V6.0
 
 > 基于「高胜率A股交易操作系统V2.0优化版」交易手册，结合量化回测验证的智能交易辅助系统

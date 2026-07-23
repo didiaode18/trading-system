@@ -81,9 +81,15 @@ def calc_position_by_ratio(buy_price: float, ratio: float,
 def calc_first_batch(buy_price: float, stop_loss_price: float,
                      stock_type: str = "龙头",
                      total_capital: float = None,
-                     current_sector_amount: float = 0) -> dict:
+                     current_sector_amount: float = 0,
+                     is_etf: bool = False) -> dict:
     """
     计算第一批试仓（40%计划仓位）
+    
+    V8.1新增（基于1322笔真实委托验证）:
+    - 单笔最低2万元（62.8%小单<1万被手续费吃掉）
+    - ETF单只最大20%（科创50占53%严重超限）
+    - 每日最多3笔买入（日均18笔→巨亏）
     
     参数:
         buy_price: 买入价
@@ -91,6 +97,7 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
         stock_type: "龙头" 或 "弹性"
         total_capital: 总资金
         current_sector_amount: 该赛道当前已占用金额
+        is_etf: 是否为ETF基金
     
     返回:
         {
@@ -107,7 +114,11 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
         total_capital = config.TOTAL_CAPITAL
 
     # 个股仓位上限
-    if stock_type == "弹性":
+    discipline = getattr(config, 'DISCIPLINE_CONFIG', {})
+    if is_etf:
+        # V8.1: ETF单只最大20%（防止科创50占53%的情况）
+        max_ratio = discipline.get('max_single_etf_ratio', 0.20)
+    elif stock_type == "弹性":
         max_ratio = config.FLEXIBLE_STOCK_MAX_RATIO
     else:
         max_ratio = config.LEADER_STOCK_MAX_RATIO
@@ -143,12 +154,27 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
     cash_reserve = total_capital * config.CASH_RESERVE_RATIO
     pass_cash = first_amount <= (total_capital - cash_reserve)
 
-    pass_risk = pass_sector and pass_cash and (max_loss_ratio <= config.MAX_SINGLE_LOSS_RATIO)
+    # V8.1: 最小交易金额检查（单笔不低于2万，避免小单碎片化）
+    min_trade = discipline.get('min_trade_amount', 20000)
+    pass_min_amount = first_amount >= min_trade
+    if not pass_min_amount and first_shares > 0:
+        # 尝试提升到最低金额
+        min_shares = int(min_trade / buy_price / 100) * 100
+        if min_shares > first_shares and min_shares <= final_shares:
+            first_shares = min_shares
+            first_amount = first_shares * buy_price
+            max_loss = first_shares * (buy_price - stop_loss_price)
+            max_loss_ratio = max_loss / total_capital if total_capital > 0 else 0
+            pass_min_amount = first_amount >= min_trade
+
+    pass_risk = pass_sector and pass_cash and pass_min_amount and (max_loss_ratio <= config.MAX_SINGLE_LOSS_RATIO)
     risk_msgs = []
     if not pass_sector:
         risk_msgs.append(f"赛道仓位超限: {sector_total:.0f} > {sector_limit:.0f}")
     if not pass_cash:
         risk_msgs.append(f"突破现金安全垫: 需{first_amount:.0f}, 可用{total_capital-cash_reserve:.0f}")
+    if not pass_min_amount:
+        risk_msgs.append(f"低于最低交易额: {first_amount:.0f} < {min_trade:.0f}元(小单无意义)")
     if max_loss_ratio > config.MAX_SINGLE_LOSS_RATIO:
         risk_msgs.append(f"单笔亏损超限: {max_loss_ratio:.2%} > {config.MAX_SINGLE_LOSS_RATIO:.0%}")
 

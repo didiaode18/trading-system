@@ -1,0 +1,425 @@
+{
+  "total_trades": 1322,
+  "win_rate": 46.9,
+  "avg_win_pct": 5.33,
+  "avg_loss_pct": -6.72,
+  "profit_factor": 0.79,
+  "expectancy": -1.07,
+  "total_pnl": -315161.8,
+  "avg_hold_days": 4.8,
+  "median_hold_days": 4.0,
+  "max_consec_loss": 31,
+  "date_range": "2026-05-07 ~ 2026-07-22",
+  "stock_count": 173,
+  "hold_stats": [
+    {
+      "hold_bucket": "当日(T+0)",
+      "count": 306,
+      "wins": 198,
+      "total_pnl": 15132.6,
+      "avg_pnl_pct": 1.709313725490196,
+      "win_rate": 64.7
+    },
+    {
+      "hold_bucket": "1-3天",
+      "count": 325,
+      "wins": 134,
+      "total_pnl": -156403.3,
+      "avg_pnl_pct": -1.6176307692307692,
+      "win_rate": 41.2
+    },
+    {
+      "hold_bucket": "3-5天",
+      "count": 278,
+      "wins": 139,
+      "total_pnl": -81976.3,
+      "avg_pnl_pct": -1.3728417266187052,
+      "win_rate": 50.0
+    },
+    {
+      "hold_bucket": "5-10天",
+      "count": 305,
+      "wins": 120,
+      "total_pnl": -48934.5,
+      "avg_pnl_pct": -1.5321311475409836,
+      "win_rate": 39.3
+    },
+    {
+      "hold_bucket": "10-20天",
+      "count": 86,
+      "wins": 24,
+      "total_pnl": -37725.0,
+      "avg_pnl_pct": -4.023953488372093,
+      "win_rate": 27.9
+    },
+    {
+      "hold_bucket": "20-60天",
+      "count": 19,
+      "wins": 3,
+      "total_pnl": -6549.2,
+      "avg_pnl_pct": -11.849473684210528,
+      "win_rate": 15.8
+    }
+  ],
+  "stock_stats": [
+    {
+      "code": "002258",
+      "name": "利尔化学",
+      "count": 46,
+      "wins": 35,
+      "total_pnl": 14049.0,
+      "avg_pnl_pct": 3.8039130434782606,
+      "avg_hold": 4.456521739130435,
+      "win_rate": 76.1
+    },
+    {
+      "code": "601336",
+      "name": "新华保险",
+      "count": 38,
+      "wins": 34,
+      "total_pnl": 11058.0,
+      "avg_pnl_pct": 2.084736842105263,
+      "avg_hold": 2.710526315789474,
+      "win_rate": 89.5
+    },
+    {
+      "code": "000969",
+      "name": "安泰科技",
+      "count": 11,
+      "wins": 11,
+      "total_pnl": 9286.5,
+      "avg_pnl_pct": 6.245454545454546,
+      "avg_hold": 4.090909090909091,
+      "win_rate": 100.0
+    },
+    {
+      "code": "603738",
+      "name": "泰晶科技",
+      "count": 10,
+      "wins": 10,
+      "total_pnl": 6785.9,
+      "avg_pnl_pct": 8.899,
+      "avg_hold": 3.2,
+      "win_rate": 100.0
+    },
+    {
+      "code": "002716",
+      "name": "湖南白银",
+      "count": 17,
+      "wins": 15,
+      "total_pnl": 4864.0,
+      "avg_pnl_pct": 3.7747058823529414,
+      "avg_hold": 6.470588235294118,
+      "win_rate": 88.2
+    },
+    {
+      "code": "603201",
+      "name": "常润股份",
+      "count": 7,
+      "wins": 7,
+      "total_pnl": 4514.0,
+      "avg_pnl_pct": 11.04142857142857,
+      "avg_hold": 1.5714285714285714,
+      "win_rate": 100.0
+    },
+    {
+      "code": "603127",
+      "name": "昭衍新药",
+      "count": 19,
+      "wins": 14,
+      "total_pnl": 3192.9,
+      "avg_pnl_pct": 4.300526315789473,
+      "avg_hold": 5.0,
+      "win_rate": 73.7
+    },
+    {
+      "code": "603391",
+      "name": "力聚热能",
+      "count": 8,
+      "wins": 6,
+      "total_pnl": 3110.0,
+      "avg_pnl_pct": 7.9,
+      "avg_hold": 4.375,
+      "win_rate": 75.0
+    },
+    {
+      "code": "600828",
+      "name": "茂业商业",
+      "count": 8,
+      "wins": 6,
+      "total_pnl": 2929.0,
+      "avg_pnl_pct": 4.16625,
+      "avg_hold": 7.875,
+      "win_rate": 75.0
+    },
+    {
+      "code": "603931",
+      "name": "格林达",
+      "count": 50,
+      "wins": 33,
+      "total_pnl": 2762.7999999999993,
+      "avg_pnl_pct": 2.1635999999999997,
+      "avg_hold": 3.84,
+      "win_rate": 66.0
+    },
+    {
+      "code": "002888",
+      "name": "惠威科技",
+      "count": 9,
+      "wins": 9,
+      "total_pnl": 2657.9,
+      "avg_pnl_pct": 7.235555555555556,
+      "avg_hold": 8.444444444444445,
+      "win_rate": 100.0
+    },
+    {
+      "code": "605358",
+      "name": "立昂微",
+      "count": 3,
+      "wins": 3,
+      "total_pnl": 2023.0,
+      "avg_pnl_pct": 9.12,
+      "avg_hold": 1.6666666666666667,
+      "win_rate": 100.0
+    },
+    {
+      "code": "603950",
+      "name": "长源东谷",
+      "count": 3,
+      "wins": 3,
+      "total_pnl": 2004.0,
+      "avg_pnl_pct": 8.656666666666666,
+      "avg_hold": 3.0,
+      "win_rate": 100.0
+    },
+    {
+      "code": "002185",
+      "name": "华天科技",
+      "count": 4,
+      "wins": 3,
+      "total_pnl": 1867.0,
+      "avg_pnl_pct": 9.765,
+      "avg_hold": 1.0,
+      "win_rate": 75.0
+    },
+    {
+      "code": "002600",
+      "name": "领益智造",
+      "count": 11,
+      "wins": 10,
+      "total_pnl": 1523.0,
+      "avg_pnl_pct": 3.9354545454545455,
+      "avg_hold": 6.181818181818182,
+      "win_rate": 90.9
+    },
+    {
+      "code": "159330",
+      "name": "300基金",
+      "count": 3,
+      "wins": 3,
+      "total_pnl": 1410.0,
+      "avg_pnl_pct": 1.5266666666666666,
+      "avg_hold": 2.3333333333333335,
+      "win_rate": 100.0
+    },
+    {
+      "code": "501018",
+      "name": "南方原油",
+      "count": 4,
+      "wins": 2,
+      "total_pnl": 1286.9,
+      "avg_pnl_pct": 1.9825000000000002,
+      "avg_hold": 0.5,
+      "win_rate": 50.0
+    },
+    {
+      "code": "002993",
+      "name": "奥海科技",
+      "count": 2,
+      "wins": 2,
+      "total_pnl": 1120.0,
+      "avg_pnl_pct": 8.95,
+      "avg_hold": 2.0,
+      "win_rate": 100.0
+    },
+    {
+      "code": "603501",
+      "name": "豪威集团",
+      "count": 2,
+      "wins": 2,
+      "total_pnl": 1025.0,
+      "avg_pnl_pct": 5.145,
+      "avg_hold": 1.0,
+      "win_rate": 100.0
+    },
+    {
+      "code": "002484",
+      "name": "江海股份",
+      "count": 1,
+      "wins": 1,
+      "total_pnl": 845.0,
+      "avg_pnl_pct": 8.33,
+      "avg_hold": 3.0,
+      "win_rate": 100.0
+    }
+  ],
+  "month_stats": [
+    {
+      "month": "2026-05",
+      "count": 181,
+      "wins": 101,
+      "total_pnl": 25649.8,
+      "avg_pnl_pct": 0.5083425414364641,
+      "win_rate": 55.8
+    },
+    {
+      "month": "2026-06",
+      "count": 651,
+      "wins": 335,
+      "total_pnl": -63613.6,
+      "avg_pnl_pct": 0.07913978494623655,
+      "win_rate": 51.5
+    },
+    {
+      "month": "2026-07",
+      "count": 490,
+      "wins": 184,
+      "total_pnl": -277198.0,
+      "avg_pnl_pct": -3.1791020408163266,
+      "win_rate": 37.6
+    }
+  ],
+  "current_holdings": {
+    "588000": {
+      "名称": "科创50",
+      "成本": 1.049,
+      "最新": 1.036,
+      "盈亏pct": -1.263,
+      "盈亏": -4993.65,
+      "仓位pct": 53.41,
+      "hist_trades": 19,
+      "hist_win_rate": 68.4,
+      "hist_avg_hold": 3.8,
+      "suggest_hold": "5-10天(微亏观望,破成本-5%止损)"
+    },
+    "001309": {
+      "名称": "德明利",
+      "成本": 441.0,
+      "最新": 435.42,
+      "盈亏pct": -1.266,
+      "盈亏": -1759.21,
+      "仓位pct": 18.76,
+      "hist_trades": 7,
+      "hist_win_rate": 42.9,
+      "hist_avg_hold": 2.0,
+      "suggest_hold": "5-10天(微亏观望,破成本-5%止损)"
+    },
+    "002558": {
+      "名称": "巨人网络",
+      "成本": 15.714,
+      "最新": 14.975,
+      "盈亏pct": -4.704,
+      "盈亏": -3043.24,
+      "仓位pct": 8.78,
+      "hist_trades": 0,
+      "hist_win_rate": 0,
+      "hist_avg_hold": 0,
+      "suggest_hold": "3-5天(亏损中,严格-10%止损线)"
+    },
+    "002415": {
+      "名称": "海康威视",
+      "成本": 30.218,
+      "最新": 31.246,
+      "盈亏pct": 3.401,
+      "盈亏": 1757.65,
+      "仓位pct": 7.01,
+      "hist_trades": 0,
+      "hist_win_rate": 0,
+      "hist_avg_hold": 0,
+      "suggest_hold": "10-20天(微利持有,等待主升浪)"
+    },
+    "600036": {
+      "名称": "招商银行",
+      "成本": 42.825,
+      "最新": 43.465,
+      "盈亏pct": 1.495,
+      "盈亏": 684.1,
+      "仓位pct": 6.22,
+      "hist_trades": 3,
+      "hist_win_rate": 0.0,
+      "hist_avg_hold": 1.0,
+      "suggest_hold": "10-20天(微利持有,等待主升浪)"
+    },
+    "000858": {
+      "名称": "五粮液",
+      "成本": 135.619,
+      "最新": 136.844,
+      "盈亏pct": 0.906,
+      "盈亏": 201.45,
+      "仓位pct": 3.03,
+      "hist_trades": 0,
+      "hist_win_rate": 0,
+      "hist_avg_hold": 0,
+      "suggest_hold": "10-20天(微利持有,等待主升浪)"
+    },
+    "603501": {
+      "名称": "豪威集团",
+      "成本": 73.862,
+      "最新": 78.437,
+      "盈亏pct": 6.194,
+      "盈亏": 1189.62,
+      "仓位pct": 2.61,
+      "hist_trades": 2,
+      "hist_win_rate": 100.0,
+      "hist_avg_hold": 1.0,
+      "suggest_hold": "5-15天(浮盈>5%,用回落止盈4-6%跟踪)"
+    },
+    "601012": {
+      "名称": "隆基绿能",
+      "成本": 15.434,
+      "最新": 15.412,
+      "盈亏pct": -0.143,
+      "盈亏": -11.08,
+      "仓位pct": 1.05,
+      "hist_trades": 0,
+      "hist_win_rate": 0,
+      "hist_avg_hold": 0,
+      "suggest_hold": "5-10天(微亏观望,破成本-5%止损)"
+    },
+    "159205": {
+      "名称": "创业东财",
+      "成本": 1.311,
+      "最新": 1.303,
+      "盈亏pct": -0.625,
+      "盈亏": -12.2,
+      "仓位pct": 0.26,
+      "hist_trades": 0,
+      "hist_win_rate": 0,
+      "hist_avg_hold": 0,
+      "suggest_hold": "5-10天(微亏观望,破成本-5%止损)"
+    },
+    "002185": {
+      "名称": "华天科技",
+      "成本": 13.389,
+      "最新": 13.389,
+      "盈亏pct": 0.0,
+      "盈亏": 1858.4,
+      "仓位pct": 1.87,
+      "hist_trades": 4,
+      "hist_win_rate": 75.0,
+      "hist_avg_hold": 1.0,
+      "suggest_hold": "5-10天(微亏观望,破成本-5%止损)"
+    }
+  },
+  "diagnosis": {
+    "avg_daily_ops": 18.4,
+    "quick_loss_count": 170,
+    "quick_loss_ratio": 12.9,
+    "early_profit_count": 239,
+    "early_profit_ratio": 38.5,
+    "late_stop_count": 154,
+    "late_stop_ratio": 21.9,
+    "small_trades_count": 830,
+    "small_ratio": 62.8
+  }
+}

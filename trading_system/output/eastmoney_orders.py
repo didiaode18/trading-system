@@ -6,7 +6,7 @@
 
 V6.0 优化（基于312笔回测网格搜索）:
 - 双轨止盈: 阶梯止盈(10%卖1/3, 20%再卖1/3) + 回落止盈(龙头7%/赛道6%/弹性5%)
-- 止损: 龙头10%/弹性12% + 移动止损只上移不下移 + 仅收盘价触发
+- 止损: 龙头10%/弹性12% + 移动止损只上移不下移 + 盘中价实时触发
 - 强制卖出: 单日放量大跌>8%无条件离场
 - 时间止损: 持仓超45天且浮盈<3%则卖出
 - 关闭MACD死叉卖出和趋势破位卖出（回测证明假信号太多）
@@ -263,25 +263,34 @@ def _get_drawdown_pct(stock_type: str, sector: str = "") -> float:
     return drawdown_map.get("高弹性", 0.03)
 
 
+def _get_order_validity(category: str) -> str:
+    """条件单有效期规则（基于中线波段3天-4周定位）"""
+    validity_map = {
+        "stop_loss": "20个交易日（长期有效，直到清仓）",
+        "take_profit": "10个交易日（到期未触发请重新评估）",
+        "drawdown": "10个交易日（随最高价更新）",
+        "buy": "5个交易日（过期作废，不追）",
+        "add_position": "5个交易日（过期作废）",
+        "time_stop": "10个交易日",
+    }
+    return validity_map.get(category, "5个交易日")
+
+
 def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) -> list:
     """
-    为每个持仓生成完整的条件单组合（V6.0 双轨止盈优化版）
-    
-    双轨止盈体系:
-    - 第一轨（阶梯止盈）: 浮盈10%→卖1/3, 浮盈20%→再卖1/3
-    - 第二轨（回落止盈）: 剩余1/3底仓→高点回落7%/6%/5%卖出
-    
-    止损体系:
-    - 初始止损: 龙头10% / 弹性12%
-    - 移动止损: 每日盘后更新（只上移不下移）
-    - 仅收盘价触发，盘中跳水不割
-    - 时间止损: 持仓超45天且浮盈<3%则卖出
-    
+    为每个持仓生成完整的条件单组合（V8.0 中线波段四大条件单版）
+
+    四大条件单体系:
+    1. 定价卖出(刚性止损): 成本-10%无条件止损 + 14:50时间确认单
+    2. 回落卖出(中线止盈神器): 浮盈分级 - <5%固定止盈 / 5-10%回落4% / >10%回落5-6%
+    3. 阶梯止盈(分批锁利): 浮盈10%卖1/3, 20%再卖1/3
+    4. 时间条件单(14:50尾盘确认): 过滤盘中噪音，近似收盘价触发
+
     参数:
         code: 股票代码
         sig: 策略信号
         holding: 持仓信息
-        data_df: 技术指标DataFrame（可选，用于ATR/支撑位计算）
+        data_df: 技术指标DataFrame
     """
     orders = []
     stock_info = config.get_stock_info(code)
@@ -304,36 +313,35 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
     stop_info = _calculate_smart_stop_loss(code, holding, sig, data_df)
     stop_loss = stop_info["stop_loss"]
 
-    # ---- 1. 止损条件单（定价卖出）- 最高优先级 ----
-    # V6.0: 初始止损 龙头10% / 弹性10%
+    # ================================================================
+    # 条件单一: 定价卖出（刚性止损保命线）
+    # ================================================================
     initial_stop_pct = getattr(config, 'INITIAL_STOP_LOSS_LOW', 0.10) if stock_type == "龙头" else getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)
     initial_stop_price = round(buy_price * (1 - initial_stop_pct), 2)
-    # 取移动止损和初始止损中更高的（只上移不下移）
     final_stop = max(stop_loss, initial_stop_price) if stop_loss > 0 else initial_stop_price
-    # 止损不能高于现价（否则立刻成交）
     if final_stop >= current_price:
         final_stop = round(current_price * 0.97, 2)
 
-    # V7.1: 软止损模式 - 下移3%给缓冲空间，避免被洗盘触发
+    # V7.1: 软止损模式
     anti_wash = getattr(config, 'ANTI_WASH_CONFIG', {})
     soft_stop_mode = anti_wash.get("soft_stop_mode", True)
-    soft_stop_buffer = anti_wash.get("soft_stop_buffer", 0.03)  # 3%缓冲
-    
+    soft_stop_buffer = anti_wash.get("soft_stop_buffer", 0.03)
+
     if soft_stop_mode:
-        display_stop = round(final_stop * (1 - soft_stop_buffer), 2)  # 显示下移后的价格
+        display_stop = round(final_stop * (1 - soft_stop_buffer), 2)
         stop_label = "定价卖出（软止损预警）"
         stop_notes = (f"{stop_info['method']} | 成本{buy_price:.2f} | 浮盈{profit_pct:.1%} | "
-                      f"软止损模式: 触发后请人工确认 | 原止损{final_stop:.2f}下移{soft_stop_buffer:.0%}缓冲")
+                      f"软止损: 触发后请人工确认 | 原止损{final_stop:.2f}下移{soft_stop_buffer:.0%}缓冲")
     else:
         display_stop = final_stop
-        stop_label = "定价卖出（止损）"
+        stop_label = "定价卖出（刚性止损）"
         stop_notes = (f"{stop_info['method']} | 成本{buy_price:.2f} | 浮盈{profit_pct:.1%} | "
-                      f"仅收盘价触发，盘中跳水不割")
-    
+                      f"盘中价实时触发，到价即执行")
+
     if stop_info["is_breached"]:
         stop_label = "定价卖出（⚠️已破止损）"
         stop_notes = f"{stop_info['recommendation']} | 跌破{stop_info['breach_pct']:.1%} | 建议开盘择机卖出"
-    
+
     orders.append({
         "order_type": "sell_stop_loss",
         "order_type_cn": stop_label,
@@ -342,62 +350,137 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
         "trigger_price": display_stop,
         "order_price": round(display_stop * 0.99, 2),
         "shares": shares,
-        "condition_desc": f"收盘价 <= {display_stop:.2f} 时，卖出全部 {shares} 股" + 
-                          ("（软止损: 触发后请人工确认）" if soft_stop_mode else "（仅收盘价触发）"),
+        "condition_desc": f"盘中价 <= {display_stop:.2f} 时，卖出全部 {shares} 股" +
+                          ("（软止损: 触发后请人工确认）" if soft_stop_mode else "（盘中实时触发）"),
         "priority": 1,
         "notes": stop_notes,
-        "category": "stop_loss"
+        "category": "stop_loss",
+        "validity": _get_order_validity("stop_loss"),
     })
 
-    # ---- 2. 第一轨：阶梯止盈条件单 ----
-    ladder_levels = getattr(config, 'LADDER_SELL_LEVELS', [(0.08, 1/3), (0.20, 1/3)])
-    for i, (threshold, sell_ratio) in enumerate(ladder_levels, 1):
-        target_price = round(buy_price * (1 + threshold), 2)
-        # 只有目标价高于现价才有意义
-        if target_price <= current_price:
-            continue  # 已达到或超过该档，跳过（可能已执行）
-        sell_shares = max(100, int(shares * sell_ratio / 100) * 100)
-        profit_amount = sell_shares * (target_price - buy_price)
+    # ================================================================
+    # 条件单二: 时间条件单（14:50尾盘确认止损，过滤盘中假跌破）
+    # ================================================================
+    # 只在非紧急情况下设置（已破止损时不需要时间确认）
+    if not stop_info["is_breached"] and profit_pct > -0.08:
+        time_stop_price = round(final_stop * 0.99, 2)  # 比实时止损略低1%
         orders.append({
-            "order_type": "sell_stop_loss",
-            "order_type_cn": f"定价卖出（阶梯止盈第{i}档）",
+            "order_type": "sell_time_confirm",
+            "order_type_cn": "时间条件单（14:50尾盘确认）",
             "code": code,
             "name": name,
-            "trigger_price": target_price,
-            "order_price": round(target_price * 0.99, 2),
-            "shares": sell_shares,
-            "condition_desc": f"收盘价 >= {target_price:.2f} 时，卖出 {sell_shares} 股（浮盈+{threshold:.0%}，卖{sell_ratio:.0%}仓位）",
-            "priority": 3,
-            "notes": f"阶梯止盈第{i}档 | 成本+{threshold:.0%} | 卖出{sell_shares}股 | 预计盈利{profit_amount:,.0f}元",
-            "category": "take_profit"
+            "trigger_price": time_stop_price,
+            "order_price": round(time_stop_price * 0.99, 2),
+            "shares": shares,
+            "trigger_time": "14:50",
+            "condition_desc": (f"14:50时，若最新价 <= {time_stop_price:.2f}，卖出全部 {shares} 股"
+                              f"（过滤盘中假跌破，近似收盘价触发）"),
+            "priority": 1,
+            "notes": (f"日线级别确认 | 避免盘中假跳水洗盘 | "
+                      f"若14:50价格仍在止损线上方则不触发，继续持有"),
+            "category": "time_stop",
+            "validity": _get_order_validity("time_stop"),
         })
 
-    # ---- 3. 第二轨：回落止盈条件单（底仓保护）----
+    # ================================================================
+    # 条件单三: 回落卖出（中线止盈第一神器）
+    # 浮盈分级: <5%固定止盈 / 5-10%回落4% / >10%回落5-6%
+    # ================================================================
     drawdown_pct = _get_drawdown_pct(stock_type, sector)
-    # 回落止盈基于持仓期间最高价
-    drawdown_trigger = round(highest_price * (1 - drawdown_pct), 2)
-    # 底仓 = 总仓位 - 已阶梯卖出的部分（简化为1/3底仓）
-    base_shares = max(100, int(shares / 3 / 100) * 100)
-    
-    # 回落止盈只在有浮盈时设置
-    if profit_pct > 0.02 and drawdown_trigger > buy_price:
+
+    if profit_pct >= 0.10:
+        # --- 浮盈>10%: 回落卖出，让利润奔跑 ---
+        monitor_price = round(buy_price * 1.05, 2)  # 监控价=成本+5%
+        dd_trigger = round(highest_price * (1 - drawdown_pct), 2)
         type_label = "龙头5%" if stock_type == "龙头" else ("赛道4%" if drawdown_pct == 0.04 else "弹性3%")
         orders.append({
             "order_type": "sell_drawdown",
-            "order_type_cn": "回落卖出（底仓止盈）",
+            "order_type_cn": "回落卖出（中线止盈神器）",
             "code": code,
             "name": name,
-            "trigger_price": drawdown_trigger,
-            "order_price": round(drawdown_trigger * 0.99, 2),
-            "shares": base_shares,
-            "condition_desc": f"从最高{highest_price:.2f}回落{drawdown_pct:.0%}（<= {drawdown_trigger:.2f}）时，卖出底仓 {base_shares} 股",
+            "trigger_price": dd_trigger,
+            "order_price": round(dd_trigger * 0.99, 2),
+            "shares": shares,
+            "monitor_price": monitor_price,
+            "condition_desc": (f"监控价{monitor_price:.2f}，股价涨过监控价后，"
+                              f"从高点{highest_price:.2f}回落{drawdown_pct:.0%}"
+                              f"（<= {dd_trigger:.2f}）时，卖出全部 {shares} 股"),
             "priority": 2,
-            "notes": (f"第二轨回落止盈 | 类型:{type_label} | 最高价{highest_price:.2f} | "
-                       f"回落{drawdown_pct:.0%}触发 | 锁定利润{(drawdown_trigger - buy_price) * base_shares:,.0f}元"),
-            "category": "drawdown"
+            "notes": (f"浮盈{profit_pct:.1%} | 类型:{type_label} | 监控价{monitor_price:.2f} | "
+                       f"最高价{highest_price:.2f} | 一直涨就一直持有，不提前卖飞 | "
+                       f"锁定利润≥{(dd_trigger - buy_price) * shares:,.0f}元"),
+            "category": "drawdown",
+            "validity": _get_order_validity("drawdown"),
         })
+    elif profit_pct >= 0.05:
+        # --- 浮盈5-10%: 回落卖出，回落4% ---
+        monitor_price = round(buy_price * 1.05, 2)
+        dd_pct_mid = 0.04
+        dd_trigger = round(highest_price * (1 - dd_pct_mid), 2)
+        if dd_trigger > buy_price:  # 确保触发价高于成本
+            orders.append({
+                "order_type": "sell_drawdown",
+                "order_type_cn": "回落卖出（保护利润）",
+                "code": code,
+                "name": name,
+                "trigger_price": dd_trigger,
+                "order_price": round(dd_trigger * 0.99, 2),
+                "shares": shares,
+                "monitor_price": monitor_price,
+                "condition_desc": (f"监控价{monitor_price:.2f}，股价涨过后，"
+                                  f"从高点回落4%（<= {dd_trigger:.2f}）时，卖出全部 {shares} 股"),
+                "priority": 2,
+                "notes": (f"浮盈{profit_pct:.1%} | 监控价{monitor_price:.2f} | "
+                           f"回落4%触发 | 锁定利润≥{(dd_trigger - buy_price) * shares:,.0f}元"),
+                "category": "drawdown",
+                "validity": _get_order_validity("drawdown"),
+            })
+    elif profit_pct > 0:
+        # --- 浮盈<5%: 固定止盈价（成本+5%定价卖出）---
+        fixed_tp = round(buy_price * 1.05, 2)
+        if fixed_tp > current_price:
+            orders.append({
+                "order_type": "sell_stop_loss",
+                "order_type_cn": "定价卖出（固定止盈+5%）",
+                "code": code,
+                "name": name,
+                "trigger_price": fixed_tp,
+                "order_price": round(fixed_tp * 0.99, 2),
+                "shares": shares,
+                "condition_desc": f"盘中价 >= {fixed_tp:.2f} 时，卖出全部 {shares} 股（浮盈+5%固定止盈）",
+                "priority": 3,
+                "notes": f"浮盈{profit_pct:.1%} | 浮盈<5%用固定止盈 | 到+5%后切换为回落卖出",
+                "category": "take_profit",
+                "validity": _get_order_validity("take_profit"),
+            })
 
-    # ---- 4. 如果有明确卖出信号，更新止损单 ----
+    # ================================================================
+    # 条件单四: 阶梯止盈（分批锁利，仅浮盈>10%时设置）
+    # ================================================================
+    if profit_pct < 0.10:  # 浮盈>10%时已由回落卖出接管，不再设阶梯
+        ladder_levels = getattr(config, 'LADDER_SELL_LEVELS', [(0.08, 1/3), (0.20, 1/3)])
+        for i, (threshold, sell_ratio) in enumerate(ladder_levels, 1):
+            target_price = round(buy_price * (1 + threshold), 2)
+            if target_price <= current_price:
+                continue
+            sell_shares = max(100, int(shares * sell_ratio / 100) * 100)
+            profit_amount = sell_shares * (target_price - buy_price)
+            orders.append({
+                "order_type": "sell_stop_loss",
+                "order_type_cn": f"定价卖出（阶梯止盈第{i}档）",
+                "code": code,
+                "name": name,
+                "trigger_price": target_price,
+                "order_price": round(target_price * 0.99, 2),
+                "shares": sell_shares,
+                "condition_desc": f"盘中价 >= {target_price:.2f} 时，卖出 {sell_shares} 股（浮盈+{threshold:.0%}）",
+                "priority": 3,
+                "notes": f"阶梯止盈第{i}档 | 成本+{threshold:.0%} | 预计盈利{profit_amount:,.0f}元",
+                "category": "take_profit",
+                "validity": _get_order_validity("take_profit"),
+            })
+
+    # ---- 如果有明确卖出信号，更新止损单 ----
     if sig.get("sell_signal"):
         sell_price = sig.get("sell_price", final_stop)
         sell_type = sig.get("sell_type", "")
@@ -408,7 +491,7 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
                 if sell_price < current_price:
                     order["trigger_price"] = round(sell_price, 2)
                     order["order_price"] = round(sell_price * 0.99, 2)
-                    order["condition_desc"] = f"收盘价 <= {sell_price:.2f} 时，卖出全部 {shares} 股（仅收盘价触发）"
+                    order["condition_desc"] = f"盘中价 <= {sell_price:.2f} 时，卖出全部 {shares} 股（盘中实时触发）"
 
                 if "强制卖出" in reason or sell_type == "force_sell":
                     order["order_type_cn"] = "定价卖出（⚠️强制卖出）"
@@ -419,12 +502,6 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
                 elif "趋势破位" in reason or sell_type == "trend_break":
                     order["order_type_cn"] = "定价卖出（趋势破位）"
                     order["notes"] = f"⚠️ 趋势破位卖出 | {reason}"
-                elif "MACD死叉" in reason or sell_type == "macd_death_cross":
-                    order["order_type_cn"] = "定价卖出（MACD死叉）"
-                    order["notes"] = f"MACD死叉卖出 | {reason}"
-                elif "RSI" in reason:
-                    order["order_type_cn"] = "定价卖出（RSI超买回落）"
-                    order["notes"] = f"RSI超买回落 | {reason}"
                 else:
                     order["notes"] = f"卖出信号 | {reason}"
                 order["priority"] = 1
@@ -462,7 +539,8 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
     if holding and holding.get("shares", 0) > 0:
         orders.extend(_generate_holding_orders(code, sig, holding, data_df))
 
-    # ---- 买入信号：生成定价买入条件单 ----
+    # ---- 买入信号：反弹买入条件单（精准捕捉回踩买点）----
+    # 核心逻辑: 跌到支撑位不着急买，等真的企稳反弹再出手
     if sig.get("buy_signal") and sig.get("buy_price"):
         buy_price = sig["buy_price"]
         stop_loss = sig.get("stop_loss_initial", buy_price * 0.9)
@@ -472,19 +550,33 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
         shares = batch["shares"] if batch["pass_risk"] else 0
 
         if shares > 0:
-            trigger_price = round(buy_price, 2)
+            # 支撑价: 取MA20或信号买入价
+            support_price = round(buy_price, 2)
+            if data_df is not None and len(data_df) >= 20 and "ma20" in data_df.columns:
+                ma20_val = data_df["ma20"].iloc[-1]
+                if ma20_val and ma20_val > 0:
+                    support_price = round(ma20_val, 2)
+
+            rebound_pct = 0.02  # 反弹2%确认企稳
+            rebound_price = round(support_price * (1 + rebound_pct), 2)
+
             orders.append({
-                "order_type": "buy_limit",
-                "order_type_cn": "定价买入",
+                "order_type": "buy_rebound",
+                "order_type_cn": "反弹买入（回踩企稳）",
                 "code": code,
                 "name": name,
-                "trigger_price": trigger_price,
-                "order_price": round(trigger_price * 1.01, 2),
+                "trigger_price": support_price,
+                "order_price": rebound_price,
                 "shares": shares,
-                "condition_desc": f"股价 <= {trigger_price:.2f} 时，以市价买入 {shares} 股（约{shares * trigger_price:,.0f}元）",
+                "rebound_pct": rebound_pct,
+                "condition_desc": (f"股价跌到{support_price:.2f}以下后，"
+                                  f"反弹超过{rebound_pct:.0%}（即≥{rebound_price:.2f}）时，"
+                                  f"买入 {shares} 股（约{shares * rebound_price:,.0f}元）"),
                 "priority": 2,
-                "notes": sig.get("signal_reason", ""),
-                "category": "buy"
+                "notes": (f"支撑价{support_price:.2f}(MA20) | 反弹{rebound_pct:.0%}确认 | "
+                          f"避免接飞刀，等企稳再买 | {sig.get('signal_reason', '')}"),
+                "category": "buy",
+                "validity": _get_order_validity("buy"),
             })
 
     # ---- 加仓信号：反弹买入 ----
@@ -499,19 +591,31 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
             add_shares = second["shares"]
 
             if add_shares > 0:
-                trigger = round(add_price, 2)
+                # 支撑价用MA20
+                support_price = round(add_price, 2)
+                if data_df is not None and len(data_df) >= 20 and "ma20" in data_df.columns:
+                    ma20_val = data_df["ma20"].iloc[-1]
+                    if ma20_val and ma20_val > 0:
+                        support_price = round(ma20_val, 2)
+
+                rebound_pct = 0.02
+                rebound_price = round(support_price * (1 + rebound_pct), 2)
+
                 orders.append({
                     "order_type": "buy_rebound",
                     "order_type_cn": "反弹买入（加仓）",
                     "code": code,
                     "name": name,
-                    "trigger_price": trigger,
-                    "order_price": round(trigger * 1.01, 2),
+                    "trigger_price": support_price,
+                    "order_price": rebound_price,
                     "shares": add_shares,
-                    "condition_desc": f"股价站稳 {trigger:.2f} 后反弹，买入 {add_shares} 股（第二批加仓）",
+                    "rebound_pct": rebound_pct,
+                    "condition_desc": (f"股价跌到{support_price:.2f}后反弹{rebound_pct:.0%}"
+                                      f"（≥{rebound_price:.2f}），买入 {add_shares} 股（第二批加仓）"),
                     "priority": 3,
-                    "notes": sig.get("signal_reason", ""),
-                    "category": "add_position"
+                    "notes": f"支撑{support_price:.2f} | 反弹{rebound_pct:.0%}确认 | {sig.get('signal_reason', '')}",
+                    "category": "add_position",
+                    "validity": _get_order_validity("add_position"),
                 })
 
     return orders
@@ -638,6 +742,26 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
         </div>
 """
 
+    # P3: 操作预算警告 + 小单合并提示
+    max_daily_ops = getattr(config, 'MAX_DAILY_OPERATIONS', 3)
+    buy_count_total = len(buy_orders)
+    budget_warning = ""
+    if buy_count_total > max_daily_ops:
+        budget_warning = f'<div style="background:#FFF7E6;border:2px solid #FA8C16;border-radius:8px;padding:12px 16px;margin:10px 0;"><div style="font-size:14px;font-weight:bold;color:#D46B08;margin-bottom:4px">⚠️ 操作预算超限警告</div><div style="font-size:13px;color:#333;">今日买入条件单 <b>{buy_count_total}</b> 笔，超过日预算 <b>{max_daily_ops}</b> 笔！<br>请仅执行优先级最高的 {max_daily_ops} 笔买入，其余<b>观察不动</b>。<br><span style="color:#999;font-size:12px;">记住: 过度交易是亏损的根源。少做=少错。</span></div></div>'
+
+    # 小单合并提示
+    merge_tips = []
+    for stock_key, orders in stock_orders.items():
+        buy_orders_stock = [o for o in orders if o.get("category") in ("buy", "add_position")]
+        if len(buy_orders_stock) >= 2:
+            total_shares = sum(o["shares"] for o in buy_orders_stock)
+            merge_tips.append(f"{stock_key}: 建议合并为1笔 {total_shares}股")
+    merge_html = ""
+    if merge_tips:
+        merge_html = '<div style="background:#E6F7FF;border:1px solid #91D5FF;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:12px;"><b style="color:#096DD9">📦 小单合并提示:</b> ' + '；'.join(merge_tips[:5]) + '<br><span style="color:#999">避免碎片化建仓，一次性挂出完整仓位</span></div>'
+
+    html += budget_warning + merge_html
+
     # 时间红线警告
     no_trade_morning = getattr(config, 'NO_TRADE_MORNING', ("09:30", "10:00"))
     no_trade_afternoon = getattr(config, 'NO_TRADE_AFTERNOON', ("14:30", "15:00"))
@@ -649,7 +773,10 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
                 • <b>{no_trade_morning[0]}-{no_trade_morning[1]}</b> 禁止新开仓（开盘半小时不动）<br>
                 • <b>{no_trade_afternoon[0]}-{no_trade_afternoon[1]}</b> 禁止新开仓（收盘半小时不动）<br>
                 • <b>{no_new_after}后</b> 禁止新开计划外标的<br>
-                • 止损单仅看<b>收盘价</b>，盘中跳水不割肉
+                • 今日最多执行 <b style="color:#FF4D4F">{max_daily_ops}笔</b> 买入操作（含加仓）<br>
+                • 所有条件单均为<b>盘中实时价格</b>触发（非收盘价）<br>
+                • 止损单: 盘中价 <= 止损价 即触发卖出<br>
+                • 止盈单: 盘中价 >= 止盈价 即触发卖出
             </div>
         </div>
 """
@@ -657,16 +784,23 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
     # 操作指南
     html += """
         <div class="guide">
-            <h3>东方财富APP操作步骤（双轨止盈版）</h3>
+            <h3>东方财富APP操作步骤（四大条件单版）</h3>
             <ol>
                 <li>打开东方财富APP → 交易 → <b>智能条件单</b></li>
                 <li>按从上到下顺序设置，<span style="color:#FF4D4F;font-weight:bold">红色=紧急止损</span>优先</li>
-                <li><b>止损单</b>：触发价=止损价，委托价=触发价×0.99，仅收盘价触发</li>
-                <li><b>阶梯止盈</b>：第1档成本+10%卖1/3，第2档成本+20%再卖1/3</li>
-                <li><b>回落卖出</b>：底仓1/3，龙头回落7%/赛道6%/弹性5%触发</li>
-                <li><b>定价买入</b>：触发价=目标价，委托价=触发价×1.01</li>
-                <li>每只股票设置完止损+阶梯止盈+回落卖出后再设下一只</li>
+                <li><b>① 定价卖出(止损)</b>：触发价=止损价，委托价=触发价×0.99，盘中实时触发</li>
+                <li><b>② 时间条件单(14:50)</b>：触发时间=14:50，价格条件=最新价≤止损价，过滤盘中假跌破</li>
+                <li><b>③ 回落卖出(止盈神器)</b>：设置监控价，股价涨过监控价后，从高点回落4-6%触发卖出</li>
+                <li><b>④ 反弹买入</b>：监控价=MA20支撑位，反弹幅度=2%，跌到支撑后反弹企稳才买</li>
+                <li>每只股票设置完止损+时间确认+回落卖出后再设下一只</li>
             </ol>
+            <div style="margin-top:10px;padding:8px 12px;background:#f0f5ff;border-radius:6px;font-size:12px;">
+                <b>📅 条件单有效期规则:</b><br>
+                • 止损单: <b>20个交易日</b>（长期有效，直到清仓）<br>
+                • 回落卖出/止盈: <b>10个交易日</b>（到期未触发请重新评估）<br>
+                • 买入单: <b>5个交易日</b>（过期作废，不追！）<br>
+                • 时间条件单: <b>10个交易日</b>（每日14:50自动判断）
+            </div>
         </div>
 """
 
@@ -707,6 +841,9 @@ def generate_eastmoney_orders(signals: list, holdings: dict = None, data_dict: d
         for order in orders:
             cat = order.get("category", "")
             if cat == "stop_loss":
+                row_class = "urgent"
+                tag_class = "stop-loss"
+            elif cat == "time_stop":
                 row_class = "urgent"
                 tag_class = "stop-loss"
             elif cat == "take_profit":
@@ -774,6 +911,11 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
     """
     生成并发送东方财富条件单邮件
     
+    V9.0增强:
+    - 信号衰减标记: 过期信号标注 [已过期]
+    - 大单拆分提示: >5万股标注 [建议分N笔]
+    - 条件单有效期: 标注每笔单的有效期
+    
     参数:
         signals: 策略信号列表
         holdings: 持仓数据
@@ -789,8 +931,49 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
         next_day += datetime.timedelta(days=1)
     next_trade_day = next_day.strftime("%Y-%m-%d")
 
+    # V9.0: 信号衰减检查
+    expired_signals = []
+    try:
+        from strategy.signal_decay import SignalDecayManager
+        decay_mgr = SignalDecayManager()
+        for code, sig in signals:
+            freshness = decay_mgr.evaluate_freshness(sig)
+            sig["signal_freshness"] = freshness["decay_factor"]
+            sig["signal_valid"] = freshness["is_valid"]
+            if not freshness["is_valid"] and (sig.get("buy_signal") or sig.get("sell_signal")):
+                name = config.get_stock_name(code)
+                expired_signals.append(f"{code} {name}")
+    except Exception:
+        pass
+
+    # V9.0: 大单拆分检查
+    large_orders = []
+    if holdings:
+        for code, pos in holdings.items():
+            shares = pos.get("shares", 0)
+            if shares > 50000:
+                name = config.get_stock_name(code)
+                split_count = min(5, max(2, shares // 20000))
+                large_orders.append(f"{code} {name}: {shares}股 [建议分{split_count}笔]")
+
     subject = f"[条件单] 东方财富智能条件单 - {next_trade_day}（提前挂单）"
     html_content = generate_eastmoney_orders(signals, holdings, data_dict)
+
+    # V9.0: 插入衰减/拆分提示板块
+    v9_alerts_html = ""
+    if expired_signals or large_orders:
+        v9_alerts_html = '<div style="max-width:800px;margin:10px auto;padding:0 15px">'
+        if expired_signals:
+            v9_alerts_html += '<div style="background:#FFF7E6;border:1px solid #FFD591;border-radius:6px;padding:10px 14px;margin:6px 0;font-size:12px">'
+            v9_alerts_html += f'<b style="color:#D46B08">[信号衰减]</b> 以下信号已过期(仅供参考): {", ".join(expired_signals)}'
+            v9_alerts_html += '</div>'
+        if large_orders:
+            v9_alerts_html += '<div style="background:#E6F7FF;border:1px solid #91D5FF;border-radius:6px;padding:10px 14px;margin:6px 0;font-size:12px">'
+            v9_alerts_html += f'<b style="color:#096DD9">[大单拆分]</b> {"; ".join(large_orders)}'
+            v9_alerts_html += '</div>'
+        v9_alerts_html += '</div>'
+        # 插入到content区域开头
+        html_content = html_content.replace('<div class="content">', '<div class="content">' + v9_alerts_html)
 
     # 追加新闻/政策风险预警板块（仅供参考，非交易信号）
     if news_risk:

@@ -1,5 +1,5 @@
 """
-定时任务调度模块 V2.0
+定时任务调度模块 V3.0 (报告重构版)
 ==================
 每个交易日自动运行交易分析流程并发送邮件报告
 
@@ -8,20 +8,19 @@
   python scheduler.py --install    # 安装为Windows任务计划（开机自启）
   python scheduler.py --uninstall  # 卸载Windows任务计划
 
-调度时间（建议）:
-  - 每个交易日 08:30 盘前趋势预测（基于前日收盘数据，规划当日操作）
-  - 每个交易日 09:25 竞价后选股报告
-  - 每个交易日 15:30 盘后分析（数据更新+信号扫描+条件单+选股+仓位分析）
-  - 每个交易日 15:35 盘后趋势预测（更新数据后，预测次日走势）
-  - 每周五 16:00 周度仓位分析（单独发送）
+调度时间:
+  - 每个交易日 08:30 盘前作战计划（大盘展望+操作清单+持仓快览+条件单提醒）
+  - 每个交易日 15:30 盘后分析（数据更新+信号扫描+综合日报）
+  - 每个交易日 19:00 条件单（东方财富智能条件单，提前挂单）
+  - 每周五 16:00 周度回顾（绩效+归因+压力测试+下周建议）
   - 非交易日（周末/法定节假日）自动跳过
 
-邮件报告列表:
-  1. [持仓趋势预测] 日期 | N只持仓分析（盘前+盘后各一封）
-  2. [条件单] 东方财富智能条件单 - 日期（提前挂单）
-  3. [CANSLIM选股] 日期 | 行业分布 | N只入选
-  4. [仓位分析] 资金优化方案 | N项风险预警
-  5. [交易系统] 每日报告 日期
+邮件报告列表("3+1"体系):
+  1. [盘前作战计划] 日期 | N项操作
+  2. [盘后综合日报] 日期 | 买N/卖N | 风险N分
+  3. [条件单] 东方财富智能条件单 - 日期（提前挂单）
+  4. [周度回顾] 日期 | 周收益+x.x%
+  + [紧急预警] 盘中实时预警（保留）
 """
 
 import os
@@ -242,8 +241,9 @@ def run_morning_reminder():
                     "signal_reason": "持仓观望（无明确信号，生成默认止损单）"
                 }))
 
-        # 为所有非持仓候选股评分，只推荐评分最高的5只买入
-        MAX_BUY_RECOMMEND = 5  # 最多推荐5只买入
+        # V8.1: 买入推荐数量受纪律配置约束（验证: 日均18笔→巨亏）
+        discipline = getattr(config, 'DISCIPLINE_CONFIG', {})
+        MAX_BUY_RECOMMEND = discipline.get('max_daily_buys', 3)  # 最多推荐3只买入
         buy_candidates = []  # [(score, code, new_sig), ...]
         signals_dict = {code: sig for code, sig in signals}
 
@@ -350,19 +350,20 @@ def run_morning_reminder():
 
 
 def run_forecast_morning():
-    """盘前趋势预测（08:30运行）—— 基于前日收盘数据，生成当日操作计划"""
+    """盘前作战计划（08:30运行）—— 合并原盘前预测+操作清单+持仓快览+条件单提醒"""
     today = datetime.date.today()
 
     if not is_trading_day(today):
-        logger.info(f"[{today}] 非交易日，跳过盘前趋势预测")
+        logger.info(f"[{today}] 非交易日，跳过盘前作战计划")
         return
 
-    logger.info(f"[{today}] 盘前趋势预测分析（08:30）...")
+    logger.info(f"[{today}] 盘前作战计划（08:30）...")
 
     try:
         from data.data_loader import init_db, load_daily_data
         from strategy.trend_strategy import compute_indicators
-        from strategy.trend_forecast import TrendForecaster, send_forecast_email
+        from risk.risk_control import judge_market_strength, get_max_position_ratio
+        from output.morning_brief import send_morning_brief, prepare_morning_brief_data
         import json
 
         conn = init_db()
@@ -386,86 +387,53 @@ def run_forecast_morning():
                 df = compute_indicators(df)
                 data_dict[code] = df
 
-        # 执行预测分析
-        forecaster = TrendForecaster()
-        results = forecaster.batch_analyze(data_dict, holdings)
+        # 更新持仓现价
+        for code, pos in holdings.items():
+            if code in data_dict and not data_dict[code].empty:
+                pos["current_price"] = data_dict[code].iloc[-1]["close"]
 
-        # 发送邮件
-        if results and config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            send_forecast_email(results)
-            logger.info(f"[{today}] 盘前趋势预测发送成功 ({len(results)}只)")
+        # 判断市场强度
+        benchmark_df = load_daily_data(config.BENCHMARK_INDEX, conn, days=120)
+        if not benchmark_df.empty:
+            market_strength = judge_market_strength(benchmark_df)
+        else:
+            market_strength = "normal"
+        max_pos = get_max_position_ratio(market_strength)
+
+        # 准备数据并发送
+        brief_data = prepare_morning_brief_data(
+            holdings, data_dict,
+            market_strength=market_strength,
+            max_pos=max_pos
+        )
+
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            send_morning_brief(brief_data)
+            logger.info(f"[{today}] 盘前作战计划发送成功 ({len(holdings)}只持仓)")
 
         conn.close()
     except Exception as e:
-        logger.error(f"[{today}] 盘前趋势预测失败: {e}", exc_info=True)
+        logger.error(f"[{today}] 盘前作战计划失败: {e}", exc_info=True)
 
 
 def run_forecast_afternoon():
-    """盘后趋势预测（15:35运行）—— 收盘后更新数据，生成次日趋势预测"""
-    today = datetime.date.today()
-
-    if not is_trading_day(today):
-        logger.info(f"[{today}] 非交易日，跳开盘后趋势预测")
-        return
-
-    logger.info(f"[{today}] 盘后趋势预测分析（15:35）...")
-
-    try:
-        from data.data_loader import init_db, batch_update_all, load_daily_data
-        from strategy.trend_strategy import compute_indicators
-        from strategy.trend_forecast import TrendForecaster, send_forecast_email
-        import json
-
-        conn = init_db()
-
-        # 先更新数据（获取当日收盘数据）
-        batch_update_all(conn, full_pool=False)
-
-        # 加载持仓
-        holdings_file = config.get_holdings_file()
-        holdings = {}
-        if os.path.exists(holdings_file):
-            with open(holdings_file, "r", encoding="utf-8") as f:
-                holdings = json.load(f)
-
-        if not holdings:
-            logger.info("  无持仓，跳过")
-            conn.close()
-            return
-
-        # 加载数据
-        data_dict = {}
-        for code in holdings:
-            df = load_daily_data(code, conn, days=120)
-            if not df.empty and len(df) >= 20:
-                df = compute_indicators(df)
-                data_dict[code] = df
-
-        # 执行预测分析
-        forecaster = TrendForecaster()
-        results = forecaster.batch_analyze(data_dict, holdings)
-
-        # 发送邮件
-        if results and config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            send_forecast_email(results)
-            logger.info(f"[{today}] 盘后趋势预测发送成功 ({len(results)}只)")
-
-        conn.close()
-    except Exception as e:
-        logger.error(f"[{today}] 盘后趋势预测失败: {e}", exc_info=True)
+    """盘后趋势预测（15:35）—— 已合并到盘后综合日报，此函数保留但不再单独发邮件"""
+    # V9.0报告重构: 盘后预测已合并到 main.py Step 14 -> 综合日报“明日展望”板块
+    logger.info("[盘后预测] 已合并到盘后综合日报，跳过独立发送")
+    return
 
 
 def run_weekly_portfolio():
-    """每周五盘后仓位分析（16:00运行）"""
+    """每周五盘后周度回顾（16:00运行）—— 合并原仓位分析+V9.0模块"""
     today = datetime.date.today()
     if today.weekday() != 4:  # 只周五运行
         return
 
-    logger.info(f"[{today}] 周度仓位分析...")
+    logger.info(f"[{today}] 周度回顾...")
     try:
         from data.data_loader import init_db, load_daily_data
         from strategy.trend_strategy import compute_indicators
-        from strategy.portfolio_analyzer import analyze_portfolio, send_portfolio_email
+        from output.weekly_review import send_weekly_review, prepare_weekly_data
         import json
 
         conn = init_db()
@@ -485,13 +453,15 @@ def run_weekly_portfolio():
             if code in data_dict and not data_dict[code].empty:
                 pos["current_price"] = data_dict[code].iloc[-1]["close"]
 
-        result = analyze_portfolio(holdings, data_dict)
-        send_portfolio_email(result)
-        logger.info(f"[{today}] 周度仓位分析发送成功")
+        # 准备周度数据并发送
+        weekly_data = prepare_weekly_data(holdings, data_dict)
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            send_weekly_review(weekly_data)
+            logger.info(f"[{today}] 周度回顾发送成功")
 
         conn.close()
     except Exception as e:
-        logger.error(f"[{today}] 周度仓位分析失败: {e}", exc_info=True)
+        logger.error(f"[{today}] 周度回顾失败: {e}", exc_info=True)
 
 
 def run_weekly_task():
@@ -586,40 +556,32 @@ def start_scheduler():
         return
 
     logger.info("=" * 50)
-    logger.info("  交易系统定时调度器 V2.0")
+    logger.info("  交易系统定时调度器 V3.0 (报告重构版)")
     logger.info(f"  启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 50)
 
-    # 每个交易日 08:30 盘前趋势预测（基于前日收盘数据，规划当日操作）
+    # 每个交易日 08:30 盘前作战计划（合并原盘前预测+操作清单+持仓快览）
     schedule.every().day.at("08:30").do(run_forecast_morning)
 
-    # 每个交易日 15:35 盘后趋势预测（更新数据后，预测次日走势）
-    schedule.every().day.at("15:35").do(run_forecast_afternoon)
-
-    # 每个交易日 15:30 盘后分析（数据更新+信号+条件单）
+    # 每个交易日 15:30 盘后分析（数据更新+信号+综合日报）
     schedule.every().day.at("15:30").do(run_daily_task)
 
-    # 每个交易日 09:25 竞价后选股（前瞻性选股报告，盘中可操作）
-    schedule.every().day.at("09:25").do(run_morning_screener)
-
-    # 每个交易日 19:00 盘前条件单提醒（前一天晚上发送，方便提前挂单）
+    # 每个交易日 19:00 条件单（统一发送，方便提前挂单）
     schedule.every().day.at("19:00").do(run_morning_reminder)
 
-    # 每周五 16:00 周度仓位分析
+    # 每周五 16:00 周度回顾
     schedule.every().friday.at("16:00").do(run_weekly_portfolio)
 
     # 每周日 10:00 股票池更新提醒
     schedule.every().sunday.at("10:00").do(run_weekly_task)
 
     logger.info("调度器已启动，等待执行...")
-    logger.info(f"  盘前趋势预测: 每个交易日 08:30")
-    logger.info(f"  盘后趋势预测: 每个交易日 15:35")
-    logger.info(f"  盘后分析: 每个交易日 15:30")
-    logger.info(f"  竞价选股: 每个交易日 09:25")
-    logger.info(f"  盘前提醒: 每个交易日 08:00")
-    logger.info(f"  仓位分析: 每周五 16:00")
+    logger.info(f"  盘前作战计划: 每个交易日 08:30")
+    logger.info(f"  盘后综合日报: 每个交易日 15:30")
+    logger.info(f"  条件单: 每个交易日 19:00")
+    logger.info(f"  周度回顾: 每周五 16:00")
     logger.info(f"  周日提醒: 每周日 10:00")
-    logger.info(f"  盘中监控: 每个交易日 09:30-15:00 (每30秒)")
+    logger.info(f"  盘中监控: 每个交易日 09:30-15:00")
 
     # 盘中监控（后台线程）
     schedule.every().day.at("09:30").do(start_intraday_monitor)

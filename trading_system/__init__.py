@@ -1,39 +1,34 @@
 """
-高胜率A股交易操作系统 V2.0
+高胜率A股交易操作系统 V7.0
 =========================
 
-基于「高胜率A股交易操作系统V2.0」规则构建的量化交易系统。
+定位: 中线波段(3天-4周) · 条件单驱动 · 纪律自动化
+数据源: baostock(历史K线) + 腾讯行情API(实时价格)
+输出: 邮件报告 + 条件单JSON + QMT自动执行
 
-模块结构:
-    - data: 行情数据获取与增量更新
-    - strategy: 趋势策略与仓位计算
-    - risk: 风控熔断校验
-    - notify: 钉钉/企微通知
-    - output: 条件单Excel生成
+模块架构:
+    data/        数据层 - 行情获取(baostock/akshare/腾讯实时)
+    strategy/    策略层 - 趋势分析/五层选股/条件单生成/反洗盘
+    risk/        风控层 - 熔断/仓位限制/强制卖出
+    output/      输出层 - 条件单Excel/日报/周报/晨间简报
+    notify/      通知层 - 邮件(QQ SMTP)/企业微信
+    backtest/    回测层 - 策略回测/蒙特卡洛/滚动优化
+    factors/     因子层 - 动量/技术/量能/复合因子
+    position/    仓位层 - Kelly/风险平价/波动率目标
+    quant/       量化层 - 多因子引擎/组合优化/绩效归因
+    ml/          机器学习 - 特征工程/预测/监控
+    execution/   执行层 - TWAP/滑点追踪
+    monitor/     监控层 - 盘中实时预警
+    attribution/ 归因层 - Alpha/Beta/Barra
 
-核心功能:
-    - 全市场选股（stock_screener.py）
-    - 中线趋势交易信号扫描（中线趋势交易信号.py）
-    - 持仓信号监控（持仓信号监控.py）
-    - 完整交易流程（main.py）
+根目录脚本:
+    run.py                    统一CLI入口
+    daily_orders.py           每日条件单生成器
+    generate_holdings_report.py  盘后综合分析报告
+    qmt_trader.py             QMT自动交易执行器
+    auto_scheduler.py         自动化调度守护进程
+    setup.py                  环境初始化
 """
 
-__version__ = "2.0.0"
-__author__ = "Trading System V2.0"
-
-from . import config
-from .data import data_loader
-from .strategy import trend_strategy, position
-from .risk import risk_control
-from .notify import wechat_notify
-from .output import condition_sheet
-
-__all__ = [
-    "config",
-    "data_loader",
-    "trend_strategy",
-    "position",
-    "risk_control",
-    "wechat_notify",
-    "condition_sheet",
-]
+__version__ = "7.0.0"
+__author__ = "Trading System"
