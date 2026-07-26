@@ -60,7 +60,8 @@ class TradeLog:
                 trade["sell_price"] = price
                 trade["sell_date"] = date
                 trade["pnl"] = (price - trade["buy_price"]) * trade["buy_shares"]
-                trade["pnl_pct"] = (price - trade["buy_price"]) / trade["buy_price"]
+                # FIX: 修复 buy_price 为0时除零崩溃的问题
+                trade["pnl_pct"] = (price - trade["buy_price"]) / trade["buy_price"] if trade["buy_price"] > 0 else 0
                 trade["hold_days"] = (
                     datetime.datetime.strptime(date, "%Y-%m-%d") -
                     datetime.datetime.strptime(trade["buy_date"], "%Y-%m-%d")

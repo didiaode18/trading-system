@@ -8,12 +8,19 @@ IC监控模块
 - 分层回测: 按因子值分5组验证单调性
 """
 
+import os
+import json
 import logging
 import pandas as pd
 import numpy as np
 from scipy import stats
 
 logger = logging.getLogger(__name__)
+
+# 默认持久化路径
+DEFAULT_IC_HISTORY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'ic_history.json'
+)
 
 
 class ICMonitor:
@@ -28,15 +35,21 @@ class ICMonitor:
             print(f"{factor_name} IC衰减，建议降权")
     """
 
-    def __init__(self, decay_threshold: float = 0.02, decay_days: int = 5):
+    def __init__(self, decay_threshold: float = 0.02, decay_days: int = 5,
+                 history_path: str = None):
         """
         参数:
             decay_threshold: IC衰减阈值（|IC|<此值视为无效）
             decay_days: 连续多少天低于阈值触发预警
+            history_path: IC历史JSON持久化路径（None=默认路径）
         """
         self.decay_threshold = decay_threshold
         self.decay_days = decay_days
-        self.ic_records: dict[str, list] = {}  # {factor_name: [ic_values]}
+        self.history_path = history_path or DEFAULT_IC_HISTORY_PATH
+        # ic_records: {factor_name: [{"date": "2026-07-24", "ic": 0.05, "ir": 1.2}, ...]}
+        self.ic_records: dict[str, list] = {}
+        # 初始化时自动加载历史数据
+        self.load()
 
     def calc_ic(self, factor_values: pd.Series, forward_returns: pd.Series) -> float:
         """
@@ -85,11 +98,37 @@ class ICMonitor:
 
         return pd.DataFrame(ic_series).set_index("date")["ic"]
 
-    def update(self, factor_name: str, ic_value: float):
-        """更新因子IC记录"""
+    def update(self, factor_name: str, ic_value: float, date: str = None):
+        """更新因子IC记录并自动持久化
+        
+        参数:
+            factor_name: 因子名称
+            ic_value: 当期IC值
+            date: 日期字符串(YYYY-MM-DD)，默认当天
+        """
         if factor_name not in self.ic_records:
             self.ic_records[factor_name] = []
-        self.ic_records[factor_name].append(ic_value)
+        if date is None:
+            import datetime
+            date = datetime.date.today().strftime('%Y-%m-%d')
+        # 计算当前IR（滚动）
+        records = self.ic_records[factor_name]
+        all_ics = [r['ic'] if isinstance(r, dict) else r for r in records] + [ic_value]
+        ir = self._calc_ir(all_ics)
+        self.ic_records[factor_name].append({
+            'date': date, 'ic': round(ic_value, 6), 'ir': round(ir, 4)
+        })
+        # 自动持久化
+        self.save()
+
+    @staticmethod
+    def _calc_ir(ic_list: list) -> float:
+        """计算IR = IC均值/IC标准差"""
+        if len(ic_list) < 2:
+            return 0.0
+        arr = np.array(ic_list, dtype=float)
+        std = arr.std()
+        return float(arr.mean() / std) if std > 0 else 0.0
 
     def get_ic_stats(self, factor_name: str) -> dict:
         """获取因子IC统计"""
@@ -97,7 +136,7 @@ class ICMonitor:
         if not records:
             return {"ic_mean": 0, "ic_std": 0, "ir": 0, "ic_positive_ratio": 0}
 
-        arr = np.array(records)
+        arr = np.array([r['ic'] if isinstance(r, dict) else r for r in records])
         ic_mean = arr.mean()
         ic_std = arr.std()
         ir = ic_mean / ic_std if ic_std > 0 else 0
@@ -112,16 +151,34 @@ class ICMonitor:
         }
 
     def is_decaying(self, factor_name: str) -> bool:
-        """判断因子是否IC衰减"""
+        """判断因子是否IC衰减（连续N天|IC|<阈值）"""
         records = self.ic_records.get(factor_name, [])
         if len(records) < self.decay_days:
             return False
         recent = records[-self.decay_days:]
-        return all(abs(ic) < self.decay_threshold for ic in recent)
+        return all(
+            abs(r['ic'] if isinstance(r, dict) else r) < self.decay_threshold
+            for r in recent
+        )
+
+    def is_strong(self, factor_name: str, threshold: float = 0.05) -> bool:
+        """判断因子是否IC强劲（连续N天|IC|>阈值）"""
+        records = self.ic_records.get(factor_name, [])
+        if len(records) < self.decay_days:
+            return False
+        recent = records[-self.decay_days:]
+        return all(
+            abs(r['ic'] if isinstance(r, dict) else r) > threshold
+            for r in recent
+        )
 
     def get_decaying_factors(self) -> list:
         """获取所有衰减因子"""
         return [name for name in self.ic_records if self.is_decaying(name)]
+
+    def get_strong_factors(self, threshold: float = 0.05) -> list:
+        """获取所有强劲因子"""
+        return [name for name in self.ic_records if self.is_strong(name, threshold)]
 
     def rank_factors(self) -> list:
         """按IR排序所有因子"""
@@ -131,6 +188,37 @@ class ICMonitor:
             ranked.append((name, stats_dict["ir"], stats_dict["ic_mean"]))
         ranked.sort(key=lambda x: abs(x[1]), reverse=True)
         return ranked
+
+    # ============================================================
+    # 持久化
+    # ============================================================
+
+    def save(self, path: str = None):
+        """将IC历史序列化为JSON文件"""
+        save_path = path or self.history_path
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(self.ic_records, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"IC历史保存失败({save_path}): {e}")
+
+    def load(self, path: str = None):
+        """从JSON文件恢复IC历史"""
+        load_path = path or self.history_path
+        try:
+            if os.path.exists(load_path):
+                with open(load_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.ic_records = data
+                    logger.info(f"IC历史已加载: {len(data)}个因子, "
+                               f"共{sum(len(v) for v in data.values())}条记录")
+                else:
+                    logger.warning(f"IC历史文件格式异常，已忽略")
+        except Exception as e:
+            logger.warning(f"IC历史加载失败({load_path}): {e}")
+            self.ic_records = {}
 
     def layer_backtest(self, factor_values: pd.Series, forward_returns: pd.Series,
                        n_layers: int = 5) -> dict:

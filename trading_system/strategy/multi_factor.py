@@ -243,8 +243,9 @@ class MultiFactorScorer:
                     score += 10
                 elif roe < 5:
                     score -= 10
-        except Exception:
-            pass  # 基本面数据不可用时保持中性
+        # FIX: 修复基本面数据异常时except pass静默吞没，改为记录日志
+        except Exception as e:
+            logger.debug(f"基本面评分异常: {e}")
 
         return max(0, min(100, score))
 

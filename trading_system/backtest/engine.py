@@ -16,6 +16,7 @@
 
 import logging
 import datetime
+import time
 import pandas as pd
 import numpy as np
 from typing import Callable, Optional
@@ -28,6 +29,7 @@ import config
 from backtest.broker import SimBroker, Order, CostConfig
 from backtest.data_feed import DataFeed
 from backtest.metrics import generate_performance_report, format_report_text
+from attribution.trade_log import TradeLog
 
 logger = logging.getLogger(__name__)
 
@@ -131,10 +133,13 @@ class BacktestEngineV2:
         self.feed: Optional[DataFeed] = None
         self.daily_values: list[dict] = []
         self.order_log: list[dict] = []
+        self.trade_log: Optional[TradeLog] = None
 
     def run(self, data_dict: dict, strategy_fn: StrategyFn = None,
             start_date: str = None, end_date: str = None,
-            benchmark_code: str = None) -> dict:
+            benchmark_code: str = None,
+            auto_monte_carlo: bool = True,
+            mc_simulations: int = 1000) -> dict:
         """
         运行回测
         
@@ -144,6 +149,8 @@ class BacktestEngineV2:
             start_date: 回测开始日期
             end_date: 回测结束日期
             benchmark_code: 基准指数代码（默认沪深300）
+            auto_monte_carlo: 是否自动运行Monte Carlo压力测试
+            mc_simulations: Monte Carlo模拟次数
         
         返回:
             绩效报告字典
@@ -156,6 +163,9 @@ class BacktestEngineV2:
         self.feed = DataFeed(data_dict, start_date, end_date)
         self.daily_values = []
         self.order_log = []
+        # TradeLog：仅内存使用，不写入实盘日志文件
+        self.trade_log = TradeLog()
+        self.trade_log.trades = []
 
         if not self.feed.trading_dates:
             return {"error": "无有效交易日数据"}
@@ -171,7 +181,16 @@ class BacktestEngineV2:
         self._force_close_all()
 
         # 生成报告
-        return self._build_report(benchmark_code)
+        report = self._build_report(benchmark_code)
+
+        # 新增指标日志摘要
+        self._log_new_metrics(report)
+
+        # Monte Carlo 压力测试
+        if auto_monte_carlo:
+            self._run_monte_carlo(report, mc_simulations)
+
+        return report
 
     def _process_day(self, date: str, strategy_fn: StrategyFn):
         """处理单个交易日"""
@@ -205,6 +224,14 @@ class BacktestEngineV2:
                     "shares": fill.shares, "price": fill.price,
                     "cost": fill.total_cost, "reason": order.reason,
                 })
+                # TradeLog 记录卖出
+                try:
+                    self.trade_log.record_sell(
+                        code=order.code, price=fill.price,
+                        date=date, reason=order.reason,
+                    )
+                except Exception as e:
+                    logger.debug(f"TradeLog record_sell 异常: {e}")
 
         for order in buy_orders:
             bar = self.feed.get_bar(order.code, date)
@@ -215,6 +242,26 @@ class BacktestEngineV2:
                     "shares": fill.shares, "price": fill.price,
                     "cost": fill.total_cost, "reason": order.reason,
                 })
+                # TradeLog 记录买入
+                try:
+                    self.trade_log.record_buy(
+                        code=order.code, price=fill.price,
+                        shares=fill.shares, date=date,
+                        reason=order.reason,
+                    )
+                except Exception as e:
+                    logger.debug(f"TradeLog record_buy 异常: {e}")
+
+        # 5.5 更新持仓MFE/MAE
+        for code in list(self.broker.positions.keys()):
+            price_info = price_dict.get(code)
+            if price_info:
+                cur_price = price_info.get("close") if isinstance(price_info, dict) else price_info
+                if cur_price:
+                    try:
+                        self.trade_log.update_extremes(code, float(cur_price))
+                    except Exception:
+                        pass
 
         # 6. 记录每日净值
         total_value = self.broker.get_total_value(price_dict)
@@ -228,6 +275,8 @@ class BacktestEngineV2:
 
     def _force_close_all(self):
         """回测结束强制平仓"""
+        # FIX: 修复末日跌停无法平仓导致净值偏乐观的问题，
+        # 跌停无法卖出时按跌停价估值并标注“末日未平仓”
         if not self.feed.trading_dates:
             return
         final_date = self.feed.trading_dates[-1]
@@ -242,7 +291,32 @@ class BacktestEngineV2:
                     date=final_date,
                     reason="回测结束强制平仓",
                 )
-                self.broker.execute_sell(order, bar)
+                fill = self.broker.execute_sell(order, bar)
+                if fill:
+                    self.order_log.append({
+                        "date": order.date, "code": code, "action": "sell",
+                        "shares": fill.shares, "price": fill.price,
+                        "cost": fill.total_cost, "reason": "回测结束强制平仓",
+                    })
+                    try:
+                        self.trade_log.record_sell(
+                            code=code, price=fill.price,
+                            date=order.date, reason="回测结束强制平仓",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # 跌停无法卖出：按跌停价估值，记录为末日未平仓
+                    limit_down_price = round(bar["pre_close"] * 0.9, 2) if bar.get("pre_close", 0) > 0 else bar["close"]
+                    self.order_log.append({
+                        "date": final_date, "code": code, "action": "sell",
+                        "shares": pos.shares, "price": limit_down_price,
+                        "cost": 0, "reason": "末日未平仓(跌停无法卖出)",
+                    })
+                    # 修正净值：将该持仓按跌停价重新估值
+                    self.broker.cash += pos.shares * limit_down_price
+                    del self.broker.positions[code]
+                    logger.warning(f"{code} 末日跌停无法平仓，按跌停价{limit_down_price}估值")
 
     def _build_report(self, benchmark_code: str = None) -> dict:
         """构建绩效报告"""
@@ -279,6 +353,19 @@ class BacktestEngineV2:
             benchmark_curve=benchmark_curve,
             initial_capital=self.initial_capital,
         )
+
+        # 合并 TradeLog MFE/MAE 统计
+        try:
+            tl_stats = self.trade_log.get_stats()
+            if tl_stats.get("total", 0) > 0:
+                report["trade_log_mfe"] = round(tl_stats.get("avg_mfe", 0), 4)
+                report["trade_log_mae"] = round(tl_stats.get("avg_mae", 0), 4)
+                report["trade_log_mfe_capture"] = round(tl_stats.get("mfe_capture", 0), 4)
+                logger.info(f"TradeLog MFE/MAE: 平均MFE={tl_stats.get('avg_mfe', 0):.2%}, "
+                           f"平均MAE={tl_stats.get('avg_mae', 0):.2%}, "
+                           f"MFE捕获率={tl_stats.get('mfe_capture', 0):.2%}")
+        except Exception as e:
+            logger.warning(f"TradeLog 统计合并失败: {e}")
 
         # 附加信息
         report["total_commission"] = round(self.broker.total_commission, 2)
@@ -329,6 +416,75 @@ class BacktestEngineV2:
             return pd.DataFrame(pnl_records)
         return trades_df
 
+    def _log_new_metrics(self, report: dict):
+        """输出新增指标摘要日志"""
+        try:
+            logger.info("─── 新增绩效指标 ───")
+            logger.info(f"  条件Sharpe:     {report.get('conditional_sharpe', 0):.2f}")
+            logger.info(f"  CVaR(95%):      {report.get('cvar_95', 0):.2%}")
+            logger.info(f"  年化换手率:     {report.get('annual_turnover', 0):.2f}")
+            logger.info(f"  月均换手率:     {report.get('monthly_turnover', 0):.2f}")
+            logger.info(f"  总交易金额:     {report.get('total_trade_amount', 0):,.0f} 元")
+        except Exception as e:
+            logger.debug(f"新增指标日志输出失败: {e}")
+
+    def _run_monte_carlo(self, report: dict, mc_simulations: int):
+        """运行Monte Carlo压力测试并合并结果到报告"""
+        trades_df = report.get("trades")
+        if trades_df is None or (hasattr(trades_df, 'empty') and trades_df.empty):
+            logger.info("Monte Carlo: 无交易记录，跳过")
+            return
+
+        # 转换为 MonteCarloStressTest 需要的格式
+        if isinstance(trades_df, pd.DataFrame) and "pnl_pct" in trades_df.columns:
+            trades_list = trades_df.to_dict("records")
+        else:
+            logger.info("Monte Carlo: 交易记录缺少pnl_pct字段，跳过")
+            return
+
+        n_trades = len(trades_list)
+        if n_trades < 10:
+            logger.info(f"Monte Carlo: 交易次数({n_trades})<10，样本不足跳过")
+            report["mc_skipped"] = True
+            report["mc_skip_reason"] = f"交易次数不足({n_trades}<10)"
+            return
+
+        try:
+            from backtest.monte_carlo import MonteCarloStressTest
+
+            t0 = time.time()
+            mc = MonteCarloStressTest(n_simulations=mc_simulations)
+            mc_result = mc.run(trades_list, self.initial_capital)
+            elapsed = time.time() - t0
+
+            if elapsed > 60:
+                logger.warning(f"Monte Carlo 耗时过长: {elapsed:.1f}秒 (>60秒)")
+
+            if "error" in mc_result:
+                logger.warning(f"Monte Carlo 执行失败: {mc_result['error']}")
+                report["mc_skipped"] = True
+                report["mc_skip_reason"] = mc_result["error"]
+                return
+
+            # 合并关键指标到报告
+            report["mc_95_max_drawdown"] = mc_result["max_drawdown_distribution"]["p95"]
+            report["mc_bankruptcy_prob"] = mc_result["ruin_probability"]
+            report["mc_avg_drawdown"] = mc_result["max_drawdown_distribution"]["mean"]
+            report["mc_result"] = mc_result
+
+            # 日志输出摘要
+            logger.info(f"Monte Carlo 压力测试完成 ({mc_simulations}次模拟, {n_trades}笔交易, {elapsed:.1f}秒)")
+            logger.info(f"  95%置信度最大回撤: {report['mc_95_max_drawdown']:.1%}")
+            logger.info(f"  平均回撤: {report['mc_avg_drawdown']:.1%}")
+            logger.info(f"  破产概率(资金腰斩): {report['mc_bankruptcy_prob']:.2%}")
+            if mc_result.get("confidence_statement"):
+                logger.info(f"  {mc_result['confidence_statement']}")
+
+        except Exception as e:
+            logger.warning(f"Monte Carlo 执行异常，不影响回测结果: {e}")
+            report["mc_skipped"] = True
+            report["mc_skip_reason"] = str(e)
+
 
 # ============================================================
 # 便捷接口
@@ -338,7 +494,9 @@ def run_backtest_v2(stock_codes: list = None, data_dict: dict = None,
                     initial_capital: float = None,
                     start_date: str = None, end_date: str = None,
                     strategy_fn: StrategyFn = None,
-                    benchmark_code: str = "000300") -> dict:
+                    benchmark_code: str = "000300",
+                    auto_monte_carlo: bool = True,
+                    mc_simulations: int = 1000) -> dict:
     """
     便捷回测接口 V2
     
@@ -350,6 +508,8 @@ def run_backtest_v2(stock_codes: list = None, data_dict: dict = None,
         end_date: 结束日期
         strategy_fn: 自定义策略函数
         benchmark_code: 基准指数代码
+        auto_monte_carlo: 是否自动运行Monte Carlo压力测试
+        mc_simulations: Monte Carlo模拟次数
     
     返回:
         绩效报告字典
@@ -363,7 +523,8 @@ def run_backtest_v2(stock_codes: list = None, data_dict: dict = None,
                                       end_date or datetime.date.today().strftime("%Y-%m-%d"))
 
     engine = BacktestEngineV2(initial_capital)
-    report = engine.run(data_dict, strategy_fn, start_date, end_date, benchmark_code)
+    report = engine.run(data_dict, strategy_fn, start_date, end_date,
+                        benchmark_code, auto_monte_carlo, mc_simulations)
     return report
 
 
@@ -459,6 +620,15 @@ if __name__ == "__main__":
     print(f"\n  交易成本: 佣金{report.get('total_commission', 0):,.0f}元 + "
           f"印花税{report.get('total_stamp_tax', 0):,.0f}元 = "
           f"合计{report.get('total_cost', 0):,.0f}元")
+
+    # Monte Carlo 摘要输出
+    if report.get("mc_95_max_drawdown") is not None:
+        print(f"\n  Monte Carlo 压力测试:")
+        print(f"    95%置信度最大回撤: {report['mc_95_max_drawdown']:.1%}")
+        print(f"    平均回撤: {report['mc_avg_drawdown']:.1%}")
+        print(f"    破产概率(资金腰斩): {report['mc_bankruptcy_prob']:.2%}")
+    elif report.get("mc_skipped"):
+        print(f"\n  Monte Carlo: 已跳过 ({report.get('mc_skip_reason', '未知原因')})")
 
     # 生成HTML报告
     from backtest.report import generate_html_report

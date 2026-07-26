@@ -74,8 +74,15 @@ class MLPredictor:
 
         try:
             prob = self.model.predict_proba(current)[0]
-            # prob[1] = 上涨概率
-            return float(prob[1]) if len(prob) > 1 else float(prob[0])
+            # FIX: 修复三分类模型概率索引错误，prob[1]是震荡而非上涨
+            classes = list(self.model.classes_) if hasattr(self.model, 'classes_') else None
+            if classes and len(classes) == 3:
+                # 三分类: {-1, 0, 1}，动态定位上涨类别索引
+                up_idx = classes.index(1) if 1 in classes else 2
+                return float(prob[up_idx])
+            else:
+                # 二分类: 保持现有逻辑
+                return float(prob[1]) if len(prob) > 1 else float(prob[0])
         except Exception as e:
             logger.debug(f"ML预测失败: {e}")
             return None
@@ -103,6 +110,15 @@ class MLPredictor:
                 "ml_prob": 0.5,
                 "action": traditional_signal,
                 "reason": "ML模型未加载，直接通过",
+            }
+
+        # 检查模型是否已降级
+        if self._is_monitor_degraded():
+            return {
+                "confirmed": True,
+                "ml_prob": 0.5,
+                "action": traditional_signal,
+                "reason": "ML模型已降级(准确率不足)，跳过ML确认",
             }
 
         prob = self.predict(df)
@@ -149,6 +165,22 @@ class MLPredictor:
             "action": "hold",
             "reason": f"观望(ML概率{prob:.1%})",
         }
+
+    def _is_monitor_degraded(self) -> bool:
+        """检查模型监控器是否已标记降级（准确率<45%）"""
+        try:
+            from ml.monitor import ModelMonitor
+            monitor = ModelMonitor()
+            report = monitor.get_accuracy_report(days=30)
+            accuracy = report.get('accuracy', 0.5)
+            total = report.get('total', 0)
+            if total >= 20 and accuracy < 0.45:
+                logger.warning(f"ML模型已降级: 30天准确率{accuracy:.1%} < 45%")
+                return True
+            return report.get('is_degraded', False)
+        except Exception as e:
+            logger.debug(f"监控器检查失败(不影响预测): {e}")
+            return False
 
     @property
     def is_ready(self) -> bool:

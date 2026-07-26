@@ -1,13 +1,16 @@
 """
-反主力操控分析模块 V1.0
+反主力操控分析模块 V2.0
 ========================
 识别主力洗盘、诱多、诱空等操控行为，辅助止损/止盈决策
 
 核心检测:
-  1. 量价背离识别（洗盘 vs 出货）
-  2. 诱多/诱空陷阱检测
-  3. 主力行为评分（0-100）
-  4. 评分影响止损阈值
+  1. 量价背离识别（洗盘 vs 出货）—— ATR自适应窗口(5-10天)
+  2. 洗盘特征检测 —— ATR自适应窗口(7-14天)
+  3. 诱多/诱空陷阱检测
+  4. 主力行为评分（0-100）
+  5. 评分影响止损阈值 —— 基于ATR动态倍数
+  6. 对倒骗线检测 —— 量能阈值自适应
+  7. 大单净流入异常检测（压盘吸筹识别）
 
 使用方式:
     from strategy.anti_manipulation import AntiManipulationAnalyzer
@@ -115,12 +118,19 @@ class AntiManipulationAnalyzer:
         if pattern_score != 0:
             details.append(pat_detail)
 
+        # ---- 7. 大单净流入异常检测（压盘吸筹） ----
+        accum_result = self.detect_accumulation_anomaly(df)
+        if accum_result.get("is_accumulation"):
+            score += 15  # 压盘吸筹 → 洗盘概率增加15分
+            details.append(accum_result["description"])
+            logger.info(f"[{code}] 检测到压盘吸筹信号(置信度{accum_result['confidence']:.2f}, 持续{accum_result['days']}天)")
+
         # 限制评分范围
         score = max(0, min(100, score))
         result["manipulation_score"] = score
 
         # ---- 生成建议 ----
-        result.update(self._generate_suggestion(score, result, holding))
+        result.update(self._generate_suggestion(score, result, holding, df))
         result["detail"] = " | ".join(details[:4])  # 最多4条
 
         # 置信度：基于数据量和信号强度
@@ -131,12 +141,73 @@ class AntiManipulationAnalyzer:
         return result
 
     # ============================================================
-    # 量价背离分析
+    # ATR计算与动态窗口辅助方法
+    # ============================================================
+
+    def _compute_atr(self, df: pd.DataFrame, period: int = 20) -> float:
+        """
+        计算N日ATR（Average True Range）
+        使用标准公式: True Range的N日移动平均
+        """
+        if len(df) < period + 1:
+            period = max(1, len(df) - 1)
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
+        tr_list = []
+        start_idx = len(highs) - period
+        for i in range(max(1, start_idx), len(highs)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1])
+            )
+            tr_list.append(tr)
+        return np.mean(tr_list) if tr_list else 0.0
+
+    def _get_dynamic_window(self, df: pd.DataFrame, min_window: int, max_window: int,
+                            low_vol_pct: float = 0.015, high_vol_pct: float = 0.03) -> int:
+        """
+        根据ATR/price比率动态计算检测窗口
+        - ATR/price > high_vol_pct → max_window（高波动用大窗口）
+        - ATR/price < low_vol_pct  → min_window（低波动用小窗口）
+        - 中间线性插值
+        """
+        atr = self._compute_atr(df, 20)
+        price = df["close"].iloc[-1] if not df.empty else 1.0
+        if price <= 0:
+            return min_window
+        atr_pct = atr / price
+        if atr_pct >= high_vol_pct:
+            return max_window
+        elif atr_pct <= low_vol_pct:
+            return min_window
+        else:
+            ratio = (atr_pct - low_vol_pct) / (high_vol_pct - low_vol_pct)
+            return int(min_window + ratio * (max_window - min_window))
+
+    def _get_dynamic_vol_threshold(self, df: pd.DataFrame) -> float:
+        """
+        对倒骗线量能阈值动态化：基于20日成交量均值+2倍标准差
+        返回量比阈值（相对均量的倍数），最低1.5
+        """
+        if len(df) < 20:
+            return 1.5
+        vol_series = df["volume"].tail(20)
+        vol_ma20 = vol_series.mean()
+        vol_std20 = vol_series.std()
+        if vol_ma20 <= 0:
+            return 1.5
+        vol_threshold = vol_ma20 + 2 * vol_std20
+        return max(1.5, vol_threshold / vol_ma20)
+
+    # ============================================================
+    # 量价背离分析（ATR自适应窗口）
     # ============================================================
 
     def _analyze_volume_price(self, df: pd.DataFrame) -> tuple:
         """
-        量价关系分析:
+        量价关系分析（窗口根据ATR动态调整5-10天）:
         - 价跌量缩 = 洗盘概率大 (+20)
         - 价跌量增 = 真出货 (-15)
         - 价涨量缩 = 诱多嫌疑 (-10)
@@ -145,8 +216,12 @@ class AntiManipulationAnalyzer:
         if len(df) < 5:
             return "数据不足", 0, ""
 
-        # 最近3天的价格和成交量变化
-        recent = df.tail(3)
+        # ATR动态窗口: 高波动10天，低波动5天
+        window = self._get_dynamic_window(df, min_window=5, max_window=10)
+        window = min(window, len(df))
+        recent = df.tail(window)
+        logger.debug(f"量价背离分析窗口={window}天(ATR自适应)")
+
         price_change = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
 
         # 成交量均值对比
@@ -154,24 +229,31 @@ class AntiManipulationAnalyzer:
         recent_vol_avg = recent["volume"].mean()
         vol_ratio = recent_vol_avg / vol_ma20 if vol_ma20 > 0 else 1.0
 
+        # 动态量能阈值（对倒骗线检测）
+        dyn_vol_threshold = self._get_dynamic_vol_threshold(df)
+
         if price_change < -0.02:  # 价格下跌>2%
             if vol_ratio < self.volume_shrink_ratio:
                 state = "缩量回调"
                 score = 20
-                detail = f"价跌量缩(量比{vol_ratio:.2f})，洗盘概率大"
-            else:
+                detail = f"价跌量缩({window}日量比{vol_ratio:.2f})，洗盘概率大"
+            elif vol_ratio > dyn_vol_threshold:
                 state = "放量下跌"
                 score = -15
-                detail = f"价跌量增(量比{vol_ratio:.2f})，出货嫌疑"
+                detail = f"价跌量增({window}日量比{vol_ratio:.2f}>阈值{dyn_vol_threshold:.2f})，出货嫌疑"
+            else:
+                state = "放量下跌"
+                score = -10
+                detail = f"价跌量增({window}日量比{vol_ratio:.2f})，偏空"
         elif price_change > 0.02:  # 价格上涨>2%
             if vol_ratio < self.volume_shrink_ratio:
                 state = "缩量上涨"
                 score = -10
-                detail = f"价涨量缩(量比{vol_ratio:.2f})，诱多嫌疑"
+                detail = f"价涨量缩({window}日量比{vol_ratio:.2f})，诱多嫌疑"
             else:
                 state = "放量上涨"
                 score = 5
-                detail = f"价涨量增(量比{vol_ratio:.2f})，健康上涨"
+                detail = f"价涨量增({window}日量比{vol_ratio:.2f})，健康上涨"
         else:
             state = "量价平稳"
             score = 0
@@ -185,7 +267,7 @@ class AntiManipulationAnalyzer:
 
     def _detect_wash_trading(self, df: pd.DataFrame) -> tuple:
         """
-        洗盘特征:
+        洗盘特征检测（窗口根据ATR动态调整7-14天）:
         1. 快速下跌后快速收回（V型/长下影线）
         2. 下跌时缩量，反弹时放量
         3. 连续小阴线后突然大阳
@@ -197,8 +279,14 @@ class AntiManipulationAnalyzer:
         if len(df) < 10:
             return 0, ""
 
+        # ATR动态窗口: 高波动14天，低波动7天
+        window = self._get_dynamic_window(df, min_window=7, max_window=14)
+        window = min(window, len(df))
+        logger.debug(f"洗盘特征检测窗口={window}天(ATR自适应)")
+
         latest = df.iloc[-1]
         prev = df.iloc[-2]
+        recent = df.tail(window)
 
         # 特征1: 长下影线（下影线>实体2倍）
         body = abs(latest["close"] - latest["open"])
@@ -207,21 +295,21 @@ class AntiManipulationAnalyzer:
             score += 15
             details.append("长下影线(洗盘特征)")
 
-        # 特征2: 连续小阴线后大阳
-        if len(df) >= 5:
-            recent_5 = df.tail(5)
+        # 特征2: 连续小阴线后大阳（使用动态窗口）
+        if len(df) >= window:
             small_yin_count = 0
-            for i in range(4):
-                row = recent_5.iloc[i]
+            for i in range(window - 1):
+                row = recent.iloc[i]
                 if row["close"] < row["open"]:  # 阴线
                     change = (row["open"] - row["close"]) / row["open"]
                     if change < 0.02:  # 小阴线(<2%)
                         small_yin_count += 1
             # 最后一天是大阳线
             last_change = (latest["close"] - latest["open"]) / latest["open"] if latest["open"] > 0 else 0
-            if small_yin_count >= 3 and last_change > 0.03:
+            yin_threshold = max(3, int(window * 0.6))  # 60%以上为小阴线
+            if small_yin_count >= yin_threshold and last_change > 0.03:
                 score += 20
-                details.append("连续小阴后大阳(典型洗盘完成)")
+                details.append(f"连续小阴后大阳({window}日内{small_yin_count}根小阴,典型洗盘完成)")
 
         # 特征3: 跌破MA20后快速收回
         if len(df) >= 21 and "ma20" in df.columns:
@@ -232,10 +320,10 @@ class AntiManipulationAnalyzer:
                 score += 10
                 details.append("跌破MA20后收回(诱空洗盘)")
 
-        # 特征4: 急跌后缩量企稳
-        if len(df) >= 5:
+        # 特征4: 急跌后缩量企稳（使用动态窗口）
+        if len(df) >= window:
             max_drop = 0
-            for i in range(-5, -1):
+            for i in range(-(window), -1):
                 idx = len(df) + i
                 if idx > 0:
                     day_change = (df.iloc[idx]["close"] - df.iloc[idx-1]["close"]) / df.iloc[idx-1]["close"]
@@ -246,7 +334,7 @@ class AntiManipulationAnalyzer:
                 vol_ratio = latest["volume"] / df["volume"].tail(20).mean() if df["volume"].tail(20).mean() > 0 else 1
                 if vol_ratio < 0.6:
                     score += 10
-                    details.append("急跌后缩量企稳(洗盘尾声)")
+                    details.append(f"急跌后缩量企稳({window}日内最大跌幅{max_drop:.1%},洗盘尾声)")
 
         detail_str = "+".join(details) if details else ""
         return score, detail_str
@@ -278,6 +366,9 @@ class AntiManipulationAnalyzer:
             if high_day_vol > 0 and volume < high_day_vol * self.bull_trap_vol_ratio:
                 return True, f"突破前高{high_20d:.2f}但量能仅{volume/high_day_vol:.0%}(诱多)"
 
+        # 动态量能阈值（基于个股流动性自适应）
+        dyn_vol_threshold = self._get_dynamic_vol_threshold(df)
+
         # 检测2: 高位放量长上影线
         if len(df) >= 20:
             ma20 = latest.get("ma20", close)
@@ -285,8 +376,8 @@ class AntiManipulationAnalyzer:
                 upper_shadow = latest["high"] - max(latest["close"], latest["open"])
                 body = abs(latest["close"] - latest["open"])
                 vol_ma = df["volume"].tail(20).mean()
-                if body > 0 and upper_shadow > body * 2 and volume > vol_ma * 1.5:
-                    return True, "高位放量长上影(诱多出货)"
+                if body > 0 and upper_shadow > body * 2 and volume > vol_ma * dyn_vol_threshold:
+                    return True, f"高位放量长上影(量比>{dyn_vol_threshold:.2f}动态阈值,诱多出货)"
 
         return False, ""
 
@@ -349,19 +440,11 @@ class AntiManipulationAnalyzer:
 
         latest = df.iloc[-1]
 
-        # 计算ATR(14)
-        if "atr" in df.columns:
+        # 计算ATR(14) - 优先使用统一方法
+        if "atr" in df.columns and not pd.isna(latest.get("atr", np.nan)):
             atr = latest.get("atr", 0)
         else:
-            # 手动计算ATR
-            highs = df["high"].tail(14).values
-            lows = df["low"].tail(14).values
-            closes = df["close"].tail(14).values
-            tr_list = []
-            for i in range(1, len(highs)):
-                tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-                tr_list.append(tr)
-            atr = np.mean(tr_list) if tr_list else 0
+            atr = self._compute_atr(df, 14)
 
         # 日内振幅
         amplitude = latest["high"] - latest["low"]
@@ -408,17 +491,18 @@ class AntiManipulationAnalyzer:
                     score += 25
                     details.append("地天板/大幅V反(极端洗盘)")
 
-        # 高位十字星
+        # 高位十字星（量能阈值动态化）
         if len(df) >= 20:
             ma20 = latest.get("ma20", latest["close"])
             body = abs(latest["close"] - latest["open"])
             total_range = latest["high"] - latest["low"]
+            dyn_vol_threshold = self._get_dynamic_vol_threshold(df)
             if ma20 > 0 and latest["close"] > ma20 * 1.08:
                 if total_range > 0 and body / total_range < 0.1:  # 十字星
                     vol_ma = df["volume"].tail(20).mean()
-                    if latest["volume"] > vol_ma * 1.5:
+                    if latest["volume"] > vol_ma * dyn_vol_threshold:
                         score -= 5
-                        details.append("高位放量十字星(变盘)")
+                        details.append(f"高位放量十字星(量比>{dyn_vol_threshold:.2f}动态阈值,变盘)")
 
         detail_str = "+".join(details) if details else ""
         return score, detail_str
@@ -427,41 +511,174 @@ class AntiManipulationAnalyzer:
     # 生成操作建议
     # ============================================================
 
-    def _generate_suggestion(self, score: int, result: dict, holding: dict) -> dict:
-        """根据评分生成操作建议和止损调整"""
+    def _generate_suggestion(self, score: int, result: dict, holding: dict,
+                              df: pd.DataFrame = None) -> dict:
+        """
+        根据评分生成操作建议和止损调整
+        V2.0: 止损调整改用ATR动态倍数，并设置合理性边界
+        """
         suggestion = "正常操作"
         stop_adjust = 0.0
 
+        # 计算ATR用于动态止损
+        atr = self._compute_atr(df, 20) if df is not None and not df.empty else 0
+        price = df["close"].iloc[-1] if df is not None and not df.empty else 0
+        # 原始止损基准（默认8%）
+        base_stop_pct = 0.08
+
         if score >= 75:
             suggestion = "高度疑似洗盘，建议持有观望，放宽止损"
-            stop_adjust = 0.03  # 放宽3%
+            # 洗盘高分：放宽 1.5 * ATR
+            if atr > 0 and price > 0:
+                stop_adjust = min(1.5 * atr / price, base_stop_pct * 0.20)  # 放宽不超过原始止损的20%
+                logger.debug(f"止损放宽: 1.5*ATR={1.5*atr/price:.3f}, 上限={base_stop_pct*0.20:.3f}")
+            else:
+                stop_adjust = 0.03  # 回退到固定值
         elif score >= 60:
             suggestion = "疑似洗盘，建议观望，暂不触发止损"
-            stop_adjust = 0.02  # 放宽2%
+            if atr > 0 and price > 0:
+                stop_adjust = min(1.0 * atr / price, base_stop_pct * 0.20)
+            else:
+                stop_adjust = 0.02
         elif score >= 45:
             suggestion = "主力行为不明显，按正常策略操作"
             stop_adjust = 0.0
         elif score >= 30:
             suggestion = "偏空信号，注意风险，收紧止损"
-            stop_adjust = -0.01  # 收紧1%
+            # 出货偏空：收紧 0.5 * ATR
+            if atr > 0 and price > 0:
+                stop_adjust = -min(0.5 * atr / price, base_stop_pct * 0.50)  # 收紧不低于原始止损的50%
+                logger.debug(f"止损收紧: 0.5*ATR={0.5*atr/price:.3f}, 上限={base_stop_pct*0.50:.3f}")
+            else:
+                stop_adjust = -0.01
         else:
             suggestion = "真破位概率大，严格执行止损"
-            stop_adjust = -0.02  # 收紧2%
+            if atr > 0 and price > 0:
+                stop_adjust = -min(1.0 * atr / price, base_stop_pct * 0.50)
+            else:
+                stop_adjust = -0.02
 
         # 诱多特殊处理
         if result.get("bull_trap"):
             suggestion = "疑似诱多，勿追高，已持仓考虑减仓"
-            stop_adjust = -0.01
+            if atr > 0 and price > 0:
+                stop_adjust = -min(0.5 * atr / price, base_stop_pct * 0.50)
+            else:
+                stop_adjust = -0.01
 
         # 诱空特殊处理
         if result.get("bear_trap"):
             suggestion = "疑似诱空，勿恐慌割肉，可逢低补仓"
-            stop_adjust = 0.02
+            if atr > 0 and price > 0:
+                stop_adjust = min(1.0 * atr / price, base_stop_pct * 0.20)
+            else:
+                stop_adjust = 0.02
 
         return {
             "suggestion": suggestion,
-            "stop_loss_adjust": stop_adjust,
+            "stop_loss_adjust": round(stop_adjust, 4),
         }
+
+    # ============================================================
+    # 大单净流入异常检测（压盘吸筹）
+    # ============================================================
+
+    def detect_accumulation_anomaly(self, df: pd.DataFrame,
+                                    capital_flow_data: dict = None) -> dict:
+        """
+        检测大单净流入异常（压盘吸筹）
+
+        检测逻辑：主力大单连续3天以上净流出，但股价不跌（跌幅<1%或上涨）→ 判定为"压盘吸筹"
+
+        参数:
+            df: 日线DataFrame，需含close列；可选含capital_flow_net(大单净流入)列
+            capital_flow_data: 外部资金流数据（可选），格式 {"net_flow": [最近N日净流入列表]}
+
+        返回:
+            {"is_accumulation": bool, "confidence": float, "days": int, "description": str}
+        """
+        result = {
+            "is_accumulation": False,
+            "confidence": 0.0,
+            "days": 0,
+            "description": ""
+        }
+
+        if df.empty or len(df) < 5:
+            return result
+
+        # 获取大单净流入数据
+        net_flows = None
+        if capital_flow_data and "net_flow" in capital_flow_data:
+            net_flows = capital_flow_data["net_flow"]
+        elif "capital_flow_net" in df.columns:
+            net_flows = df["capital_flow_net"].tail(10).tolist()
+
+        if net_flows is None or len(net_flows) < 3:
+            # 无资金流数据，使用量价关系近似推断：
+            # 放量下跌日但收盘价接近开盘价 → 近似大单流出但股价不跌
+            recent = df.tail(10)
+            consecutive_days = 0
+            max_consecutive = 0
+            vol_ma = df["volume"].tail(20).mean() if len(df) >= 20 else df["volume"].mean()
+            # 使用位置索引遍历，避免时间索引类型问题
+            for i in range(len(recent)):
+                row = recent.iloc[i]
+                # 近似：当日成交量 > 均量 且 上影线较长 且 收盘跌幅 < 1%
+                is_large_outflow_approx = (
+                    row["volume"] > vol_ma * 1.2
+                    and row["high"] > max(row["open"], row["close"]) * 1.01  # 有上影
+                )
+                # 获取前一日收盘价用于计算涨跌幅
+                row_pos = len(df) - len(recent) + i
+                if row_pos > 0:
+                    prev_close = df.iloc[row_pos - 1]["close"]
+                    price_chg = (row["close"] - prev_close) / prev_close if prev_close > 0 else 0
+                else:
+                    price_chg = 0
+                price_not_dropping = price_chg > -0.01
+
+                if is_large_outflow_approx and price_not_dropping:
+                    consecutive_days += 1
+                    max_consecutive = max(max_consecutive, consecutive_days)
+                else:
+                    consecutive_days = 0
+
+            if max_consecutive >= 3:
+                confidence = min(0.9, 0.5 + (max_consecutive - 3) * 0.1)
+                result["is_accumulation"] = True
+                result["confidence"] = round(confidence, 2)
+                result["days"] = max_consecutive
+                result["description"] = f"疑似压盘吸筹(连续{max_consecutive}天大单流出但股价不跌,置信度{confidence:.0%})"
+            return result
+
+        # 有真实资金流数据时：检测连续净流出但股价不跌
+        closes = df["close"].tail(len(net_flows) + 1).tolist()
+        consecutive_days = 0
+        max_consecutive = 0
+        for i in range(len(net_flows)):
+            if net_flows[i] < 0:  # 净流出
+                # 对应日的价格变化
+                if i + 1 < len(closes):
+                    price_chg = (closes[i + 1] - closes[i]) / closes[i] if closes[i] > 0 else 0
+                else:
+                    price_chg = 0
+                if price_chg > -0.01:  # 股价不跌
+                    consecutive_days += 1
+                    max_consecutive = max(max_consecutive, consecutive_days)
+                else:
+                    consecutive_days = 0
+            else:
+                consecutive_days = 0
+
+        if max_consecutive >= 3:
+            confidence = min(0.95, 0.6 + (max_consecutive - 3) * 0.1)
+            result["is_accumulation"] = True
+            result["confidence"] = round(confidence, 2)
+            result["days"] = max_consecutive
+            result["description"] = f"压盘吸筹(连续{max_consecutive}天主力净流出但股价不跌,置信度{confidence:.0%})"
+
+        return result
 
     # ============================================================
     # 批量分析

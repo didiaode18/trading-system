@@ -94,8 +94,10 @@ class MomentumStrategy(BaseStrategy):
             vol_20 = np.mean(volume[-20:])
             vol_ok = 1 if vol_5 > vol_20 * 0.8 else 0
 
-            # 综合得分
-            score = momentum * 0.5 + bullish * 0.3 + vol_ok * 0.2
+            # 综合得分（V2: 动量归一化到0-1，避免量纲不一致）
+            # 动量5%=0.05, 20%=0.20, 截断到[0, 0.3]再归一化
+            momentum_norm = min(max(momentum, 0), 0.30) / 0.30  # 0-1
+            score = momentum_norm * 0.5 + bullish * 0.3 + vol_ok * 0.2
 
             if momentum > 0.05 and bullish:  # 至少5%动量+多头排列
                 signals.append((code, score, f"动量{momentum:.1%}+多头排列[冷静期1天]"))

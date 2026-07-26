@@ -120,7 +120,9 @@ class PoolManager:
             observe_start = info.get("observe_start", today.strftime("%Y-%m-%d"))
             try:
                 start_date = datetime.datetime.strptime(observe_start, "%Y-%m-%d").date()
-            except:
+            # FIX: 修复裸except吞没所有异常（包括KeyboardInterrupt/SystemExit）的问题
+            except (ValueError, TypeError) as e:
+                logger.warning(f"日期解析异常: {e}")
                 start_date = today
             days_observed = (today - start_date).days
 
@@ -167,7 +169,9 @@ class PoolManager:
             observe_start = info.get("observe_start", today.strftime("%Y-%m-%d"))
             try:
                 start_date = datetime.datetime.strptime(observe_start, "%Y-%m-%d").date()
-            except:
+            # FIX: 修复裸except吞没所有异常（包括KeyboardInterrupt/SystemExit）的问题
+            except (ValueError, TypeError) as e:
+                logger.warning(f"日期解析异常: {e}")
                 start_date = today
             if (today - start_date).days > 20:
                 self.watch_pool.pop(code)
@@ -195,7 +199,9 @@ class PoolManager:
         observe_start = info.get("observe_start", datetime.date.today().strftime("%Y-%m-%d"))
         try:
             start_date = datetime.datetime.strptime(observe_start, "%Y-%m-%d").date()
-        except:
+        # FIX: 修复裸except吞没所有异常（包括KeyboardInterrupt/SystemExit）的问题
+        except (ValueError, TypeError) as e:
+            logger.warning(f"日期解析异常: {e}")
             start_date = datetime.date.today()
 
         days = (datetime.date.today() - start_date).days

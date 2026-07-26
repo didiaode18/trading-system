@@ -128,7 +128,8 @@ class PerformanceAnalyzer:
                 "胜率": f"{win_rate:.0%}",
                 "盈亏比": round(pf, 2),
                 "累计盈亏": round(total_pnl, 0),
-                "贡献度": f"{total_pnl / abs(st['pnl'].sum()) * 100:.1f}%" if st["pnl"].sum() != 0 else "0%",
+                # FIX: 修复贡献度计算分母可能为0的除零错误
+                "贡献度": f"{total_pnl / max(abs(st['pnl'].sum()), 1e-6) * 100:.1f}%" if abs(st['pnl'].sum()) > 1e-6 else "0%",
             })
 
         df = pd.DataFrame(results)
@@ -157,7 +158,8 @@ class PerformanceAnalyzer:
                 "交易次数": trades_count,
                 "胜率": f"{win_rate:.0%}",
                 "累计盈亏": round(total_pnl, 0),
-                "贡献度": f"{total_pnl / abs(st['pnl'].sum()) * 100:.1f}%" if st["pnl"].sum() != 0 else "0%",
+                # FIX: 修复贡献度计算分母可能为0的除零错误
+                "贡献度": f"{total_pnl / max(abs(st['pnl'].sum()), 1e-6) * 100:.1f}%" if abs(st['pnl'].sum()) > 1e-6 else "0%",
             })
 
         df = pd.DataFrame(results)

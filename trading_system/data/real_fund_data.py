@@ -24,6 +24,8 @@
     result = fund.analyze("002415", df)
 """
 
+import threading
+import time
 import pandas as pd
 import numpy as np
 import logging
@@ -43,9 +45,13 @@ FUND_CONFIG = {
 class RealFundData:
     """真实资金数据获取器"""
 
+    # 类级别: 所有实例共享的失败缓存 {stock_code: last_failure_timestamp}
+    _stock_failure_cache: Dict[str, float] = {}
+    _cache_lock = threading.Lock()
+    _COOLDOWN_SECONDS = 300  # 5分钟冷却期
+
     def __init__(self, config: dict = None):
         self.cfg = {**FUND_CONFIG, **(config or {})}
-        self._akshare_ok = None
         self._cache = {}
 
     def analyze(self, code: str, df: pd.DataFrame = None) -> dict:
@@ -102,9 +108,36 @@ class RealFundData:
 
         return result
 
+    # ---- per-stock 冷却重试机制 ----
+
+    def _should_skip_stock(self, stock_code: str) -> bool:
+        """检查股票是否在冷却期内"""
+        with self._cache_lock:
+            last_fail = self._stock_failure_cache.get(stock_code)
+            if last_fail is None:
+                return False
+            if time.time() - last_fail < self._COOLDOWN_SECONDS:
+                return True
+            # 冷却期已过，清除记录
+            self._stock_failure_cache.pop(stock_code, None)
+            return False
+
+    def _mark_stock_failure(self, stock_code: str):
+        """记录股票获取失败时间"""
+        with self._cache_lock:
+            self._stock_failure_cache[stock_code] = time.time()
+
+    def _mark_stock_success(self, stock_code: str):
+        """股票获取成功，清除失败记录"""
+        with self._cache_lock:
+            if stock_code in self._stock_failure_cache:
+                del self._stock_failure_cache[stock_code]
+                logger.info(f"北向资金: {stock_code} 冷却期后重试成功")
+
     def _fetch_north_fund(self, code: str) -> Optional[dict]:
         """获取北向资金个股持仓数据"""
-        if self._akshare_ok is False:
+        if self._should_skip_stock(code):
+            logger.debug(f"北向资金: {code} 在冷却期内，跳过获取")
             return None
 
         try:
@@ -117,8 +150,6 @@ class RealFundData:
 
             if df is None or df.empty:
                 return None
-
-            self._akshare_ok = True
 
             # 解析最近N天数据
             recent = df.tail(10)
@@ -153,6 +184,8 @@ class RealFundData:
             else:
                 change_5d_pct = 0
 
+            self._mark_stock_success(code)
+
             return {
                 "current_holding": float(holdings[-1]),
                 "change_5d_pct": round(change_5d_pct, 2),
@@ -164,12 +197,14 @@ class RealFundData:
 
         except Exception as e:
             logger.debug(f"北向资金获取失败({code}): {e}")
-            self._akshare_ok = False
+            self._mark_stock_failure(code)
+            logger.warning(f"北向资金: {code} 获取失败，进入5分钟冷却期")
             return None
 
     def _fetch_margin_data(self, code: str) -> Optional[dict]:
         """获取融资融券数据"""
-        if self._akshare_ok is False:
+        if self._should_skip_stock(code):
+            logger.debug(f"融资融券: {code} 在冷却期内，跳过获取")
             return None
 
         try:
@@ -193,6 +228,8 @@ class RealFundData:
             margin_buy = float(row.get("融资买入额", 0))
             margin_balance = float(row.get("融资余额", 0))
 
+            self._mark_stock_success(code)
+
             return {
                 "margin_balance": margin_balance,
                 "margin_buy_today": margin_buy,
@@ -201,6 +238,8 @@ class RealFundData:
 
         except Exception as e:
             logger.debug(f"融资融券获取失败({code}): {e}")
+            self._mark_stock_failure(code)
+            logger.warning(f"融资融券: {code} 获取失败，进入5分钟冷却期")
             return None
 
     def _estimate_from_volume(self, code: str, df: pd.DataFrame) -> dict:

@@ -9,6 +9,9 @@
   3. 行业板块资金流向（发现资金聚集行业）
   4. 龙虎榜机构席位分析
   5. 资金流综合评分（供选股引擎调用）
+  6. 四级资金流分析（超大单/大单/中单/小单）
+  7. 资金流模式识别（吸筹/出货/洗盘）
+  8. 增强版资金流评分
 
 数据来源: akshare（东方财富）
 
@@ -392,6 +395,354 @@ class CapitalFlowAnalyzer:
             "stock_signal": stock_flow.get("signal", "unknown"),
             "detail": f"资金评分{total}/100 | 北向{north_score} 行业{sector_score} 主力{stock_score}"
         }
+
+    # ============================================================
+    # 四点五、四级资金流分析（增量增强）
+    # ============================================================
+
+    def _fetch_multi_level_flow_df(self, code: str, days: int = 10):
+        """获取个股四级资金流原始DataFrame，失败返回None"""
+        if not HAS_AKSHARE:
+            return None
+        try:
+            market = "sh" if code.startswith("6") else "sz"
+            df = ak.stock_individual_fund_flow(stock=code, market=market)
+            if df is None or df.empty:
+                return None
+            # 取最近 days 行
+            df = df.tail(days).reset_index(drop=True)
+            return df
+        except Exception as e:
+            logger.debug(f"[资金流] {code} 四级资金流获取失败: {e}")
+            return None
+
+    @staticmethod
+    def _find_flow_col(df: pd.DataFrame, keywords: list) -> str:
+        """在DataFrame列中按关键字顺序匹配，返回列名或None"""
+        for col in df.columns:
+            for kw in keywords:
+                if kw in col:
+                    return col
+        return None
+
+    @staticmethod
+    def _calc_flow_trend(values: np.ndarray) -> str:
+        """根据近几日数值判断趋势"""
+        if len(values) < 2:
+            return "neutral"
+        recent = values[-3:] if len(values) >= 3 else values
+        if all(recent[i] <= recent[i + 1] for i in range(len(recent) - 1)) and recent[-1] > 0:
+            return "increasing"
+        if all(recent[i] >= recent[i + 1] for i in range(len(recent) - 1)) and recent[-1] < 0:
+            return "decreasing"
+        avg = float(np.mean(recent))
+        if avg > 0:
+            return "net_inflow"
+        elif avg < 0:
+            return "net_outflow"
+        return "neutral"
+
+    def analyze_multi_level_flow(self, stock_code: str, days: int = 10) -> dict:
+        """
+        四级资金流分析（超大单/大单/中单/小单）
+
+        返回:
+            {
+                "super_large": {"net_inflow": float, "trend": str},  # 超大单
+                "large": {"net_inflow": float, "trend": str},        # 大单
+                "medium": {"net_inflow": float, "trend": str},       # 中单
+                "small": {"net_inflow": float, "trend": str},        # 小单
+                "main_force_direction": str,  # "buying"/"selling"/"neutral"
+                "visualization_data": {...},  # 柱状图数据（黄/蓝/绿/紫）
+                "success": bool
+            }
+        """
+        empty_result = {
+            "super_large": {"net_inflow": 0, "trend": "neutral"},
+            "large": {"net_inflow": 0, "trend": "neutral"},
+            "medium": {"net_inflow": 0, "trend": "neutral"},
+            "small": {"net_inflow": 0, "trend": "neutral"},
+            "main_force_direction": "neutral",
+            "visualization_data": {"dates": [], "bars": []},
+            "success": False,
+        }
+
+        df = self._fetch_multi_level_flow_df(stock_code, days)
+        if df is None:
+            return empty_result
+
+        # 匹配各等级列（akshare 返回列名如 "超大单净流入-净额" 等）
+        col_map = {
+            "super_large": self._find_flow_col(df, ["超大单"]),
+            "large": self._find_flow_col(df, ["大单"]),
+            "medium": self._find_flow_col(df, ["中单"]),
+            "small": self._find_flow_col(df, ["小单"]),
+        }
+
+        # 至少匹配到两个等级才有效
+        matched = {k: v for k, v in col_map.items() if v is not None}
+        if len(matched) < 2:
+            return empty_result
+
+        # 日期列
+        date_col = self._find_flow_col(df, ["日期", "date", "时间"])
+        if date_col is not None:
+            dates = [str(v) for v in df[date_col].tolist()]
+        else:
+            dates = [str(i) for i in range(len(df))]
+
+        result = {"success": True}
+        bars = []
+        main_net_total = 0.0
+
+        for level, col_name in matched.items():
+            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+            vals = df[col_name].dropna().values
+            net = round(float(vals[-1]), 2) if len(vals) >= 1 else 0.0
+            trend = self._calc_flow_trend(vals)
+            result[level] = {"net_inflow": net, "trend": trend}
+
+            # 主力 = 超大单 + 大单，用于方向判断
+            if level in ("super_large", "large"):
+                tail_n = min(3, len(vals))
+                main_net_total += float(np.sum(vals[-tail_n:])) if tail_n > 0 else 0
+
+        # 主力方向
+        if main_net_total > 0:
+            result["main_force_direction"] = "buying"
+        elif main_net_total < 0:
+            result["main_force_direction"] = "selling"
+        else:
+            result["main_force_direction"] = "neutral"
+
+        # 补充未匹配到的等级默认值
+        for level in ("super_large", "large", "medium", "small"):
+            if level not in result:
+                result[level] = {"net_inflow": 0, "trend": "neutral"}
+
+        # 构建可视化数据
+        for i, date_str in enumerate(dates):
+            # 主力（超大单+大单）净买入/卖出
+            main_val = 0.0
+            for lv in ("super_large", "large"):
+                cn = col_map.get(lv)
+                if cn and i < len(df):
+                    v = pd.to_numeric(df[cn].iloc[i], errors="coerce")
+                    if not pd.isna(v):
+                        main_val += float(v)
+            if main_val >= 0:
+                bars.append({
+                    "date": date_str, "type": "main_buy",
+                    "value": round(main_val, 2), "color": "yellow",
+                })
+            else:
+                bars.append({
+                    "date": date_str, "type": "main_sell",
+                    "value": round(main_val, 2), "color": "blue",
+                })
+
+            # 散户（中单+小单）
+            retail_val = 0.0
+            for lv in ("medium", "small"):
+                cn = col_map.get(lv)
+                if cn and i < len(df):
+                    v = pd.to_numeric(df[cn].iloc[i], errors="coerce")
+                    if not pd.isna(v):
+                        retail_val += float(v)
+            if retail_val >= 0:
+                bars.append({
+                    "date": date_str, "type": "retail_buy",
+                    "value": round(retail_val, 2), "color": "green",
+                })
+            else:
+                bars.append({
+                    "date": date_str, "type": "retail_sell",
+                    "value": round(retail_val, 2), "color": "purple",
+                })
+
+        result["visualization_data"] = {"dates": dates, "bars": bars}
+        return result
+
+    def detect_flow_pattern(self, stock_code: str, days: int = 10) -> dict:
+        """
+        资金流模式识别
+
+        识别模式:
+        - accumulation: 连续吸筹（主力连续净买入3天+但股价不涨或微涨）
+        - distribution: 集中出货（主力连续净卖出3天+但股价不跌或微跌）
+        - washout: 洗盘模式（大单卖出+超大单买入=对倒洗盘）
+        - neutral: 无明显模式
+
+        返回:
+            {"pattern": str, "confidence": float, "days": int, "description": str}
+        """
+        empty_pattern = {
+            "pattern": "neutral", "confidence": 0.0,
+            "days": 0, "description": "数据不足，无法识别模式",
+        }
+
+        df = self._fetch_multi_level_flow_df(stock_code, days)
+        if df is None:
+            return empty_pattern
+
+        # 主力净流入列
+        main_col = self._find_flow_col(df, ["主力净流入"])
+        super_col = self._find_flow_col(df, ["超大单"])
+        large_col = self._find_flow_col(df, ["大单"])
+
+        if main_col is None:
+            return empty_pattern
+
+        df[main_col] = pd.to_numeric(df[main_col], errors="coerce")
+        main_vals = df[main_col].dropna().values
+
+        if len(main_vals) < 3:
+            return empty_pattern
+
+        # 尝试获取涨跌幅列用于辅助判断
+        chg_col = self._find_flow_col(df, ["涨跌幅", "涨幅", "change"])
+        if chg_col is not None:
+            df[chg_col] = pd.to_numeric(df[chg_col], errors="coerce")
+            chg_vals = df[chg_col].dropna().values
+        else:
+            chg_vals = np.array([])
+
+        # --- 检测连续吸筹 accumulation ---
+        consec_buy = 0
+        for v in reversed(main_vals):
+            if v > 0:
+                consec_buy += 1
+            else:
+                break
+        if consec_buy >= 3:
+            price_flat = True
+            if len(chg_vals) >= consec_buy:
+                recent_chg = chg_vals[-consec_buy:]
+                avg_chg = float(np.mean(recent_chg))
+                if avg_chg > 3.0:  # 日均涨幅>3%不算吸筹
+                    price_flat = False
+            if price_flat:
+                confidence = min(0.5 + consec_buy * 0.1, 0.95)
+                return {
+                    "pattern": "accumulation",
+                    "confidence": round(confidence, 2),
+                    "days": consec_buy,
+                    "description": f"主力连续{consec_buy}日净买入但股价未明显上涨，疑似吸筹",
+                }
+
+        # --- 检测集中出货 distribution ---
+        consec_sell = 0
+        for v in reversed(main_vals):
+            if v < 0:
+                consec_sell += 1
+            else:
+                break
+        if consec_sell >= 3:
+            price_flat = True
+            if len(chg_vals) >= consec_sell:
+                recent_chg = chg_vals[-consec_sell:]
+                avg_chg = float(np.mean(recent_chg))
+                if avg_chg < -3.0:
+                    price_flat = False
+            if price_flat:
+                confidence = min(0.5 + consec_sell * 0.1, 0.95)
+                return {
+                    "pattern": "distribution",
+                    "confidence": round(confidence, 2),
+                    "days": consec_sell,
+                    "description": f"主力连续{consec_sell}日净卖出但股价未明显下跌，疑似出货",
+                }
+
+        # --- 检测洗盘 washout ---
+        if super_col is not None and large_col is not None:
+            df[super_col] = pd.to_numeric(df[super_col], errors="coerce")
+            df[large_col] = pd.to_numeric(df[large_col], errors="coerce")
+            super_vals = df[super_col].dropna().values
+            large_vals = df[large_col].dropna().values
+            min_len = min(len(super_vals), len(large_vals), 3)
+            if min_len >= 2:
+                recent_super = super_vals[-min_len:]
+                recent_large = large_vals[-min_len:]
+                # 超大单净买入 & 大单净卖出 = 对倒洗盘
+                super_buy_days = sum(1 for v in recent_super if v > 0)
+                large_sell_days = sum(1 for v in recent_large if v < 0)
+                if super_buy_days >= 2 and large_sell_days >= 2:
+                    confidence = min(0.4 + min(super_buy_days, large_sell_days) * 0.15, 0.85)
+                    return {
+                        "pattern": "washout",
+                        "confidence": round(confidence, 2),
+                        "days": min_len,
+                        "description": f"近{min_len}日超大单买入+大单卖出，疑似对倒洗盘",
+                    }
+
+        return {"pattern": "neutral", "confidence": 0.0, "days": 0, "description": "近期资金流无明显模式"}
+
+    def get_enhanced_flow_score(self, stock_code: str) -> float:
+        """
+        增强版资金流评分（0-100）
+
+        综合四级资金流 + 模式识别 + 原有综合评分给出评分:
+        - 四级资金流分析 (权重 35%)
+        - 模式识别 (权重 15%)
+        - 现有主力评分 get_stock_main_flow (权重 15%)
+        - 原有综合评分 calc_flow_score (权重 35%)
+        """
+        base_score = 50.0  # 中性起步
+
+        # 1) 四级资金流分析
+        multi = self.analyze_multi_level_flow(stock_code, days=10)
+        if multi.get("success"):
+            # 超大单权重最高
+            weights = {
+                "super_large": 0.35, "large": 0.25,
+                "medium": 0.10, "small": 0.05,
+            }
+            flow_score = 0.0
+            for level, weight in weights.items():
+                net = multi.get(level, {}).get("net_inflow", 0)
+                # 归一化: net>0 → +分, net<0 → -分, 以1亿为满分参考
+                normalized = max(min(net / 1e8, 1.0), -1.0)
+                flow_score += normalized * weight
+            # flow_score 范围 [-0.75, 0.75], 映射到 [-30, 30]
+            base_score += flow_score * 25
+
+            # 主力方向加分/减分
+            direction = multi.get("main_force_direction", "neutral")
+            if direction == "buying":
+                base_score += 3
+            elif direction == "selling":
+                base_score -= 3
+
+        # 2) 模式识别
+        pattern_info = self.detect_flow_pattern(stock_code, days=10)
+        pattern = pattern_info.get("pattern", "neutral")
+        confidence = pattern_info.get("confidence", 0)
+        if pattern == "accumulation":
+            base_score += 10 * confidence  # 吸筹利好
+        elif pattern == "distribution":
+            base_score -= 10 * confidence  # 出货利空
+        elif pattern == "washout":
+            base_score += 3 * confidence   # 洗盘偏中性略偏多
+
+        # 3) 现有主力评分作为补充
+        existing = self.get_stock_main_flow(stock_code)
+        if existing.get("success"):
+            sig = existing.get("signal", "neutral")
+            sig_bonus = {
+                "strong_inflow": 6, "inflow": 3,
+                "outflow": -3, "strong_outflow": -6,
+            }
+            base_score += sig_bonus.get(sig, 0)
+
+        # 4) 原有综合评分 calc_flow_score 作为基础参考
+        calc_result = self.calc_flow_score(stock_code)
+        if calc_result.get("total_score") is not None:
+            # calc_flow_score 返回 0-100, 映射到 [-25, 25] 作为调整
+            calc_adj = (calc_result["total_score"] - 50) * 0.4
+            base_score += calc_adj
+
+        # 限制范围 0-100
+        return round(max(0.0, min(100.0, base_score)), 1)
 
     # ============================================================
     # 五、完整分析报告

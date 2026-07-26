@@ -257,7 +257,7 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
 
     # ---- 强制盈亏比准入检查（V2.0核心规则）----
     risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
-    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.5)
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # OPTIMIZE: 原2.5降至2.0，解决事件驱动引擎无交易问题
     if risk_reward < min_rr:
         result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
                            f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")
@@ -431,7 +431,7 @@ def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
 
     # ---- 强制盈亏比准入检查（V2.0核心规则）----
     risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
-    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.5)
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # OPTIMIZE: 原2.5降至2.0，解决事件驱动引擎无交易问题
     if risk_reward < min_rr:
         result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
                            f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")

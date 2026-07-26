@@ -109,14 +109,54 @@ def _auto_bootstrap():
         logger.info("  请手动运行: python setup.py")
 
 
-if _is_db_empty():
-    _auto_bootstrap()
+# FIX: 修复 _auto_bootstrap() 在模块级执行导致任何import触发数据下载的问题
+# 将自动初始化逻辑移入显式函数，仅在主动运行时调用
+def maybe_auto_bootstrap():
+    """仅在数据库为空时执行自动初始化（避免import时触发下载）"""
+    if _is_db_empty():
+        _auto_bootstrap()
 
 
 # ============================================================
 # 持仓数据加载（从本地JSON文件读取）
 # ============================================================
 HOLDINGS_FILE = config.get_holdings_file()
+
+# 大盘状态检测结果（模块级变量，供CaopanEngine等模块读取）
+_current_market_regime = None
+
+# FIX: 修复 _prev_vol_scale 模块级变量进程重启后丢失的问题，持久化到JSON文件
+_VOL_SCALE_STATE_FILE = os.path.join(config.DATA_DIR, "vol_scale_state.json")
+
+
+def _load_vol_scale_state() -> float:
+    """从持久化文件加载波动率缩放状态"""
+    try:
+        if os.path.exists(_VOL_SCALE_STATE_FILE):
+            with open(_VOL_SCALE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            val = float(data.get("prev_vol_scale", 1.0))
+            print(f"DEBUG: _load_vol_scale_state from {_VOL_SCALE_STATE_FILE} = {val}")
+            return val
+    except Exception as e:
+        print(f"DEBUG: _load_vol_scale_state exception: {e}")
+    print(f"DEBUG: _load_vol_scale_state default 1.0 (file={_VOL_SCALE_STATE_FILE}, exists={os.path.exists(_VOL_SCALE_STATE_FILE)})")
+    return 1.0
+
+
+def _save_vol_scale_state(value: float):
+    """持久化波动率缩放状态到JSON文件"""
+    try:
+        os.makedirs(os.path.dirname(_VOL_SCALE_STATE_FILE), exist_ok=True)
+        with open(_VOL_SCALE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"prev_vol_scale": value, "updated": datetime.datetime.now().isoformat()}, f)
+        print(f"DEBUG: _save_vol_scale_state {value} to {_VOL_SCALE_STATE_FILE}")
+    except Exception as e:
+        logger.warning(f"  波动率缩放状态持久化失败: {e}")
+        print(f"DEBUG: _save_vol_scale_state FAILED: {e}")
+
+
+_prev_vol_scale = _load_vol_scale_state()
 
 def load_holdings() -> dict:
     """
@@ -174,6 +214,11 @@ def compute_indicators_cached(code: str, df: pd.DataFrame) -> pd.DataFrame:
     result = compute_indicators(df)
     _indicator_cache[cache_key] = (last_date, result)
     return result
+
+
+def get_current_market_regime() -> dict:
+    """获取当前大盘状态检测结果（供CaopanEngine等模块调用）"""
+    return _current_market_regime
 
 
 # ============================================================
@@ -246,6 +291,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     logger.info(f"  行情强度: {market_strength} | 仓位上限: {max_pos:.0%}")
 
     # ---- Step 2.5: 大盘状态智能识别（V3.0新增）----
+    global _current_market_regime
     market_regime_result = None
     if getattr(config, 'STRATEGY_CONFIG', {}).get('market_regime', {}).get('enabled', True):
         logger.info("[Step 2.5] 大盘状态智能识别...")
@@ -254,6 +300,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             if not benchmark_df.empty and len(benchmark_df) >= 60:
                 benchmark_with_indicators = compute_indicators(benchmark_df)
                 market_regime_result = detector.detect(benchmark_with_indicators)
+                _current_market_regime = market_regime_result  # 存入模块级变量，供CaopanEngine读取
                 logger.info(f"  {market_regime_result['detail']}")
                 # 用智能识别结果覆盖简单判断
                 regime_state = market_regime_result["state"]
@@ -337,14 +384,48 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.warning(f"  反主力分析异常: {e}")
 
-    # ---- Step 5.2: 多空共识计算（V7.1新增）----
+    # ---- Step 5.1.5: 提前执行趋势预测+资金流分析（供共识计算使用）----
+    logger.info("[Step 5.1.5] 提前执行趋势预测与资金流分析...")
+    early_forecast_results = []
+    capital_flow_results = {}
+    try:
+        # 提前执行趋势预测（全候选池，确保共识计算有真实数据）
+        forecaster = TrendForecaster()
+        for code, df in data_dict.items():
+            holding = holdings.get(code)
+            try:
+                fr = forecaster.analyze_stock(code, df, holding)
+                if fr.get("valid"):
+                    early_forecast_results.append(fr)
+            except Exception as e:
+                logger.debug(f"  {code} 预测分析异常: {e}")
+        logger.info(f"  趋势预测: {len(early_forecast_results)}/{len(data_dict)}只有效")
+
+        # 提前执行资金流分析（持仓+候选池）
+        try:
+            cfa = CapitalFlowAnalyzer()
+            flow_codes = list(holdings.keys()) + list(config.STOCK_POOL.keys())[:10]
+            for code in set(flow_codes):
+                try:
+                    flow_result = cfa.calc_flow_score(code)
+                    capital_flow_results[code] = flow_result
+                except Exception as e:
+                    logger.debug(f"  {code} 资金流分析异常: {e}")
+            logger.info(f"  资金流分析: {len(capital_flow_results)}只有效")
+        except Exception as e:
+            logger.warning(f"  资金流分析整体异常: {e}")
+    except Exception as e:
+        logger.warning(f"  提前分析异常(不影响主流程): {e}")
+
+    # ---- Step 5.2: 多空共识计算（V7.1新增，V2.0升级四维度）----
     logger.info("[Step 5.2] 多空共识计算...")
     consensus_results = {}
     try:
         consensus_results = batch_consensus(
             data_dict, holdings, signals,
-            forecast_results=None,  # 预测结果在Step14后更新
-            manipulation_results=manipulation_results
+            forecast_results=early_forecast_results,
+            manipulation_results=manipulation_results,
+            capital_flow_results=capital_flow_results
         )
         # 将共识结果添加到信号中
         for code, sig in signals:
@@ -356,6 +437,13 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         bearish = sum(1 for r in consensus_results.values() if "空" in r.get("direction", ""))
         conflict = sum(1 for r in consensus_results.values() if r.get("conflict"))
         logger.info(f"  共识统计: 看多{bullish} 看空{bearish} 分歧{conflict}")
+        # 输出各维度数据验证
+        for code, cr in list(consensus_results.items())[:3]:
+            comps = cr.get("components", {})
+            fc = comps.get("forecast", {})
+            cf = comps.get("capital_flow", {})
+            logger.info(f"  {code} 共识: {cr['direction']}({cr['score']:+.0f}) | "
+                       f"预测{fc.get('total_score', 'N/A')}分 资金{cf.get('total_score', 'N/A')}分")
     except Exception as e:
         logger.warning(f"  共识计算异常: {e}")
 
@@ -392,6 +480,33 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         except Exception as e:
             logger.warning(f"  均值回归扫描异常: {e}")
 
+    # ---- Step 5.6: 波动率目标仓位缩放（在风控前计算，供风控使用）----
+    global _prev_vol_scale
+    effective_vol_scale = 1.0
+    _vol_info_for_digest = {}
+    try:
+        from position.vol_target import VolTargetManager
+        vtm = VolTargetManager(target_vol=0.15)
+        vol_result = vtm.calc_position_scale(
+            data_dict, holdings,
+            market_info={"market_state": market_strength}
+        )
+        scale = vol_result["scale"]
+        # 上升限速：每天最多提升10%；下降不限速（风控收紧立即生效）
+        if scale > _prev_vol_scale:
+            effective_vol_scale = min(scale, _prev_vol_scale * 1.10)
+        else:
+            effective_vol_scale = scale
+        original_max = get_max_position_ratio(market_strength)
+        logger.info(f"  [波动率目标] regime={vol_result['vol_regime']} | "
+                    f"缩放={scale:.2f} | {vol_result['recommendation']}")
+        logger.info(f"  波动率目标缩放: 原始scale={scale:.2f}, 限速后={effective_vol_scale:.2f}, "
+                    f"总仓位上限调整至{original_max * effective_vol_scale:.0%}")
+        _vol_info_for_digest = vol_result
+    except Exception as e:
+        logger.warning(f"  波动率目标异常(不影响主流程，scale=1.0): {e}")
+        effective_vol_scale = 1.0
+
     # ---- Step 6: 信号过风控 ----
     logger.info("[Step 6] 信号风控校验...")
     filtered_signals = []
@@ -414,7 +529,8 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 "stock_type": stock_info.get("类型", "龙头"),
                 "stop_loss": stop_p
             }
-            risk_result = risk_check(plan, risk_state, market_strength)
+            risk_result = risk_check(plan, risk_state, market_strength,
+                                      vol_scale=effective_vol_scale)
             if risk_result["pass"]:
                 sig["position"] = batch
                 sig["risk_level"] = risk_result["level"]
@@ -446,9 +562,13 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         except Exception:
             pass
 
+        # 使用大盘状态检测器的真实置信度（而非硬编码0.6）
+        market_confidence = 0.5
+        if market_regime_result and market_regime_result.get("confidence"):
+            market_confidence = market_regime_result["confidence"]
         filtered_signals, meta_results = apply_meta_label(
             filtered_signals, data_dict,
-            market_info={"market_state": market_strength, "confidence": 0.6},
+            market_info={"market_state": market_strength, "confidence": market_confidence},
             sector_info_map=sector_info_map
         )
         logger.info(f"  [Meta-Label] 过滤后保留{len(filtered_signals)}个信号")
@@ -490,24 +610,10 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.warning(f"  筹码分析异常(不影响主流程): {e}")
 
-    # 6.5d: 波动率目标仓位缩放
-    _vol_info_for_digest = {}
-    try:
-        from position.vol_target import VolTargetManager
-        vtm = VolTargetManager(target_vol=0.15)
-        vol_result = vtm.calc_position_scale(
-            data_dict, holdings,
-            market_info={"market_state": market_strength}
-        )
-        logger.info(f"  [波动率] regime={vol_result['vol_regime']} | "
-                    f"缩放={vol_result['scale']:.2f} | {vol_result['recommendation']}")
-        # 将缩放因子写入信号
+    # 6.5d: 波动率目标仓位缩放（已在Step 5.6提前计算并应用于风控，此处仅写入信号）
+    if _vol_info_for_digest:
         for code, sig in filtered_signals:
-            sig["vol_scale"] = vol_result["scale"]
-        # 收集到综合日报（在digest_data初始化前先用局部变量存储）
-        _vol_info_for_digest = vol_result
-    except Exception as e:
-        logger.warning(f"  波动率目标异常(不影响主流程): {e}")
+            sig["vol_scale"] = _vol_info_for_digest.get("scale", 1.0)
 
     # ---- Step 7: 输出报告 ----
     logger.info("[Step 7] 生成报告...")
@@ -578,6 +684,110 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         digest_data["v9_summary"]["expired_signals"] = expired_count
     except Exception:
         pass
+    
+    # ---- Step 8.5: 信号历史记录 + 衰减曲线定期校准 ----
+    try:
+        from strategy.signal_decay import SignalHistoryTracker
+        tracker = SignalHistoryTracker()
+    
+        # 用最新行情数据回填历史信号的 T+N 收益
+        tracker.update_results(data_dict)
+    
+        # 记录当日所有信号（买入 + 卖出 + 加仓）
+        today_str = datetime.date.today().isoformat()
+        recorded = 0
+        for code, sig in filtered_signals:
+            if sig.get("buy_signal") or sig.get("sell_signal") or sig.get("add_position"):
+                tracker.record_signal(code, sig, today_str)
+                recorded += 1
+        logger.info(f"  [信号历史] 记录{recorded}个信号，累计{len(tracker.history)}条历史")
+    
+        # 每周校准：周五盘后执行衰减曲线校准
+        is_friday = datetime.date.today().weekday() == 4
+        if is_friday:
+            logger.info("  [信号衰减校准] 周五盘后，启动衰减曲线校准...")
+            stats = tracker.compute_decay_stats()
+            if stats:
+                update_summary = tracker.update_decay_curves(stats)
+                for sig_type, info in update_summary.items():
+                    if info["updated"]:
+                        logger.info(
+                            f"    {sig_type}: 已校准 "
+                            f"(样本{info['sample_count']}, "
+                            f"T1胜率{info['ci']['t1']['wr']:.0%}, "
+                            f"T3胜率{info['ci']['t3']['wr']:.0%}, "
+                            f"T5胜率{info['ci']['t5']['wr']:.0%})"
+                        )
+                    else:
+                        logger.info(
+                            f"    {sig_type}: 未校准 - {info['reason']}"
+                        )
+            else:
+                # 统计各类型样本量，输出冷启动提示
+                all_stats = {}
+                for entry in tracker.history:
+                    key = entry.get("signal_type", "unknown")
+                    all_stats[key] = all_stats.get(key, 0) + 1
+                for signal_type, count in all_stats.items():
+                    logger.info(
+                        f"    信号衰减校准: {signal_type} "
+                        f"样本量{count}/30, 暂使用默认衰减曲线"
+                    )
+        else:
+            # 非周五，输出各类型当前样本积累进度
+            all_stats = {}
+            for entry in tracker.history:
+                key = entry.get("signal_type", "unknown")
+                all_stats[key] = all_stats.get(key, 0) + 1
+            progress_parts = [f"{k}:{v}/30" for k, v in all_stats.items()]
+            if progress_parts:
+                logger.info(f"  [信号衰减] 样本积累: {', '.join(progress_parts)} (周五校准)")
+    except Exception as e:
+        logger.warning(f"  信号历史/衰减校准异常(不影响核心流程): {e}")
+
+    # ---- Step 8.6: 滑点追踪自动化（每日记录 + 月度报告）----
+    try:
+        from execution.slippage_tracker import SlippageTracker
+        slippage_tracker = SlippageTracker()
+        
+        # 每日自动记录信号的预期价格
+        recorded_count = slippage_tracker.auto_record_from_signals(filtered_signals)
+        if recorded_count > 0:
+            logger.info(f"  [滑点追踪] 记录{recorded_count}笔信号预期价格")
+        
+        # 每月1日生成月度滑点报告 + 回测参数校准建议
+        if datetime.date.today().day == 1:
+            logger.info("  [滑点追踪] 月度滑点报告生成...")
+            monthly_report = slippage_tracker.generate_monthly_report()
+            total = monthly_report.get("total_trades", 0)
+            logger.info(f"    本月滑点记录: {total}笔")
+            if total > 0:
+                logger.info(f"    {monthly_report['comparison']}")
+                logger.info(f"    统计详情: 平均{monthly_report['avg_slippage']:.3%}, "
+                           f"中位{monthly_report['median_slippage']:.3%}, "
+                           f"最大{monthly_report['max_slippage']:.3%}, "
+                           f"标准差{monthly_report['std_slippage']:.3%}")
+                # 输出配置变更历史
+                change_count = monthly_report.get('config_change_count', 0)
+                if change_count > 0:
+                    logger.info(f"    本月配置变更{change_count}次:")
+                    for ch in monthly_report.get('config_changes', []):
+                        logger.info(f"      {ch['param']}: {ch['old']:.6f} → {ch['new']:.6f} ({ch['time'][:10]})")
+                else:
+                    logger.info(f"    本月配置变更: 0次")
+                
+                # 检查是否需要调整回测参数
+                adjustment = slippage_tracker.suggest_backtest_adjustment()
+                if adjustment["should_adjust"]:
+                    logger.warning(f"    建议调整回测滑点: {adjustment['reason']}")
+                    logger.info(f"    当前: {adjustment['current_assumption']:.3%} → 建议: {adjustment['suggested_value']:.3%}")
+                    # 自动写入 config.py
+                    if slippage_tracker.apply_backtest_adjustment(adjustment['suggested_value']):
+                        logger.info(f"    ✓ buy_slippage 已自动更新为 {adjustment['suggested_value']:.6f}")
+                    else:
+                        logger.warning(f"    ✗ buy_slippage 自动更新失败，请手动修改 config.py")
+    except Exception as e:
+        logger.warning(f"  滑点追踪异常(不影响核心流程): {e}")
 
     # ---- Step 9: 盘后选股 + 全市场扫描 + 持仓诊断 ----
     logger.info("[Step 9] 盘后选股引擎（全赛道+弱势模式）...")
@@ -660,10 +870,12 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 
     # ---- Step 12: 基本面+资金流分析（V3.0新增）----
     logger.info("[Step 12] 基本面与资金流分析...")
+    step12_flow_report = None  # FIX: 保存Step12资金流结果供Step15复用，避免重复调用CapitalFlowAnalyzer
     try:
         # 资金流向分析
         cfa = CapitalFlowAnalyzer()
         flow_report = cfa.full_analysis(list(holdings.keys()) + list(config.STOCK_POOL.keys())[:5])
+        step12_flow_report = flow_report  # 保存供后续Step复用
         if flow_report.get('northbound', {}).get('success'):
             logger.info(f"  北向资金: {flow_report['northbound']['signal']}")
         if flow_report.get('sector_flow', {}).get('success'):
@@ -706,12 +918,12 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.warning(f"  交易日志异常: {e}")
 
-    # ---- Step 14: 持仓趋势预测分析（V3.1新增）----
+    # ---- Step 14: 持仓趋势预测分析（复用Step5.1.5已计算结果）----
     if getattr(config, 'FORECAST_ENABLED', True):
         logger.info("[Step 14] 持仓趋势预测分析...")
         try:
-            forecaster = TrendForecaster()
-            forecast_results = forecaster.batch_analyze(data_dict, holdings)
+            # 复用提前计算的预测结果（避免重复计算）
+            forecast_results = early_forecast_results if early_forecast_results else []
             if forecast_results:
                 # 输出摘要
                 for r in forecast_results:
@@ -721,7 +933,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 # 收集到综合日报
                 digest_data["forecast"] = forecast_results
             else:
-                logger.info("  无有效持仓数据，跳过预测")
+                logger.info("  无有效预测数据")
         except Exception as e:
             logger.error(f"  趋势预测分析异常: {e}")
 
@@ -729,14 +941,18 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     logger.info("[Step 15] 发送盘后综合日报...")
     if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
         try:
-            # 补充市场数据（北向资金/热门板块）
+            # FIX: 修复 CapitalFlowAnalyzer 重复调用，复用Step12已计算的资金流结果
+            # Step15不再创建新的CapitalFlowAnalyzer，仅复用Step12结果
             try:
-                cfa = CapitalFlowAnalyzer()
-                flow_report = cfa.full_analysis(list(holdings.keys())[:3])
-                if flow_report.get('northbound', {}).get('success'):
-                    digest_data["market"]["northbound"] = flow_report['northbound']
-                if flow_report.get('sector_flow', {}).get('success'):
-                    digest_data["market"]["hot_sectors"] = flow_report['sector_flow'].get('hot_sectors', [])
+                if step12_flow_report is not None:
+                    flow_report = step12_flow_report
+                    logger.info("  复用Step12资金流分析结果")
+                    if flow_report.get('northbound', {}).get('success'):
+                        digest_data["market"]["northbound"] = flow_report['northbound']
+                    if flow_report.get('sector_flow', {}).get('success'):
+                        digest_data["market"]["hot_sectors"] = flow_report['sector_flow'].get('hot_sectors', [])
+                else:
+                    logger.info("  Step12资金流结果不可用，跳过Step15资金流补充")
             except Exception:
                 pass
 
@@ -772,6 +988,10 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             logger.error(f"  综合日报发送异常: {e}")
     else:
         logger.info("  邮箱未配置，跳过综合日报发送")
+
+    # ---- 更新波动率缩放限速状态（供下次运行使用）----
+    _prev_vol_scale = effective_vol_scale
+    _save_vol_scale_state(_prev_vol_scale)  # FIX: 持久化波动率缩放状态到JSON文件
 
     # ---- 完成 ----
     elapsed = (datetime.datetime.now() - start_time).total_seconds()
@@ -821,4 +1041,5 @@ def main():
 
 
 if __name__ == "__main__":
+    maybe_auto_bootstrap()  # FIX: 将自动初始化移入__main__块，避免import时触发数据下载
     main()

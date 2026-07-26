@@ -275,9 +275,9 @@ class ExecutionSplitter:
         # 取整到100
         allocated = [max(min_shares, int(r / 100) * 100) for r in raw]
 
-        # 修正总数差异（加到最后一笔）
+        # FIX: 修复股数分配残留丢失问题，直接将差值修正到最后一笔，不再二次取整
         diff = total_shares - sum(allocated)
-        allocated[-1] += int(diff / 100) * 100
+        allocated[-1] += diff
         if allocated[-1] < min_shares:
             allocated[-1] = min_shares
 

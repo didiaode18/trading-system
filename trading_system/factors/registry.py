@@ -116,17 +116,46 @@ class FactorRegistry:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [s[0] for s in scored[:n]]
 
-    def update_weights_by_ic(self):
-        """根据IC动态调整权重"""
+    def update_weights_by_ic(self, ic_monitor=None) -> dict:
+        """根据IC动态调整权重
+        
+        参数:
+            ic_monitor: ICMonitor实例（可选，用于同步IC历史）
+        
+        返回:
+            调整详情 {"decaying": [...], "strong": [...], "normal": [...]}
+        """
+        # 先从ic_monitor同步IC历史到registry
+        if ic_monitor is not None:
+            for name, meta in self.factors.items():
+                records = ic_monitor.ic_records.get(name, [])
+                if records:
+                    meta.ic_history = [
+                        r['ic'] if isinstance(r, dict) else r for r in records
+                    ]
+
+        result = {"decaying": [], "strong": [], "normal": []}
         for meta in self.factors.values():
             if len(meta.ic_history) >= 5:
                 recent_ic = np.mean(meta.ic_history[-5:])
+                old_weight = meta.weight
                 if abs(recent_ic) < 0.02:
-                    meta.weight = 0.3  # IC衰减，降权
+                    meta.weight = round(old_weight * 0.5, 2)  # 衰减: 降权50%
+                    result["decaying"].append({
+                        "name": meta.name, "old_weight": old_weight,
+                        "new_weight": meta.weight, "avg_ic": round(recent_ic, 4),
+                        "days_low": sum(1 for ic in meta.ic_history[-5:] if abs(ic) < 0.02)
+                    })
                 elif abs(recent_ic) > 0.05:
-                    meta.weight = 1.5  # IC强劲，加权
+                    meta.weight = round(old_weight * 1.2, 2)  # 强劲: 加权20%
+                    result["strong"].append({
+                        "name": meta.name, "old_weight": old_weight,
+                        "new_weight": meta.weight, "avg_ic": round(recent_ic, 4)
+                    })
                 else:
                     meta.weight = 1.0
+                    result["normal"].append(meta.name)
+        return result
 
     def _auto_register(self):
         """自动注册所有内置因子"""

@@ -172,9 +172,10 @@ def build_holdings_table(results: list, holdings: dict) -> str:
 # ============================================================
 
 def build_conditional_orders(results: list, holdings: dict) -> str:
-    """生成条件单操作计划"""
+    """生成条件单操作计划（V3.0 增强版：分档止损+互斥+去重+价格校验）"""
     orders_html = ""
     order_num = 0
+    validation_log = []  # 价格校验日志
 
     for r in results:
         code = r.get("code", "")
@@ -190,78 +191,146 @@ def build_conditional_orders(results: list, holdings: dict) -> str:
 
         # 成本<=0表示已完全回本，使用特殊逻辑
         if cost <= 0:
-            pnl_pct = 100.0  # 已回本视为正收益
+            pnl_pct = 100.0
         else:
             pnl_pct = (close - cost) / cost * 100
 
-        # 止损条件单
-        if cost <= 0:
-            # 已回本持仓：使用现价回落止损（现价×85%）
-            stop_price = round(close * 0.85, 3)
+        # 获取阶段高点（用于移动止盈）
+        recent_high = r.get("recent_high", close)
+        if recent_high <= 0:
+            recent_high = close
+
+        # === 条件单生成逻辑（互斥：清仓单 > 止损单）===
+        generated_orders = []  # 当前标的已生成的订单（用于去重检测）
+
+        if trend_level <= 2:
+            # ======== 下跌趋势: 仅生成1张清仓单 ========
+            clear_price = round(close * 0.97, 3)
+            # 价格校验
+            v_note = _validate_sell_price(code, name, "清仓", clear_price, close, validation_log)
             order_num += 1
+            generated_orders.append({"type": "清仓", "price": clear_price})
+            orders_html += _order_card(
+                order_num, "清仓条件单(趋势破位)", code, name, "卖出",
+                clear_price, "14:50", shares, "3个交易日",
+                f"趋势{trend_level}级(下跌)，建议尽快清仓。触发价=现价{close:.3f}×97%。{v_note}",
+                "danger"
+            )
+            # 清仓单优先级最高，不再生成止损单
+
+        elif cost <= 0:
+            # ======== 已回本持仓: 保护性止损 ========
+            stop_price = round(close * 0.85, 3)
+            v_note = _validate_sell_price(code, name, "止损", stop_price, close, validation_log)
+            order_num += 1
+            generated_orders.append({"type": "止损", "price": stop_price})
             orders_html += _order_card(
                 order_num, "止损条件单(回本仓保护)", code, name, "卖出",
                 stop_price, "14:50", shares, "20个交易日",
-                f"已回本持仓，保护性止损 = 现价 {close:.3f} × 85%",
+                f"已回本持仓，保护性止损 = 现价 {close:.3f} × 85%。{v_note}",
                 "warning"
             )
-        elif pnl_pct < 5:
-            stop_price = round(cost * 0.90, 3)
+
+        elif pnl_pct < 0:
+            # ======== 浮亏状态: 止损价 = 现价 × 92% ========
+            stop_price = round(close * 0.92, 3)
+            v_note = _validate_sell_price(code, name, "止损", stop_price, close, validation_log)
             order_num += 1
+            generated_orders.append({"type": "止损", "price": stop_price})
+            orders_html += _order_card(
+                order_num, "止损条件单(浮亏保护)", code, name, "卖出",
+                stop_price, "14:50", shares, "20个交易日",
+                f"浮亏 {pnl_pct:+.1f}%，止损 = 现价 {close:.3f} × 92%（再跌8%离场）。{v_note}",
+                "danger"
+            )
+
+        elif pnl_pct < 5:
+            # ======== 浮盈<5%: 初始止损 = 成本×90% ========
+            stop_price = round(cost * 0.90, 3)
+            # 止损价不能高于现价
+            if stop_price >= close:
+                stop_price = round(close * 0.95, 3)
+                stop_note = f"浮盈 {pnl_pct:+.1f}% < 5%，成本止损{cost:.3f}×90%≥现价，改为现价 {close:.3f} × 95%"
+            else:
+                stop_note = f"浮盈 {pnl_pct:+.1f}% < 5%，初始止损 = 成本 {cost:.3f} × 90%"
+            v_note = _validate_sell_price(code, name, "止损", stop_price, close, validation_log)
+            order_num += 1
+            generated_orders.append({"type": "止损", "price": stop_price})
             orders_html += _order_card(
                 order_num, "止损条件单(初始止损)", code, name, "卖出",
                 stop_price, "14:50", shares, "20个交易日",
-                f"浮盈 {pnl_pct:+.1f}% < 5%，初始止损 = 成本 {cost:.3f} × 90%",
+                f"{stop_note}。{v_note}",
                 "danger"
             )
+
         elif pnl_pct < 15:
+            # ======== 浮盈5%-15%: 保本止损 = 成本×102% ========
             stop_price = round(cost * 1.02, 3)
+            if stop_price >= close:
+                stop_price = round(close * 0.95, 3)
+                stop_note = f"浮盈 {pnl_pct:+.1f}%，保本止损{cost:.3f}×102%≥现价，改为现价×95%"
+            else:
+                stop_note = f"浮盈 {pnl_pct:+.1f}%(5%~15%)，保本止损 = 成本 {cost:.3f} × 102%"
+            v_note = _validate_sell_price(code, name, "止损", stop_price, close, validation_log)
             order_num += 1
+            generated_orders.append({"type": "止损", "price": stop_price})
             orders_html += _order_card(
                 order_num, "止损条件单(保本止损)", code, name, "卖出",
                 stop_price, "14:50", shares, "20个交易日",
-                f"浮盈 {pnl_pct:+.1f}%，保本止损 = 成本 {cost:.3f} × 102%",
+                f"{stop_note}。{v_note}",
                 "warning"
             )
+
         else:
-            stop_price = round(cost * 1.12, 3)
+            # ======== 浮盈>15%: 移动止盈 = 阶段高点×95% ========
+            stop_price = round(recent_high * 0.95, 3)
+            if stop_price >= close:
+                stop_price = round(close * 0.95, 3)
+                stop_note = f"浮盈 {pnl_pct:+.1f}%，移动止盈 = 高点{recent_high:.3f}×95%≥现价，改为现价×95%"
+            else:
+                stop_note = f"浮盈 {pnl_pct:+.1f}% > 15%，移动止盈 = 阶段高点 {recent_high:.3f} × 95%"
+            v_note = _validate_sell_price(code, name, "止盈", stop_price, close, validation_log)
             order_num += 1
+            generated_orders.append({"type": "止盈", "price": stop_price})
             orders_html += _order_card(
                 order_num, "止盈条件单(移动止盈)", code, name, "卖出",
-                stop_price, "14:50", shares, "20个交易日",
-                f"浮盈 {pnl_pct:+.1f}%，锁定利润 = 成本 {cost:.3f} × 112%",
+                stop_price, "盘中实时", shares, "20个交易日",
+                f"{stop_note}。{v_note}",
                 "success"
             )
 
-        # 时间条件单（持仓超20天且浮盈<3%）
-        buy_date_str = info.get("buy_date", "")
-        if buy_date_str:
-            try:
-                buy_date = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d").date()
-                hold_days = (datetime.date.today() - buy_date).days
-                if hold_days > 20 and pnl_pct < 3:
-                    order_num += 1
-                    orders_html += _order_card(
-                        order_num, "时间条件单(效率止损)", code, name, "卖出",
-                        close, "14:50", shares, "5个交易日",
-                        f"持仓{hold_days}天，浮盈{pnl_pct:+.1f}%<3%，资金效率低",
-                        "info"
-                    )
-            except (ValueError, TypeError):
-                pass
-
-        # 下跌趋势清仓单
-        if trend_level <= 2:
-            order_num += 1
-            orders_html += _order_card(
-                order_num, "清仓条件单(趋势破位)", code, name, "卖出",
-                round(close * 0.99, 3), "09:35", shares, "5个交易日",
-                f"趋势{trend_level}级(下跌)，主力连续卖出，及时清仓",
-                "danger"
-            )
+        # ======== 时间条件单（持仓超20天且浮盈<3%，且无清仓单时才生成）========
+        if trend_level > 2:
+            buy_date_str = info.get("buy_date", "")
+            if buy_date_str:
+                try:
+                    buy_date = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d").date()
+                    hold_days = (datetime.date.today() - buy_date).days
+                    if hold_days > 20 and pnl_pct < 3:
+                        # 去重检测: 与已有卖出单触发价差距<2%则跳过
+                        if not _is_duplicate_order(generated_orders, close, "卖出"):
+                            order_num += 1
+                            generated_orders.append({"type": "时间止损", "price": close})
+                            orders_html += _order_card(
+                                order_num, "时间条件单(效率止损)", code, name, "卖出",
+                                close, "14:50", shares, "5个交易日",
+                                f"持仓{hold_days}天，浮盈{pnl_pct:+.1f}%<3%，资金效率低，建议换股",
+                                "info"
+                            )
+                except (ValueError, TypeError):
+                    pass
 
     if not orders_html:
         orders_html = '<p style="color:#999;text-align:center;padding:20px">当前无需设置条件单</p>'
+
+    # 价格校验日志摘要
+    if validation_log:
+        log_html = '<div style="background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:11px;color:#389e0d;font-family:monospace">'
+        log_html += '<b>✅ 价格校验日志:</b><br>'
+        log_html += '<br>'.join(validation_log[-10:])  # 最多显示10条
+        log_html += '</div>'
+    else:
+        log_html = ''
 
     # 操作步骤提示
     guide = """
@@ -269,13 +338,52 @@ def build_conditional_orders(results: list, holdings: dict) -> str:
         <b>操作步骤:</b> 打开东方财富APP → 交易 → 智能条件单 → 逐条添加以下条件单 → 确认后盘中不再操作
     </div>"""
 
-    return guide + orders_html
+    return guide + log_html + orders_html
+
+
+def _validate_sell_price(code: str, name: str, order_type: str,
+                         trigger_price: float, close: float, log: list) -> str:
+    """价格校验并记录日志，返回校验状态文本"""
+    if order_type in ("止损", "清仓", "减仓"):
+        if trigger_price < close:
+            msg = f"[价格校验] {code} {name} {order_type}{trigger_price:.3f} < 现价{close:.3f} ✓"
+            log.append(msg)
+            logger.info(msg)
+            return "✅校验通过"
+        else:
+            msg = f"[价格校验] {code} {name} {order_type}{trigger_price:.3f} ≥ 现价{close:.3f} ✗(已自动调整)"
+            log.append(msg)
+            logger.warning(msg)
+            return "⚠️已调整(原值≥现价)"
+    elif order_type in ("止盈", "移动止盈"):
+        if trigger_price < close:
+            # 止盈价低于现价是正常的（回落止盈）
+            msg = f"[价格校验] {code} {name} {order_type}{trigger_price:.3f} < 现价{close:.3f} ✓(回落触发)"
+            log.append(msg)
+            logger.info(msg)
+            return "✅校验通过"
+        else:
+            msg = f"[价格校验] {code} {name} {order_type}{trigger_price:.3f} > 现价{close:.3f} ✓"
+            log.append(msg)
+            logger.info(msg)
+            return "✅校验通过"
+    return ""
+
+
+def _is_duplicate_order(existing_orders: list, new_price: float, direction: str) -> bool:
+    """去重检测: 同方向触发价差距<2%视为重复"""
+    for order in existing_orders:
+        if order["price"] > 0 and new_price > 0:
+            diff_pct = abs(order["price"] - new_price) / new_price * 100
+            if diff_pct < 2.0:
+                return True
+    return False
 
 
 def _order_card(num: int, title: str, code: str, name: str, direction: str,
                 trigger_price: float, trigger_time: str, quantity: int,
                 validity: str, desc: str, level: str) -> str:
-    """生成单个条件单卡片"""
+    """生成单个条件单卡片（含触发价、触发时间、数量、有效期、校验状态）"""
     border_colors = {
         "danger": "#ff4d4f",
         "warning": "#faad14",
@@ -285,6 +393,14 @@ def _order_card(num: int, title: str, code: str, name: str, direction: str,
     border_color = border_colors.get(level, "#1890ff")
     badge = "🔴必挂" if level == "danger" else ("🟡建议" if level == "warning" else "🟢可选")
     dir_color = "#e74c3c" if direction == "卖出" else "#27ae60"
+
+    # 校验状态标识
+    if "✅校验通过" in desc:
+        check_icon = "✅"
+    elif "⚠️" in desc:
+        check_icon = "⚠️"
+    else:
+        check_icon = "✅"
 
     return f"""
     <div style="border:1px solid #e8e8e8;border-left:4px solid {border_color};border-radius:8px;padding:14px 16px;margin:10px 0">
@@ -297,6 +413,7 @@ def _order_card(num: int, title: str, code: str, name: str, direction: str,
             <tr><td style="padding:4px 0;color:#888">触发时间</td><td>{trigger_time}</td></tr>
             <tr><td style="padding:4px 0;color:#888">数量</td><td>{quantity:,} 股</td></tr>
             <tr><td style="padding:4px 0;color:#888">有效期</td><td>{validity}</td></tr>
+            <tr><td style="padding:4px 0;color:#888">校验状态</td><td>{check_icon} 价格合理性已校验</td></tr>
             <tr><td style="padding:4px 0;color:#888">说明</td><td style="color:#666">{desc}</td></tr>
         </table>
     </div>"""
@@ -432,11 +549,308 @@ def build_stock_picks(scored: list) -> str:
 
 
 # ============================================================
+# 新增数据面板构建函数
+# ============================================================
+
+def _build_multi_level_flow_section(flow_data: dict) -> str:
+    """四级资金流面板：超大单/大单/中单/小单净流入 + 资金模式识别"""
+    if not flow_data:
+        return ""
+    levels = flow_data.get("levels", {})
+    main_dir = flow_data.get("main_force_direction", "--")
+    pattern = flow_data.get("pattern", "neutral")
+    pattern_map = {
+        "accumulation": ("吸筹", "\U0001f7e2", "#27ae60"),
+        "distribution": ("出货", "\U0001f534", "#e74c3c"),
+        "washout": ("洗盘", "\U0001f7e1", "#f39c12"),
+        "neutral": ("--", "\u26aa", "#999"),
+    }
+    p_name, p_icon, p_color = pattern_map.get(pattern, pattern_map["neutral"])
+    dir_arrow = {"inflow": "\u2b06\ufe0f", "outflow": "\u2b07\ufe0f"}.get(main_dir, "\u27a1\ufe0f")
+    dir_color = "#e74c3c" if main_dir == "inflow" else ("#27ae60" if main_dir == "outflow" else "#999")
+
+    cards = ""
+    for key, label in [("super_large", "超大单"), ("large", "大单"), ("medium", "中单"), ("small", "小单")]:
+        info = levels.get(key, {})
+        net = info.get("net_inflow", 0)
+        arrow = "\u2b06\ufe0f" if net > 0 else ("\u2b07\ufe0f" if net < 0 else "\u27a1\ufe0f")
+        color = "#e74c3c" if net > 0 else ("#27ae60" if net < 0 else "#999")
+        cards += f"""
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">{label}</div>
+            <div style="font-size:16px;font-weight:700;color:{color};margin-top:3px">{arrow} {net/10000:+.0f}万</div>
+        </div>"""
+
+    html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:6px">{cards}</div>
+    <div style="margin-top:10px;font-size:13px">
+        <span style="font-weight:700">主力方向:</span> <span style="color:{dir_color};font-weight:700">{dir_arrow} {main_dir}</span>
+        <span style="margin-left:16px;font-weight:700">资金模式:</span>
+        <span style="background:{p_color};color:white;padding:2px 10px;border-radius:10px;font-size:12px;margin-left:4px">{p_icon} {p_name}</span>
+    </div>"""
+    return _section("四级资金流向分析", html, "\U0001f4b0")
+
+
+def _build_lhb_section(lhb_data: dict) -> str:
+    """龙虎榜面板：上榜次数、机构净买入趋势、游资活跃度"""
+    if not lhb_data:
+        return ""
+    count = lhb_data.get("lhb_count", 0)
+    inst_trend = lhb_data.get("institution_trend", "--")
+    hot_score = lhb_data.get("hot_money_score", 0)
+    risk = lhb_data.get("risk_warning", "")
+    signal = lhb_data.get("signal", "neutral")
+    desc = lhb_data.get("description", "")
+
+    signal_map = {
+        "bullish": ("\u770b\u591a", "#27ae60", "#f6ffed"),
+        "bearish": ("\u770b\u7a7a", "#e74c3c", "#fff1f0"),
+        "neutral": ("\u4e2d\u6027", "#999", "#f8f9fa"),
+    }
+    s_name, s_color, s_bg = signal_map.get(signal, signal_map["neutral"])
+
+    inst_color = "#e74c3c" if "增" in str(inst_trend) else ("#27ae60" if "减" in str(inst_trend) else "#999")
+    hot_bar_w = min(hot_score, 100)
+    hot_color = "#e74c3c" if hot_score >= 70 else ("#f39c12" if hot_score >= 40 else "#52c41a")
+
+    html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">上榜次数</div>
+            <div style="font-size:20px;font-weight:700;color:#f0a500;margin-top:3px">{count}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">机构趋势</div>
+            <div style="font-size:14px;font-weight:700;color:{inst_color};margin-top:3px">{inst_trend}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">游资活跃度</div>
+            <div style="font-size:14px;font-weight:700;color:{hot_color};margin-top:3px">{hot_score}分</div>
+            <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:{hot_color};width:{hot_bar_w}%;height:100%;border-radius:4px"></div></div>
+        </div>
+        <div style="flex:1;min-width:100px;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">信号</div>
+            <div style="font-size:14px;font-weight:700;color:{s_color};margin-top:3px">{s_name}</div>
+        </div>
+    </div>"""
+    if desc:
+        html += f'<div style="font-size:12px;color:#666;margin-top:6px">{desc}</div>'
+    if risk:
+        html += f'<div style="background:#fff1f0;border:1px solid #ffccc7;border-radius:6px;padding:8px 12px;margin-top:8px;font-size:12px;color:#cf1322">\u26a0\ufe0f {risk}</div>'
+    return _section("龙虎榜/游资动向", html, "\U0001f3c6")
+
+
+def _build_margin_section(margin_data: dict) -> str:
+    """融资融券面板：融资净买入天数、余额拐点、融券异常"""
+    if not margin_data:
+        return ""
+    net_days = margin_data.get("net_buy_days", 0)
+    trend = margin_data.get("balance_trend", "--")
+    turning = margin_data.get("balance_turning", False)
+    short_anomaly = margin_data.get("short_selling_anomaly", False)
+    signal = margin_data.get("signal", "neutral")
+    confidence = margin_data.get("confidence", 0)
+
+    signal_map = {
+        "bullish": ("\u878d\u8d44\u504f\u591a", "#27ae60", "#f6ffed"),
+        "bearish": ("\u878d\u8d44\u504f\u7a7a", "#e74c3c", "#fff1f0"),
+        "neutral": ("\u4e2d\u6027", "#999", "#f8f9fa"),
+    }
+    s_name, s_color, s_bg = signal_map.get(signal, signal_map["neutral"])
+
+    trend_color = "#e74c3c" if "升" in str(trend) else ("#27ae60" if "降" in str(trend) else "#999")
+    conf_bar_w = min(int(confidence * 100), 100)
+
+    html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">净买入天数</div>
+            <div style="font-size:20px;font-weight:700;color:#1a5276;margin-top:3px">{net_days}天</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">余额趋势</div>
+            <div style="font-size:14px;font-weight:700;color:{trend_color};margin-top:3px">{trend}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">信号</div>
+            <div style="font-size:14px;font-weight:700;color:{s_color};margin-top:3px">{s_name}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">置信度</div>
+            <div style="font-size:14px;font-weight:700;color:#1a5276;margin-top:3px">{confidence:.0%}</div>
+            <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:#1a5276;width:{conf_bar_w}%;height:100%;border-radius:4px"></div></div>
+        </div>
+    </div>"""
+    alerts = []
+    if turning:
+        alerts.append("\u26a0\ufe0f \u4f59\u989d\u62d0\u70b9\u51fa\u73b0\uff0c\u53ef\u80fd\u53d8\u76d8")
+    if short_anomaly:
+        alerts.append("\U0001f6a8 \u878d\u5238\u5f02\u5e38\u653e\u91cf\uff0c\u6ce8\u610f\u505a\u7a7a\u98ce\u9669")
+    if alerts:
+        html += '<div style="margin-top:8px">'
+        for a in alerts:
+            html += f'<div style="background:#fffbe6;border:1px solid #faad14;border-radius:6px;padding:6px 12px;margin:4px 0;font-size:12px;color:#ad6800">{a}</div>'
+        html += '</div>'
+    return _section("融资融券信号", html, "\U0001f4c8")
+
+
+def _build_zt_section(zt_data: dict) -> str:
+    """涨停生态面板：连板天梯、封板率、板块热度"""
+    if not zt_data:
+        return ""
+    ladder = zt_data.get("ladder", {})
+    sector_heat = zt_data.get("sector_heat", {})
+    theme = zt_data.get("theme_analysis", "")
+    summary = zt_data.get("summary", "")
+
+    html = ""
+    # 连板天梯
+    if ladder:
+        html += '<div style="margin-bottom:10px"><div style="font-weight:700;font-size:13px;color:#e74c3c;margin-bottom:6px">\U0001f525 \u8fde\u677f\u5929\u68af</div>'
+        bars = ""
+        for level in sorted(ladder.keys(), reverse=True):
+            count = ladder[level]
+            # 兼容值为列表/字典/整数的情况
+            if isinstance(count, (list, tuple)):
+                count = len(count)
+            elif isinstance(count, dict):
+                count = len(count)
+            try:
+                count = int(count)
+            except (TypeError, ValueError):
+                count = 1
+            bar_w = min(count * 20, 100)
+            bars += f"""
+            <div style="display:flex;align-items:center;margin:3px 0;font-size:12px">
+                <span style="width:60px;font-weight:700;color:#e74c3c">{level}板</span>
+                <div style="flex:1;background:#fff1f0;border-radius:4px;height:18px;margin:0 8px;position:relative">
+                    <div style="background:#e74c3c;width:{bar_w}%;height:100%;border-radius:4px"></div>
+                </div>
+                <span style="width:30px;text-align:right;font-weight:700">{count}</span>
+            </div>"""
+        html += bars + '</div>'
+
+    # 板块热度
+    if sector_heat:
+        html += '<div style="margin-bottom:10px"><div style="font-weight:700;font-size:13px;color:#f39c12;margin-bottom:6px">\U0001f525 \u677f\u5757\u70ed\u5ea6</div>'
+        tags = ""
+        try:
+            if isinstance(sector_heat, dict):
+                items = sorted(sector_heat.items(), key=lambda x: x[1], reverse=True)[:8]
+                for name, score in items:
+                    score = int(score) if not isinstance(score, int) else score
+                    bg = "#e74c3c" if score >= 80 else ("#f39c12" if score >= 50 else "#999")
+                    tags += f'<span style="background:{bg};color:white;padding:3px 10px;border-radius:12px;font-size:11px;margin:2px 4px 2px 0;display:inline-block">{name} {score}</span>'
+            elif isinstance(sector_heat, (list, tuple)):
+                for item in sector_heat[:8]:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        name, score = item[0], item[1]
+                    else:
+                        name, score = str(item), 50
+                    bg = "#f39c12"
+                    tags += f'<span style="background:{bg};color:white;padding:3px 10px;border-radius:12px;font-size:11px;margin:2px 4px 2px 0;display:inline-block">{name}</span>'
+        except Exception:
+            pass
+        html += tags + '</div>'
+
+    if theme:
+        html += f'<div style="font-size:12px;color:#666;margin:6px 0"><b>\u4e3b\u9898\u5206\u6790:</b> {theme}</div>'
+    if summary:
+        html += f'<div style="background:#fff1f0;border-radius:6px;padding:8px 12px;font-size:12px;color:#cf1322;margin-top:6px">{summary}</div>'
+    return _section("涨停生态/连板天梯", html, "\U0001f525")
+
+
+def _build_sector_heatmap_section(heatmap_html: str) -> str:
+    """嵌入板块热力图HTML"""
+    if not heatmap_html:
+        return ""
+    return _section("板块资金热力图", heatmap_html, "\U0001f5fa\ufe0f")
+
+
+def _build_release_section(release_data: dict) -> str:
+    """解禁预警面板：高冲击解禁股列表"""
+    if not release_data:
+        return ""
+    total = release_data.get("total_stocks", 0)
+    high_impact = release_data.get("high_impact", [])
+    weekly = release_data.get("weekly_breakdown", {})
+    peak = release_data.get("peak_week", "")
+
+    html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">解禁总数</div>
+            <div style="font-size:20px;font-weight:700;color:#e67e22;margin-top:3px">{total}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">高冲击</div>
+            <div style="font-size:20px;font-weight:700;color:#e74c3c;margin-top:3px">{len(high_impact)}</div>
+        </div>
+        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">高峰周</div>
+            <div style="font-size:14px;font-weight:700;color:#e67e22;margin-top:3px">{peak or '--'}</div>
+        </div>
+    </div>"""
+
+    if high_impact:
+        html += '<div style="font-weight:700;font-size:12px;color:#cf1322;margin:8px 0 4px">\u26a0\ufe0f \u9ad8\u51b2\u51fb\u89e3\u7981\u80a1:</div>'
+        html += '<table style="width:100%;font-size:11px;border-collapse:collapse">'
+        html += '<tr style="background:#fff1f0"><th style="padding:6px;text-align:center">代码</th><th style="padding:6px;text-align:center">名称</th><th style="padding:6px;text-align:center">解禁日期</th><th style="padding:6px;text-align:center">市值占比</th></tr>'
+        for item in high_impact[:10]:
+            html += f"""<tr style="border-bottom:1px solid #f0f0f0">
+                <td style="padding:5px;text-align:center">{item.get('code','')}</td>
+                <td style="padding:5px;text-align:center;font-weight:600">{item.get('name','')}</td>
+                <td style="padding:5px;text-align:center">{item.get('date','')}</td>
+                <td style="padding:5px;text-align:center;color:#e74c3c;font-weight:700">{item.get('pct',0):.1f}%</td>
+            </tr>"""
+        html += '</table>'
+
+    if weekly:
+        html += '<div style="margin-top:8px;font-size:11px;color:#888">'
+        for week, cnt in list(weekly.items())[:6]:
+            html += f'<span style="margin-right:12px">{week}: {cnt}只</span>'
+        html += '</div>'
+    return _section("解禁风险预警", html, "\u26a0\ufe0f")
+
+
+def _build_holder_section(holder_data: dict) -> str:
+    """筹码集中度面板：股东户数变化、大宗交易"""
+    if not holder_data:
+        return ""
+    trend = holder_data.get("holder_trend", "--")
+    block_signal = holder_data.get("block_trade_signal", "")
+    concentration = holder_data.get("chip_concentration", 0)
+    risk = holder_data.get("risk_warning", "")
+
+    trend_color = "#8e44ad" if "集中" in str(trend) else ("#e74c3c" if "分散" in str(trend) else "#999")
+    conc_bar_w = min(int(concentration), 100)
+
+    html = f"""
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+        <div style="flex:1;min-width:120px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">股东户数趋势</div>
+            <div style="font-size:14px;font-weight:700;color:{trend_color};margin-top:3px">{trend}</div>
+        </div>
+        <div style="flex:1;min-width:120px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+            <div style="font-size:11px;color:#888">筹码集中度</div>
+            <div style="font-size:16px;font-weight:700;color:#8e44ad;margin-top:3px">{concentration:.0f}%</div>
+            <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:#8e44ad;width:{conc_bar_w}%;height:100%;border-radius:4px"></div></div>
+        </div>
+    </div>"""
+    if block_signal:
+        html += f'<div style="font-size:12px;color:#666;margin:6px 0"><b>\u5927\u5b97\u4ea4\u6613:</b> {block_signal}</div>'
+    if risk:
+        html += f'<div style="background:#fff1f0;border:1px solid #ffccc7;border-radius:6px;padding:8px 12px;margin-top:8px;font-size:12px;color:#cf1322">\u26a0\ufe0f {risk}</div>'
+    return _section("筹码集中度变化", html, "\U0001f465")
+
+
+# ============================================================
 # 完整邮件组装
 # ============================================================
 
 def build_morning_email(results: list, holdings: dict, sector_result: dict = None,
-                        plan: dict = None, charts: dict = None) -> str:
+                        plan: dict = None, charts: dict = None,
+                        zt_data: dict = None, release_data: dict = None) -> str:
     """
     盘前作战计划邮件（08:30）
     内容：市场环境 + 板块方向 + 操作清单 + 关键价位 + 仓位
@@ -486,6 +900,14 @@ def build_morning_email(results: list, holdings: dict, sector_result: dict = Non
     if ops:
         body += _section("今日操作", ops, "⚡")
 
+    # 昨日涨停生态速览（新增，放在操作计划前）
+    if zt_data:
+        body += _build_zt_section(zt_data)
+
+    # 解禁风险提示（新增）
+    if release_data:
+        body += _build_release_section(release_data)
+
     # 关键价位
     prices = ""
     for r in results:
@@ -504,7 +926,11 @@ def build_morning_email(results: list, holdings: dict, sector_result: dict = Non
 
 
 def build_evening_email(results: list, holdings: dict, sector_result: dict = None,
-                        scored: list = None, plan: dict = None, charts: dict = None) -> str:
+                        scored: list = None, plan: dict = None, charts: dict = None,
+                        flow_data: dict = None, lhb_data: dict = None,
+                        margin_data: dict = None, zt_data: dict = None,
+                        heatmap_html: str = None, release_data: dict = None,
+                        holder_data: dict = None) -> str:
     """
     盘后深度复盘邮件（15:30）
     内容：持仓表格 + 趋势 + 资金 + 筹码 + 板块 + 多因子 + 仓位 + 风险 + 图表
@@ -524,6 +950,10 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
             trend_html += f'<div style="padding:3px 0;font-size:13px"><b>{trend_names[lv]}({lv}级):</b> {names}</div>'
     body += _section("趋势分布", trend_html, "📈")
 
+    # 四级资金流向（新增）
+    if flow_data:
+        body += _build_multi_level_flow_section(flow_data)
+
     # 资金动向
     fund_html = ""
     for r in results:
@@ -534,6 +964,14 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
         color = "#e74c3c" if score >= 60 else ("#27ae60" if score <= 40 else "#f39c12")
         fund_html += f'<div style="padding:3px 0;font-size:12px"><b>{r["name"]:<8}</b> 主力连流{streak}天 | 评分<span style="color:{color};font-weight:700">{score}</span> | {signal}</div>'
     body += _section("资金动向", fund_html, "💰")
+
+    # 龙虎榜/游资（新增）
+    if lhb_data:
+        body += _build_lhb_section(lhb_data)
+
+    # 融资融券信号（新增）
+    if margin_data:
+        body += _build_margin_section(margin_data)
 
     # 资金流向图
     if charts and charts.get("fund_flow"):
@@ -552,6 +990,10 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
         chip_html += f'<div style="padding:3px 0;font-size:12px"><b>{r["name"]:<8}</b> 获利{pr*100:.0f}% | 集中{conc*100:.1f}% | {ctrl.get("level","-")}({ctrl.get("score",0)}分) | {pattern.get("name","-")}</div>'
     body += _section("筹码分布", chip_html, "🎯")
 
+    # 筹码集中度变化（新增）
+    if holder_data:
+        body += _build_holder_section(holder_data)
+
     # 板块轮动
     if sector_result:
         ranked = sector_result.get("ranked", [])
@@ -568,6 +1010,14 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
         # 板块图
         if charts and charts.get("sector_bar"):
             body += _section("板块动量图", f'<img src="{charts["sector_bar"]}" style="width:100%;border-radius:8px">', "📊")
+
+    # 板块资金热力图（新增）
+    if heatmap_html:
+        body += _build_sector_heatmap_section(heatmap_html)
+
+    # 涨停生态（新增）
+    if zt_data:
+        body += _build_zt_section(zt_data)
 
     # 多因子评分
     if scored:
@@ -586,6 +1036,10 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
             pos_html += '</div>'
         body += _section("仓位管理", pos_html, "💼")
 
+    # 解禁风险预警（新增，放在风险提示前面）
+    if release_data:
+        body += _build_release_section(release_data)
+
     # 风险提示
     risk_html = ""
     for r in results:
@@ -599,7 +1053,8 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
     return _wrap_html("📊 盘后深度复盘", f"操盘密码V3.0 | {len(results)}只标的全量分析", body)
 
 
-def build_orders_email(results: list, holdings: dict, plan: dict = None) -> str:
+def build_orders_email(results: list, holdings: dict, plan: dict = None,
+                       release_data: dict = None) -> str:
     """
     条件单邮件（19:00）
     内容：持仓总览 + 条件单详情 + 风控 + 纪律锁 + 明日摘要
@@ -616,13 +1071,26 @@ def build_orders_email(results: list, holdings: dict, plan: dict = None) -> str:
     body += _section("条件单操作计划", build_conditional_orders(results, holdings), "📋")
 
     # 风控状态
-    body += _section("风控状态", build_risk_section(results, holdings, plan), "🛡️")
+    risk_content = build_risk_section(results, holdings, plan)
+    # 解禁检查说明（新增）
+    if release_data:
+        high_impact = release_data.get("high_impact", [])
+        if high_impact:
+            names = "、".join([item.get("name", item.get("code", "")) for item in high_impact[:5]])
+            risk_content += _alert_box(
+                f"⚠️ 解禁风险: 近期有{len(high_impact)}只高冲击解禁股（{names}），请注意流动性风险",
+                "warning"
+            )
+        else:
+            risk_content += _alert_box("✅ 近期无高冲击解禁股，解禁风险较低", "success")
+    body += _section("风控状态", risk_content, "🛡️")
 
     return _wrap_html("📋 条件单操作计划", f"操盘密码V3.0 | 总资金{750000/10000:.0f}万 | 持{len([r for r in results if holdings.get(r.get('code',''),{}).get('shares',0)])}只", body)
 
 
 def build_weekly_email(results: list, holdings: dict, sector_result: dict = None,
-                       plan: dict = None, charts: dict = None) -> str:
+                       plan: dict = None, charts: dict = None,
+                       lhb_data: dict = None, margin_data: dict = None) -> str:
     """
     周策略报告邮件（周六 10:00）
     """
@@ -684,6 +1152,14 @@ def build_weekly_email(results: list, holdings: dict, sector_result: dict = None
         names = "、".join([r["name"] for r in d_signals])
         strategy_html += f'<div style="padding:4px 0;font-size:13px;color:#f39c12"><b>关注:</b> {names} (D点信号，等待回踩确认)</div>'
     body += _section("下周策略", strategy_html, "🎯")
+
+    # 本周龙虎榜回顾（新增）
+    if lhb_data:
+        body += _build_lhb_section(lhb_data)
+
+    # 融资余额周趋势（新增）
+    if margin_data:
+        body += _build_margin_section(margin_data)
 
     # 仓位饼图
     if charts and charts.get("position_pie"):

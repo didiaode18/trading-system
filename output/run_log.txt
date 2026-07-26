@@ -1,0 +1,11 @@
+﻿python : 融资融券: 600584 获取失败，进入5分钟冷却期
+所在位置 行:1 字符: 125
++ ... space\trading-system; python generate_holdings_report.py 2>&1 | Out-F ...
++                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (融资融券: 600584 获取失败，进入5分钟冷却期:String 
+   ) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+融资融券: 603986 获取失败，进入5分钟冷却期
+融资融券: 600760 获取失败，进入5分钟冷却期
+融资融券: 600118 获取失败，进入5分钟冷却期

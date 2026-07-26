@@ -26,6 +26,7 @@ V3.0新增:
 import smtplib
 import logging
 import datetime
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
@@ -62,35 +63,41 @@ def send_email(subject: str, html_content: str,
     if receiver is None:
         receiver = config.EMAIL_RECEIVER
 
+    # FIX: 修复 SMTP发送失败无重试且未用上下文管理器的问题
+    msg = None
     try:
-        # 构建邮件
         msg = MIMEMultipart("alternative")
         msg["From"] = config.EMAIL_SENDER
         msg["To"] = receiver
         msg["Subject"] = subject
-
-        # HTML正文
         html_part = MIMEText(html_content, "html", "utf-8")
         msg.attach(html_part)
-
-        # 发送
-        smtp = smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT)
-        smtp.login(config.EMAIL_SENDER, config.EMAIL_AUTH_CODE)
-        smtp.sendmail(config.EMAIL_SENDER, [receiver], msg.as_string())
-        smtp.quit()
-
-        logger.info(f"邮件发送成功: {subject} -> {receiver}")
-        return True
-
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"邮箱认证失败: {e}（请检查EMAIL_SENDER和EMAIL_AUTH_CODE是否正确）")
-        return False
-    except smtplib.SMTPException as e:
-        logger.error(f"SMTP错误: {e}")
-        return False
     except Exception as e:
-        logger.error(f"邮件发送异常: {e}")
+        logger.error(f"构建邮件失败: {e}")
         return False
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            with smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT) as smtp:
+                smtp.login(config.EMAIL_SENDER, config.EMAIL_AUTH_CODE)
+                smtp.sendmail(config.EMAIL_SENDER, [receiver], msg.as_string())
+            logger.info(f"邮件发送成功: {subject} -> {receiver}")
+            return True
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"邮箱认证失败: {e}（请检查EMAIL_SENDER和EMAIL_AUTH_CODE是否正确）")
+            return False
+        except smtplib.SMTPException as e:
+            logger.error(f"SMTP错误(第{attempt}次): {e}")
+            if attempt < max_retries:
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"邮件发送异常(第{attempt}次): {e}")
+            if attempt < max_retries:
+                time.sleep(5)
+
+    logger.error(f"邮件发送失败，已重试{max_retries}次: {subject}")
+    return False
 
 
 # ============================================================
@@ -475,7 +482,7 @@ def send_comprehensive_daily_report(
         for code, h in holdings.items():
             name = h.get("name", code)
             shares = h.get("shares", 0)
-            buy_price = h.get("buy_price", 0)
+            buy_price = h.get("buy_price") or 0  # FIX: 修复 buy_price 为None时导致后续计算异常
             current = h.get("current_price", buy_price)
             stop_loss = h.get("stop_loss", 0)
             pnl_pct = (current - buy_price) / buy_price * 100 if buy_price > 0 else 0

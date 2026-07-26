@@ -329,12 +329,16 @@ class SimBroker:
                 pos.frozen_shares = 0
                 pos.frozen_date = ""
 
-    def update_highest(self, code: str, price: float):
-        """更新持仓最高价"""
+    def update_highest(self, code: str, price):
+        """更新持仓最高价（兼容float和dict格式）"""
         if code in self.positions:
-            pos = self.positions[code]
-            if price > pos.highest_price:
-                pos.highest_price = price
+            # 兼容price为dict的情况（如{"close": xx}）
+            if isinstance(price, dict):
+                price = price.get("close", 0)
+            if price and price > 0:
+                pos = self.positions[code]
+                if price > pos.highest_price:
+                    pos.highest_price = price
 
     # ----------------------------------------------------------
     # 查询接口

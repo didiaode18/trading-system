@@ -49,17 +49,26 @@ STOCK_SECTOR = {
     "002415": "电子", "600036": "银行", "000858": "食品饮料",
     "603501": "电子", "601012": "电力设备", "002185": "电子",
     "001309": "电子", "002558": "传媒", "588000": "科技ETF",
-    "159205": "金融ETF", "688234": "电子",
+    "159205": "金融ETF", "688234": "电子", "002409": "电子",
+    "600276": "医药", "603993": "有色资源",
 }
 
 
 class PositionSizer:
     """仓位管理器"""
 
-    def __init__(self, total_capital: float = None, config: dict = None):
+    def __init__(self, total_capital: float = None, available_cash: float = None, config: dict = None):
         self.cfg = {**SIZING_CONFIG, **(config or {})}
         if total_capital:
             self.cfg["total_capital"] = total_capital
+        # V2.0: 可用资金约束（用于判断买入建议是否可执行）
+        self.available_cash = available_cash
+        if self.available_cash is None:
+            try:
+                import config as _cfg
+                self.available_cash = getattr(_cfg, 'AVAILABLE_CASH', 0)
+            except Exception:
+                self.available_cash = 0
 
     def calc_positions(self, results: List[dict], holdings: dict = None) -> dict:
         """
@@ -109,6 +118,7 @@ class PositionSizer:
 
         return {
             "total_capital": capital,
+            "available_cash": self.available_cash,
             "positions": positions,
             "total_allocated": round(total_allocated, 0),
             "cash_remaining": round(capital - total_allocated, 0),
@@ -282,8 +292,10 @@ class PositionSizer:
         }
 
     def _calc_rebalance(self, positions: List[dict], holdings: dict, capital: float) -> List[dict]:
-        """计算再平衡建议"""
+        """计算再平衡建议（V2.0: 结合可用资金约束）"""
         rebalance = []
+        remaining_cash = self.available_cash  # 跟踪剩余可用资金
+
         for p in positions:
             code = p["code"]
             current = p["current_shares"]
@@ -293,14 +305,42 @@ class PositionSizer:
             if abs(diff) >= 100:  # 至少100股才调整
                 action = "买入" if diff > 0 else "卖出"
                 amount = abs(diff) * p["close"]
-                rebalance.append({
-                    "code": code,
-                    "name": p["name"],
-                    "action": action,
-                    "shares": abs(diff),
-                    "amount": round(amount, 0),
-                    "reason": f"目标{target}股 vs 当前{current}股",
-                })
+
+                # V2.0: 买入时检查可用资金
+                feasible = True
+                note = ""
+                if action == "买入":
+                    if remaining_cash < amount:
+                        # 资金不足，计算实际可买股数
+                        affordable_shares = int(remaining_cash / p["close"] / 100) * 100
+                        if affordable_shares >= 100:
+                            note = f"⚠️资金不足,可买{affordable_shares}股(需{amount/10000:.1f}万,仅有{remaining_cash/10000:.2f}万)"
+                            amount = affordable_shares * p["close"]
+                            diff = affordable_shares
+                        else:
+                            feasible = False
+                            note = f"⛔资金不足(需{amount/10000:.1f}万,仅有{remaining_cash/10000:.2f}万)"
+                    else:
+                        remaining_cash -= amount
+
+                if feasible:
+                    rebalance.append({
+                        "code": code,
+                        "name": p["name"],
+                        "action": action,
+                        "shares": abs(diff),
+                        "amount": round(amount, 0),
+                        "reason": f"目标{target}股 vs 当前{current}股" + (f" | {note}" if note else ""),
+                    })
+                else:
+                    rebalance.append({
+                        "code": code,
+                        "name": p["name"],
+                        "action": "买入(不可执行)",
+                        "shares": abs(diff),
+                        "amount": round(amount, 0),
+                        "reason": note,
+                    })
 
         # 检查需要清仓的（在holdings中但不在positions中）
         position_codes = {p["code"] for p in positions}
@@ -327,9 +367,11 @@ class PositionSizer:
 
 
 def position_summary(plan: dict) -> str:
-    """仓位计划摘要文本"""
+    """仓位计划摘要文本（V2.0: 含可用资金提示）"""
     lines = ["📊 仓位管理计划"]
     lines.append(f"  {plan['summary']}")
+    available = plan.get('available_cash', 0)
+    lines.append(f"  💰 当前可用资金: {available:.2f}元" + (" ⚠️几乎无可用资金" if available < 1000 else ""))
     lines.append("")
     lines.append(f"  {'标的':<10} {'操作':<4} {'目标股数':<8} {'金额(万)':<8} {'占比':<6} {'止损':<8} {'凯利%':<6}")
     lines.append("  " + "─" * 60)

@@ -31,6 +31,7 @@ sys.path.insert(0, BASE_DIR)
 
 import config
 from strategy.caopan_signal import CaopanEngine
+from strategy.market_regime import MarketRegimeDetector
 from strategy.sector_flow import SectorMonitor, sector_summary
 from strategy.multi_factor import MultiFactorScorer, factor_summary
 from risk.position_sizing import PositionSizer, position_summary
@@ -47,8 +48,9 @@ def load_holdings() -> dict:
     """加载持仓配置"""
     # 名称映射表
     NAME_MAP = {
-        "588000": "科创50", "603501": "豪威集团", "002558": "巨人网络",
-        "159205": "创业东财", "002185": "华天科技",
+        "588000": "科创50", "002415": "海康威视", "603501": "豪威集团",
+        "002409": "雅克科技", "002185": "华天科技", "600036": "招商银行",
+        "159205": "创业东财", "600276": "恒瑞医药", "603993": "洛阳钼业",
     }
     holdings_path = os.path.join(BASE_DIR, "holdings.json")
     if os.path.exists(holdings_path):
@@ -62,8 +64,14 @@ def load_holdings() -> dict:
     return {}
 
 
-def fetch_stock_data(code: str, days: int = 500) -> "pd.DataFrame":
-    """获取股票历史K线数据"""
+def fetch_stock_data(code: str, days: int = 500, _logged_in: bool = False) -> "pd.DataFrame":
+    """获取股票历史K线数据
+    
+    Args:
+        code: 股票代码
+        days: 历史天数
+        _logged_in: 是否已登录baostock（循环调用时设为True，并在循环外统一login/logout）
+    """
     import baostock as bs
     import pandas as pd
 
@@ -74,7 +82,9 @@ def fetch_stock_data(code: str, days: int = 500) -> "pd.DataFrame":
         else:
             code = f"sz.{code}"
 
-    lg = bs.login()
+    # FIX: 修复每只股票单独login/logout的性能问题，支持复用已登录会话
+    if not _logged_in:
+        bs.login()
     end_date = datetime.date.today().strftime("%Y-%m-%d")
     start_date = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -91,7 +101,8 @@ def fetch_stock_data(code: str, days: int = 500) -> "pd.DataFrame":
     while rs.error_code == '0' and rs.next():
         data_list.append(rs.get_row_data())
 
-    bs.logout()
+    if not _logged_in:
+        bs.logout()
 
     if not data_list:
         return None
@@ -116,53 +127,78 @@ def run_analyze():
         print("\n⚠️ 未找到holdings.json，使用默认持仓列表")
         # 从config获取默认持仓
         holdings = {
-            "588000": {"name": "科创50ETF", "shares": 170100, "cost": 1.063},
-            "603501": {"name": "韦尔股份", "shares": 200, "cost": 131.35},
-            "688234": {"name": "天岳先进", "shares": 500, "cost": 72.80},
-            "002185": {"name": "华天科技", "shares": 2000, "cost": 12.50},
-            "000858": {"name": "五粮液", "shares": 500, "cost": 148.60},
+            "588000": {"name": "科创50", "shares": 170100, "cost": 1.063},
+            "002415": {"name": "海康威视", "shares": 500, "cost": 29.124},
+            "603501": {"name": "豪威集团", "shares": 400, "cost": 145.155},
+            "002409": {"name": "雅克科技", "shares": 400, "cost": 76.065},
+            "002185": {"name": "华天科技", "shares": 0, "cost": 0},
+            "600036": {"name": "招商银行", "shares": 100, "cost": 42.42},
+            "159205": {"name": "创业东财", "shares": 3000, "cost": 1.389},
+            "600276": {"name": "恒瑞医药", "shares": 100, "cost": 59.05},
+            "603993": {"name": "洛阳钼业", "shares": 400, "cost": 20.15},
         }
 
     engine = CaopanEngine()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # 大盘状态检测（传入CaopanEngine联动过滤）
+    market_regime = None
+    try:
+        from data.data_loader import load_daily_data, init_db
+        conn = init_db()
+        benchmark_df = load_daily_data(config.BENCHMARK_INDEX, conn, days=120)
+        if not benchmark_df.empty and len(benchmark_df) >= 60:
+            detector = MarketRegimeDetector()
+            market_regime = detector.detect(benchmark_df)
+            print(f"\n  🌐 大盘状态: {market_regime['state_cn']} | 置信度{market_regime['confidence']:.0%}")
+            print(f"     {market_regime['detail']}\n")
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️ 大盘状态检测失败: {e}，使用默认阈值")
+
     results = []
     print(f"\n📡 正在获取数据并分析 {len(holdings)} 只标的...\n")
 
-    for code, info in holdings.items():
-        name = info.get("name", code)
-        print(f"  分析 {name}({code})...", end=" ")
+    # FIX: 修复每只股票单独baostock login/logout，改为循环外一次login，循环后一次logout
+    import baostock as bs
+    bs.login()
+    try:
+        for code, info in holdings.items():
+            name = info.get("name", code)
+            print(f"  分析 {name}({code})...", end=" ")
 
-        try:
-            df = fetch_stock_data(code, days=500)
-            if df is None or len(df) < 60:
-                print("❌ 数据不足")
-                continue
+            try:
+                df = fetch_stock_data(code, days=500, _logged_in=True)
+                if df is None or len(df) < 60:
+                    print("❌ 数据不足")
+                    continue
 
-            result = engine.analyze(df, code=code, name=name)
-            if "error" in result:
-                print(f"❌ {result['error']}")
-                continue
+                result = engine.analyze(df, code=code, name=name, market_regime=market_regime)
+                if "error" in result:
+                    print(f"❌ {result['error']}")
+                    continue
 
-            # 生成图表
-            chart_path = os.path.join(OUTPUT_DIR, f"caopan_{code}_{datetime.date.today().strftime('%Y%m%d')}.html")
-            generate_caopan_chart(result, output_path=chart_path)
+                # 生成图表
+                chart_path = os.path.join(OUTPUT_DIR, f"caopan_{code}_{datetime.date.today().strftime('%Y%m%d')}.html")
+                generate_caopan_chart(result, output_path=chart_path)
 
-            # 输出摘要
-            dk = result.get("dk_signal") or "无"
-            trend = result.get("trend_desc", "")
-            grade = result.get("dk_grade", "")
-            filtered = result.get("dk_filtered", False)
-            action = result.get("action_suggestion", {})
-            rr = result.get("risk_reward", {})
-            env = result.get("market_env", {})
-            filter_mark = "[已过滤]" if filtered else ""
-            print(f"✅ {trend} | DK={dk}({result.get('dk_strength',0)}分/{grade}){filter_mark} | 盈亏比{rr.get('risk_reward_1',0):.1f}:1 | {action.get('desc','')}")
+                # 输出摘要
+                dk = result.get("dk_signal") or "无"
+                trend = result.get("trend_desc", "")
+                grade = result.get("dk_grade", "")
+                filtered = result.get("dk_filtered", False)
+                action = result.get("action_suggestion", {})
+                rr = result.get("risk_reward", {})
+                env = result.get("market_env", {})
+                filter_mark = "[已过滤]" if filtered else ""
+                print(f"✅ {trend} | DK={dk}({result.get('dk_strength',0)}分/{grade}){filter_mark} | 盈亏比{rr.get('risk_reward_1',0):.1f}:1 | {action.get('desc','')}")
 
-            results.append(result)
+                results.append(result)
 
-        except Exception as e:
-            print(f"❌ 异常: {e}")
+            except Exception as e:
+                print(f"❌ 异常: {e}")
+    finally:
+        bs.logout()
 
     # 输出汇总
     print(f"\n{'─' * 60}")
@@ -370,10 +406,15 @@ def run_backtest():
     holdings = load_holdings()
     if not holdings:
         holdings = {
-            "588000": {"name": "科创50ETF"},
-            "603501": {"name": "韦尔股份"},
+            "588000": {"name": "科创50"},
+            "002415": {"name": "海康威视"},
+            "603501": {"name": "豪威集团"},
+            "002409": {"name": "雅克科技"},
             "002185": {"name": "华天科技"},
-            "000858": {"name": "五粮液"},
+            "600036": {"name": "招商银行"},
+            "159205": {"name": "创业东财"},
+            "600276": {"name": "恒瑞医药"},
+            "603993": {"name": "洛阳钼业"},
         }
 
     engine = CaopanEngine()
@@ -381,27 +422,33 @@ def run_backtest():
 
     print(f"\n📡 获取3年数据并回测...\n")
 
-    for code, info in holdings.items():
-        name = info.get("name", code)
-        print(f"  回测 {name}({code})...", end=" ")
+    # FIX: 循环外一次baostock login，循环后一次logout
+    import baostock as bs
+    bs.login()
+    try:
+        for code, info in holdings.items():
+            name = info.get("name", code)
+            print(f"  回测 {name}({code})...", end=" ")
 
-        try:
-            df = fetch_stock_data(code, days=1200)  # ~3年
-            if df is None or len(df) < 120:
-                print("❌ 数据不足")
-                continue
+            try:
+                df = fetch_stock_data(code, days=1200, _logged_in=True)  # ~3年
+                if df is None or len(df) < 120:
+                    print("❌ 数据不足")
+                    continue
 
-            bt = engine.backtest(df, code=code)
-            if "error" in bt:
-                print(f"❌ {bt['error']}")
-                continue
+                bt = engine.backtest(df, code=code)
+                if "error" in bt:
+                    print(f"❌ {bt['error']}")
+                    continue
 
-            all_results.append({**bt, "name": name})
-            pass_mark = "✅达标" if bt["all_pass"] else "❌未达标"
-            print(f"✅ 交易{bt['total_trades']}次 | 胜率{bt['win_rate']:.0%} | 盈亏比{bt['profit_factor']:.1f} | 年化{bt['annual_return']:.1%} | 回撤{bt['max_drawdown']:.1%} | {pass_mark}")
+                all_results.append({**bt, "name": name})
+                pass_mark = "✅达标" if bt["all_pass"] else "❌未达标"
+                print(f"✅ 交易{bt['total_trades']}次 | 胜率{bt['win_rate']:.0%} | 盈亏比{bt['profit_factor']:.1f} | 年化{bt['annual_return']:.1%} | 回撤{bt['max_drawdown']:.1%} | {pass_mark}")
 
-        except Exception as e:
-            print(f"❌ 异常: {e}")
+            except Exception as e:
+                print(f"❌ 异常: {e}")
+    finally:
+        bs.logout()
 
     # 输出完整报告
     if all_results:
@@ -466,17 +513,23 @@ def run_scan():
     names = {}
     count = 0
 
-    for code, name in scan_pool.items():
-        try:
-            df = fetch_stock_data(code, days=300)
-            if df is not None and len(df) >= 60:
-                data_dict[code] = df
-                names[code] = name
-                count += 1
-                if count % 20 == 0:
-                    print(f"  已加载 {count}/{len(scan_pool)} ...")
-        except Exception:
-            continue
+    # FIX: 循环外一次baostock login，循环后一次logout
+    import baostock as bs
+    bs.login()
+    try:
+        for code, name in scan_pool.items():
+            try:
+                df = fetch_stock_data(code, days=300, _logged_in=True)
+                if df is not None and len(df) >= 60:
+                    data_dict[code] = df
+                    names[code] = name
+                    count += 1
+                    if count % 20 == 0:
+                        print(f"  已加载 {count}/{len(scan_pool)} ...")
+            except Exception:
+                continue
+    finally:
+        bs.logout()
 
     print(f"\n  数据加载完成: {count}只有效")
     print(f"  正在计算信号...")
@@ -576,16 +629,14 @@ def _get_scan_pool() -> dict:
         pass
 
     # 备选: 从config获取赛道龙头
+    # FIX: 修复引用不存在的 config.SECTOR_CONFIG，改为 config.SECTOR_CANDIDATES
     try:
         pool = {}
-        sectors = getattr(config, "SECTOR_CONFIG", {})
+        sectors = getattr(config, "SECTOR_CANDIDATES", {})
         for sector_name, sector_info in sectors.items():
-            stocks = sector_info.get("stocks", [])
-            for s in stocks[:5]:
-                if isinstance(s, dict):
-                    pool[s.get("code", "")] = s.get("name", "")
-                elif isinstance(s, str):
-                    pool[s] = s
+            stocks = sector_info.get("stocks", {})
+            for code, info in list(stocks.items())[:5]:
+                pool[code] = info.get("名称", code)
         if pool:
             return pool
     except Exception:
@@ -623,50 +674,70 @@ def run_orders():
     engine = CaopanEngine()
     orders = []
 
+    # 大盘状态检测
+    market_regime = None
+    try:
+        from data.data_loader import load_daily_data, init_db
+        conn = init_db()
+        benchmark_df = load_daily_data(config.BENCHMARK_INDEX, conn, days=120)
+        if not benchmark_df.empty and len(benchmark_df) >= 60:
+            detector = MarketRegimeDetector()
+            market_regime = detector.detect(benchmark_df)
+            print(f"  🌐 大盘状态: {market_regime['state_cn']}\n")
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️ 大盘状态检测失败: {e}，使用默认阈值")
+
     print(f"\n📡 分析{len(holdings)}只持仓并生成条件单...\n")
 
-    for code, info in holdings.items():
-        name = info.get("name", code)
-        try:
-            df = fetch_stock_data(code, days=300)
-            if df is None or len(df) < 60:
-                continue
+    # FIX: 循环外一次baostock login，循环后一次logout
+    import baostock as bs
+    bs.login()
+    try:
+        for code, info in holdings.items():
+            name = info.get("name", code)
+            try:
+                df = fetch_stock_data(code, days=300, _logged_in=True)
+                if df is None or len(df) < 60:
+                    continue
 
-            result = engine.analyze(df, code=code, name=name)
-            if "error" in result:
-                continue
+                result = engine.analyze(df, code=code, name=name, market_regime=market_regime)
+                if "error" in result:
+                    continue
 
-            close = result["close"]
-            ll2 = result.get("support_price", close * 0.95)
-            trend_level = result.get("trend_level", 3)
-            rr = result.get("risk_reward", {})
-            action = result.get("action_suggestion", {})
+                close = result["close"]
+                ll2 = result.get("support_price", close * 0.95)
+                trend_level = result.get("trend_level", 3)
+                rr = result.get("risk_reward", {})
+                action = result.get("action_suggestion", {})
 
-            # 动态止损: LL2下方3%
-            stop_loss = round(ll2 * (1 - config.CAOPAN_CONFIG["stop_loss_below_ll2"]), 3)
-            # 超买止盈: 乖离>10%的价位
-            overbought_price = round(result.get("ll_fast", close) * (1 + config.CAOPAN_CONFIG["deviation_overbought"]), 3)
-            # 目标位
-            target_1 = rr.get("target_1", close * 1.1)
-            target_2 = rr.get("target_2", close * 1.2)
+                # 动态止损: LL2下方3%
+                stop_loss = round(ll2 * (1 - config.CAOPAN_CONFIG["stop_loss_below_ll2"]), 3)
+                # 超买止盈: 乖离>10%的价位
+                overbought_price = round(result.get("ll_fast", close) * (1 + config.CAOPAN_CONFIG["deviation_overbought"]), 3)
+                # 目标位
+                target_1 = rr.get("target_1", close * 1.1)
+                target_2 = rr.get("target_2", close * 1.2)
 
-            order = {
-                "code": code, "name": name, "close": close,
-                "trend": result.get("trend_desc", ""),
-                "trend_level": trend_level,
-                "stop_loss": stop_loss,
-                "overbought_price": overbought_price,
-                "target_1": target_1, "target_2": target_2,
-                "action": action.get("desc", ""),
-                "dk_signal": result.get("dk_signal"),
-                "deviation_pct": result.get("deviation_pct", 0),
-            }
-            orders.append(order)
+                order = {
+                    "code": code, "name": name, "close": close,
+                    "trend": result.get("trend_desc", ""),
+                    "trend_level": trend_level,
+                    "stop_loss": stop_loss,
+                    "overbought_price": overbought_price,
+                    "target_1": target_1, "target_2": target_2,
+                    "action": action.get("desc", ""),
+                    "dk_signal": result.get("dk_signal"),
+                    "deviation_pct": result.get("deviation_pct", 0),
+                }
+                orders.append(order)
 
-            print(f"  {name}({code}) | 趋势{trend_level}级 | 止损{stop_loss} | 超买{overbought_price} | {action.get('desc','')}")
+                print(f"  {name}({code}) | 趋势{trend_level}级 | 止损{stop_loss} | 超买{overbought_price} | {action.get('desc','')}")
 
-        except Exception as e:
-            print(f"  {name}({code}) ❌ {e}")
+            except Exception as e:
+                print(f"  {name}({code}) ❌ {e}")
+    finally:
+        bs.logout()
 
     # 输出条件单表格
     if orders:

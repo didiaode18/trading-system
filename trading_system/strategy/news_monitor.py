@@ -316,7 +316,8 @@ def _match_market_alert_to_stocks(alert: dict, sentiment: dict,
         sector = pos.get("sector", "")
         name = config.get_stock_name(code)
         # 如果新闻标题包含行业关键词或股票名称
-        if sector and sector in title or name and name in title:
+        # FIX: 修复运算符优先级缺括号导致逻辑错误
+        if (sector and sector in title) or (name and name in title):
             if code not in risk_result:
                 risk_result[code] = {
                     "level": sentiment["level"],

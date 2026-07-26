@@ -57,11 +57,50 @@ logger = logging.getLogger(__name__)
 # eps_growth_3y: 近3年净利润复合增速(%)
 # has_institution: 是否有机构持仓/北向加仓
 # 未配置的个股使用默认中性值
-FUNDAMENTAL_DATA = {
-    # 示例（请根据实际财报数据更新）:
-    # "002371": {"eps_growth_q": 35, "eps_growth_3y": 28, "has_institution": True},
-    # "603986": {"eps_growth_q": 20, "eps_growth_3y": 15, "has_institution": True},
-}
+FUNDAMENTAL_DATA = {}
+
+
+def _load_fundamental_data(stock_codes: list) -> dict:
+    """
+    通过 FundamentalAnalyzer 批量获取基本面数据，填充 FUNDAMENTAL_DATA
+    
+    参数:
+        stock_codes: 需要获取基本面数据的股票代码列表
+    返回:
+        {code: {"eps_growth_q": xx, "eps_growth_3y": xx, "has_institution": bool}}
+    """
+    global FUNDAMENTAL_DATA
+    try:
+        from strategy.fundamental import FundamentalAnalyzer
+    except ImportError as e:
+        logger.warning(f"[基本面] FundamentalAnalyzer导入失败，CAI因子使用中性默认值: {e}")
+        return {}
+
+    fa = FundamentalAnalyzer()
+    loaded_count = 0
+    failed_count = 0
+
+    for code in stock_codes:
+        try:
+            data = fa.get_canslim_fundamental(code)
+            if data and (data.get("eps_growth_q", 0) != 0
+                         or data.get("eps_growth_3y", 0) != 0
+                         or data.get("has_institution") is True):
+                FUNDAMENTAL_DATA[code] = data
+                loaded_count += 1
+            else:
+                failed_count += 1
+        except Exception as e:
+            logger.debug(f"[基本面] {code}数据获取异常: {e}")
+            failed_count += 1
+
+    logger.info(f"[基本面] 数据加载完成: 成功{loaded_count}只 / 失败{failed_count}只 / 共{len(stock_codes)}只")
+    if loaded_count > 0:
+        logger.info(f"[基本面] 已填充FUNDAMENTAL_DATA，CAI因子将基于真实基本面数据计算")
+    else:
+        logger.warning(f"[基本面] 未能获取任何有效基本面数据，CAI因子将使用中性默认值")
+
+    return FUNDAMENTAL_DATA
 
 
 # ============================================================
@@ -502,32 +541,46 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None) -> dict:
     vol_ma20 = df["volume"].iloc[-20:].mean()
     vol_ratio = vol / vol_ma20 if vol_ma20 > 0 else 1
 
-    # ★ 核心买点：缩量回踩20日均线
+    # ★ 核心买点：缩量回踩20日均线（V3增强: 回踩不破确认）
     if "ma20" in df.columns and not pd.isna(latest.get("ma20", None)):
-        dist_to_ma20 = (current_price - latest["ma20"]) / latest["ma20"]
+        ma20_val = latest["ma20"]
+        dist_to_ma20 = (current_price - ma20_val) / ma20_val
+        day_low = latest.get("low", current_price)  # 盘中最低价
 
         # 缩量：成交量较20日均量萎缩30%以上
         is_shrink = vol_ratio < 0.7
-        # 回踩MA20：价格在MA20附近（-3%到+2%）
+        # 回踩不破确认：盘中最低触及MA20附近（≤MA20×1.01）
+        touch_ma20 = day_low <= ma20_val * 1.01
+        # 收盘站稳：收盘价仍在MA20上方（不破位）
+        hold_above_ma20 = current_price > ma20_val
+        # 价格在MA20附近（-3%到+2%）
         is_pullback = -0.03 <= dist_to_ma20 <= 0.02
-        # 不跌破：收盘价仍在MA20上方或仅微破
-        is_holding = dist_to_ma20 >= -0.03
 
-        if is_shrink and is_pullback and is_holding:
-            s_score += 20  # 完美缩量回踩MA20
-            signals.append("★缩量回踩MA20")
-        elif is_pullback and is_holding:
+        if is_shrink and touch_ma20 and hold_above_ma20:
+            s_score += 20  # 完美缩量回踩MA20不破（核心买点）
+            signals.append("★缩量回踩MA20不破")
+            logger.info(f"  [买点] {code} 缩量回踩MA20不破: low={day_low:.2f} MA20={ma20_val:.2f} close={current_price:.2f} vol_ratio={vol_ratio:.2f}")
+        elif is_shrink and is_pullback and hold_above_ma20:
+            s_score += 16  # 缩量+MA20附近+站稳（次优买点）
+            signals.append("缩量回踩MA20")
+        elif is_pullback and hold_above_ma20:
             s_score += 12  # 回踩MA20但未缩量
             signals.append("回踩MA20")
         elif is_shrink and -0.05 <= dist_to_ma20 <= 0.05:
             s_score += 8   # 缩量但在MA20附近稍远
 
-    # 放量突破（另一个核心买点）
-    if vol_ratio > 1.5 and current_price > prev["close"]:
+    # 放量突破（V3增强: 需确认突破60日新高，避免假突破）
+    high_60d_for_breakout = df["high"].iloc[-60:].max() if len(df) >= 60 else current_price
+    is_near_high = current_price >= high_60d_for_breakout * 0.98  # 接近或突破60日新高
+    if vol_ratio > 1.5 and current_price > prev["close"] and is_near_high:
         s_score += 10
+        signals.append("放量突破新高")
+        logger.info(f"  [买点] {code} 放量突破: vol_ratio={vol_ratio:.2f} price={current_price:.2f} high60={high_60d_for_breakout:.2f}")
+    elif vol_ratio > 1.5 and current_price > prev["close"]:
+        s_score += 6   # 放量上涨但未突破新高（降级）
         signals.append("放量上涨")
     elif vol_ratio > 1.2 and current_price > prev["close"]:
-        s_score += 5
+        s_score += 4
 
     # 下跌缩量（健康的量价关系）
     if current_price < prev["close"] and vol_ratio < 0.7:
@@ -736,7 +789,8 @@ def predict_forward(df: pd.DataFrame, code: str) -> dict:
         
         if 0 < dist_to_20d_high <= 2:
             score += 5  # 距20日新高仅2%，明日可能突破
-            signals.append("即将突码20日新高")
+            # FIX: 修复“即将突码”笔误，应为“即将突破”
+            signals.append("即将突破20日新高")
         elif 0 < dist_to_60d_high <= 3:
             score += 4  # 距60日新高3%以内
             signals.append("逼近60日新高")
@@ -871,6 +925,20 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     candidates_stop = [s for s in [atr_stop, support_stop, fixed_stop] if s > 0]
     final_stop = max(candidates_stop) if candidates_stop else fixed_stop
     final_stop = min(final_stop, round(current_price * 0.95, 2))  # 最多5%以内
+    # 止损价保护：确保止损价 < 现价（参考report_email.py保护逻辑）
+    if final_stop >= current_price:
+        final_stop = round(current_price * 0.92, 2)
+        logger.warning(f"  [止损保护] {code} 止损价异常，强制调整为现价×92%={final_stop}")
+    stop_loss_pct = round((current_price - final_stop) / current_price * 100, 1)
+    logger.info(f"  [止损] {code} 最终止损={final_stop}(-{stop_loss_pct}%) | ATR止损={atr_stop} 支撑止损={support_stop} 固定止损={fixed_stop}")
+
+    # 风险等级标注（基于止损距离）
+    if stop_loss_pct <= 5:
+        risk_level = "低风险(止损≤5%)"
+    elif stop_loss_pct <= 8:
+        risk_level = "中风险(止损5-8%)"
+    else:
+        risk_level = "高风险(止损>8%)"
 
     # ---- 分批建仓方案 ----
     # 使用可用资金（而非总资金）计算实际可买股数
@@ -923,7 +991,8 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
         "conservative_buy": conservative_buy,
         # 止损
         "stop_loss": final_stop,
-        "stop_loss_pct": round((current_price - final_stop) / current_price * 100, 1),
+        "stop_loss_pct": stop_loss_pct,
+        "risk_level": risk_level,
         "atr": round(atr, 2),
         # 分批建仓
         "first_shares": first_shares,
@@ -1039,6 +1108,16 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     
     scan_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     logger.info(f"[选股引擎V3] 开始运行（全赛道+弱势模式），候选股票 {len(data_dict)} 只")
+
+    # 基本面数据加载：通过FundamentalAnalyzer获取真实PE/PB/ROE/增速数据
+    logger.info("[选股引擎V3] 加载基本面数据（CAI因子）...")
+    stock_codes = [code for code in data_dict.keys()
+                   if code != "000300"
+                   and not code.startswith("300")
+                   and not code.startswith("688")
+                   and not code.startswith("588")
+                   and not code.startswith("159")]
+    _load_fundamental_data(stock_codes)
 
     # M因子：大盘方向判断
     logger.info("[选股引擎V3] M因子: 大盘方向判断...")
@@ -1297,7 +1376,7 @@ def diagnose_holdings(holdings: dict, data_dict: dict) -> list:
         
         # 计算止损位
         from strategy.trend_strategy import compute_trailing_stop
-        stop_loss = compute_trailing_stop(buy_price, current_price)
+        stop_loss = compute_trailing_stop(buy_price, current_price) if buy_price > 0 else 0
         diagnosis["stop_loss_price"] = stop_loss
         
         # 诊断逻辑
@@ -1481,6 +1560,7 @@ def generate_screener_report_html(result: dict) -> str:
                     <th rowspan="2">CANSLIM<br>评分</th><th rowspan="2">买入信号</th>
                     <th rowspan="2">现价</th><th colspan="3">买点价格</th>
                     <th rowspan="2">止损价<br>(跌幅)</th>
+                    <th rowspan="2">风险<br>等级</th>
                     <th colspan="2">第一批(40%)</th><th colspan="2">第二批(60%)</th>
                     <th rowspan="2">最大亏损</th>
                 </tr>
@@ -1515,6 +1595,7 @@ def generate_screener_report_html(result: dict) -> str:
                     <td class="buy-price">{stock['moderate_buy']:.2f}</td>
                     <td class="buy-price">{stock['conservative_buy']:.2f}</td>
                     <td class="stop-price">{stock['stop_loss']:.2f}<br><span class="note">(-{stock['stop_loss_pct']}%)</span></td>
+                    <td><span class="note">{stock.get('risk_level', '-')}</span></td>
                     <td><span class="batch-box">{stock['first_shares']}股<br>{stock['first_amount']:,.0f}元</span></td>
                     <td><span class="batch-box">{stock['add_price']:.2f}<br>+3%触发</span></td>
                     <td><span class="batch-box">{stock['second_shares']}股<br>{stock['second_amount']:,.0f}元</span></td>

@@ -20,6 +20,7 @@
     result = monitor.analyze(holdings_data)
 """
 
+import os
 import pandas as pd
 import numpy as np
 import logging
@@ -27,6 +28,14 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
+
+# pyecharts 可选依赖
+try:
+    from pyecharts import options as opts
+    from pyecharts.charts import TreeMap, Bar
+    HAS_PYECHARTS = True
+except ImportError:
+    HAS_PYECHARTS = False
 
 # 板块配置
 SECTOR_CONFIG = {
@@ -363,6 +372,566 @@ class SectorMonitor:
             lines.append(f"持仓预警: {len(alerts)}条")
 
         return " | ".join(lines) if lines else "无显著轮动信号"
+
+
+   # ============================================================
+    # 热力图 / 火苗图可视化（新增方法）
+    # ============================================================
+
+    def _collect_sector_flow_data(self, data: dict = None) -> List[dict]:
+        """收集板块资金流向数据，供热力图/火苗图使用
+
+        优先使用传入 data，否则尝试 akshare 获取全市场板块，
+        最后回退到已有 analyze 结果。
+
+        返回: [{name, value, change_pct, net_inflow}, ...]
+        """
+        if data and isinstance(data, list) and len(data) > 0:
+            return data
+
+        # 尝试 akshare 获取全市场板块
+        market_sectors = self._try_akshare_sectors()
+        if market_sectors:
+            result = []
+            for s in market_sectors:
+                result.append({
+                    "name": s.get("name", ""),
+                    "value": max(s.get("turnover", 1), 1),  # 换手率作为面积
+                    "change_pct": float(s.get("change_pct", 0)),
+                    "net_inflow": 0,  # akshare 板块概览无净流入，用涨跌幅代替方向
+                })
+            if result:
+                return result
+
+        # 回退：返回空列表
+        return []
+
+    def _collect_stock_flame_data(self) -> List[dict]:
+        """收集个股资金流数据，供火苗图使用
+
+        调用 CapitalFlowAnalyzer 获取持仓池个股四级资金流，
+        不重复造轮子。
+
+        返回: [{name, value, change_pct, net_inflow}, ...]
+        """
+        try:
+            from strategy.capital_flow import CapitalFlowAnalyzer
+            import config
+            cfa = CapitalFlowAnalyzer()
+            codes = list(getattr(config, "STOCK_POOL", {}).keys())[:20]
+            if not codes:
+                # 回退到 STOCK_SECTOR_MAP
+                codes = list(STOCK_SECTOR_MAP.keys())
+
+            items = []
+            for code in codes:
+                flow = cfa.get_stock_main_flow(code)
+                if not flow.get("success"):
+                    continue
+                name = STOCK_SECTOR_MAP.get(code, code)
+                net_5d = flow.get("5d_main_net", 0)  # 万元
+                # 用绝对值做面积，符号做颜色
+                items.append({
+                    "name": f"{name}({code})",
+                    "value": max(abs(net_5d), 100),  # 面积
+                    "change_pct": 0,
+                    "net_inflow": net_5d,  # 正=流入 负=流出
+                })
+            return items
+        except Exception as e:
+            logger.debug(f"[板块热力图] 个股资金流获取失败: {e}")
+            return []
+
+    # ---------- 颜色工具 ----------
+
+    @staticmethod
+    def _change_to_color_rgb(change_pct: float) -> str:
+        """A股配色：红涨绿跌，颜色深浅表示幅度"""
+        if change_pct >= 3:
+            return "#CC0000"
+        elif change_pct >= 1:
+            return "#FF3333"
+        elif change_pct >= 0:
+            return "#FF9999"
+        elif change_pct >= -1:
+            return "#99FF99"
+        elif change_pct >= -3:
+            return "#33CC33"
+        else:
+            return "#006600"
+
+    @staticmethod
+    def _flow_to_color_rgb(net_inflow: float) -> str:
+        """资金流向配色：红=流入，绿=流出，深浅表示力度"""
+        if net_inflow >= 5000:  # >5000万
+            return "#CC0000"
+        elif net_inflow >= 1000:
+            return "#FF3333"
+        elif net_inflow >= 0:
+            return "#FF9999"
+        elif net_inflow >= -1000:
+            return "#99FF99"
+        elif net_inflow >= -5000:
+            return "#33CC33"
+        else:
+            return "#006600"
+
+    @staticmethod
+    def _format_amount(val: float) -> str:
+        """金额格式化（万元→亿元自动转换）"""
+        abs_val = abs(val)
+        if abs_val >= 10000:
+            return f"{val / 10000:+.1f}亿"
+        return f"{val:+.0f}万"
+
+    # ---------- 1. render_heatmap 板块资金热力图 ----------
+
+    def render_heatmap(self, data: dict = None, output_path: str = None) -> str:
+        """生成板块资金流向热力图（pyecharts TreeMap）
+
+        色块大小 = 换手率或成交额
+        色块颜色 = 涨跌幅方向（红涨绿跌，A股配色习惯）
+        色块标签 = 板块名称 + 涨跌幅
+
+        Args:
+            data: 板块资金流数据列表，如为None则自动获取最新数据
+            output_path: HTML输出路径，默认为 output/sector_heatmap.html
+
+        Returns:
+            HTML文件路径
+        """
+        items = self._collect_sector_flow_data(data)
+        if not items:
+            logger.warning("[板块热力图] 无板块数据，无法生成热力图")
+            return ""
+
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "sector_heatmap.html")
+
+        if not HAS_PYECHARTS:
+            return self._render_heatmap_text(items, output_path)
+
+        try:
+            tree_data = []
+            for item in items:
+                change = item.get("change_pct", 0)
+                tree_data.append({
+                    "name": item["name"],
+                    "value": max(item.get("value", 1), 1),
+                    "itemStyle": {"color": self._change_to_color_rgb(change)},
+                    "label": {
+                        "show": True,
+                        "formatter": (
+                            f"{item['name']}\n"
+                            f"{'🔥' if change >= 1 else '❄️' if change <= -1 else ''}"
+                            f"{change:+.2f}%"
+                        ),
+                    },
+                })
+
+            chart = (
+                TreeMap()
+                .add(
+                    series_name="板块资金流向",
+                    data=tree_data,
+                    leaf_depth=1,
+                    levels=[
+                        opts.TreeMapLevelsOpts(
+                            item_style_opts=opts.ItemStyleOpts(
+                                border_color="#555", border_width=1, gap_width=1
+                            )
+                        )
+                    ],
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="板块资金流向热力图"),
+                    legend_opts=opts.LegendOpts(is_show=False),
+                )
+            )
+            chart.render(output_path)
+            logger.info(f"[板块热力图] 已生成: {output_path}")
+            return output_path
+        except Exception as e:
+            logger.warning(f"[板块热力图] pyecharts渲染失败，降级文本输出: {e}")
+            return self._render_heatmap_text(items, output_path)
+
+    def _render_heatmap_text(self, items: List[dict], output_path: str) -> str:
+        """降级方案：生成纯文本热力表格"""
+        items_sorted = sorted(items, key=lambda x: x.get("change_pct", 0), reverse=True)
+        lines = [
+            "板块资金流向热力图（文本版）",
+            "=" * 50,
+            f"{'板块':<10} {'涨跌幅':>8} {'热度条':<20}",
+            "-" * 50,
+        ]
+        for item in items_sorted:
+            change = item.get("change_pct", 0)
+            bar_len = int(min(abs(change) * 3, 20))
+            if change >= 0:
+                bar = "🔴" * bar_len + "⚪" * (20 - bar_len)
+            else:
+                bar = "🟢" * bar_len + "⚪" * (20 - bar_len)
+            lines.append(f"{item['name']:<10} {change:>+7.2f}% {bar}")
+
+        text = "\n".join(lines)
+        # 保存为 .txt
+        txt_path = output_path.replace(".html", ".txt")
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            logger.info(f"[板块热力图] 文本版已生成: {txt_path}")
+        except Exception:
+            pass
+        return txt_path
+
+    # ---------- 2. render_treemap_html 可嵌入邮件HTML ----------
+
+    def render_treemap_html(self, data: dict = None) -> str:
+        """生成可嵌入邮件的HTML字符串（不保存文件）
+
+        使用 pyecharts render_embed() 获取精简HTML，
+        不可用时降级为HTML表格。
+
+        Returns:
+            HTML字符串，可直接嵌入邮件正文
+        """
+        items = self._collect_sector_flow_data(data)
+        if not items:
+            return "<p>暂无板块资金流向数据</p>"
+
+        if not HAS_PYECHARTS:
+            return self._render_treemap_html_fallback(items)
+
+        try:
+            tree_data = []
+            for item in items:
+                change = item.get("change_pct", 0)
+                tree_data.append({
+                    "name": item["name"],
+                    "value": max(item.get("value", 1), 1),
+                    "itemStyle": {"color": self._change_to_color_rgb(change)},
+                    "label": {
+                        "show": True,
+                        "formatter": (
+                            f"{item['name']}\n"
+                            f"{'🔥' if change >= 1 else '❄️' if change <= -1 else ''}"
+                            f"{change:+.2f}%"
+                        ),
+                    },
+                })
+
+            chart = (
+                TreeMap(init_opts=opts.InitOpts(width="800px", height="500px"))
+                .add(
+                    series_name="板块资金流向",
+                    data=tree_data,
+                    leaf_depth=1,
+                    levels=[
+                        opts.TreeMapLevelsOpts(
+                            item_style_opts=opts.ItemStyleOpts(
+                                border_color="#555", border_width=1, gap_width=1
+                            )
+                        )
+                    ],
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="板块资金流向热力图"),
+                    legend_opts=opts.LegendOpts(is_show=False),
+                )
+            )
+            return chart.render_embed()
+        except Exception as e:
+            logger.warning(f"[板块热力图] render_embed失败，降级表格: {e}")
+            return self._render_treemap_html_fallback(items)
+
+    @staticmethod
+    def _render_treemap_html_fallback(items: List[dict]) -> str:
+        """降级方案：生成HTML表格代替TreeMap"""
+        items_sorted = sorted(items, key=lambda x: x.get("change_pct", 0), reverse=True)
+        rows = []
+        for item in items_sorted:
+            change = item.get("change_pct", 0)
+            color = "#CC0000" if change >= 0 else "#006600"
+            rows.append(
+                f"<tr><td>{item['name']}</td>"
+                f"<td style='color:{color};font-weight:bold'>{change:+.2f}%</td></tr>"
+            )
+        return (
+            "<div style='font-family:Arial,sans-serif;padding:10px'>"
+            "<h3>板块资金流向</h3>"
+            "<table style='border-collapse:collapse;width:100%'>"
+            "<tr style='background:#f0f0f0'><th style='padding:6px;border:1px solid #ddd'>板块</th>"
+            "<th style='padding:6px;border:1px solid #ddd'>涨跌幅</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
+
+    # ---------- 3. get_sector_rotation_signal 板块轮动信号 ----------
+
+    def get_sector_rotation_signal(self) -> dict:
+        """板块轮动信号
+
+        分析板块资金流向变化，识别资金从哪些板块流出、流入哪些板块。
+
+        Returns:
+            {
+                inflow_sectors: [{name, amount, days}],
+                outflow_sectors: [{name, amount, days}],
+                rotation_direction: str  # "科技→消费" 等
+            }
+        """
+        result = {
+            "inflow_sectors": [],
+            "outflow_sectors": [],
+            "rotation_direction": "无明显轮动",
+        }
+
+        # 尝试从 akshare 获取板块数据
+        market_sectors = self._try_akshare_sectors()
+        if market_sectors:
+            inflow = []
+            outflow = []
+            for s in market_sectors:
+                change = float(s.get("change_pct", 0))
+                name = s.get("name", "")
+                if change > 1.0:
+                    inflow.append({"name": name, "amount": change, "days": 1})
+                elif change < -1.0:
+                    outflow.append({"name": name, "amount": change, "days": 1})
+
+            inflow.sort(key=lambda x: x["amount"], reverse=True)
+            outflow.sort(key=lambda x: x["amount"])
+
+            result["inflow_sectors"] = inflow[:5]
+            result["outflow_sectors"] = outflow[:5]
+
+            if inflow and outflow:
+                top_in = inflow[0]["name"]
+                top_out = outflow[0]["name"]
+                result["rotation_direction"] = f"{top_out}→{top_in}"
+
+            return result
+
+        # 回退：使用已有 analyze 结果（需外部先调用 analyze）
+        # 没有数据时返回默认空结果
+        return result
+
+    # ---------- 4. render_flame_map 个股资金火苗图 ----------
+
+    def render_flame_map(self, data: dict = None, output_path: str = None) -> str:
+        """生成个股资金火苗图（pyecharts Bar 柱状图）
+
+        柱状图横轴 = 股票名称，柱子高度 = 5日净流入金额
+        红色 = 流入，绿色 = 流出
+        🔥 = 大单持续流入（>=1000万），❄️ = 持续流出（<=-1000万）
+
+        Args:
+            data: 个股资金流数据列表，如为None则自动获取
+            output_path: HTML输出路径
+
+        Returns:
+            HTML文件路径
+        """
+        items = self._collect_stock_flame_data() if data is None else (
+            data if isinstance(data, list) else []
+        )
+        if not items:
+            logger.warning("[资金火苗图] 无个股资金流数据，无法生成火苗图")
+            return ""
+
+        if output_path is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "stock_flame_map.html")
+
+        if not HAS_PYECHARTS:
+            return self._render_flame_map_text(items, output_path)
+
+        try:
+            # 按净流入金额降序排列
+            items_sorted = sorted(items, key=lambda x: x.get("net_inflow", 0), reverse=True)
+            names = [it["name"] for it in items_sorted]
+            values = [it.get("net_inflow", 0) for it in items_sorted]
+
+            chart = (
+                Bar(init_opts=opts.InitOpts(width="900px", height="500px"))
+                .add_xaxis(names)
+                .add_yaxis(
+                    "5日净流入(万)",
+                    values,
+                    itemstyle_opts=opts.ItemStyleOpts(
+                        color=opts.utils.JsCode(
+                            "function(params){"
+                            "  var v=params.value;"
+                            "  if(v>=5000) return '#CC0000';"
+                            "  if(v>=1000) return '#FF3333';"
+                            "  if(v>=0) return '#FF9999';"
+                            "  if(v>=-1000) return '#99FF99';"
+                            "  if(v>=-5000) return '#33CC33';"
+                            "  return '#006600';"
+                            "}"
+                        )
+                    ),
+                    label_opts=opts.LabelOpts(
+                        position="top",
+                        formatter=opts.utils.JsCode(
+                            "function(params){"
+                            "  var v=params.value;"
+                            "  var icon=v>=1000?'🔥':v<=-1000?'❄️':'';"
+                            "  var abs=Math.abs(v);"
+                            "  var s=abs>=10000?(v/10000).toFixed(1)+'亿':v.toFixed(0)+'万';"
+                            "  return icon+s;"
+                            "}"
+                        ),
+                    ),
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="个股资金火苗图"),
+                    xaxis_opts=opts.AxisOpts(
+                        axislabel_opts=opts.LabelOpts(rotate=30, font_size=10),
+                    ),
+                    yaxis_opts=opts.AxisOpts(name="净流入(万)"),
+                    legend_opts=opts.LegendOpts(is_show=False),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                )
+            )
+            chart.render(output_path)
+            logger.info(f"[资金火苗图] 已生成: {output_path}")
+            return output_path
+        except Exception as e:
+            logger.warning(f"[资金火苗图] pyecharts渲染失败，降级文本输出: {e}")
+            return self._render_flame_map_text(items, output_path)
+
+    def _render_flame_map_text(self, items: List[dict], output_path: str) -> str:
+        """降级方案：生成纯文本火苗表格"""
+        items_sorted = sorted(items, key=lambda x: x.get("net_inflow", 0), reverse=True)
+        lines = [
+            "个股资金火苗图（文本版）",
+            "=" * 55,
+            f"{'个股':<16} {'5日净流入':>10} {'力度条':<20}",
+            "-" * 55,
+        ]
+        for item in items_sorted:
+            net = item.get("net_inflow", 0)
+            bar_len = int(min(abs(net) / 500, 20))
+            if net >= 0:
+                bar = "🔴" * bar_len + "⚪" * (20 - bar_len)
+            else:
+                bar = "🟢" * bar_len + "⚪" * (20 - bar_len)
+            lines.append(f"{item['name']:<16} {self._format_amount(net):>10} {bar}")
+
+        text = "\n".join(lines)
+        txt_path = output_path.replace(".html", ".txt")
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            logger.info(f"[资金火苗图] 文本版已生成: {txt_path}")
+        except Exception:
+            pass
+        return txt_path
+
+    # ---------- 5. render_flame_map_html 可嵌入邮件HTML ----------
+
+    def render_flame_map_html(self, data: dict = None) -> str:
+        """生成可嵌入邮件的个股资金火苗图HTML字符串（不保存文件）
+
+        使用 pyecharts Bar render_embed() 获取精简HTML，
+        不可用时降级为HTML表格。
+
+        Returns:
+            HTML字符串，可直接嵌入邮件正文
+        """
+        items = self._collect_stock_flame_data() if data is None else (
+            data if isinstance(data, list) else []
+        )
+        if not items:
+            return "<p>暂无个股资金流数据</p>"
+
+        if not HAS_PYECHARTS:
+            return self._render_flame_html_fallback(items)
+
+        try:
+            items_sorted = sorted(items, key=lambda x: x.get("net_inflow", 0), reverse=True)
+            names = [it["name"] for it in items_sorted]
+            values = [it.get("net_inflow", 0) for it in items_sorted]
+
+            chart = (
+                Bar(init_opts=opts.InitOpts(width="900px", height="500px"))
+                .add_xaxis(names)
+                .add_yaxis(
+                    "5日净流入(万)",
+                    values,
+                    itemstyle_opts=opts.ItemStyleOpts(
+                        color=opts.utils.JsCode(
+                            "function(params){"
+                            "  var v=params.value;"
+                            "  if(v>=5000) return '#CC0000';"
+                            "  if(v>=1000) return '#FF3333';"
+                            "  if(v>=0) return '#FF9999';"
+                            "  if(v>=-1000) return '#99FF99';"
+                            "  if(v>=-5000) return '#33CC33';"
+                            "  return '#006600';"
+                            "}"
+                        )
+                    ),
+                    label_opts=opts.LabelOpts(
+                        position="top",
+                        formatter=opts.utils.JsCode(
+                            "function(params){"
+                            "  var v=params.value;"
+                            "  var icon=v>=1000?'🔥':v<=-1000?'❄️':'';"
+                            "  var abs=Math.abs(v);"
+                            "  var s=abs>=10000?(v/10000).toFixed(1)+'亿':v.toFixed(0)+'万';"
+                            "  return icon+s;"
+                            "}"
+                        ),
+                    ),
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="个股资金火苗图"),
+                    xaxis_opts=opts.AxisOpts(
+                        axislabel_opts=opts.LabelOpts(rotate=30, font_size=10),
+                    ),
+                    yaxis_opts=opts.AxisOpts(name="净流入(万)"),
+                    legend_opts=opts.LegendOpts(is_show=False),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                )
+            )
+            return chart.render_embed()
+        except Exception as e:
+            logger.warning(f"[资金火苗图] render_embed失败，降级表格: {e}")
+            return self._render_flame_html_fallback(items)
+
+    @staticmethod
+    def _render_flame_html_fallback(items: List[dict]) -> str:
+        """降级方案：生成HTML表格代替火苗图"""
+        items_sorted = sorted(items, key=lambda x: x.get("net_inflow", 0), reverse=True)
+        rows = []
+        for item in items_sorted:
+            net = item.get("net_inflow", 0)
+            color = "#CC0000" if net >= 0 else "#006600"
+            icon = "🔥" if net >= 1000 else "❄️" if net <= -1000 else ""
+            abs_val = abs(net)
+            amount_str = f"{net / 10000:+.1f}亿" if abs_val >= 10000 else f"{net:+.0f}万"
+            rows.append(
+                f"<tr><td>{item['name']}</td>"
+                f"<td style='color:{color};font-weight:bold'>{icon}{amount_str}</td></tr>"
+            )
+        return (
+            "<div style='font-family:Arial,sans-serif;padding:10px'>"
+            "<h3>个股资金火苗图</h3>"
+            "<table style='border-collapse:collapse;width:100%'>"
+            "<tr style='background:#f0f0f0'><th style='padding:6px;border:1px solid #ddd'>个股</th>"
+            "<th style='padding:6px;border:1px solid #ddd'>5日净流入</th></tr>"
+            + "".join(rows)
+            + "</table></div>"
+        )
 
 
 # === 便捷函数 ===

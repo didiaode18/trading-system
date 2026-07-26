@@ -184,12 +184,12 @@ class MetaLabelFilter:
         for code, sig in signals:
             df = data_dict.get(code)
             if df is None or df.empty:
-                # 无数据，默认通过
+                # FIX: 修复无数据时默认decision="execute"违背过滤初衷，改为"observe"
                 results.append((code, sig, {
                     "confidence": 0.5,
-                    "decision": "execute",
+                    "decision": "observe",
                     "scores": {},
-                    "reasons": ["无数据，默认通过"],
+                    "reasons": ["无数据，默认观察"],
                     "original_signal": sig,
                 }))
                 continue

@@ -197,7 +197,7 @@ def _deviation_guidance(deviation: pd.Series) -> pd.Series:
 # 二、三重共振DK信号 + 假信号回检 + 强度分级
 # ============================================================
 
-def generate_dk_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
+def generate_dk_signals_v2(df: pd.DataFrame, stock_code: str = "") -> pd.DataFrame:
     """
     DK买卖点 V2.0 - 三重共振确认
 
@@ -219,7 +219,7 @@ def generate_dk_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
     vol_ma_period = CFG["dk_volume_ma_period"]
     false_days = CFG["dk_false_signal_days"]
     min_medium = CFG["dk_min_strength_medium"]
-    cross_freq_threshold = CFG["market_cross_freq_threshold"]
+    cross_freq_threshold = CFG.get("market_cross_freq_threshold", 4)  # 从5降到4，减少震荡市假信号
 
     # 量能均线
     df["vol_ma20"] = df["volume"].rolling(vol_ma_period).mean()
@@ -251,6 +251,16 @@ def generate_dk_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
 
         # === D点（三重确认）===
         if cross_up and trend >= 3:  # 震荡及以上都可出D点（震荡市得分降低）
+            # --- D点回踩深度过滤: 回踩低点相对LL2偏离>阈值 → 视为破位 ---
+            dip_threshold = CFG.get("dk_dip_depth_threshold", 0.03)
+            ll2_val = row.get("ll_slow", 0)
+            low_val = row.get("low", 0)
+            if ll2_val > 0 and low_val < ll2_val:
+                dip_pct = (ll2_val - low_val) / ll2_val
+                if dip_pct > dip_threshold:
+                    logger.info(f"D点回踩深度过滤: {stock_code} 回踩幅度{dip_pct:.1%}超过LL2的{dip_threshold:.0%}，判定为破位")
+                    continue  # 破位，不生成D点信号
+
             score = 0
             reasons = []
 
@@ -351,25 +361,73 @@ def generate_dk_signals_v2(df: pd.DataFrame) -> pd.DataFrame:
             df.iloc[i, df.columns.get_loc("dk_reason")] = "+".join(reasons)
             df.iloc[i, df.columns.get_loc("dk_grade")] = grade
 
-    # === 假信号回检 ===
-    df = _detect_false_signals(df, false_days)
+    # === 假信号回检（D点ATR动态窗口 + K点对称回检）===
+    df = _detect_false_signals(df, false_days, stock_code)
 
     return df
 
 
-def _detect_false_signals(df: pd.DataFrame, window: int) -> pd.DataFrame:
+def _detect_false_signals(df: pd.DataFrame, window: int, stock_code: str = "") -> pd.DataFrame:
     """
-    假信号回检: 金叉后N日内收盘跌破LL2 → 标记假D点
+    假信号回检 V2.0:
+    - D点: ATR动态窗口（高波动5天/低波动3天/中间线性插值），金叉后N日内收盘跌破LL2 → 假D点
+    - K点: 对称回检，死叉后N日内收盘站回LL1上方 → 假K点（洗盘诱空）
+
+    新增config参数（通过CFG.get获取，无需修改config.py）:
+    - dk_false_atr_high_vol: ATR/price高于此值=高波动 (默认0.03)
+    - dk_false_atr_low_vol: ATR/price低于此值=低波动 (默认0.015)
+    - dk_false_window_high: 高波动回检窗口 (默认5)
+    - dk_false_window_low: 低波动回检窗口 (默认3)
+    - dk_dip_depth_threshold: D点回踩深度阈值 (默认0.03)
     """
+    atr_high_vol = CFG.get("dk_false_atr_high_vol", 0.03)
+    atr_low_vol = CFG.get("dk_false_atr_low_vol", 0.015)
+    win_high = CFG.get("dk_false_window_high", 5)
+    win_low = CFG.get("dk_false_window_low", 3)
+
+    def _atr_dynamic_window(idx: int) -> int:
+        """根据信号发生时的ATR/price比率动态计算回检窗口"""
+        row = df.iloc[idx]
+        close = row.get("close", 0)
+        atr = row.get("atr", 0)
+        if close <= 0 or np.isnan(atr) or atr <= 0:
+            return window  # 回退到config固定值
+        ratio = atr / close
+        if ratio >= atr_high_vol:
+            return win_high
+        elif ratio <= atr_low_vol:
+            return win_low
+        else:
+            # 线性插值: ratio在[low_vol, high_vol]之间时，窗口在[win_low, win_high]之间
+            t = (ratio - atr_low_vol) / (atr_high_vol - atr_low_vol)
+            return int(win_low + t * (win_high - win_low))
+
+    # === D点假信号回检 ===
     for i in range(len(df)):
-        if df.iloc[i].get("dk_signal") == "D" and df.iloc[i].get("dk_grade") != "false":
-            # 检查后续N日
-            for j in range(i+1, min(i+window+1, len(df))):
+        signal = df.iloc[i].get("dk_signal")
+        grade = df.iloc[i].get("dk_grade", "")
+
+        if signal == "D" and grade != "false":
+            dyn_window = _atr_dynamic_window(i)
+            for j in range(i + 1, min(i + dyn_window + 1, len(df))):
                 if df.iloc[j]["close"] < df.iloc[j]["ll_slow"]:
                     df.iloc[i, df.columns.get_loc("dk_grade")] = "false"
                     df.iloc[i, df.columns.get_loc("dk_filtered")] = True
-                    df.iloc[i, df.columns.get_loc("dk_reason")] += "+假信号(跌破LL2)"
+                    df.iloc[i, df.columns.get_loc("dk_reason")] += f"+假信号(金叉后{dyn_window}日内跌破LL2)"
+                    logger.info(f"D点假信号回检: {stock_code} 金叉后{dyn_window}日内跌破LL2，判定为假D点")
                     break
+
+        # === K点假信号回检（对称逻辑）===
+        elif signal == "K" and grade != "false":
+            dyn_window = _atr_dynamic_window(i)
+            for j in range(i + 1, min(i + dyn_window + 1, len(df))):
+                if df.iloc[j]["close"] > df.iloc[j]["ll_fast"]:
+                    df.iloc[i, df.columns.get_loc("dk_grade")] = "false"
+                    df.iloc[i, df.columns.get_loc("dk_filtered")] = True
+                    df.iloc[i, df.columns.get_loc("dk_reason")] += f"+假信号(死叉后{dyn_window}日内收回LL1上方)"
+                    logger.info(f"K点假信号回检: {stock_code} 死叉后{dyn_window}日内收回LL1上方，判定为洗盘诱空")
+                    break
+
     return df
 
 
@@ -523,7 +581,7 @@ def detect_market_environment(df: pd.DataFrame) -> dict:
 
     latest = df.iloc[-1]
     cross_freq = latest.get("cross_freq_20d", 0)
-    threshold = CFG["market_cross_freq_threshold"]
+    threshold = CFG.get("market_cross_freq_threshold", 4)
     vol_period = CFG["market_vol_period"]
 
     # 20日波动率
@@ -663,8 +721,17 @@ class CaopanEngine:
     def __init__(self, params: dict = None):
         self.params = {**CFG, **(params or {})}
 
-    def analyze(self, df: pd.DataFrame, code: str = "", name: str = "") -> dict:
-        """完整分析单只标的"""
+    def analyze(self, df: pd.DataFrame, code: str = "", name: str = "", market_regime: dict = None) -> dict:
+        """完整分析单只标的
+        
+        参数:
+            df: K线数据
+            code: 股票代码
+            name: 股票名称
+            market_regime: 大盘状态检测结果(MarketRegimeDetector.detect()的返回值)，
+                          包含 state("BULL"/"BEAR"/"RANGE")、confidence 等字段。
+                          为 None 时使用默认阈值（向后兼容）。
+        """
         if df is None or len(df) < 60:
             return {"code": code, "name": name, "error": "数据不足(需≥60根K线)"}
 
@@ -673,7 +740,10 @@ class CaopanEngine:
         # 2. 资金流
         df = compute_fund_flow_v2(df)
         # 3. DK信号
-        df = generate_dk_signals_v2(df)
+        df = generate_dk_signals_v2(df, code)
+
+        # 3.5 大盘状态联动过滤（V2.1新增）
+        df = self._apply_regime_filter(df, market_regime)
 
         latest = df.iloc[-1]
         trend_level = int(latest.get("trend_level", 3))
@@ -712,10 +782,17 @@ class CaopanEngine:
             dk_filtered = True
             dk_grade = "filtered_weekly"
 
-        # 盈亏比过滤
+        # 盈亏比过滤（根据大盘状态调整阈值）
+        effective_min_rr = self._get_effective_min_rr(market_regime)
         if dk == "D" and not rr["passed"]:
             dk_filtered = True
             dk_grade = "filtered_rr"
+        elif dk == "D" and rr["passed"] and effective_min_rr > CFG["min_risk_reward"]:
+            # BEAR环境下用更高阈值二次校验
+            if rr["risk_reward_1"] < effective_min_rr:
+                dk_filtered = True
+                dk_grade = "filtered_rr_regime"
+                logger.info(f"[{code}] BEAR环境盈亏比二次过滤: {rr['risk_reward_1']:.2f} < {effective_min_rr}")
 
         return {
             "code": code, "name": name,
@@ -752,6 +829,95 @@ class CaopanEngine:
             "fund_data": fund_data,
             "df_analyzed": df,
         }
+
+    # ============================================================
+    # 大盘状态联动过滤
+    # ============================================================
+
+    def _get_regime_state(self, market_regime: dict) -> str:
+        """从 market_regime 中提取状态（兼容 state/regime 字段名）"""
+        if not market_regime:
+            return "RANGE"  # 默认
+        return market_regime.get("state", market_regime.get("regime", "RANGE"))
+
+    def _get_effective_min_rr(self, market_regime: dict) -> float:
+        """根据大盘状态返回有效盈亏比阈值"""
+        state = self._get_regime_state(market_regime)
+        default_rr = CFG["min_risk_reward"]
+        if state == "BEAR":
+            return max(3.0, default_rr)  # BEAR环境提升到至少3.0
+        return default_rr  # BULL/RANGE 保持原值
+
+    def _apply_regime_filter(self, df: pd.DataFrame, market_regime: dict) -> pd.DataFrame:
+        """
+        根据大盘市场环境调整DK信号过滤阈值
+        
+        BEAR: 提升min_risk_reward到3.0、收紧dk_min_strength_medium到60、震荡市屏蔽D点
+        BULL: 放宽震荡市屏蔽（允许trend_level>=3的D点通过）
+        RANGE: 保持原有逻辑
+        """
+        if not market_regime:
+            return df  # 向后兼容，无大盘状态时不额外过滤
+
+        state = self._get_regime_state(market_regime)
+        confidence = market_regime.get("confidence", 0.5)
+
+        if state == "BEAR":
+            logger.info(f"[操盘引擎] 市场环境: BEAR(置信度{confidence:.0%}), 信号过滤阈值已收紧")
+            bear_min_strength = 60
+            for i in range(len(df)):
+                dk_signal = df.iloc[i].get("dk_signal")
+                dk_grade = df.iloc[i].get("dk_grade", "")
+                dk_filtered = df.iloc[i].get("dk_filtered", False)
+                dk_strength = df.iloc[i].get("dk_strength", 0)
+                trend = int(df.iloc[i].get("trend_level", 3))
+
+                if dk_signal == "D" and not dk_filtered:
+                    # BEAR: 震荡市直接屏蔽D点
+                    if trend <= 3:
+                        df.iloc[i, df.columns.get_loc("dk_filtered")] = True
+                        df.iloc[i, df.columns.get_loc("dk_grade")] = "filtered_bear_oscillation"
+                        df.iloc[i, df.columns.get_loc("dk_reason")] += "+BEAR震荡屏蔽"
+                    # BEAR: 信号强度门槛收紧到60
+                    elif dk_strength < bear_min_strength:
+                        df.iloc[i, df.columns.get_loc("dk_filtered")] = True
+                        df.iloc[i, df.columns.get_loc("dk_grade")] = "filtered_bear_strength"
+                        df.iloc[i, df.columns.get_loc("dk_reason")] += f"+BEAR强度不足({int(dk_strength)}<{bear_min_strength})"
+
+        elif state == "BULL":
+            logger.info(f"[操盘引擎] 市场环境: BULL(置信度{confidence:.0%}), 震荡市D点过滤已放宽")
+            # BULL环境: 放宽震荡市屏蔽
+            # 原始 generate_dk_signals_v2 中震荡市(trend==3)被屏蔽的信号，
+            # 在BULL环境下允许 trend_level>=3 的D点通过（恢复被震荡屏蔽的信号）
+            cross_freq_threshold = CFG.get("market_cross_freq_threshold", 4)
+            for i in range(1, len(df)):
+                row = df.iloc[i]
+                trend = int(row.get("trend_level", 3))
+                cross_up = row.get("ll_cross_up", False)
+                dk_signal = row.get("dk_signal")
+
+                # 恢复BULL环境下被震荡屏蔽的有效D点
+                if dk_signal is None and cross_up and trend >= 3:
+                    cross_freq = row.get("cross_freq_20d", 0)
+                    is_oscillation = (trend == 3) or (cross_freq >= cross_freq_threshold)
+                    if is_oscillation:
+                        # BULL放宽: 给一个弱D点信号
+                        score = 30 + 10 + 10  # 金叉 + 缩量 + 震荡趋势
+                        if score >= CFG.get("dk_min_strength_medium", 50):
+                            grade = "medium"
+                        else:
+                            grade = "weak"
+                        if grade != "weak":
+                            df.iloc[i, df.columns.get_loc("dk_signal")] = "D"
+                            df.iloc[i, df.columns.get_loc("dk_strength")] = score
+                            df.iloc[i, df.columns.get_loc("dk_reason")] = "LL1上穿LL2+BULL放宽"
+                            df.iloc[i, df.columns.get_loc("dk_grade")] = grade
+                            df.iloc[i, df.columns.get_loc("dk_filtered")] = False
+
+        else:  # RANGE
+            logger.info(f"[操盘引擎] 市场环境: RANGE(置信度{confidence:.0%}), 保持原有过滤逻辑")
+
+        return df
 
     def _generate_action_v2(self, latest, df, env, rr, weekly) -> dict:
         """V2.0操作建议（融合所有维度）"""
@@ -847,7 +1013,7 @@ class CaopanEngine:
 
         df = compute_adaptive_life_lines(df, self.params["life_line_fast"], self.params["life_line_slow"])
         df = compute_fund_flow_v2(df)
-        df = generate_dk_signals_v2(df)
+        df = generate_dk_signals_v2(df, code)
 
         commission = self.params["backtest_commission"]
         stamp_tax = self.params["backtest_stamp_tax"]
@@ -899,8 +1065,10 @@ class CaopanEngine:
                                 shares = buy_shares
                                 buy_price = buy_cost
                                 highest_since_buy = close
+                                # FIX: 修复回测持仓天数恒为0，买入记录缺少_idx字段
                                 trades.append({"date": date, "action": "buy", "price": round(buy_cost, 3),
-                                               "shares": buy_shares, "reason": f"D点({dk_grade},{row.get('dk_strength',0)})"})
+                                               "shares": buy_shares, "_idx": i,
+                                               "reason": f"D点({dk_grade},{row.get('dk_strength',0)})"})
 
                 # 方式A续: D点回踩入场
                 elif pending_d and (i - pending_d_idx) <= pullback_days:
@@ -916,8 +1084,9 @@ class CaopanEngine:
                                 shares = buy_shares
                                 buy_price = buy_cost
                                 highest_since_buy = close
+                                # FIX: 修复回测持仓天数恒为0，买入记录缺少_idx字段
                                 trades.append({"date": date, "action": "buy", "price": round(buy_cost, 3),
-                                               "shares": buy_shares,
+                                               "shares": buy_shares, "_idx": i,
                                                "reason": f"D点回踩({pending_d['grade']},{pending_d['strength']})"})
                                 pending_d = None
                 elif pending_d and (i - pending_d_idx) > pullback_days:
@@ -942,8 +1111,9 @@ class CaopanEngine:
                                 shares = buy_shares
                                 buy_price = buy_cost
                                 highest_since_buy = close
+                                # FIX: 修复回测持仓天数恒为0，买入记录缺少_idx字段
                                 trades.append({"date": date, "action": "buy", "price": round(buy_cost, 3),
-                                               "shares": buy_shares,
+                                               "shares": buy_shares, "_idx": i,
                                                "reason": f"缩量回踩LL1(趋势{trend}级)"})
 
             # === 卖出逻辑 ===
@@ -1110,8 +1280,8 @@ class CaopanEngine:
 
 
 # 便捷函数
-def quick_analyze(df, code="", name=""):
-    return CaopanEngine().analyze(df, code=code, name=name)
+def quick_analyze(df, code="", name="", market_regime=None):
+    return CaopanEngine().analyze(df, code=code, name=name, market_regime=market_regime)
 
 def quick_backtest(df, code=""):
     return CaopanEngine().backtest(df, code=code)

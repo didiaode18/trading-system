@@ -135,8 +135,8 @@ class FactorEngine:
         else:
             factors["breakout"] = 0.5
 
-        # 7. 回调买入因子（新增）: 从近期高点回落5-10%且MA20仍向上
-        # 得分越高 = 回调到位 + 趋势未破 = 好的买点
+        # 7. 回调买入因子（V2增强）: 从近期高点回落5-10%且MA20仍向上+缩量企稳
+        # 得分越高 = 回调到位 + 趋势未破 + 缩量确认 = 好的买点
         if n >= 20:
             high_20 = np.max(close[-20:])
             drawdown_from_high = (high_20 - close[-1]) / high_20 if high_20 > 0 else 0
@@ -164,7 +164,15 @@ class FactorEngine:
             # 价格仍在MA20上方加分
             above_ma20 = 1.0 if close[-1] > ma20 else 0.4
 
-            factors["pullback"] = pullback_score * trend_bonus * above_ma20
+            # V2新增: 缩量企稳确认（近2日量 < 5日均量×0.7）
+            if n >= 5:
+                vol_2 = np.mean(volume[-2:])
+                vol_5 = np.mean(volume[-5:])
+                vol_shrink_bonus = 1.0 if (vol_5 > 0 and vol_2 < vol_5 * 0.7) else 0.7
+            else:
+                vol_shrink_bonus = 0.7
+
+            factors["pullback"] = pullback_score * trend_bonus * above_ma20 * vol_shrink_bonus
         else:
             factors["pullback"] = 0
 

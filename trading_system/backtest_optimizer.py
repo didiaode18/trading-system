@@ -55,11 +55,11 @@ DEFAULT_PARAMS = {
     # 买入参数
     "vol_shrink_ratio": 0.70,       # 缩量阈值（量<均量×N）
     "support_touch_pct": 0.01,      # 支撑位容差
-    "min_signal_quality": 55,       # 信号质量最低分
+    "min_signal_quality": 60,       # OPTIMIZE: 信号质量最低分（原55，回测显示低质量交易过多）
     "require_ma60_up": True,        # 是否要求MA60向上
 
     # 止损参数
-    "initial_stop_loss": 0.08,      # 初始止损幅度
+    "initial_stop_loss": 0.07,      # OPTIMIZE: 初始止损幅度（原0.08，回测显示平均亏损-10.20%含滑点）
     "breakeven_profit": 0.05,       # 浮盈多少后上移到保本
     "breakeven_lock": 0.02,         # 保本后锁定利润
     "profit_lock_1": 0.12,          # 浮盈15-30%锁定
@@ -68,12 +68,12 @@ DEFAULT_PARAMS = {
     # 止盈参数
     "ladder_1_pct": 0.08,           # 阶梯止盈第1档
     "ladder_2_pct": 0.20,           # 阶梯止盈第2档
-    "drawdown_leader": 0.05,        # 回落止盈（龙头）
+    "drawdown_leader": 0.06,        # OPTIMIZE: 回落止盈龙头（原0.05，让利润多跑一段）
     "drawdown_flex": 0.03,          # 回落止盈（弹性）
 
     # 卖出逻辑
-    "macd_death_cross": "profit",   # MACD死叉: "profit"=盈利时卖, "none"=不卖, "profit5"=浮盈>5%才卖
-    "trend_break_mode": "ma60",     # 趋势破位: "ma60"=跌破MA60, "ma60_2day"=连续2日, "none"=不用
+    "macd_death_cross": "none",     # OPTIMIZE: MACD死叉关闭（原"profit"，回测显示61笔胜率75%但平均仅+1.50%）
+    "trend_break_mode": "none",     # OPTIMIZE: 趋势破位关闭（原"ma60"，回测显示91笔胜率0%完全失效）
     "max_hold_days": 0,             # 最大持仓天数（0=不限制）
     "time_stop_profit": 0.03,       # 时间止损：超期且浮盈<此值则卖
 }

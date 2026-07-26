@@ -19,15 +19,20 @@ import datetime
 import numpy as np
 import pandas as pd
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # 配置参数
 # ============================================================
-TOTAL_CAPITAL = 722000       # 总资金（元）
-MAX_SINGLE_RISK = 0.02       # 单笔最大风险 = 总资金2%
-STOP_LOSS_PCT = 0.08         # 默认止损幅度8%
-MIN_RISK_REWARD = 2.5        # 最低盈亏比
+# FIX: 修复TOTAL_CAPITAL硬编码与config不一致导致仓位计算错误
+TOTAL_CAPITAL = getattr(config, 'TOTAL_CAPITAL', 722000)   # 从 config 读取
+MAX_SINGLE_RISK = getattr(config, 'MAX_SINGLE_RISK', 0.02)  # 单笔最大风险
+STOP_LOSS_PCT = getattr(config, 'INITIAL_STOP_LOSS_PCT', getattr(config, 'STOP_LOSS_PCT', 0.08))
+MIN_RISK_REWARD = getattr(config, 'MIN_RISK_REWARD_RATIO', getattr(config, 'MIN_RISK_REWARD', 2.0))
 MIN_AVG_AMOUNT = 3e8         # 日均成交额最低3亿
 MIN_MARKET_CAP = 100e8       # 最低总市值100亿（近似用成交额替代）
 MAX_SECTOR_RATIO = 0.25      # 单赛道最大仓位25%
@@ -473,21 +478,51 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     buy_low = round(first_support * 0.995, 2)
     buy_high = round(price * 1.005, 2)  # 不超过当前价+0.5%
 
-    # 判断买点类型
+    # 判断买点类型（V2增强: 回踩不破MA20确认 + 放量突破连续2日站稳）
     vol_ma20 = latest.get("vol_ma20", 0)
     volume = latest.get("volume", 0)
     vol_ratio = volume / vol_ma20 if not pd.isna(vol_ma20) and vol_ma20 > 0 else 1.0
 
-    if not pd.isna(ma20) and abs(price - ma20) / ma20 < 0.02 and vol_ratio < 0.7:
-        entry_type = "★缩量回踩MA20（核心买点）"
-    elif not pd.isna(ma20) and price > ma20 and vol_ratio > 1.5:
-        entry_type = "放量突破（追入买点）"
-        buy_low = round(price * 0.99, 2)
-        buy_high = round(price * 1.01, 2)
-    elif first_support < price * 0.97:
-        entry_type = f"等待回踩{supports[0][0] if supports else '支撑位'}"
+    # 缩量回踩MA20买点: 增加"回踩不破MA20"确认
+    # 条件: 当日最低 ≤ MA20×1.01 且 收盘 > MA20 且 缩量
+    day_low = latest.get("low", price)
+    if not pd.isna(ma20) and ma20 > 0:
+        touch_ma20 = day_low <= ma20 * 1.01  # 最低触及MA20附近
+        hold_ma20 = price > ma20              # 收盘站稳MA20
+        shrink_vol = vol_ratio < 0.7          # 缩量
+        if touch_ma20 and hold_ma20 and shrink_vol:
+            entry_type = "★缩量回踩MA20不破（核心买点）"
+        elif abs(price - ma20) / ma20 < 0.02 and vol_ratio < 0.7:
+            entry_type = "缩量接近MA20（观察买点）"
+        else:
+            entry_type = None
     else:
-        entry_type = "当前价附近可建仓"
+        entry_type = None
+
+    # 放量突破买点: 突破后需连续2日站稳突破位（避免假突破）
+    if entry_type is None and not pd.isna(ma20) and price > ma20 and vol_ratio > 1.5:
+        # 检查前一日是否也站稳突破位
+        if len(df) >= 2:
+            prev_close = df["close"].iloc[-2]
+            prev_ma20 = df["close"].rolling(20).mean().iloc[-2] if len(df) >= 21 else ma20
+            if not pd.isna(prev_ma20) and prev_close > prev_ma20:
+                entry_type = "放量突破连续2日站稳（追入买点）"
+                buy_low = round(price * 0.99, 2)
+                buy_high = round(price * 1.01, 2)
+            else:
+                entry_type = "放量突破(待确认站稳)"
+                buy_low = round(price * 0.99, 2)
+                buy_high = round(price * 1.01, 2)
+        else:
+            entry_type = "放量突破（追入买点）"
+            buy_low = round(price * 0.99, 2)
+            buy_high = round(price * 1.01, 2)
+
+    if entry_type is None:
+        if first_support < price * 0.97:
+            entry_type = f"等待回踩{supports[0][0] if supports else '支撑位'}"
+        else:
+            entry_type = "当前价附近可建仓"
 
     # ---- 止损价 ----
     # 取ATR止损和固定8%止损中较高的
@@ -506,10 +541,18 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     if target_2 <= target_1 * 1.03:
         target_2 = round(price * 1.20, 2)
 
-    # ---- 盈亏比 ----
+    # ---- 盈亏比（硬门槛: <2.0直接不推荐，标注风险等级） ----
     potential_loss = price - stop_loss
     potential_gain_1 = target_1 - price
     risk_reward = potential_gain_1 / potential_loss if potential_loss > 0 else 0
+
+    # 风险等级标注
+    if risk_reward >= 2.5:
+        risk_level = "低风险(盈亏比≥2.5)"
+    elif risk_reward >= 2.0:
+        risk_level = "中风险(盈亏比2.0~2.5)"
+    else:
+        risk_level = "高风险(盈亏比<2.0，不推荐)"
 
     # ---- 仓位计算（单笔风险≤总资金2%）----
     max_risk_amount = TOTAL_CAPITAL * MAX_SINGLE_RISK
@@ -529,17 +572,21 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
 
     # ---- 评分 ----
     score = 0
-    if risk_reward >= MIN_RISK_REWARD:
+    if risk_reward >= 2.5:
         score += 40
-    elif risk_reward >= 2.0:
-        score += 25
+    elif risk_reward >= MIN_RISK_REWARD:  # 2.0
+        score += 28
     elif risk_reward >= 1.5:
         score += 10
 
-    if "核心买点" in entry_type:
+    if "★缩量回踩MA20不破" in entry_type:
         score += 30
+    elif "缩量回踩MA20" in entry_type or "缩量接近MA20" in entry_type:
+        score += 22
+    elif "放量突破连续2日站稳" in entry_type:
+        score += 25
     elif "放量突破" in entry_type:
-        score += 20
+        score += 18
     elif "当前价" in entry_type:
         score += 15
 
@@ -575,6 +622,7 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
         "target_1": target_1,
         "target_2": target_2,
         "risk_reward": round(risk_reward, 2),
+        "risk_level": risk_level,
         "position_pct": round(position_pct, 1),
         "buy_shares": buy_shares,
         "buy_amount": round(buy_amount, 0),
@@ -638,14 +686,14 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
     # 通过条件（分级 + 趋势硬门槛）:
     # 硬规则: 空头排列（收盘价<MA20<MA60）直接进排除池，连观察池都不进
     # A级推荐: 综合分>=55 且 盈亏比>=2.5 且 趋势分>=50 且 多头排列
-    # B级推荐: 综合分>=50 且 盈亏比>=2.0 且 趋势分>=40
+    # B级推荐: 综合分>=50 且 盈亏比>=2.0 且 趋势分>=40（中风险标注）
     is_bearish = l4["score"] < 20  # 趋势分极低 = 空头排列
     passed_a = (total_score >= 55 and
                 l5["risk_reward"] >= 2.5 and
                 l4["score"] >= 50 and
                 not is_bearish)
     passed_b = (total_score >= 50 and
-                l5["risk_reward"] >= 2.0 and
+                l5["risk_reward"] >= MIN_RISK_REWARD and  # 2.0
                 l4["score"] >= 40 and
                 not is_bearish)
     passed = passed_a or passed_b
@@ -824,3 +872,78 @@ def run_recommendation(candidate_data: list, top_n: int = 8) -> dict:
         "rejected_count": len(excluded_pool),
         "total_scanned": len(results),
     }
+
+
+# ============================================================
+# 选股结果与条件单联动
+# ============================================================
+def generate_entry_orders(recommendation_result: dict) -> list:
+    """
+    根据选股推荐结果自动生成"建仓条件单"
+    
+    规则:
+      - 只对核心池(recommended)中评分≥55的标的生成建仓单
+      - 触发价 = 推荐买入价(buy_low)
+      - 有效期 = 3个交易日
+      - 条件单中注明选股评分、推荐理由、建议仓位、风险等级
+    
+    返回: [条件单 dict, ...]
+    """
+    orders = []
+    recommended = recommendation_result.get("recommended", [])
+    
+    for item in recommended:
+        if item.get("total_score", 0) < 55:
+            continue
+        plan = item.get("plan")
+        if not plan:
+            continue
+        
+        code = item.get("code", "")
+        name = item.get("name", "")
+        score = item.get("total_score", 0)
+        grade = item.get("grade", "C")
+        reasons = item.get("reasons", [])
+        
+        buy_price = plan.get("buy_low", 0)
+        buy_shares = plan.get("buy_shares", 0)
+        position_pct = plan.get("position_pct", 0)
+        risk_reward = plan.get("risk_reward", 0)
+        risk_level = plan.get("risk_level", "")
+        entry_type = plan.get("entry_type", "")
+        stop_loss = plan.get("stop_loss", 0)
+        target_1 = plan.get("target_1", 0)
+        
+        if buy_price <= 0 or buy_shares <= 0:
+            continue
+        
+        # 盈亏比硬门槛: <2.0不生成建仓单
+        if risk_reward < 2.0:
+            logger.info(f"[选股联动] {code} {name} 盈亏比{risk_reward:.1f}<2.0，跳过建仓单")
+            continue
+        
+        reason_text = "、".join(reasons[:2]) if reasons else entry_type
+        
+        order = {
+            "类型": f"建仓条件单({grade}级推荐)",
+            "优先级": "★★建议" if grade == "A" else "★可选",
+            "证券代码": code,
+            "证券名称": name,
+            "方向": "买入",
+            "触发价": buy_price,
+            "触发时间": "盘中实时",
+            "数量": buy_shares,
+            "有效期": "3个交易日",
+            "说明": (
+                f"选股评分{score:.0f}分 | {reason_text} | "
+                f"建议仓位{position_pct:.1f}% | 盈亏比{risk_reward:.1f} | {risk_level} | "
+                f"止损{stop_loss:.2f} 目标{target_1:.2f}"
+            ),
+            "选股评分": score,
+            "推荐理由": reason_text,
+            "风险等级": risk_level,
+        }
+        orders.append(order)
+        logger.info(f"[选股联动] {code} {name} 建仓单: 触发价{buy_price:.2f} {buy_shares}股 评分{score:.0f}")
+    
+    return orders

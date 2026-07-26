@@ -24,6 +24,25 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# 延迟导入ATR止损函数（避免循环导入）
+_adaptive_stop_imported = False
+_calc_adaptive_stop_loss = None
+_get_atr_value = None
+
+
+def _ensure_adaptive_stop_import():
+    """延迟导入ATR自适应止损函数"""
+    global _adaptive_stop_imported, _calc_adaptive_stop_loss, _get_atr_value
+    if not _adaptive_stop_imported:
+        try:
+            from strategy.position import calc_adaptive_stop_loss, _get_atr_value as _get_atr
+            _calc_adaptive_stop_loss = calc_adaptive_stop_loss
+            _get_atr_value = _get_atr
+            _adaptive_stop_imported = True
+        except ImportError:
+            logger.debug("ATR自适应止损模块导入失败，将使用固定百分比止损")
+            _adaptive_stop_imported = True  # 避免重复尝试
+
 # ============================================================
 # 风控参数（可配置，集中管理）
 # ============================================================
@@ -88,14 +107,16 @@ class RiskStateManager:
             "sell_cooldown": {},            # {code: "解禁日期"} 卖出后冷却
             "weekly_force_reduce": False,   # 周熔断强制减仓标记
             "total_capital": 424000,        # 总资金
+            "intraday_risk_flags": {},      # 盘中风险标记 {flag: {"time": ISO时间, "details": dict}}
         }
+        # FIX: 修复 _load_state 裸except吞没状态损坏异常的问题
         try:
             if os.path.exists(STATE_FILE):
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 default.update(saved)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"风控状态文件损坏，使用默认状态: {e}")
 
         # 日期重置逻辑
         today = datetime.date.today().isoformat()
@@ -124,7 +145,8 @@ class RiskStateManager:
 
     def record_sell(self, code: str):
         """记录卖出（启动冷却期）"""
-        cooldown_days = RISK_CONFIG["cooldown_after_sell"]
+        unified_cfg = getattr(config, 'RISK_UNIFIED_CONFIG', RISK_CONFIG)
+        cooldown_days = unified_cfg.get("cool_down_days", RISK_CONFIG.get("cooldown_after_sell", 3))
         unlock = (datetime.date.today() + datetime.timedelta(days=cooldown_days)).isoformat()
         self.state["sell_cooldown"][code] = unlock
         self.save()
@@ -150,11 +172,313 @@ class RiskStateManager:
 
 
 # ============================================================
+# 策略失效检测器（P0级风控增强）
+# ============================================================
+
+class StrategyFailureDetector:
+    """
+    策略失效检测器 V1.0
+    
+    基于滚动窗口胜率/期望收益的三级熔断机制：
+      - 降级（DEGRADE）: 滚动20笔胜率 < 40% → 仓位减半
+      - 暂停（PAUSE）:  滚动20笔胜率 < 30% → 禁止买入
+      - 熔断（BREAKER）: 滚动20笔期望 < 0% → 全面暂停
+    
+    设计原理：
+      回测显示最大连续亏损17次，说明策略在特定市场环境下会持续失效。
+      与其等到连续亏损熔断（3笔暂停），不如提前通过滚动胜率检测策略退化。
+    
+    使用方式:
+        detector = StrategyFailureDetector()
+        detector.record_trade(profit_pct=2.5)  # 记录每笔交易
+        status = detector.get_status()  # 获取当前状态
+    """
+    
+    # 三级阈值（不修改config.py，使用类内默认值）
+    WINDOW_SIZE = 20          # 滚动窗口大小
+    DEGRADE_WIN_RATE = 40     # 胜率<40% → 降级（仓位减半）
+    PAUSE_WIN_RATE = 30       # 胜率<30% → 暂停买入
+    BREAKER_EXPECTANCY = 0    # 期望<0% → 全面熔断
+    RECOVERY_TRADES = 5       # 恢复后前5笔仓位减半（试探性恢复）
+    
+    def __init__(self):
+        self.state = self._load_state()
+    
+    def _load_state(self) -> dict:
+        """加载持久化状态"""
+        default = {
+            "trade_history": [],       # 最近N笔交易收益 [{"pnl_pct": float, "date": str}]
+            "current_level": "normal", # normal / degrade / pause / breaker
+            "trades_since_recovery": 0, # 恢复后的交易计数
+            "last_level_change": "",    # 上次状态变更日期
+        }
+        state_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "output", "strategy_failure_state.json")
+        try:
+            if os.path.exists(state_file):
+                with open(state_file, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                default.update(saved)
+        except Exception as e:
+            logger.warning(f"策略失效状态文件损坏: {e}")
+        default["_state_file"] = state_file
+        return default
+    
+    def _save_state(self):
+        """持久化状态"""
+        state_file = self.state.get("_state_file", "")
+        if not state_file:
+            return
+        save_data = {k: v for k, v in self.state.items() if not k.startswith("_")}
+        os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+    
+    def record_trade(self, profit_pct: float, date: str = ""):
+        """
+        记录一笔交易结果，更新策略状态
+        
+        参数:
+            profit_pct: 盈亏百分比（正=盈利，负=亏损）
+            date: 交易日期
+        """
+        history = self.state["trade_history"]
+        history.append({"pnl_pct": profit_pct, "date": date or datetime.date.today().isoformat()})
+        
+        # 保留最近WINDOW_SIZE笔
+        if len(history) > self.WINDOW_SIZE:
+            history = history[-self.WINDOW_SIZE:]
+            self.state["trade_history"] = history
+        
+        # 更新状态
+        self._update_level()
+        self._save_state()
+    
+    def _update_level(self):
+        """根据滚动窗口统计更新策略状态"""
+        history = self.state["trade_history"]
+        if len(history) < self.WINDOW_SIZE:
+            return  # 样本不足，不判定
+        
+        pnls = [t["pnl_pct"] for t in history]
+        wins = sum(1 for p in pnls if p > 0)
+        win_rate = wins / len(pnls) * 100
+        expectancy = sum(pnls) / len(pnls)
+        
+        old_level = self.state["current_level"]
+        
+        # 三级判定（从严到宽）
+        if expectancy < self.BREAKER_EXPECTANCY:
+            new_level = "breaker"
+        elif win_rate < self.PAUSE_WIN_RATE:
+            new_level = "pause"
+        elif win_rate < self.DEGRADE_WIN_RATE:
+            new_level = "degrade"
+        else:
+            new_level = "normal"
+        
+        if new_level != old_level:
+            self.state["current_level"] = new_level
+            self.state["last_level_change"] = datetime.date.today().isoformat()
+            if new_level == "normal" and old_level != "normal":
+                # 恢复时设置试探期
+                self.state["trades_since_recovery"] = 0
+            logger.warning(
+                f"[策略失效检测] 状态变更: {old_level} → {new_level} | "
+                f"滚动{len(pnls)}笔胜率={win_rate:.1f}% 期望={expectancy:+.2f}%"
+            )
+    
+    def get_status(self) -> dict:
+        """
+        获取当前策略状态
+        
+        返回:
+            {
+                "level": str,           # normal/degrade/pause/breaker
+                "win_rate": float,      # 滚动胜率
+                "expectancy": float,    # 滚动期望
+                "position_scale": float,# 仓位缩放因子
+                "allow_buy": bool,      # 是否允许买入
+                "message": str,         # 描述信息
+            }
+        """
+        history = self.state["trade_history"]
+        level = self.state["current_level"]
+        
+        if len(history) < self.WINDOW_SIZE:
+            return {
+                "level": "normal", "win_rate": 0, "expectancy": 0,
+                "position_scale": 1.0, "allow_buy": True,
+                "message": f"样本积累中({len(history)}/{self.WINDOW_SIZE}笔)",
+            }
+        
+        pnls = [t["pnl_pct"] for t in history]
+        wins = sum(1 for p in pnls if p > 0)
+        win_rate = wins / len(pnls) * 100
+        expectancy = sum(pnls) / len(pnls)
+        
+        # 试探性恢复期仓位减半
+        recovery_scale = 1.0
+        if self.state.get("trades_since_recovery", 99) < self.RECOVERY_TRADES:
+            recovery_scale = 0.5
+        
+        level_map = {
+            "normal": {"scale": 1.0, "allow_buy": True, "msg": "策略正常运行"},
+            "degrade": {"scale": 0.5, "allow_buy": True, "msg": f"策略降级: 胜率{win_rate:.0f}%<40%, 仓位减半"},
+            "pause": {"scale": 0.0, "allow_buy": False, "msg": f"策略暂停: 胜率{win_rate:.0f}%<30%, 禁止买入"},
+            "breaker": {"scale": 0.0, "allow_buy": False, "msg": f"策略熔断: 期望{expectancy:+.2f}%<0%, 全面暂停"},
+        }
+        info = level_map.get(level, level_map["normal"])
+        
+        return {
+            "level": level,
+            "win_rate": round(win_rate, 1),
+            "expectancy": round(expectancy, 3),
+            "position_scale": info["scale"] * recovery_scale,
+            "allow_buy": info["allow_buy"],
+            "message": info["msg"],
+        }
+    
+    def check_buy_allowed(self) -> tuple:
+        """
+        检查是否允许买入（供UnifiedRiskEngine调用）
+        
+        返回: (allowed: bool, reason: str, position_scale: float)
+        """
+        status = self.get_status()
+        if not status["allow_buy"]:
+            return False, f"[策略失效] {status['message']}", 0.0
+        return True, "", status["position_scale"]
+
+
+# ============================================================
+# P2: 动态熔断增强器
+# ============================================================
+
+class DynamicFuseEnhancer:
+    """
+    动态熔断增强器 V1.0
+    
+    增强现有固定阈值熔断机制，新增:
+      1. 波动率自适应: 高波动时收紧熔断阈值，低波动时略微放宽
+      2. 严重度分级暂停: 暂停天数与亏损严重度成正比
+      3. 恢复渐进: 熔断解除后不立即恢复满仓，而是逐步放大
+    
+    设计原理:
+      回测显示最大连续亏损13次，但固定3天暂停可能不足以覆盖
+      持续熊市。动态熔断根据市场环境和亏损程度自动调整保护力度。
+    """
+    
+    def __init__(self):
+        self._fuse_history = []  # 熔断历史记录
+        self._recovery_step = 1.0  # 恢复比例 (0.5=半仓恢复, 1.0=完全恢复)
+        self._last_fuse_date = ""
+    
+    def get_volatility_adjustment(self, market_info: dict = None) -> dict:
+        """
+        根据市场波动率调整熔断参数
+        
+        参数:
+            market_info: {"index_pct_change": float, "vix": float, "atr_pct": float}
+        
+        返回: 调整后的熔断参数
+        """
+        # 默认调整系数 = 1.0（不调整）
+        vol_factor = 1.0
+        
+        if market_info:
+            # 指数单日跌幅>2% → 高波动，收紧20%
+            idx_chg = market_info.get("index_pct_change", 0)
+            if idx_chg < -2:
+                vol_factor = 0.8  # 收紧: 阈值*0.8
+            elif idx_chg < -1:
+                vol_factor = 0.9
+            elif idx_chg > 1:
+                vol_factor = 1.1  # 放宽: 阈值*1.1
+            
+            # ATR波动率调整
+            atr_pct = market_info.get("atr_pct", 0)
+            if atr_pct > 3:  # 指数ATR%>3 → 极端波动
+                vol_factor *= 0.85
+        
+        # 计算调整后的阈值
+        base_cfg = RISK_CONFIG
+        adjusted = {
+            "daily_loss_block": base_cfg["daily_loss_block"] * vol_factor,
+            "weekly_loss_force": base_cfg["weekly_loss_force"] * vol_factor,
+            "consecutive_loss_today": base_cfg["consecutive_loss_today"],
+            "consecutive_loss_block": base_cfg["consecutive_loss_block"],
+            "vol_factor": vol_factor,
+        }
+        return adjusted
+    
+    def calc_pause_days(self, consec_losses: int, daily_loss_pct: float = 0) -> int:
+        """
+        P2: 严重度分级暂停天数
+        
+        规则:
+          - 3笔连续亏损: 暂停3天（基础）
+          - 4笔: 5天
+          - 5笔+: 7天
+          - 单日亏损>4%: 额外+2天
+        """
+        base_pause = RISK_CONFIG.get("consecutive_loss_pause", 3)
+        
+        # 根据连续亏损笔数递增
+        if consec_losses >= 5:
+            pause = 7
+        elif consec_losses >= 4:
+            pause = 5
+        else:
+            pause = base_pause
+        
+        # 单日亏损严重度加成
+        if daily_loss_pct > 4:
+            pause += 2
+        elif daily_loss_pct > 3:
+            pause += 1
+        
+        return pause
+    
+    def get_recovery_scale(self) -> float:
+        """
+        P2: 熔断解除后的恢复比例
+        
+        规则:
+          - 熔断解除后第1笔: 仓位*0.5（半仓试探）
+          - 第1笔盈利: 恢复1.0
+          - 第1笔亏损: 继续保持0.5
+        """
+        return self._recovery_step
+    
+    def on_fuse_triggered(self, reason: str, consec_losses: int):
+        """熔断触发时调用"""
+        self._fuse_history.append({
+            "date": datetime.date.today().isoformat(),
+            "reason": reason,
+            "consec_losses": consec_losses,
+        })
+        self._recovery_step = 0.5  # 熔断后恢复时半仓开始
+        self._last_fuse_date = datetime.date.today().isoformat()
+    
+    def on_recovery_trade(self, is_profit: bool):
+        """熔断解除后的恢复交易结果"""
+        if is_profit:
+            self._recovery_step = 1.0  # 盈利后完全恢复
+        # 亏损则继续保持0.5
+
+
+# ============================================================
 # 核心风控引擎
 # ============================================================
 class RiskGate:
     """
-    风控硬拦截门
+    风控硬拦截门（V2.0 - 已废弃，请使用 UnifiedRiskEngine）
+    
+    .. deprecated::
+        此类已被 UnifiedRiskEngine 取代。保留仅为向后兼容。
+        内部已委托给 UnifiedRiskEngine 实现。
+    
     所有信号必须通过此门，不通过直接淘汰
 
     使用方式:
@@ -503,14 +827,931 @@ def quick_risk_check(signal: dict, holdings: dict,
         if not result["pass"]:
             print(f"被拦截: {result['reason']}")
     """
-    gate = RiskGate(total_capital=total_capital)
-    return gate.check_buy(signal, holdings, market_info)
+    engine = UnifiedRiskEngine(total_capital=total_capital)
+    return engine.check_buy(signal, holdings, market_info)
 
 
 def quick_inspect(holdings: dict, total_capital: float = 424000) -> List[dict]:
     """快速持仓巡检"""
-    gate = RiskGate(total_capital=total_capital)
-    return gate.inspect_holdings(holdings)
+    engine = UnifiedRiskEngine(total_capital=total_capital)
+    return engine.inspect_holdings(holdings)
+
+
+# ============================================================
+# 统一风控引擎（合并 V2.0 RiskGate + V3.0 risk_check）
+# ============================================================
+
+class UnifiedRiskEngine:
+    """
+    统一风控引擎 U0 —— 系统中唯一有效的风控引擎
+
+    整合 RiskGate(V2.0) 与 risk_check(V3.0) 两套系统的优点：
+      - 从 RiskGate 继承：状态持久化（JSON文件）、10级关卡检查链
+      - 从 risk_check 继承：函数式调用接口、与 main.py 的兼容性
+      - 统一参数源：全部从 config.RISK_UNIFIED_CONFIG 读取
+
+    使用方式（两种接口均可）:
+        # 接口 1：兼容 risk_check()
+        engine = UnifiedRiskEngine(total_capital=737834)
+        result = engine.check(trade_plan, risk_state, market_strength)
+
+        # 接口 2：兼容 RiskGate
+        result = engine.check_buy(signal, holdings, market_info)
+    """
+
+    _instance = None  # 单例，保证状态一致
+
+    def __new__(cls, total_capital: float = None, allowed_pool: set = None):
+        # 单例模式：确保全局只有一个引擎实例（状态持久化一致）
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, total_capital: float = None, allowed_pool: set = None):
+        if self._initialized:
+            # 允许更新资金和股票池
+            if total_capital is not None:
+                self.total_capital = total_capital
+                self.state_mgr.state["total_capital"] = total_capital
+            if allowed_pool is not None:
+                self.allowed_pool = allowed_pool
+            return
+        self._initialized = True
+
+        self.cfg = getattr(config, 'RISK_UNIFIED_CONFIG', {})
+        self.total_capital = total_capital or getattr(config, 'TOTAL_CAPITAL', 424000)
+        self.state_mgr = RiskStateManager()
+        self.state_mgr.state["total_capital"] = self.total_capital
+        self.allowed_pool = allowed_pool  # None=不限制, set=只允许池内标的
+        # P0: 策略失效检测器（滚动20笔胜率三级熔断）
+        self.failure_detector = StrategyFailureDetector()
+        # P2: 动态熔断增强器（波动率自适应+严重度分级+恢复渐进）
+        self.fuse_enhancer = DynamicFuseEnhancer()
+        # 加载盘中风险标记并执行盘后自动过期
+        self._load_intraday_flags()
+        self._expire_intraday_flags()
+
+    @classmethod
+    def reset_instance(cls):
+        """重置单例（仅用于测试）"""
+        cls._instance = None
+
+    # --------------------------------------------------------
+    # 接口 1：兼容 risk_check() 的调用方式
+    # --------------------------------------------------------
+    def check(self, trade_plan: dict, risk_state,
+              market_strength: str = "normal",
+              vol_scale: float = 1.0) -> dict:
+        """
+        统一风控校验入口（兼容 risk_check 签名）
+
+        参数:
+            trade_plan: {"code", "action", "price", "shares", "sector",
+                         "stock_type", "stop_loss"}
+            risk_state: RiskState 实例（含 current_positions, daily_pnl 等）
+            market_strength: "strong" / "normal" / "weak"
+            vol_scale: 波动率目标缩放因子（>1允许加仓，<1需减仓），默认1.0不影响
+
+        返回:
+            {"pass": bool, "level": str, "reasons": list,
+             "adjusted_shares": int, "warnings": list}
+        """
+        try:
+            return self._do_check(trade_plan, risk_state, market_strength, vol_scale=vol_scale)
+        except Exception as e:
+            logger.exception(f"[UnifiedRiskEngine] 引擎异常: {e}")
+            return {
+                "pass": False,
+                "level": "red",
+                "reasons": [f"ENGINE_ERROR: 风控引擎异常，暂停交易 ({e})"],
+                "adjusted_shares": 0,
+                "warnings": []
+            }
+
+    def _do_check(self, trade_plan: dict, risk_state,
+                  market_strength: str = "normal",
+                  vol_scale: float = 1.0) -> dict:
+        """内部校验逻辑（异常由外层 check() 捕获）"""
+        cfg = self.cfg
+        result = {
+            "pass": True,
+            "level": "green",
+            "reasons": [],
+            "adjusted_shares": trade_plan.get("shares", 0),
+            "warnings": []
+        }
+
+        action = trade_plan.get("action", "buy")
+        # FIX: 修复check()卖出路径不更新风控状态，冷却期和连续亏损计数失效
+        if action == "sell":
+            code = trade_plan.get("code", "")
+            pnl = trade_plan.get("pnl", 0)
+            self.state_mgr.record_sell(code)
+            if pnl < 0:
+                self.state_mgr.record_loss()
+            else:
+                self.state_mgr.record_profit()
+            result["reasons"].append("卖出信号，直接通过")
+            return result
+
+        # 同步 RiskState 数据到状态管理器
+        self._sync_risk_state(risk_state)
+
+        # ===== 关卡-1: 盘中风险标记检查（最高优先级）=====
+        self._expire_intraday_flags()  # 每次检查前先清理过期标记
+        intraday_block = self._check_intraday_risk_flags()
+        if intraday_block:
+            return intraday_block
+
+        # ===== 关卡-0.5: 策略失效检测（P0级增强）=====
+        # 滚动20笔胜率<30%禁止买入，期望<0%全面熔断
+        sf_allowed, sf_reason, sf_scale = self.failure_detector.check_buy_allowed()
+        if not sf_allowed:
+            return self._block_result(sf_reason)
+
+        code = trade_plan.get("code", "")
+        price = trade_plan.get("price", 0)
+        shares = trade_plan.get("shares", 0)
+        sector = trade_plan.get("sector", "")
+        stock_type = trade_plan.get("stock_type", "龙头")
+        amount = shares * price
+        positions = risk_state.current_positions if hasattr(risk_state, 'current_positions') else {}
+        total_capital = getattr(risk_state, 'total_capital', self.total_capital)
+
+        # ===== 关卡0: 满仓禁止加仓（情绪化交易防护，最高优先级）=====
+        full_threshold = cfg.get("full_position_threshold",
+                                  getattr(config, 'FULL_POSITION_THRESHOLD', 0.90))
+        near_full = cfg.get("near_full_position",
+                            getattr(config, 'NEAR_FULL_POSITION', 0.80))
+        current_position_ratio = self._calc_position_ratio(positions, total_capital)
+        available_cash = getattr(config, 'AVAILABLE_CASH', 0)
+
+        if current_position_ratio >= full_threshold:
+            return self._block_result(
+                f"★满仓禁止: 当前仓位{current_position_ratio:.1%} >= {full_threshold:.0%}红线，"
+                f"绝对禁止买入/加仓（情绪化交易防护）"
+            )
+
+        if available_cash < amount and available_cash < price * 100:
+            return self._block_result(
+                f"资金不足: 可用{available_cash:.0f}元 < 最低买入{price*100:.0f}元，禁止买入"
+            )
+
+        if current_position_ratio >= near_full and code not in positions:
+            return self._block_result(
+                f"仓位过高: 当前{current_position_ratio:.1%} >= {near_full:.0%}，"
+                f"禁止新开仓（只允许减仓）"
+            )
+
+        # ===== 关卡0.5: 股票池外拦截 =====
+        if self.allowed_pool is not None and code not in self.allowed_pool:
+            return self._block_result(
+                f"池外拦截: {code}不在核心池/观察池中，禁止买入"
+            )
+
+        # ===== 关卡1: 暂停期检查（状态持久化）=====
+        paused, pause_reason = self.state_mgr.is_paused()
+        if paused:
+            return self._block_result(pause_reason)
+
+        # ===== 关卡2: 冷却期检查（状态持久化）=====
+        cooling, cool_reason = self.state_mgr.is_cooling_down(code)
+        if cooling:
+            return self._block_result(cool_reason)
+
+        # ===== 关卡3: 日开仓次数限制 =====
+        max_daily = cfg.get("max_daily_opens", 2)
+        if self.state_mgr.state["daily_open_count"] >= max_daily:
+            return self._block_result(
+                f"今日已开仓{self.state_mgr.state['daily_open_count']}笔，"
+                f"达到上限{max_daily}笔，禁止再开"
+            )
+
+        # ===== 关卡4: 连续亏损熔断（状态持久化）=====
+        consec = self.state_mgr.state["consecutive_losses"]
+        consec_block = cfg.get("consecutive_loss_pause", 3)
+        consec_today = cfg.get("consecutive_loss_today", 2)
+        if consec >= consec_block:
+            pause_days = cfg.get("consecutive_loss_pause", 3)
+            until = (datetime.date.today() + datetime.timedelta(days=pause_days)).isoformat()
+            self.state_mgr.state["pause_until"] = until
+            self.state_mgr.save()
+            return self._block_result(
+                f"连续亏损{consec}笔触发熔断，暂停开仓{pause_days}天（至{until}）"
+            )
+        elif consec >= consec_today:
+            return self._block_result(
+                f"连续亏损{consec}笔，当日禁止开仓（强制冷静）"
+            )
+
+        # ===== 关卡5: 时间红线 =====
+        now = datetime.datetime.now()
+        current_time = now.strftime("%H:%M")
+        if _in_no_trade_zone(current_time):
+            return self._block_result(f"当前时间{current_time}处于禁止交易时段")
+
+        # ===== 关卡6: 日度亏损熔断 =====
+        daily_pnl = getattr(risk_state, 'daily_pnl', 0)
+        daily_loss_ratio = abs(daily_pnl) / total_capital if daily_pnl < 0 else 0
+        daily_l2 = cfg.get("daily_loss_limit_l2",
+                            getattr(config, 'DAILY_LOSS_LIMIT_2', 0.03))
+        daily_l1 = cfg.get("daily_loss_limit",
+                            getattr(config, 'DAILY_LOSS_LIMIT_1', 0.02))
+        if daily_loss_ratio >= daily_l2:
+            return self._block_result(
+                f"日度熔断L2: 当日亏损{daily_loss_ratio:.2%} >= {daily_l2:.0%}，禁止开新仓"
+            )
+        if daily_loss_ratio >= daily_l1:
+            return self._block_result(
+                f"日度熔断L1: 当日亏损{daily_loss_ratio:.2%} >= {daily_l1:.0%}，只卖不买"
+            )
+
+        # ===== 关卡7: 周度亏损熔断 =====
+        weekly_pnl = getattr(risk_state, 'weekly_pnl', 0)
+        weekly_loss_ratio = abs(weekly_pnl) / total_capital if weekly_pnl < 0 else 0
+        weekly_limit = cfg.get("weekly_loss_limit",
+                                getattr(config, 'WEEKLY_LOSS_LIMIT', 0.08))
+        if weekly_loss_ratio >= weekly_limit:
+            return self._block_result(
+                f"周度熔断: 本周亏损{weekly_loss_ratio:.2%} >= {weekly_limit:.0%}，强制休息"
+            )
+
+        # ===== 关卡8: 持仓数量硬限制 =====
+        max_holdings = cfg.get("max_holdings",
+                                getattr(config, 'MAX_HOLDINGS', 7))
+        if action == "buy" and code not in positions:
+            if len(positions) >= max_holdings:
+                return self._block_result(
+                    f"持仓数量超限: 当前{len(positions)}只 >= 上限{max_holdings}只，禁止新开仓"
+                )
+
+        # ===== 关卡9: 浮亏加仓绝对拦截 =====
+        if action == "add" and code in positions:
+            pos = positions[code]
+            buy_p = pos.get("buy_price", 0)
+            cur_p = pos.get("current_price", buy_p)
+            if buy_p > 0 and cur_p < buy_p:
+                return self._block_result(
+                    f"铁则违反: {code}当前浮亏{(cur_p-buy_p)/buy_p:.2%}，绝对禁止加仓"
+                )
+        # 兼容 RiskGate 的浮亏检查（买入已持仓标的也拦截）
+        if cfg.get("block_add_on_loss", True) and code in positions and action == "buy":
+            pos = positions[code]
+            cost = pos.get("buy_price", pos.get("cost", 0))
+            cur_price = pos.get("current_price", pos.get("price", cost))
+            if cost > 0 and cur_price < cost:
+                loss_pct = (cur_price - cost) / cost * 100
+                return self._block_result(
+                    f"浮亏加仓拦截: {code}当前浮亏{loss_pct:.1f}%，绝对禁止补仓/加仓（铁律）"
+                )
+
+        # ===== 关卡10: 个股仓位上限 =====
+        if stock_type == "弹性":
+            max_ratio = cfg.get("flexible_max_ratio",
+                                getattr(config, 'FLEXIBLE_STOCK_MAX_RATIO', 0.08))
+        else:
+            max_ratio = cfg.get("stock_max_ratio",
+                                getattr(config, 'LEADER_STOCK_MAX_RATIO', 0.15))
+        current_stock_amount = 0
+        if code in positions:
+            pos = positions[code]
+            current_stock_amount = pos.get("shares", 0) * pos.get(
+                "current_price", pos.get("buy_price", 0))
+        new_total = current_stock_amount + amount
+        if new_total / total_capital > max_ratio:
+            max_amount = total_capital * max_ratio - current_stock_amount
+            if max_amount > 0 and price > 0:
+                adjusted = int(max_amount / price)
+                adjusted = (adjusted // 100) * 100
+                if adjusted < shares:
+                    result["adjusted_shares"] = adjusted
+                    result["warnings"].append(
+                        f"仓位超限: 原计划{shares}股 -> 调整为{adjusted}股 (上限{max_ratio:.0%})"
+                    )
+                    shares = adjusted
+                    amount = shares * price
+            else:
+                return self._block_result(f"个股仓位超限{max_ratio:.0%}且无法缩减")
+
+        # ===== 关卡11: 赛道仓位上限 =====
+        if sector:
+            sector_max = cfg.get("sector_max_ratio",
+                                  getattr(config, 'SECTOR_MAX_RATIO', 0.40))
+            sector_amount = self._calc_sector_amount(positions, sector)
+            new_sector = sector_amount + amount
+            if new_sector / total_capital > sector_max:
+                result["warnings"].append(
+                    f"赛道仓位预警: {sector}将达到{new_sector/total_capital:.1%}，"
+                    f"上限{sector_max:.0%}"
+                )
+                result["level"] = "yellow" if result["level"] == "green" else result["level"]
+
+        # ===== 关卡12: 总仓位上限（按行情强度 × 波动率缩放 × 盘中风险）=====
+        max_pos_ratio = get_max_position_ratio(market_strength) * vol_scale
+        # 盘中系统性风险强制降低仓位上限
+        intraday_limit = self._get_intraday_position_limit()
+        if intraday_limit is not None and intraday_limit < max_pos_ratio:
+            logger.warning(f"[盘中风控] 系统性风险强制仓位上限: {max_pos_ratio:.0%} -> {intraday_limit:.0%}")
+            max_pos_ratio = intraday_limit
+        current_pos_amount = self._calc_total_position_amount(positions)
+        new_pos_amount = current_pos_amount + amount
+        new_pos_ratio = new_pos_amount / total_capital
+        if new_pos_ratio > max_pos_ratio:
+            result["warnings"].append(
+                f"总仓位预警: 将达{new_pos_ratio:.1%}，"
+                f"当前行情({market_strength})上限{max_pos_ratio:.0%}"
+            )
+            if new_pos_ratio > max_pos_ratio + 0.05:
+                return self._block_result(
+                    f"总仓位严重超限: {new_pos_ratio:.1%} > {max_pos_ratio:.0%}"
+                )
+
+        # ===== 关卡13: 现金安全垫 =====
+        min_cash_ratio = cfg.get("min_cash_ratio",
+                                  getattr(config, 'CASH_RESERVE_RATIO', 0.10))
+        cash_after = total_capital - current_pos_amount - amount
+        min_cash = total_capital * min_cash_ratio
+        if cash_after < min_cash:
+            return self._block_result(
+                f"突破现金安全垫: 剩余{cash_after:.0f} < 最低保留{min_cash:.0f}({min_cash_ratio:.0%})"
+            )
+
+        # ===== 关卡14: 单笔亏损控制 =====
+        stop_loss = trade_plan.get("stop_loss",
+                                    price * (1 - cfg.get("initial_stop_loss_pct",
+                                               getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10))))
+
+        # ATR自适应止损计算（V8.3新增）
+        adaptive_result = self._try_adaptive_stop_loss(
+            code, price, trade_plan.get("volatility_regime", "normal")
+        )
+        if adaptive_result:
+            stop_loss = adaptive_result["stop_price"]
+            result["adaptive_stop"] = adaptive_result
+            logger.info(
+                f"[ATR自适应止损] {code}: 止损={adaptive_result['stop_price']:.2f} "
+                f"({adaptive_result['stop_pct']:.2%}), ATR={adaptive_result['atr_used']:.4f}"
+            )
+
+        max_loss = shares * (price - stop_loss)
+        max_loss_ratio = max_loss / total_capital
+        max_single_loss = cfg.get("max_single_loss_ratio",
+                                    getattr(config, 'MAX_SINGLE_LOSS_RATIO', 0.02))
+        if max_loss_ratio > max_single_loss:
+            result["warnings"].append(
+                f"单笔亏损偏大: {max_loss_ratio:.2%} > {max_single_loss:.0%}"
+            )
+            result["level"] = "yellow" if result["level"] == "green" else result["level"]
+
+        # ===== 全部通过 =====
+        if result["pass"]:
+            result["reasons"].append("风控校验通过")
+        return result
+
+    # --------------------------------------------------------
+    # 接口 2：兼容 RiskGate 的调用方式
+    # --------------------------------------------------------
+    def check_buy(self, signal: dict, holdings: dict,
+                  market_info: dict = None) -> dict:
+        """
+        RiskGate 兼容接口：买入/加仓信号风控校验
+
+        参数:
+            signal: {"code", "name", "price", "shares", "sector", "type",
+                     "stop_loss", "target", "risk_reward"}
+            holdings: {code: {"shares", "cost", "price", "sector", "type"}}
+            market_info: {"index_price", "index_ma20", "index_ma60"}
+
+        返回:
+            {"pass": bool, "reason": str, "adjusted_shares": int, "level": str}
+        """
+        try:
+            return self._do_check_buy(signal, holdings, market_info)
+        except Exception as e:
+            logger.exception(f"[UnifiedRiskEngine] 引擎异常: {e}")
+            return self._block(f"ENGINE_ERROR: 风控引擎异常，暂停交易 ({e})")
+
+    def _do_check_buy(self, signal: dict, holdings: dict,
+                      market_info: dict = None) -> dict:
+        """RiskGate 兼容接口的内部实现"""
+        # FIX: 修复 total_capital 为0时除零崩溃的风险
+        if self.total_capital <= 0:
+            return self._block("系统错误: 总资金配置异常")
+        cfg = self.cfg
+        code = signal.get("code", "")
+        name = signal.get("name", code)
+        price = signal.get("price", 0)
+        shares = signal.get("shares", 0)
+        sector = signal.get("sector", "")
+        stock_type = signal.get("type", "stock")
+        risk_reward = signal.get("risk_reward", 0)
+        amount = price * shares
+
+        # 第-1关：盘中风险标记检查（最高优先级）
+        self._expire_intraday_flags()  # 每次检查前先清理过期标记
+        intraday_block = self._check_intraday_risk_flags_for_buy()
+        if intraday_block:
+            return intraday_block
+
+        # 第0关：盈亏比硬门槛
+        min_rr = cfg.get("min_risk_reward", 2.5)
+        if risk_reward > 0 and risk_reward < min_rr:
+            return self._block(
+                f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，拦截（宁缺毋滥）"
+            )
+
+        # 第0.5关：股票池外拦截
+        if self.allowed_pool is not None and code not in self.allowed_pool:
+            return self._block(
+                f"池外拦截: {name}({code})不在核心池/观察池中，禁止买入"
+            )
+
+        # 第1关：暂停期检查
+        paused, pause_reason = self.state_mgr.is_paused()
+        if paused:
+            return self._block(pause_reason)
+
+        # 第2关：冷却期检查
+        cooling, cool_reason = self.state_mgr.is_cooling_down(code)
+        if cooling:
+            return self._block(cool_reason)
+
+        # 第3关：日开仓次数限制
+        max_daily = cfg.get("max_daily_opens", 2)
+        if self.state_mgr.state["daily_open_count"] >= max_daily:
+            return self._block(
+                f"今日已开仓{self.state_mgr.state['daily_open_count']}笔，"
+                f"达到上限{max_daily}笔，禁止再开"
+            )
+
+        # 第4关：连续亏损熔断
+        # P2: 动态熔断增强 - 暂停天数与严重度成正比
+        consec = self.state_mgr.state["consecutive_losses"]
+        consec_block = cfg.get("consecutive_loss_pause", 3)
+        consec_today = cfg.get("consecutive_loss_today", 2)
+        if consec >= consec_block:
+            # P2: 使用动态熔断增强器计算暂停天数
+            daily_pnl = self.state_mgr.state.get("daily_pnl", 0)
+            daily_loss_pct = abs(daily_pnl) / self.total_capital * 100 if daily_pnl < 0 else 0
+            pause_days = self.fuse_enhancer.calc_pause_days(consec, daily_loss_pct)
+            until = (datetime.date.today() + datetime.timedelta(days=pause_days)).isoformat()
+            self.state_mgr.state["pause_until"] = until
+            self.state_mgr.save()
+            # P2: 记录熔断触发
+            self.fuse_enhancer.on_fuse_triggered(f"连续亏损{consec}笔", consec)
+            return self._block(
+                f"连续亏损{consec}笔触发熔断，暂停开仓{pause_days}天（至{until}）"
+            )
+        elif consec >= consec_today:
+            return self._block(
+                f"连续亏损{consec}笔，当日禁止开仓（强制冷静）"
+            )
+
+        # 第5关：日度亏损熔断
+        daily_pnl = self.state_mgr.state.get("daily_pnl", 0)
+        daily_limit = cfg.get("daily_loss_limit", 0.02)
+        if daily_pnl < 0 and abs(daily_pnl) / self.total_capital >= daily_limit:
+            return self._block(
+                f"单日亏损{abs(daily_pnl)/self.total_capital:.1%}≥{daily_limit:.0%}，"
+                f"当日禁止新开仓"
+            )
+
+        # 第6关：周度亏损熔断
+        weekly_pnl = self.state_mgr.state.get("weekly_pnl", 0)
+        weekly_limit = cfg.get("weekly_loss_limit", 0.08)
+        if weekly_pnl < 0 and abs(weekly_pnl) / self.total_capital >= weekly_limit:
+            return self._block(
+                f"本周亏损{abs(weekly_pnl)/self.total_capital:.1%}≥{weekly_limit:.0%}，"
+                f"强制降仓+暂停{cfg.get('weekly_loss_pause_days', 3)}天"
+            )
+
+        # 第7关：浮亏加仓绝对拦截
+        if cfg.get("block_add_on_loss", True) and code in holdings:
+            pos = holdings[code]
+            cost = pos.get("cost", 0)
+            cur_price = pos.get("price", cost)
+            if cost > 0 and cur_price < cost:
+                loss_pct = (cur_price - cost) / cost * 100
+                return self._block(
+                    f"浮亏加仓拦截: {name}当前浮亏{loss_pct:.1f}%，"
+                    f"绝对禁止补仓/加仓（铁律）"
+                )
+
+        # 第8关：持仓数量限制
+        max_holdings = cfg.get("max_holdings", 7)
+        if code not in holdings and len(holdings) >= max_holdings:
+            return self._block(
+                f"持仓数量{len(holdings)}只已达上限{max_holdings}只，禁止新开仓"
+            )
+
+        # 第9关：三级仓位硬限制
+        if stock_type == "etf":
+            single_max = cfg.get("etf_max_ratio", 0.20)
+        else:
+            single_max = cfg.get("stock_max_ratio", 0.15)
+
+        current_amount = 0
+        if code in holdings:
+            pos = holdings[code]
+            current_amount = pos.get("shares", 0) * pos.get("price", 0)
+        new_single_ratio = (current_amount + amount) / self.total_capital
+        if new_single_ratio > single_max:
+            allowed_amount = self.total_capital * single_max - current_amount
+            if allowed_amount <= 0:
+                return self._block(
+                    f"单只仓位超限: {name}将达{new_single_ratio:.1%} > "
+                    f"上限{single_max:.0%}，拦截"
+                )
+            adjusted_shares = int(allowed_amount / price / 100) * 100
+            if adjusted_shares < 100:
+                return self._block(
+                    f"单只仓位超限: {name}已达上限{single_max:.0%}，无法再买"
+                )
+            shares = adjusted_shares
+            amount = shares * price
+
+        # 9b. 赛道仓位
+        if sector:
+            sector_max = cfg.get("sector_max_ratio", 0.40)
+            sector_amount = sum(
+                h.get("shares", 0) * h.get("price", 0)
+                for h in holdings.values()
+                if h.get("sector") == sector
+            )
+            new_sector_ratio = (sector_amount + amount) / self.total_capital
+            if new_sector_ratio > sector_max:
+                return self._block(
+                    f"赛道仓位超限: {sector}将达{new_sector_ratio:.1%} > "
+                    f"上限{sector_max:.0%}，拦截"
+                )
+
+        # 9c. 总仓位（动态，与指数均线绑定 + 盘中风险联动）
+        total_position = sum(
+            h.get("shares", 0) * h.get("price", 0)
+            for h in holdings.values()
+        )
+        max_total = self._get_dynamic_total_limit(market_info)
+        # 盘中系统性风险强制降低仓位上限
+        intraday_limit = self._get_intraday_position_limit()
+        if intraday_limit is not None and intraday_limit < max_total:
+            logger.warning(f"[盘中风控] 系统性风险强制仓位上限: {max_total:.0%} -> {intraday_limit:.0%}")
+            max_total = intraday_limit
+        new_total_ratio = (total_position + amount) / self.total_capital
+        if new_total_ratio > max_total:
+            return self._block(
+                f"总仓位超限: 将达{new_total_ratio:.1%} > "
+                f"动态上限{max_total:.0%}，拦截"
+            )
+
+        # 第10关：现金安全垫
+        min_cash_ratio = cfg.get("min_cash_ratio", 0.10)
+        cash_after = self.total_capital - total_position - amount
+        min_cash = self.total_capital * min_cash_ratio
+        if cash_after < min_cash:
+            return self._block(
+                f"突破现金安全垫: 剩余{cash_after:.0f}元 < "
+                f"最低保留{min_cash:.0f}元({min_cash_ratio:.0%})"
+            )
+
+        # ATR自适应止损计算（V8.3新增）
+        adaptive_result = self._try_adaptive_stop_loss(
+            code, price, signal.get("volatility_regime", "normal")
+        )
+
+        # 全部通过
+        pass_result = {
+            "pass": True,
+            "reason": "风控通过",
+            "level": "green",
+            "adjusted_shares": shares,
+            "warnings": [],
+        }
+        if adaptive_result:
+            pass_result["adaptive_stop"] = adaptive_result
+            logger.info(
+                f"[ATR自适应止损] {code}: 止损={adaptive_result['stop_price']:.2f} "
+                f"({adaptive_result['stop_pct']:.2%}), ATR={adaptive_result['atr_used']:.4f}"
+            )
+        return pass_result
+
+    # --------------------------------------------------------
+    # 卖出信号校验
+    # --------------------------------------------------------
+    def check_sell(self, signal: dict, holdings: dict) -> dict:
+        """卖出信号处理：记录冷却期、更新连续亏损、更新策略失效检测"""
+        code = signal.get("code", "")
+        pnl = signal.get("pnl", 0)
+        self.state_mgr.record_sell(code)
+        if pnl < 0:
+            self.state_mgr.record_loss()
+        else:
+            self.state_mgr.record_profit()
+        
+        # P0: 记录交易结果到策略失效检测器
+        pnl_pct = signal.get("pnl_pct", 0)
+        if pnl_pct == 0 and pnl != 0:
+            # 如果没有pnl_pct字段，尝试从持仓计算
+            pos = holdings.get(code, {})
+            cost = pos.get("cost", pos.get("buy_price", 0))
+            if cost > 0:
+                shares = pos.get("shares", 0)
+                pnl_pct = (pnl / (cost * shares) * 100) if shares > 0 else 0
+        if pnl_pct != 0:
+            self.failure_detector.record_trade(pnl_pct)
+        
+        # P2: 熔断恢复期交易跟踪
+        self.fuse_enhancer.on_recovery_trade(pnl >= 0)
+        
+        return {"pass": True, "reason": "卖出放行", "level": "green"}
+
+    # --------------------------------------------------------
+    # 持仓健康度巡检（兼容 RiskGate.inspect_holdings）
+    # --------------------------------------------------------
+    def inspect_holdings(self, holdings: dict,
+                         market_info: dict = None) -> List[dict]:
+        """持仓风险四级巡检（与 RiskGate 完全兼容）"""
+        cfg = self.cfg
+        results = []
+        for code, pos in holdings.items():
+            cost = pos.get("cost", pos.get("buy_price", 0))
+            price = pos.get("price", pos.get("current_price", cost))
+            name = pos.get("name", code)
+            ma20 = pos.get("ma20", price)
+            ma60 = pos.get("ma60", price)
+            pnl_pct = (price / cost - 1) * 100 if cost > 0 else 0
+            is_bullish = price > ma20 and ma20 > ma60
+
+            if pnl_pct <= -15 or (price < ma60 and pnl_pct < -10):
+                level, action, urgency = "危险", "无条件清仓", 0
+            elif not is_bullish and pnl_pct < 0:
+                level, action, urgency = "预警", "反弹减仓（设14:50条件单）", 1
+            elif not is_bullish and pnl_pct >= 0:
+                level, action, urgency = "关注", "持有观察，跌破MA20即减仓", 2
+            elif is_bullish and pnl_pct < 0:
+                level, action, urgency = "关注", "持有+带好止损（成本×90%）", 2
+            else:
+                level, action, urgency = "健康", "持有，止损上移", 3
+
+            position_ratio = (pos.get("shares", 0) * price) / self.total_capital
+            stock_type = pos.get("type", "stock")
+            max_ratio = cfg.get("etf_max_ratio", 0.20) if stock_type == "etf" \
+                else cfg.get("stock_max_ratio", 0.15)
+            over_limit = position_ratio > max_ratio
+
+            reduce_shares = 0
+            if over_limit:
+                target_amount = self.total_capital * max_ratio
+                current_amount = pos.get("shares", 0) * price
+                reduce_amount = current_amount - target_amount
+                reduce_shares = int(reduce_amount / price / 100) * 100
+
+            results.append({
+                "code": code, "name": name, "level": level,
+                "urgency": urgency, "pnl_pct": round(pnl_pct, 2),
+                "is_bullish": is_bullish, "action": action,
+                "position_ratio": round(position_ratio * 100, 1),
+                "over_limit": over_limit, "reduce_shares": reduce_shares,
+                "stop_loss": round(cost * 0.9, 3) if level in ("关注", "预警")
+                             else round(price * 0.92, 3),
+            })
+        results.sort(key=lambda x: x["urgency"])
+        return results
+
+    # --------------------------------------------------------
+    # 内部辅助方法
+    # --------------------------------------------------------
+    def _sync_risk_state(self, risk_state):
+        """将 RiskState 的盈亏数据同步到持久化状态管理器"""
+        if hasattr(risk_state, 'daily_pnl'):
+            self.state_mgr.state["daily_pnl"] = risk_state.daily_pnl
+        if hasattr(risk_state, 'weekly_pnl'):
+            self.state_mgr.state["weekly_pnl"] = risk_state.weekly_pnl
+        if hasattr(risk_state, 'total_capital'):
+            self.total_capital = risk_state.total_capital
+            self.state_mgr.state["total_capital"] = risk_state.total_capital
+
+    def _calc_position_ratio(self, positions: dict, total_capital: float) -> float:
+        if total_capital <= 0:
+            return 0
+        return self._calc_total_position_amount(positions) / total_capital
+
+    @staticmethod
+    def _calc_total_position_amount(positions: dict) -> float:
+        total = 0
+        for pos in positions.values():
+            total += pos.get("shares", 0) * pos.get(
+                "current_price", pos.get("buy_price", pos.get("price", 0)))
+        return total
+
+    @staticmethod
+    def _calc_sector_amount(positions: dict, sector: str) -> float:
+        total = 0
+        for pos in positions.values():
+            if pos.get("sector") == sector:
+                total += pos.get("shares", 0) * pos.get(
+                    "current_price", pos.get("buy_price", pos.get("price", 0)))
+        return total
+
+    def _get_dynamic_total_limit(self, market_info: dict = None) -> float:
+        cfg = self.cfg
+        if not market_info:
+            return cfg.get("total_above_ma20", 0.80)
+        index_price = market_info.get("index_price", 0)
+        index_ma20 = market_info.get("index_ma20", 0)
+        index_ma60 = market_info.get("index_ma60", 0)
+        if index_price <= 0 or index_ma20 <= 0:
+            return cfg.get("total_above_ma20", 0.80)
+        if index_price < index_ma60:
+            return cfg.get("total_below_ma60", 0.30)
+        elif index_price < index_ma20:
+            return cfg.get("total_below_ma20", 0.50)
+        else:
+            return cfg.get("total_above_ma20", 0.80)
+
+    # --------------------------------------------------------
+    # ATR自适应止损辅助方法
+    # --------------------------------------------------------
+    def _try_adaptive_stop_loss(self, code: str, price: float,
+                                volatility_regime: str = "normal") -> Optional[dict]:
+        """
+        尝试计算ATR自适应止损价。
+        成功返回止损结果 dict，ATR数据不可用时返回 None（fallback到固定百分比）。
+        """
+        _ensure_adaptive_stop_import()
+        if _get_atr_value is None or _calc_adaptive_stop_loss is None:
+            return None
+
+        try:
+            atr = _get_atr_value(code, price)
+            if atr <= 0:
+                logger.debug(f"[ATR止损] {code}: ATR数据不可用({atr}), fallback到固定百分比止损")
+                return None
+
+            result = _calc_adaptive_stop_loss(price, atr, volatility_regime)
+
+            # 验证止损价合理性
+            cfg = self.cfg
+            max_stop_pct = cfg.get('max_stop_loss_pct', 0.15)
+            stop_distance = (price - result["stop_price"]) / price if price > 0 else 0
+            if stop_distance > max_stop_pct:
+                logger.warning(
+                    f"[ATR止损] {code}: 止损距离{stop_distance:.2%}超过上限{max_stop_pct:.0%}，"
+                    f"截断到固定止损"
+                )
+                return None
+
+            return result
+        except Exception as e:
+            logger.warning(f"[ATR止损] {code}: 自适应止损计算异常({e}), fallback到固定百分比")
+            return None
+
+    # --------------------------------------------------------
+    # 盘中风险联动方法
+    # --------------------------------------------------------
+    def set_intraday_risk_flag(self, flag: str, details: dict):
+        """
+        设置盘中风险标记（由 IntradayMonitor 联动调用）
+
+        参数:
+            flag: 风险标记名称，如 "systemic_risk", "intraday_pause"
+            details: 风险详情 dict
+        """
+        try:
+            flags = self.state_mgr.state.setdefault("intraday_risk_flags", {})
+            flags[flag] = {
+                "time": datetime.datetime.now().isoformat(),
+                "details": details,
+            }
+            self.state_mgr.save()
+            logger.critical(f"[盘中风控] 设置风险标记: {flag}, 详情: {details}")
+        except Exception as e:
+            logger.error(f"[盘中风控] 设置标记失败({flag}): {e}")
+
+    def clear_intraday_risk_flag(self, flag: str):
+        """
+        清除盘中风险标记（风险解除时调用）
+
+        参数:
+            flag: 要清除的风险标记名称
+        """
+        try:
+            flags = self.state_mgr.state.get("intraday_risk_flags", {})
+            if flag in flags:
+                del flags[flag]
+                self.state_mgr.save()
+                logger.info(f"[盘中风控] 清除风险标记: {flag}")
+        except Exception as e:
+            logger.error(f"[盘中风控] 清除标记失败({flag}): {e}")
+
+    def _load_intraday_flags(self):
+        """从持久化状态加载盘中风险标记"""
+        flags = self.state_mgr.state.get("intraday_risk_flags", {})
+        if flags:
+            logger.info(f"[盘中风控] 从持久化状态加载 {len(flags)} 个风险标记: {list(flags.keys())}")
+
+    def _expire_intraday_flags(self):
+        """
+        盘中风险标记自动过期机制：
+        当日15:30后自动清除所有盘中风险标记（盘后自动解除）
+        """
+        try:
+            flags = self.state_mgr.state.get("intraday_risk_flags", {})
+            if not flags:
+                return
+            now = datetime.datetime.now()
+            expire_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+            if now >= expire_time:
+                expired_flags = list(flags.keys())
+                self.state_mgr.state["intraday_risk_flags"] = {}
+                self.state_mgr.save()
+                logger.info(f"[盘中风控] 盘后自动过期清除标记: {expired_flags}")
+        except Exception as e:
+            logger.error(f"[盘中风控] 过期清理失败: {e}")
+
+    def _check_intraday_risk_flags(self) -> Optional[dict]:
+        """
+        检查盘中风险标记（用于 _do_check 接口）
+        - systemic_risk → 总仓位上限强制降至30%
+        - intraday_pause → 拒绝所有新买入
+        """
+        flags = self.state_mgr.state.get("intraday_risk_flags", {})
+        if not flags:
+            return None
+
+        if "intraday_pause" in flags:
+            pause_info = flags["intraday_pause"]
+            return self._block_result(
+                f"盘中暂停: {pause_info.get('details', {}).get('reason', '盘中急跌暂停')}，"
+                f"所有新买入被拒绝（{pause_info.get('time', '')}触发）"
+            )
+
+        if "systemic_risk" in flags:
+            risk_info = flags["systemic_risk"]
+            pct = risk_info.get("details", {}).get("pct_down", 0)
+            logger.warning(f"[盘中风控] 系统性风险标记生效，总仓位上限强制30% (触发时间: {risk_info.get('time', '')})")
+            # 系统性风险不直接拦截，而是降低仓位上限（在关卡12中生效）
+            # 此处仅输出警告，不返回拦截结果
+        return None
+
+    def _check_intraday_risk_flags_for_buy(self) -> Optional[dict]:
+        """
+        检查盘中风险标记（用于 _do_check_buy / RiskGate 兼容接口）
+        - intraday_pause → 拒绝所有新买入
+        - systemic_risk → 总仓位上限强制降至30%（在仓位检查关卡中生效）
+        """
+        flags = self.state_mgr.state.get("intraday_risk_flags", {})
+        if not flags:
+            return None
+
+        if "intraday_pause" in flags:
+            pause_info = flags["intraday_pause"]
+            return self._block(
+                f"盘中暂停: {pause_info.get('details', {}).get('reason', '盘中急跌暂停')}，"
+                f"所有新买入被拒绝（{pause_info.get('time', '')}触发）"
+            )
+        return None
+
+    def _get_intraday_position_limit(self) -> Optional[float]:
+        """获取盘中风险标记强制的仓位上限（None=无限制）"""
+        flags = self.state_mgr.state.get("intraday_risk_flags", {})
+        if "systemic_risk" in flags:
+            return 0.30  # 系统性风险 → 总仓位上限30%
+        return None
+
+    @staticmethod
+    def _block(reason: str) -> dict:
+        """RiskGate 格式拦截结果"""
+        logger.warning(f"[风控拦截] {reason}")
+        return {
+            "pass": False, "reason": reason, "level": "red",
+            "adjusted_shares": 0, "warnings": [],
+        }
+
+    @staticmethod
+    def _block_result(reason: str) -> dict:
+        """risk_check 格式拦截结果"""
+        logger.warning(f"[风控拦截] {reason}")
+        return {
+            "pass": False, "level": "red", "reasons": [reason],
+            "adjusted_shares": 0, "warnings": [],
+        }
+
+
+# 全局单例引用（延迟初始化）
+_unified_engine: Optional[UnifiedRiskEngine] = None
+
+
+def _get_unified_engine() -> UnifiedRiskEngine:
+    """获取全局 UnifiedRiskEngine 单例"""
+    global _unified_engine
+    if _unified_engine is None:
+        _unified_engine = UnifiedRiskEngine(
+            total_capital=getattr(config, 'TOTAL_CAPITAL', 424000)
+        )
+    return _unified_engine
+
+
 """
 风控熔断校验模块
 ==================
@@ -640,219 +1881,21 @@ def get_max_position_ratio(market_strength: str) -> float:
 # ============================================================
 
 def risk_check(trade_plan: dict, risk_state: RiskState,
-               market_strength: str = "normal") -> dict:
+               market_strength: str = "normal",
+               vol_scale: float = 1.0) -> dict:
     """
-    交易信号风控校验（V3.0升级版，所有信号必须先过此函数）
+    交易信号风控校验（向后兼容包装器）
     
-    新增检查:
-    - 持仓数量硬限制: <= 7只
-    - 单笔亏损达总资金2%无条件止损
-    - 浮亏持仓禁止加仓
+    实际已委托给 UnifiedRiskEngine.check() 执行。
+    保留此函数仅为与 main.py 的导入兼容。
+    
+    参数:
+        vol_scale: 波动率目标缩放因子（>1允许加仓，<1需减仓），默认1.0不影响
     """
-    result = {
-        "pass": True,
-        "level": "green",
-        "reasons": [],
-        "adjusted_shares": trade_plan.get("shares", 0),
-        "warnings": []
-    }
-
-    action = trade_plan.get("action", "buy")
-
-    # 卖出信号不需要风控检查
-    if action == "sell":
-        result["reasons"].append("卖出信号，直接通过")
-        return result
-
-    # ---- 以下仅对买入/加仓进行校验 ----
-
-    code = trade_plan.get("code", "")
-    price = trade_plan.get("price", 0)
-    shares = trade_plan.get("shares", 0)
-    sector = trade_plan.get("sector", "")
-    stock_type = trade_plan.get("stock_type", "龙头")
-    amount = shares * price
-
-    # ---- 检查-1: 满仓禁止加仓（情绪化交易防护，最高优先级）----
-    full_threshold = getattr(config, 'FULL_POSITION_THRESHOLD', 0.90)
-    near_full = getattr(config, 'NEAR_FULL_POSITION', 0.80)
-    current_position_ratio = risk_state.get_position_ratio()
-    available_cash = getattr(config, 'AVAILABLE_CASH', 0)
-
-    # 硬性规则：仓位>=90% 或 可用资金不足 → 绝对禁止任何买入
-    if current_position_ratio >= full_threshold:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"★满仓禁止: 当前仓位{current_position_ratio:.1%} >= {full_threshold:.0%}红线，"
-            f"绝对禁止买入/加仓（情绪化交易防护）"
-        )
-        return result
-
-    # 可用资金不足 → 禁止买入
-    if available_cash < amount and available_cash < price * 100:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"资金不足: 可用{available_cash:.0f}元 < 最低买入{price*100:.0f}元，禁止买入"
-        )
-        return result
-
-    # 仓位>=80% → 禁止新开仓（只允许已持仓的减仓操作）
-    if current_position_ratio >= near_full and code not in risk_state.current_positions:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"仓位过高: 当前{current_position_ratio:.1%} >= {near_full:.0%}，"
-            f"禁止新开仓（只允许减仓）"
-        )
-        return result
-
-    # ---- 检查0: 持仓数量硬限制 ----
-    max_holdings = getattr(config, 'MAX_HOLDINGS', 7)
-    current_count = len(risk_state.current_positions)
-    if action == "buy" and code not in risk_state.current_positions:
-        if current_count >= max_holdings:
-            result["pass"] = False
-            result["level"] = "red"
-            result["reasons"].append(
-                f"持仓数量超限: 当前{current_count}只 >= 上限{max_holdings}只，禁止新开仓"
-            )
-            return result
-
-    # ---- 检查0.5: 浮亏持仓禁止加仓 ----
-    if action == "add" and code in risk_state.current_positions:
-        pos = risk_state.current_positions[code]
-        buy_p = pos.get("buy_price", 0)
-        cur_p = pos.get("current_price", buy_p)
-        if buy_p > 0 and cur_p < buy_p:
-            result["pass"] = False
-            result["level"] = "red"
-            result["reasons"].append(
-                f"铁则违反: {code}当前浮亏{(cur_p-buy_p)/buy_p:.2%}，绝对禁止加仓"
-            )
-            return result
-
-    # ---- 检查1: 时间红线 ----
-    now = datetime.datetime.now()
-    current_time = now.strftime("%H:%M")
-    if _in_no_trade_zone(current_time):
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(f"当前时间{current_time}处于禁止交易时段")
-        return result
-
-    # ---- 检查2: 日度熔断 ----
-    daily_loss_ratio = abs(risk_state.daily_pnl) / risk_state.total_capital if risk_state.daily_pnl < 0 else 0
-    if daily_loss_ratio >= config.DAILY_LOSS_LIMIT_2:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"日度熔断L2: 当日亏损{daily_loss_ratio:.2%} >= {config.DAILY_LOSS_LIMIT_2:.0%}，禁止开新仓"
-        )
-        return result
-
-    if daily_loss_ratio >= config.DAILY_LOSS_LIMIT_1:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"日度熔断L1: 当日亏损{daily_loss_ratio:.2%} >= {config.DAILY_LOSS_LIMIT_1:.0%}，只卖不买"
-        )
-        return result
-
-    # ---- 检查3: 周度熔断 ----
-    weekly_loss_ratio = abs(risk_state.weekly_pnl) / risk_state.total_capital if risk_state.weekly_pnl < 0 else 0
-    if weekly_loss_ratio >= config.WEEKLY_LOSS_LIMIT:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"周度熔断: 本周亏损{weekly_loss_ratio:.2%} >= {config.WEEKLY_LOSS_LIMIT:.0%}，强制休息"
-        )
-        return result
-
-    # ---- 检查4: 个股仓位上限 ----
-    if stock_type == "弹性":
-        max_ratio = config.FLEXIBLE_STOCK_MAX_RATIO
-    else:
-        max_ratio = config.LEADER_STOCK_MAX_RATIO
-    current_stock_amount = 0
-    if code in risk_state.current_positions:
-        pos = risk_state.current_positions[code]
-        current_stock_amount = pos.get("shares", 0) * pos.get("current_price", pos.get("buy_price", 0))
-
-    new_total = current_stock_amount + amount
-    if new_total / risk_state.total_capital > max_ratio:
-        # 尝试缩减仓位
-        max_amount = risk_state.total_capital * max_ratio - current_stock_amount
-        if max_amount > 0 and price > 0:
-            adjusted = int(max_amount / price)
-            adjusted = (adjusted // 100) * 100
-            if adjusted < shares:
-                result["adjusted_shares"] = adjusted
-                result["warnings"].append(
-                    f"仓位超限: 原计划{shares}股 -> 调整为{adjusted}股 (上限{max_ratio:.0%})"
-                )
-                shares = adjusted
-                amount = shares * price
-        else:
-            result["pass"] = False
-            result["level"] = "red"
-            result["reasons"].append(f"个股仓位超限{max_ratio:.0%}且无法缩减")
-            return result
-
-    # ---- 检查5: 赛道仓位上限 ----
-    if sector:
-        sector_amount = risk_state.get_sector_amount(sector)
-        new_sector = sector_amount + amount
-        if new_sector / risk_state.total_capital > config.SECTOR_MAX_RATIO:
-            result["warnings"].append(
-                f"赛道仓位预警: {sector}将达到{new_sector/risk_state.total_capital:.1%}，"
-                f"上限{config.SECTOR_MAX_RATIO:.0%}"
-            )
-            result["level"] = "yellow" if result["level"] == "green" else result["level"]
-
-    # ---- 检查6: 总仓位上限（按行情强度）----
-    max_pos_ratio = get_max_position_ratio(market_strength)
-    current_pos_ratio = risk_state.get_position_ratio()
-    new_pos_amount = risk_state.get_total_position_amount() + amount
-    new_pos_ratio = new_pos_amount / risk_state.total_capital
-
-    if new_pos_ratio > max_pos_ratio:
-        result["warnings"].append(
-            f"总仓位预警: 将达{new_pos_ratio:.1%}，"
-            f"当前行情({market_strength})上限{max_pos_ratio:.0%}"
-        )
-        if new_pos_ratio > max_pos_ratio + 0.05:  # 超5%以上直接拒绝
-            result["pass"] = False
-            result["level"] = "red"
-            result["reasons"].append(f"总仓位严重超限: {new_pos_ratio:.1%} > {max_pos_ratio:.0%}")
-            return result
-
-    # ---- 检查7: 现金安全垫 ----
-    cash_after = risk_state.total_capital - risk_state.get_total_position_amount() - amount
-    min_cash = risk_state.total_capital * config.CASH_RESERVE_RATIO
-    if cash_after < min_cash:
-        result["pass"] = False
-        result["level"] = "red"
-        result["reasons"].append(
-            f"突破现金安全垫: 剩余{cash_after:.0f} < 最低保留{min_cash:.0f}({config.CASH_RESERVE_RATIO:.0%})"
-        )
-        return result
-
-    # ---- 检查8: 单笔亏损控制 ----
-    stop_loss = trade_plan.get("stop_loss", price * (1 - config.INITIAL_STOP_LOSS_PCT))
-    max_loss = shares * (price - stop_loss)
-    max_loss_ratio = max_loss / risk_state.total_capital
-    if max_loss_ratio > config.MAX_SINGLE_LOSS_RATIO:
-        result["warnings"].append(
-            f"单笔亏损偏大: {max_loss_ratio:.2%} > {config.MAX_SINGLE_LOSS_RATIO:.0%}"
-        )
-        result["level"] = "yellow" if result["level"] == "green" else result["level"]
-
-    if result["pass"]:
-        result["reasons"].append("风控校验通过")
-
-    return result
+    engine = _get_unified_engine()
+    # 同步资金信息
+    engine.total_capital = getattr(risk_state, 'total_capital', config.TOTAL_CAPITAL)
+    return engine.check(trade_plan, risk_state, market_strength, vol_scale=vol_scale)
 
 
 def _in_no_trade_zone(current_time: str) -> bool:
@@ -906,9 +1949,12 @@ def daily_risk_summary(risk_state: RiskState, market_strength: str) -> str:
 
     # 风控状态
     daily_loss = abs(risk_state.daily_pnl) / risk_state.total_capital if risk_state.daily_pnl < 0 else 0
-    if daily_loss >= config.DAILY_LOSS_LIMIT_2:
+    unified_cfg = getattr(config, 'RISK_UNIFIED_CONFIG', {})
+    daily_l2 = unified_cfg.get("daily_loss_limit_l2", getattr(config, 'DAILY_LOSS_LIMIT_2', 0.03))
+    daily_l1 = unified_cfg.get("daily_loss_limit", getattr(config, 'DAILY_LOSS_LIMIT_1', 0.02))
+    if daily_loss >= daily_l2:
         lines.append(f"\n  [!] 日度熔断L2触发，禁止开新仓")
-    elif daily_loss >= config.DAILY_LOSS_LIMIT_1:
+    elif daily_loss >= daily_l1:
         lines.append(f"\n  [!] 日度熔断L1触发，只卖不买")
 
     return "\n".join(lines)

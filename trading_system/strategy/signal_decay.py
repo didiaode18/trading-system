@@ -355,16 +355,17 @@ class SignalHistoryTracker:
         return []
 
     def record_signal(self, code: str, signal: dict, signal_date: str):
-        """记录新信号"""
+        """记录新信号，记录后自动持久化"""
         entry = {
             "code": code,
             "date": signal_date,
             "type": "buy" if signal.get("buy_signal") else "sell",
             "buy_type": signal.get("buy_type", ""),
+            "signal_type": self._classify_signal_to_decay_key(signal),
             "quality_score": signal.get("quality_score", 50),
             "price": signal.get("buy_price") or signal.get("sell_price", 0),
             "recorded_at": datetime.datetime.now().isoformat(),
-            # 后续填充
+            # 后续由 update_results() 填充
             "result_t1": None,
             "result_t3": None,
             "result_t5": None,
@@ -372,6 +373,37 @@ class SignalHistoryTracker:
         self.history.append(entry)
         # 只保留最近200条
         self.history = self.history[-200:]
+        # 每次记录后自动保存
+        self.save()
+
+    @staticmethod
+    def _classify_signal_to_decay_key(signal: dict) -> str:
+        """将信号分类为 DECAY_CURVES 中对应的 key"""
+        reason = signal.get("signal_reason", "")
+        buy_type = signal.get("buy_type", "")
+
+        if signal.get("sell_signal"):
+            if "止损" in reason or "强制" in reason:
+                return "sell_stop_loss"
+            elif "止盈" in reason or "阶梯" in reason:
+                return "sell_take_profit"
+            elif "趋势破位" in reason or "跌破" in reason:
+                return "sell_trend_break"
+            else:
+                return "sell_stop_loss"
+
+        if signal.get("add_position"):
+            return "add_position"
+
+        if signal.get("buy_signal"):
+            if "双买点" in reason or "共振" in reason:
+                return "buy_dual"
+            elif "突破" in buy_type or "突破" in reason:
+                return "buy_breakout"
+            else:
+                return "buy_pullback"
+
+        return "buy_pullback"
 
     def update_results(self, data_dict: dict):
         """
@@ -407,56 +439,205 @@ class SignalHistoryTracker:
 
     def compute_decay_stats(self) -> dict:
         """
-        统计各类型信号的实际衰减数据
-        用于校准 DECAY_CURVES
+        统计各类型信号的实际衰减数据，用于校准 DECAY_CURVES。
+
+        返回:
+            {signal_type: {
+                "t1_win_rate": float,   # T+1 胜率 (0~1)
+                "t3_win_rate": float,   # T+3 胜率
+                "t5_win_rate": float,   # T+5 胜率
+                "t1_avg_return": float, # T+1 平均收益率
+                "t3_avg_return": float,
+                "t5_avg_return": float,
+                "sample_count": int,    # 样本量
+                "t1_returns": list,     # T+1 收益率列表（供Bootstrap使用）
+                "t3_returns": list,
+                "t5_returns": list,
+            }}
+        仅当样本量 >= 30 时才输出校准结果，否则对应类型不包含在返回值中。
         """
-        stats = {}
+        # 按信号类型聚合
+        stats: dict = {}
         for entry in self.history:
-            sig_type = entry.get("buy_type", "pullback")
-            if entry["type"] == "buy":
-                if "突破" in sig_type:
-                    key = "buy_breakout"
-                elif "共振" in sig_type or "双" in sig_type:
-                    key = "buy_dual"
+            # 优先使用 record_signal 写入的 signal_type
+            key = entry.get("signal_type")
+            if not key:
+                # 兼容旧数据：通过 buy_type 字段推断
+                buy_type_str = entry.get("buy_type", "pullback")
+                if entry["type"] == "buy":
+                    if "突破" in buy_type_str:
+                        key = "buy_breakout"
+                    elif "共振" in buy_type_str or "双" in buy_type_str:
+                        key = "buy_dual"
+                    else:
+                        key = "buy_pullback"
                 else:
-                    key = "buy_pullback"
-            else:
-                key = "sell"
+                    key = "sell_stop_loss"  # 旧数据无细分，归入止损
 
             if key not in stats:
                 stats[key] = {"t1": [], "t3": [], "t5": [], "count": 0}
-
             stats[key]["count"] += 1
-            if entry["result_t1"] is not None:
+            if entry.get("result_t1") is not None:
                 stats[key]["t1"].append(entry["result_t1"])
-            if entry["result_t3"] is not None:
+            if entry.get("result_t3") is not None:
                 stats[key]["t3"].append(entry["result_t3"])
-            if entry["result_t5"] is not None:
+            if entry.get("result_t5") is not None:
                 stats[key]["t5"].append(entry["result_t5"])
 
-        # 计算胜率衰减
+        # 计算胜率与平均收益
         result = {}
         for key, data in stats.items():
-            if data["count"] < 5:
-                continue
-            t1_winrate = np.mean([1 for r in data["t1"] if r > 0]) if data["t1"] else None
-            t3_winrate = np.mean([1 for r in data["t3"] if r > 0]) if data["t3"] else None
-            t5_winrate = np.mean([1 for r in data["t5"] if r > 0]) if data["t5"] else None
+            if data["count"] < 30:
+                continue  # 样本不足，跳过
+
+            def _calc_win_rate(returns: list) -> float:
+                if not returns:
+                    return 0.0
+                wins = sum(1 for r in returns if r > 0)
+                return wins / len(returns)
 
             result[key] = {
-                "count": data["count"],
-                "t1_winrate": round(t1_winrate, 3) if t1_winrate else None,
-                "t3_winrate": round(t3_winrate, 3) if t3_winrate else None,
-                "t5_winrate": round(t5_winrate, 3) if t5_winrate else None,
+                "sample_count": data["count"],
+                "t1_win_rate": round(_calc_win_rate(data["t1"]), 4),
+                "t3_win_rate": round(_calc_win_rate(data["t3"]), 4),
+                "t5_win_rate": round(_calc_win_rate(data["t5"]), 4),
                 "t1_avg_return": round(np.mean(data["t1"]), 4) if data["t1"] else None,
                 "t3_avg_return": round(np.mean(data["t3"]), 4) if data["t3"] else None,
                 "t5_avg_return": round(np.mean(data["t5"]), 4) if data["t5"] else None,
+                # 保留原始收益列表供 Bootstrap 使用
+                "t1_returns": data["t1"],
+                "t3_returns": data["t3"],
+                "t5_returns": data["t5"],
             }
 
         return result
 
+    # ============================================================
+    # 衰减曲线自动校准（Bootstrap 置信区间保护）
+    # ============================================================
+
+    @staticmethod
+    def _bootstrap_win_rate_ci(returns: list, n_boot: int = 1000,
+                                alpha: float = 0.05) -> tuple:
+        """
+        Bootstrap 重采样计算胜率 95% 置信区间。
+
+        参数:
+            returns: 收益率列表
+            n_boot: 重采样次数
+            alpha: 显著性水平 (0.05 -> 95% CI)
+
+        返回:
+            (ci_low, ci_high, ci_width)
+        """
+        if len(returns) < 5:
+            return (0.0, 0.0, 0.0)
+        arr = np.array(returns)
+        boot_wins = []
+        rng = np.random.default_rng(42)  # 固定种子保证可复现
+        n = len(arr)
+        for _ in range(n_boot):
+            sample = rng.choice(arr, size=n, replace=True)
+            wr = np.sum(sample > 0) / n
+            boot_wins.append(wr)
+        ci_low = float(np.percentile(boot_wins, 100 * alpha / 2))
+        ci_high = float(np.percentile(boot_wins, 100 * (1 - alpha / 2)))
+        ci_width = ci_high - ci_low
+        return (round(ci_low, 4), round(ci_high, 4), round(ci_width, 4))
+
+    def update_decay_curves(self, stats: dict) -> dict:
+        """
+        根据实际回测统计更新 DECAY_CURVES。
+
+        规则:
+          - 样本量 < 30 的类型跳过
+          - Bootstrap 95% 置信区间宽度 > 0.20 标记为"不可靠"，不更新
+          - 置信区间合格则用实际胜率替换默认衰减曲线
+
+        参数:
+            stats: compute_decay_stats() 的返回值
+
+        返回:
+            {signal_type: {"updated": bool, "reason": str, "curve": dict, ...}}
+        """
+        summary = {}
+
+        for sig_type, s in stats.items():
+            # 样本量检查
+            if s.get("sample_count", 0) < 30:
+                summary[sig_type] = {
+                    "updated": False,
+                    "reason": f"样本量{s.get('sample_count', 0)}/30不足",
+                }
+                continue
+
+            # 对 T+1 / T+3 / T+5 分别做 Bootstrap CI
+            ci_results = {}
+            reliable = True
+            for t_label, returns_key in [("t1", "t1_returns"),
+                                          ("t3", "t3_returns"),
+                                          ("t5", "t5_returns")]:
+                returns = s.get(returns_key, [])
+                if not returns:
+                    ci_results[t_label] = {"ci_low": 0, "ci_high": 0,
+                                           "ci_width": 1.0, "wr": 0}
+                    reliable = False
+                    continue
+                ci_low, ci_high, ci_width = self._bootstrap_win_rate_ci(returns)
+                wr = s.get(f"{t_label}_win_rate", 0)
+                ci_results[t_label] = {
+                    "ci_low": ci_low, "ci_high": ci_high,
+                    "ci_width": ci_width, "wr": wr,
+                }
+                if ci_width > 0.20:
+                    reliable = False
+
+            if not reliable:
+                wide_labels = [k for k, v in ci_results.items()
+                               if v["ci_width"] > 0.20]
+                summary[sig_type] = {
+                    "updated": False,
+                    "reason": f"Bootstrap CI 过宽({','.join(wide_labels)}>20%)，数据不可靠",
+                    "ci": ci_results,
+                }
+                continue
+
+            # 用实际胜率构建新衰减曲线
+            new_curve = {}
+            for t_label, day_num in [("t1", 1), ("t3", 3), ("t5", 5)]:
+                wr = ci_results[t_label]["wr"]
+                # 胜率转换为衰减系数：T+1 基准为 1.0，后续按比例衰减
+                if day_num == 1:
+                    new_curve[day_num] = 1.00
+                else:
+                    t1_wr = ci_results["t1"]["wr"]
+                    if t1_wr > 0:
+                        new_curve[day_num] = round(min(1.0, wr / t1_wr), 2)
+                    else:
+                        new_curve[day_num] = round(wr, 2)
+
+            # 保留默认曲线中 T+2 / T+10 / T+30 的插值点
+            default_curve = DECAY_CURVES.get(sig_type, {})
+            merged = dict(new_curve)
+            for d in [2, 10, 30]:
+                if d in default_curve and d not in merged:
+                    merged[d] = default_curve[d]
+
+            summary[sig_type] = {
+                "updated": True,
+                "reason": "Bootstrap CI 合格，已用实际数据校准",
+                "curve": dict(sorted(merged.items())),
+                "sample_count": s["sample_count"],
+                "ci": ci_results,
+            }
+
+        return summary
+
     def save(self):
         """保存历史记录"""
-        os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            json.dump(self.history, f, ensure_ascii=False, indent=2)
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"信号历史保存失败: {e}")

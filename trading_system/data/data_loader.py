@@ -693,21 +693,31 @@ def load_daily_data(code: str, conn: sqlite3.Connection = None,
     从数据库加载某只股票最近N天的日线数据
     返回按日期升序排列的DataFrame
     """
+    # FIX: 修复自建SQLite连接未关闭导致连接泄漏
+    own_conn = False
     if conn is None:
         conn = init_db()
+        own_conn = True
 
-    query = """
-        SELECT date, open, close, high, low, volume
-        FROM daily_kline
-        WHERE code = ?
-        ORDER BY date DESC
-        LIMIT ?
-    """
-    df = pd.read_sql_query(query, conn, params=(code, days))
-    if df.empty:
+    try:
+        query = """
+            SELECT date, open, close, high, low, volume
+            FROM daily_kline
+            WHERE code = ?
+            ORDER BY date DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(code, days))
+        if df.empty:
+            return df
+        df = df.sort_values("date").reset_index(drop=True)
         return df
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.debug(f"关闭自建SQLite连接失败: {e}")
 
 
 # ============================================================
@@ -826,21 +836,32 @@ def load_capital_flow(code: str, conn: sqlite3.Connection = None,
     返回:
         DataFrame: date, main_net, super_net, big_net, mid_net, small_net
     """
+    # FIX: 修复自建SQLite连接未关闭导致连接泄漏
+    own_conn = False
     if conn is None:
         conn = init_db()
-    init_capital_flow_table(conn)
+        own_conn = True
 
-    query = """
-        SELECT date, main_net, super_net, big_net, mid_net, small_net
-        FROM capital_flow
-        WHERE code = ?
-        ORDER BY date DESC
-        LIMIT ?
-    """
-    df = pd.read_sql_query(query, conn, params=(code, days))
-    if df.empty:
-        return df
-    return df.sort_values("date").reset_index(drop=True)
+    try:
+        init_capital_flow_table(conn)
+
+        query = """
+            SELECT date, main_net, super_net, big_net, mid_net, small_net
+            FROM capital_flow
+            WHERE code = ?
+            ORDER BY date DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(code, days))
+        if df.empty:
+            return df
+        return df.sort_values("date").reset_index(drop=True)
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.debug(f"关闭自建SQLite连接失败: {e}")
 
 
 def get_capital_flow_signal(code: str, conn: sqlite3.Connection = None) -> dict:
@@ -891,6 +912,327 @@ def get_capital_flow_signal(code: str, conn: sqlite3.Connection = None) -> dict:
             result["trend"] = "decreasing"
 
     return result
+
+
+# ============================================================
+# 数据源分层架构（盘前/盘中/盘后自动切换）
+# ============================================================
+
+import threading
+
+# 实时行情本地缓存（避免频繁请求被限流）
+_realtime_cache = {}       # {code: {"data": {...}, "ts": timestamp}}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 30            # 缓存有效期30秒
+
+
+def _get_market_phase() -> str:
+    """
+    判断当前市场阶段
+    返回: "pre_market" / "intraday" / "post_market" / "closed"
+    """
+    now = datetime.datetime.now()
+    weekday = now.weekday()
+    if weekday >= 5:  # 周六日
+        return "closed"
+    t = now.hour * 100 + now.minute
+    if t < 830:
+        return "pre_market"
+    elif t < 930:
+        return "pre_market"  # 集合竞价阶段仍用昨收
+    elif t <= 1500:
+        return "intraday"
+    else:
+        return "post_market"
+
+
+def validate_price(code: str, price: float, prev_close: float = 0) -> dict:
+    """
+    价格校验机制：检测异常数据
+    
+    校验规则:
+      1. 价格为0或负数 → 异常
+      2. 涨跌幅 > 11%（非ST/非新股）→ 异常
+      3. 与昨收偏差 > 20% → 异常
+    
+    返回: {"valid": bool, "reason": str, "price": float}
+    """
+    if price <= 0:
+        logger.warning(f"[价格校验] {code} 价格异常: price={price} ≤ 0 ✗")
+        return {"valid": False, "reason": f"价格无效({price})", "price": 0}
+    
+    if prev_close > 0:
+        change_pct = abs(price - prev_close) / prev_close * 100
+        if change_pct > 20:
+            logger.warning(f"[价格校验] {code} 价格异常: 与昨收偏差{change_pct:.1f}% > 20% ✗")
+            return {"valid": False, "reason": f"与昨收偏差{change_pct:.1f}%>20%", "price": price}
+        if change_pct > 11:
+            logger.warning(f"[价格校验] {code} 数据可疑: 涨跌幅{change_pct:.1f}% > 11%（可能前复权错误）")
+            return {"valid": True, "reason": f"涨跌幅{change_pct:.1f}%偏大", "price": price, "suspicious": True}
+    
+    return {"valid": True, "reason": "正常", "price": price}
+
+
+def get_smart_price(code: str, conn: sqlite3.Connection = None) -> dict:
+    """
+    智能价格获取（数据源分层架构）
+    
+    策略:
+      - 盘前（08:30前）：使用 baostock/DB 最新收盘价作为基准
+      - 盘中（09:30-15:00）：接入实时行情源，每30秒刷新（带缓存）
+      - 盘后（15:00后）：以当日收盘价为准确基准
+    
+    容错:
+      - 单只股票获取失败不影响其他标的
+      - 降级使用最近有效数据并标注"⚠️数据延迟"
+    
+    返回: {
+        "price": float,        # 当前有效价格
+        "prev_close": float,   # 昨收
+        "source": str,         # 数据来源
+        "phase": str,          # 市场阶段
+        "stale": bool,         # 是否为降级数据
+        "valid": bool,         # 价格是否通过校验
+        "reason": str,         # 校验说明
+    }
+    """
+    global _realtime_cache
+    phase = _get_market_phase()
+    result = {
+        "price": 0, "prev_close": 0, "source": "none",
+        "phase": phase, "stale": False, "valid": False, "reason": ""
+    }
+    
+    # ---- 盘中: 优先使用实时行情（带30秒缓存）----
+    if phase == "intraday":
+        try:
+            from data.realtime import fetch_realtime_batch
+            
+            # 检查缓存
+            # FIX: 修复缓存写入在锁外执行导致多线程竞态
+            import time as _time
+            with _cache_lock:
+                cached = _realtime_cache.get(code)
+                if cached and (_time.time() - cached["ts"]) < _CACHE_TTL:
+                    rt = cached["data"]
+                else:
+                    # 缓存过期，重新获取
+                    rt_map = fetch_realtime_batch([code])
+                    rt = rt_map.get(code, {})
+                    if rt:
+                        _realtime_cache[code] = {"data": rt, "ts": _time.time()}
+            
+            if rt and rt.get("price", 0) > 0:
+                price = rt["price"]
+                prev_close = rt.get("prev_close", 0)
+                # 价格校验
+                v = validate_price(code, price, prev_close)
+                result.update({
+                    "price": price, "prev_close": prev_close,
+                    "source": f"realtime({rt.get('source', 'tencent')})",
+                    "valid": v["valid"], "reason": v["reason"],
+                })
+                logger.info(f"[价格校验] {code} 实时价{price:.3f} 来源:{result['source']} ✓")
+                return result
+        except Exception as e:
+            logger.warning(f"[{code}] 盘中实时行情获取失败: {e}，降级使用DB数据")
+    
+    # ---- 盘前/盘后/实时失败: 使用DB最新收盘价 ----
+    own_conn = False
+    try:
+        # FIX: 修复自建SQLite连接未关闭导致连接泄漏
+        if conn is None:
+            conn = init_db()
+            own_conn = True
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT close, date FROM daily_kline 
+            WHERE code=? ORDER BY date DESC LIMIT 2
+        """, (code,))
+        rows = cursor.fetchall()
+        
+        if rows:
+            price = rows[0][0]
+            prev_close = rows[1][0] if len(rows) > 1 else 0
+            v = validate_price(code, price, prev_close)
+            
+            # 盘后尝试用实时行情覆盖（获取当日收盘价）
+            if phase == "post_market":
+                try:
+                    from data.realtime import fetch_realtime_batch
+                    rt_map = fetch_realtime_batch([code])
+                    rt = rt_map.get(code, {})
+                    if rt and rt.get("price", 0) > 0:
+                        price = rt["price"]
+                        prev_close = rt.get("prev_close", prev_close)
+                        v = validate_price(code, price, prev_close)
+                        result["source"] = f"post_close({rt.get('source', 'tencent')})"
+                except Exception:
+                    pass
+            
+            if result["source"] == "none":
+                result["source"] = "db_close"
+                # 如果DB数据不是今天的，标记为延迟
+                db_date = rows[0][1]
+                today_str = datetime.date.today().strftime("%Y-%m-%d")
+                if db_date < today_str and phase != "pre_market":
+                    result["stale"] = True
+                    result["reason"] = f"⚠️数据延迟(DB日期{db_date})"
+                    logger.warning(f"[价格校验] {code} ⚠️数据延迟: DB最新={db_date}")
+            
+            result.update({
+                "price": price, "prev_close": prev_close,
+                "valid": v["valid"],
+                "reason": result.get("reason") or v["reason"],
+            })
+            if result["valid"]:
+                logger.info(f"[价格校验] {code} 价格{price:.3f} 来源:{result['source']} ✓")
+            return result
+    except Exception as e:
+        logger.error(f"[{code}] DB数据获取失败: {e}")
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.debug(f"关闭自建SQLite连接失败: {e}")
+    
+    # ---- 最终降级: 尝试baostock直接拉取 ----
+    try:
+        df = fetch_stock_daily_baostock(code, 
+              start_date=(datetime.date.today() - datetime.timedelta(days=10)).strftime("%Y-%m-%d"))
+        if not df.empty:
+            price = float(df.iloc[-1]["close"])
+            prev_close = float(df.iloc[-2]["close"]) if len(df) >= 2 else 0
+            v = validate_price(code, price, prev_close)
+            result.update({
+                "price": price, "prev_close": prev_close,
+                "source": "baostock_fallback", "stale": True,
+                "valid": v["valid"], "reason": f"⚠️降级数据(baostock)",
+            })
+            logger.warning(f"[价格校验] {code} ⚠️降级使用baostock: {price:.3f}")
+    except Exception as e:
+        logger.error(f"[{code}] 所有数据源均失败: {e}")
+    
+    return result
+
+
+def get_smart_price_batch(codes: list, conn: sqlite3.Connection = None) -> dict:
+    """
+    批量智能价格获取（带容错，单只失败不影响其他）
+    
+    返回: {code: {price, prev_close, source, phase, stale, valid, reason}}
+    """
+    if conn is None:
+        conn = init_db()
+    
+    phase = _get_market_phase()
+    results = {}
+    
+    # 盘中批量获取实时行情（一次网络请求）
+    if phase == "intraday":
+        try:
+            from data.realtime import fetch_realtime_batch
+            import time as _time
+            
+            # 检查哪些需要刷新
+            need_fetch = []
+            with _cache_lock:
+                for code in codes:
+                    cached = _realtime_cache.get(code)
+                    if not cached or (_time.time() - cached["ts"]) >= _CACHE_TTL:
+                        need_fetch.append(code)
+                    else:
+                        rt = cached["data"]
+                        if rt.get("price", 0) > 0:
+                            v = validate_price(code, rt["price"], rt.get("prev_close", 0))
+                            results[code] = {
+                                "price": rt["price"], "prev_close": rt.get("prev_close", 0),
+                                "source": f"realtime_cache({rt.get('source', '')})",
+                                "phase": phase, "stale": False,
+                                "valid": v["valid"], "reason": v["reason"],
+                            }
+            
+            if need_fetch:
+                rt_map = fetch_realtime_batch(need_fetch)
+                with _cache_lock:
+                    for code in need_fetch:
+                        rt = rt_map.get(code, {})
+                        if rt and rt.get("price", 0) > 0:
+                            _realtime_cache[code] = {"data": rt, "ts": _time.time()}
+                            v = validate_price(code, rt["price"], rt.get("prev_close", 0))
+                            results[code] = {
+                                "price": rt["price"], "prev_close": rt.get("prev_close", 0),
+                                "source": f"realtime({rt.get('source', 'tencent')})",
+                                "phase": phase, "stale": False,
+                                "valid": v["valid"], "reason": v["reason"],
+                            }
+                        else:
+                            logger.warning(f"[{code}] 实时行情缺失，降级使用DB")
+        except Exception as e:
+            logger.warning(f"批量实时行情获取失败: {e}")
+    
+    # 未获取到的用DB补全
+    missing = [c for c in codes if c not in results]
+    if missing:
+        for code in missing:
+            results[code] = get_smart_price(code, conn)
+    
+    # 统计
+    valid_count = sum(1 for v in results.values() if v.get("valid"))
+    stale_count = sum(1 for v in results.values() if v.get("stale"))
+    logger.info(f"[智能价格] {len(codes)}只: 有效{valid_count} 延迟{stale_count} 阶段:{phase}")
+    
+    return results
+
+
+def validate_order_price(code: str, name: str, order_type: str,
+                         trigger_price: float, current_price: float) -> dict:
+    """
+    条件单价格合理性校验
+    
+    规则:
+      - 止损/清仓单: 触发价不得 >= 现价（否则开盘即触发）
+      - 止盈单: 触发价不得 <= 现价（否则立即触发）
+      - 建仓单(买入): 触发价不得 >= 现价×1.05（追高保护）
+    
+    返回: {"valid": bool, "adjusted_price": float, "note": str}
+    """
+    if current_price <= 0 or trigger_price <= 0:
+        return {"valid": False, "adjusted_price": trigger_price, "note": "价格无效"}
+    
+    adjusted = trigger_price
+    note = ""
+    
+    if order_type in ("止损", "清仓", "减仓", "强制减仓"):
+        if trigger_price >= current_price:
+            adjusted = round(current_price * 0.92, 3)
+            note = f"止损价{trigger_price:.3f}≥现价{current_price:.3f}，调整为现价×92%={adjusted:.3f}"
+            logger.warning(f"[价格校验] {code} {name} {note}")
+        else:
+            logger.info(f"[价格校验] {code} {name} 止损{trigger_price:.3f} < 现价{current_price:.3f} ✓")
+    
+    elif order_type in ("止盈", "移动止盈", "回落止盈"):
+        if trigger_price <= current_price:
+            adjusted = round(current_price * 1.05, 3)
+            note = f"止盈价{trigger_price:.3f}≤现价{current_price:.3f}，调整为现价×105%={adjusted:.3f}"
+            logger.warning(f"[价格校验] {code} {name} {note}")
+        else:
+            logger.info(f"[价格校验] {code} {name} 止盈{trigger_price:.3f} > 现价{current_price:.3f} ✓")
+    
+    elif order_type in ("建仓", "买入"):
+        if trigger_price >= current_price * 1.05:
+            adjusted = round(current_price * 1.01, 3)
+            note = f"建仓价{trigger_price:.3f}追高(>现价×105%)，调整为现价×101%={adjusted:.3f}"
+            logger.warning(f"[价格校验] {code} {name} {note}")
+        else:
+            logger.info(f"[价格校验] {code} {name} 建仓{trigger_price:.3f} 现价{current_price:.3f} ✓")
+    
+    return {
+        "valid": note == "",
+        "adjusted_price": adjusted,
+        "note": note if note else "校验通过",
+    }
 
 
 if __name__ == "__main__":

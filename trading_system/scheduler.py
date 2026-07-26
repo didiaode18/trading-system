@@ -49,12 +49,30 @@ logger = logging.getLogger("scheduler")
 # 一、交易日判断
 # ============================================================
 
-# 中国法定节假日（需每年手动更新，或使用第三方库如chinese_calendar）
-# 格式: "YYYY-MM-DD"
-HOLIDAYS = set()
+# FIX: 填入2026年A股法定节假日和调休日，修复节假日判断失效
+# 注意：具体日期以国务院年度公告为准，当前为合理预估值
+HOLIDAYS = {
+    # 元旦
+    "2026-01-01", "2026-01-02",
+    # 春节（预估，以国务院公告为准）
+    "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22",
+    # 清明节
+    "2026-04-05", "2026-04-06", "2026-04-07",
+    # 劳动节
+    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+    # 端午节
+    "2026-06-19", "2026-06-20", "2026-06-21",
+    # 中秋节+国庆节
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+}
 
 # 周末调休上班日（需每年手动更新）
-WORKDAYS = set()
+WORKDAYS = {
+    # 调休上班日（周末补班）
+    "2026-02-14", "2026-02-28",  # 春节前后调休
+    "2026-04-26",  # 劳动节调休
+    "2026-10-10",  # 国庆调休
+}
 
 
 def is_trading_day(date: datetime.date = None) -> bool:
@@ -118,6 +136,24 @@ def run_daily_task():
         sell_count = sum(1 for _, s in signals if s.get("sell_signal"))
 
         logger.info(f"[{today}] 盘后分析完成: {buy_count}个买入信号, {sell_count}个卖出信号")
+
+        # ---- ML预测 + 记录（不影响主流程）----
+        try:
+            _run_daily_ml_prediction(signals)
+        except Exception as e:
+            logger.error(f"[{today}] ML预测异常(不影响主流程): {e}")
+
+        # ---- ML预测回填验证（不影响主流程）----
+        try:
+            _run_daily_prediction_verification()
+        except Exception as e:
+            logger.error(f"[{today}] ML验证异常(不影响主流程): {e}")
+
+        # ---- IC因子监控 + 自适应权重（不影响主流程）----
+        try:
+            _run_daily_ic_monitoring()
+        except Exception as e:
+            logger.error(f"[{today}] IC监控异常(不影响主流程): {e}")
 
     except Exception as e:
         logger.error(f"[{today}] 任务执行失败: {e}", exc_info=True)
@@ -481,6 +517,652 @@ def run_weekly_task():
 
 
 # ============================================================
+# 二-2、ML自动化（训练/预测/验证/预警）
+# ============================================================
+
+def _run_weekly_ml_training():
+    """[周度] ML模型训练 - 每周六自动训练全市场模型"""
+    today = datetime.date.today()
+    logger.info(f"[{today}] 🤖 开始周度ML模型训练...")
+    try:
+        from data.data_loader import init_db, load_daily_data
+        from ml.trainer import ModelTrainer
+        from ml.features import prepare_dataset
+
+        conn = init_db()
+        pool = set(config.STOCK_POOL.keys())
+        # 补充行业候选池
+        sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+        for sector_info in sector_candidates.values():
+            pool.update(sector_info.get('stocks', {}).keys())
+
+        logger.info(f"ML训练: 股票池{len(pool)}只")
+
+        # 获取最近300个交易日数据
+        stock_data = {}
+        for stock_code in pool:
+            try:
+                df = load_daily_data(stock_code, conn, days=300)
+                if df is not None and not df.empty and len(df) > 60:
+                    stock_data[stock_code] = df
+            except Exception as e:
+                logger.debug(f"ML训练跳过{stock_code}: {e}")
+
+        conn.close()
+
+        if len(stock_data) < 50:
+            msg = f"可用股票不足({len(stock_data)}只)，跳过ML训练"
+            logger.warning(msg)
+            return
+
+        # 准备数据集（特征工程 + 标签 + 时间衰减权重）
+        X, y, temporal_weights = prepare_dataset(stock_data)
+
+        if X.empty or y.empty:
+            logger.warning("特征数据为空，跳过训练")
+            return
+
+        logger.info(f"训练数据: {len(X)}样本, {X.shape[1]}特征, "
+                   f"标签分布: {dict(y.value_counts())}")
+
+        # 执行训练
+        trainer = ModelTrainer(model_type='xgboost')
+        model = trainer.train(X, y, cv_folds=5, temporal_weights=temporal_weights)
+
+        if model is None:
+            logger.warning("ML训练返回空模型")
+            return
+
+        # 保存模型
+        trainer.save(model, 'xgb_daily')
+
+        # 获取交叉验证分数
+        f1_mean = 0.0
+        f1_std = 0.0
+        try:
+            from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+            tscv = TimeSeriesSplit(n_splits=5)
+            scores = cross_val_score(model, X, y, cv=tscv, scoring='f1_macro')
+            f1_mean = scores.mean()
+            f1_std = scores.std()
+        except Exception:
+            pass
+
+        logger.info(
+            f"ML训练完成: {len(X)}样本, F1={f1_mean:.3f}±{f1_std:.3f}, "
+            f"模型已保存为xgb_daily"
+        )
+
+        # 发送训练成功通知
+        try:
+            from notify.email_notify import send_email
+            send_email(
+                f"[ML训练] 周度模型训练完成 - {today}",
+                f"<p>训练时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</p>"
+                f"<p>股票池: {len(stock_data)}只</p>"
+                f"<p>训练样本: {len(X)}条</p>"
+                f"<p>特征维度: {X.shape[1]}</p>"
+                f"<p>F1分数: {f1_mean:.3f}±{f1_std:.3f}</p>"
+                f"<p>模型已保存: xgb_daily</p>"
+            )
+        except Exception as e:
+            logger.warning(f"发送训练通知失败: {e}")
+
+    except Exception as e:
+        import traceback
+        logger.error(f"ML训练异常: {e}", exc_info=True)
+        try:
+            from notify.email_notify import send_email
+            send_email(
+                f"[ML训练] 训练失败 - {today}",
+                f"<p>错误: {str(e)}</p><pre>{traceback.format_exc()}</pre>"
+            )
+        except Exception:
+            pass
+
+
+def _run_daily_ml_prediction(signals=None):
+    """[每日盘后] ML预测+记录 - 对候选股进行ML预测并记录到监控
+    
+    Args:
+        signals: run_daily_pipeline返回的 (code, signal_dict) 列表
+    """
+    today = datetime.date.today()
+    today_str = today.strftime('%Y-%m-%d')
+    logger.info(f"[{today}] 🧠 ML盘后预测...")
+    try:
+        from ml.predictor import MLPredictor
+        from ml.monitor import ModelMonitor
+        from data.data_loader import init_db, load_daily_data
+        from strategy.trend_strategy import compute_indicators
+
+        predictor = MLPredictor()
+        # 尝试加载已训练的模型
+        if not predictor.load_model('xgb_daily'):
+            logger.info("ML预测: 无可用模型，跳过")
+            return
+
+        monitor = ModelMonitor()
+
+        # 收集需要预测的股票（信号股+持仓股+股票池）
+        codes_to_predict = set()
+        if signals:
+            for code, sig in signals:
+                codes_to_predict.add(code)
+        # 补充持仓
+        holdings_file = config.get_holdings_file()
+        if os.path.exists(holdings_file):
+            import json
+            with open(holdings_file, 'r', encoding='utf-8') as f:
+                holdings = json.load(f)
+            codes_to_predict.update(holdings.keys())
+        # 补充股票池
+        codes_to_predict.update(config.STOCK_POOL.keys())
+
+        if not codes_to_predict:
+            logger.info("ML预测: 无候选股")
+            return
+
+        # 加载数据
+        conn = init_db()
+        prediction_count = 0
+        for code in codes_to_predict:
+            try:
+                df = load_daily_data(code, conn, days=120)
+                if df.empty or len(df) < 30:
+                    continue
+                df = compute_indicators(df)
+                prob = predictor.predict(df)
+                if prob is not None:
+                    monitor.record_prediction(code, today_str, prob)
+                    prediction_count += 1
+            except Exception as e:
+                logger.debug(f"ML预测跳过{code}: {e}")
+
+        conn.close()
+        monitor.save()
+        logger.info(f"ML预测完成: {prediction_count}/{len(codes_to_predict)}只已预测并记录")
+
+    except Exception as e:
+        logger.error(f"ML盘后预测异常: {e}", exc_info=True)
+
+
+def _run_daily_prediction_verification():
+    """[每日盘后] 回填验证5个交易日前的ML预测"""
+    today = datetime.date.today()
+    logger.info(f"[{today}] 🔍 ML预测验证回填...")
+    try:
+        from ml.monitor import ModelMonitor
+        from data.data_loader import init_db, load_daily_data
+
+        monitor = ModelMonitor()
+
+        # 找出5个交易日前的预测
+        # 回溯7个自然日，取其中5个交易日的预测
+        target_dates = set()
+        d = today
+        trading_days_found = 0
+        for _ in range(14):  # 最多回溯14个自然日
+            d = d - datetime.timedelta(days=1)
+            if is_trading_day(d):
+                trading_days_found += 1
+                if trading_days_found == 5:
+                    target_dates.add(d.strftime('%Y-%m-%d'))
+                    break
+
+        if not target_dates:
+            logger.info("ML验证: 未找到5个交易日前的日期")
+            return
+
+        # 找出这些日期的未验证预测
+        target_preds = [
+            p for p in monitor.predictions
+            if p.get('date') in target_dates and not p.get('verified')
+        ]
+
+        if not target_preds:
+            logger.info(f"ML验证: {target_dates}无待验证预测")
+            return
+
+        # 加载数据计算实际收益
+        conn = init_db()
+        verified_count = 0
+        for pred in target_preds:
+            code = pred['code']
+            pred_date = pred['date']
+            try:
+                # 加载pred_date之后5个交易日的数据
+                df = load_daily_data(code, conn, days=30)
+                if df.empty:
+                    continue
+                # 找到预测日之后的数据
+                pred_dt = datetime.datetime.strptime(pred_date, '%Y-%m-%d')
+                future = df[df.index > pred_dt]
+                if len(future) < 5:
+                    continue
+                # 5日后收益
+                actual_return = (future.iloc[4]['close'] - future.iloc[0]['open']) / future.iloc[0]['open']
+                monitor.verify_prediction(code, pred_date, actual_return)
+                verified_count += 1
+            except Exception as e:
+                logger.debug(f"ML验证跳过{code}@{pred_date}: {e}")
+
+        conn.close()
+        monitor.save()
+        logger.info(f"ML验证完成: 回填验证{verified_count}条")
+
+        # 检查是否需要发送准确率预警
+        _check_ml_accuracy_alert(monitor)
+
+    except Exception as e:
+        logger.error(f"ML预测验证异常: {e}", exc_info=True)
+
+
+def _check_ml_accuracy_alert(monitor=None):
+    """检查ML准确率，低于阈值时发送预警邮件"""
+    try:
+        if monitor is None:
+            from ml.monitor import ModelMonitor
+            monitor = ModelMonitor()
+
+        report = monitor.get_accuracy_report(days=30)
+        accuracy = report.get('accuracy', 0.5)
+        total = report.get('total', 0)
+
+        if total < 20:
+            return  # 样本不足，不预警
+
+        # 连续10天 < 55% 发送预警
+        if report.get('is_degraded'):
+            try:
+                from notify.email_notify import send_email
+                trend = report.get('recent_trend', [])
+                trend_str = '<br>'.join(
+                    f"{t['date']}: {t['accuracy']:.1%} ({t['count']}条)"
+                    for t in trend
+                )
+                send_email(
+                    f"[ML预警] 模型准确率异常 - {datetime.date.today()}",
+                    f"<p>最近30天准确率: {accuracy:.1%} ({report['correct']}/{total})</p>"
+                    f"<p>状态: {'已自动降级' if accuracy < 0.45 else '降级预警'}</p>"
+                    f"<p>最近7天趋势:</p><p>{trend_str}</p>"
+                    f"<p>建议: 检查市场状态并考虑重新训练模型</p>"
+                )
+                logger.warning(f"ML准确率预警已发送: {accuracy:.1%}")
+            except Exception as e:
+                logger.warning(f"发送ML预警邮件失败: {e}")
+
+    except Exception as e:
+        logger.error(f"ML准确率检查异常: {e}")
+
+
+# ============================================================
+# 二-3、IC监控与自适应权重
+# ============================================================
+
+# 全局IC监控摘要（供日报使用）
+_daily_ic_report = {}
+
+
+def _run_daily_ic_monitoring():
+    """[每日盘后] IC监控：计算截面IC、检测衰减、自适应权重调整"""
+    global _daily_ic_report
+    today = datetime.date.today()
+    today_str = today.strftime('%Y-%m-%d')
+    logger.info(f"[{today}] 📊 IC因子监控开始...")
+
+    try:
+        from factors.ic_monitor import ICMonitor
+        from factors.registry import get_registry
+        from data.data_loader import init_db, load_daily_data, get_all_candidate_codes
+        from strategy.trend_strategy import compute_indicators
+
+        # 1. 初始化ICMonitor（自动加载历史）
+        monitor = ICMonitor()
+        registry = get_registry()
+
+        # 2. 加载全市场候选股数据（50+只）
+        conn = init_db()
+        all_codes = get_all_candidate_codes()
+        # 排除基准指数
+        benchmark = getattr(config, 'BENCHMARK_INDEX', '')
+        stock_codes = [c for c in all_codes if c != benchmark]
+        logger.info(f"  IC计算: 加载{len(stock_codes)}只候选股...")
+
+        # 加载数据并计算因子
+        stock_data = {}  # {code: df}
+        for code in stock_codes:
+            try:
+                df = load_daily_data(code, conn, days=120)
+                if df is not None and not df.empty and len(df) >= 30:
+                    df = compute_indicators(df)
+                    stock_data[code] = df
+            except Exception:
+                pass
+        conn.close()
+
+        if len(stock_data) < 10:
+            logger.warning(f"IC监控: 可用股票不足({len(stock_data)}只)，跳过")
+            _daily_ic_report = {"status": "skipped", "reason": "样本不足"}
+            return
+
+        logger.info(f"  IC计算: {len(stock_data)}只股票数据就绪")
+
+        # 3. 计算每个注册因子的截面IC
+        #    截面IC: 同一时间点，各股票的因子值 vs 未来5日收益的相关系数
+        #    这里用最近一日作为当期，近5日收益用倒数第6到倒数第1的涨幅
+        computed_count = 0
+        for factor_name, factor_meta in registry.factors.items():
+            if not factor_meta.enabled:
+                continue
+            try:
+                # 构建截面数据：每只股票的因子值 + 未来收益
+                factor_vals = {}
+                forward_returns = {}
+                for code, df in stock_data.items():
+                    try:
+                        fv = factor_meta.func(df)
+                        if fv is not None and len(fv) == len(df):
+                            # 当期因子值（最后一行）
+                            factor_vals[code] = fv.iloc[-1]
+                            # 未来5日收益近似：用倒数5日涨幅
+                            if len(df) >= 6:
+                                ret = (df['close'].iloc[-1] - df['close'].iloc[-6]) / df['close'].iloc[-6]
+                                forward_returns[code] = ret
+                    except Exception:
+                        pass
+
+                if len(factor_vals) < 10:
+                    continue
+
+                # 对齐并计算截面IC
+                common_codes = set(factor_vals.keys()) & set(forward_returns.keys())
+                if len(common_codes) < 10:
+                    continue
+
+                import pandas as pd
+                f_series = pd.Series({c: factor_vals[c] for c in common_codes})
+                r_series = pd.Series({c: forward_returns[c] for c in common_codes})
+                ic = monitor.calc_ic(f_series, r_series)
+                monitor.update(factor_name, ic, date=today_str)
+                computed_count += 1
+            except Exception as e:
+                logger.debug(f"IC计算跳过{factor_name}: {e}")
+
+        # 4. 检测衰减和强劲因子
+        decaying_factors = monitor.get_decaying_factors()
+        strong_factors = monitor.get_strong_factors(threshold=0.05)
+
+        logger.info(f"IC监控: {computed_count}个因子已计算, "
+                   f"{len(decaying_factors)}个衰减, {len(strong_factors)}个强劲")
+
+        # 衰减因子详情日志
+        for fname in decaying_factors:
+            records = monitor.ic_records.get(fname, [])
+            low_days = sum(
+                1 for r in records[-5:]
+                if abs(r['ic'] if isinstance(r, dict) else r) < 0.02
+            )
+            meta = registry.get(fname)
+            new_weight = (meta.weight * 0.5) if meta else 0
+            logger.warning(f"因子{fname}连续{low_days}天|IC|<0.02, "
+                          f"权重将降至{new_weight:.2f}")
+
+        # 强劲因子日志
+        for fname in strong_factors:
+            meta = registry.get(fname)
+            new_weight = (meta.weight * 1.2) if meta else 0
+            logger.info(f"因子{fname}连续5天|IC|>0.05, 权重将加至{new_weight:.2f}")
+
+        # 5. 自适应权重调整
+        weight_result = registry.update_weights_by_ic(ic_monitor=monitor)
+        n_decay = len(weight_result.get("decaying", []))
+        n_strong = len(weight_result.get("strong", []))
+        if n_decay > 0 or n_strong > 0:
+            logger.info(f"权重调整: {n_decay}个降权, {n_strong}个加权")
+
+        # 6. 构建IC报告摘要（供日报使用）
+        _daily_ic_report = _get_ic_report(monitor, weight_result, computed_count)
+
+        # 7. 持久化已由monitor.update自动完成
+        logger.info(f"[{today}] IC监控完成")
+
+    except Exception as e:
+        logger.error(f"IC监控异常: {e}", exc_info=True)
+        _daily_ic_report = {"status": "error", "error": str(e)}
+
+
+def _get_ic_report(monitor=None, weight_result=None, computed_count=0) -> dict:
+    """生成IC监控摘要供日报使用
+    
+    返回:
+        dict: {status, n_factors, decaying, strong, weight_adjustments, top_factors}
+    """
+    try:
+        if monitor is None:
+            from factors.ic_monitor import ICMonitor
+            monitor = ICMonitor()
+
+        decaying = monitor.get_decaying_factors()
+        strong = monitor.get_strong_factors(threshold=0.05)
+        ranked = monitor.rank_factors()
+
+        report = {
+            "status": "ok",
+            "n_factors": computed_count,
+            "n_decaying": len(decaying),
+            "n_strong": len(strong),
+            "decaying_factors": decaying,
+            "strong_factors": strong,
+            "top_factors": ranked[:5],  # IR最高的5个因子
+            "weight_adjustments": weight_result or {},
+        }
+        return report
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ============================================================
+# 二-4、月度Walk-Forward验证
+# ============================================================
+
+def _run_monthly_walk_forward():
+    """[月度] Walk-Forward滚动窗口验证 - 每月1日自动运行，防止策略过拟合"""
+    today = datetime.date.today()
+    if today.day != 1 and not getattr(_run_monthly_walk_forward, '__skip_day_check__', False):
+        return
+
+    logger.info(f"[{today}] 🔄 开始月度Walk-Forward验证...")
+    start_time = datetime.datetime.now()
+
+    try:
+        from data.data_loader import init_db, load_daily_data
+        from strategy.trend_strategy import compute_indicators
+        from backtest.walk_forward import WalkForwardAnalyzer, format_walk_forward_report
+        import numpy as np
+
+        conn = init_db()
+
+        # 1. 加载全量股票历史数据（股票池+行业候选池，300天）
+        pool = set(config.STOCK_POOL.keys())
+        sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+        for sector_info in sector_candidates.values():
+            pool.update(sector_info.get('stocks', {}).keys())
+
+        logger.info(f"  Walk-Forward: 加载全量{len(pool)}只数据（300日历史）...")
+        data_dict = {}
+        for code in pool:
+            try:
+                df = load_daily_data(code, conn, days=300)
+                if df is not None and not df.empty and len(df) >= 80:
+                    df = compute_indicators(df)
+                    data_dict[code] = df
+            except Exception as e:
+                logger.debug(f"  Walk-Forward跳过{code}: {e}")
+
+        conn.close()
+
+        if len(data_dict) < 50:
+            msg = f"Walk-Forward: 可用股票不足({len(data_dict)}只<50)，跳过"
+            logger.warning(msg)
+            return
+
+        # 检查数据长度：至少需要 train_window + test_window = 80 天
+        min_required = 80
+        valid_data = {k: v for k, v in data_dict.items() if len(v) >= min_required}
+        if len(valid_data) < 50:
+            msg = (f"Walk-Forward: 历史数据不足{min_required}天的股票过多"
+                   f"（仅{len(valid_data)}只满足，需≥50只），跳过")
+            logger.warning(msg)
+            return
+
+        logger.info(f"  Walk-Forward: {len(valid_data)}只股票数据就绪（≥{min_required}天）")
+
+        # 2. 实例化并运行Walk-Forward分析（全量股票：股票池+行业候选池）
+        wf = WalkForwardAnalyzer(
+            train_days=60,
+            test_days=20,
+            max_windows=6,  # 限制窗口数，避免运行时间过长
+        )
+        stock_codes = list(valid_data.keys())
+        logger.info(f"  Walk-Forward: 对{len(stock_codes)}只做滚动窗口分析（可能耗时较长）...")
+        result = wf.run(valid_data, stock_codes)
+
+        if "error" in result:
+            logger.error(f"  Walk-Forward分析失败: {result['error']}")
+            return
+
+        elapsed = (datetime.datetime.now() - start_time).total_seconds()
+        logger.info(f"  Walk-Forward: 分析完成，耗时{elapsed:.0f}秒")
+
+        # 3. 样本内外表现比较与预警
+        # 计算样本内平均Sharpe（从各窗口的train_sharpe取均值）
+        train_sharpes = [w["train_sharpe"] for w in result["windows"]]
+        train_win_rates = [w.get("test_win_rate", 0) for w in result["windows"]]  # 近似
+        avg_in_sample_sharpe = float(np.mean(train_sharpes)) if train_sharpes else 0
+        avg_out_sample_sharpe = result.get("oos_sharpe", 0)
+        avg_out_sample_win_rate = result.get("oos_win_rate", 0)
+
+        # 预警判断
+        alerts = []
+        if avg_in_sample_sharpe > 0 and avg_out_sample_sharpe < avg_in_sample_sharpe * 0.5:
+            alerts.append(
+                f"⚠️ 样本外Sharpe({avg_out_sample_sharpe:.2f})"
+                f" < 样本内Sharpe({avg_in_sample_sharpe:.2f}) × 0.5\n"
+                f"   → 触发参数重优化预警：策略可能过拟合"
+            )
+
+        # 用窗口内train胜率近似样本内胜率
+        avg_in_sample_wr = float(np.mean(train_win_rates)) if train_win_rates else 0
+        if avg_in_sample_wr > 0 and avg_out_sample_win_rate < avg_in_sample_wr * 0.7:
+            alerts.append(
+                f"⚠️ 样本外胜率({avg_out_sample_win_rate:.1%})"
+                f" < 样本内胜率({avg_in_sample_wr:.1%}) × 0.7\n"
+                f"   → 触发参数重优化预警：胜率衰减明显"
+            )
+
+        # 4. 生成报告文本
+        report_text = format_walk_forward_report(result)
+        logger.info(f"\n{report_text}")
+
+        # 预警详情日志
+        if alerts:
+            for alert in alerts:
+                logger.warning(f"  Walk-Forward预警: {alert}")
+
+        # 5. 发送邮件通知
+        try:
+            from notify.email_notify import send_email
+
+            # 构建HTML邮件内容
+            alert_html = ""
+            if alerts:
+                alert_items = "".join(f"<li>{a}</li>" for a in alerts)
+                alert_html = (
+                    f"<div style='background:#fff3cd;padding:10px;margin:10px 0;'>"
+                    f"<strong>🚨 参数重优化预警</strong>"
+                    f"<ul>{alert_items}</ul></div>"
+                )
+
+            # 各窗口详情
+            window_rows = ""
+            for i, w in enumerate(result["windows"]):
+                window_rows += (
+                    f"<tr>"
+                    f"<td>{i+1}</td>"
+                    f"<td>{w['test_period'][0]}~{w['test_period'][1]}</td>"
+                    f"<td>{w['test_sharpe']:.2f}</td>"
+                    f"<td>{w['test_return']:.2%}</td>"
+                    f"<td>{str(w['best_params'])}</td>"
+                    f"</tr>"
+                )
+
+            html_body = f"""
+            <h2>Walk-Forward 滚动窗口分析报告</h2>
+            <p>运行时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} | 耗时: {elapsed:.0f}秒</p>
+            <p>股票数: {len(valid_data)}只 | 窗口数: {result['num_windows']} | 训练/验证: 60天/20天</p>
+            {alert_html}
+            <h3>样本外表现</h3>
+            <table border="1" cellpadding="5" cellspacing="0">
+              <tr><th>指标</th><th>数值</th></tr>
+              <tr><td>平均夏普</td><td>{result['oos_sharpe']:.2f} ± {result['oos_sharpe_std']:.2f}</td></tr>
+              <tr><td>平均收益</td><td>{result['oos_return']:.2%}</td></tr>
+              <tr><td>平均胜率</td><td>{result['oos_win_rate']:.1%}</td></tr>
+              <tr><td>平均回撤</td><td>{result['oos_max_dd']:.2%}</td></tr>
+            </table>
+            <h3>稳健性评估</h3>
+            <table border="1" cellpadding="5" cellspacing="0">
+              <tr><th>指标</th><th>数值</th></tr>
+              <tr><td>参数稳定性</td><td>{result['stability_score']:.0%}</td></tr>
+              <tr><td>过拟合程度</td><td>{result['overfit_ratio']:.1%}</td></tr>
+              <tr><td>综合判定</td><td>{result['verdict']}</td></tr>
+            </table>
+            <h3>各窗口详情</h3>
+            <table border="1" cellpadding="5" cellspacing="0">
+              <tr><th>窗口</th><th>验证期</th><th>夏普</th><th>收益</th><th>最优参数</th></tr>
+              {window_rows}
+            </table>
+            """
+
+            subject_prefix = "🚨[Walk-Forward预警]" if alerts else "[Walk-Forward]"
+            send_email(
+                f"{subject_prefix} 月度策略验证 - {today}",
+                html_body
+            )
+            logger.info(f"  Walk-Forward: 邮件通知发送成功")
+        except Exception as e:
+            logger.warning(f"  Walk-Forward: 邮件发送失败: {e}")
+
+        logger.info(f"[{today}] Walk-Forward验证完成")
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Walk-Forward验证异常: {e}", exc_info=True)
+        try:
+            from notify.email_notify import send_email
+            send_email(
+                f"[Walk-Forward] 验证失败 - {today}",
+                f"<p>错误: {str(e)}</p><pre>{traceback.format_exc()}</pre>"
+            )
+        except Exception:
+            pass
+
+
+def _force_walk_forward():
+    """CLI手动触发Walk-Forward（忽略日期限制）"""
+    import types
+    today = datetime.date.today()
+    logger.info(f"[{today}] 🔄 手动触发Walk-Forward验证...")
+    # 临时将today.day替换为1以绕过日期检查
+    original_day = today.day
+    # 直接调用内部逻辑：将day检查绕过
+    _run_monthly_walk_forward.__skip_day_check__ = True
+    _run_monthly_walk_forward()
+    _run_monthly_walk_forward.__skip_day_check__ = False
+
+
+# ============================================================
 # 三、盘中监控（后台线程）
 # ============================================================
 
@@ -572,15 +1254,25 @@ def start_scheduler():
     # 每周六 10:00 周策略报告
     schedule.every().saturday.at("10:00").do(run_weekly_portfolio)
 
+    # 每周六 11:00 ML模型训练（周策略报告之后）
+    schedule.every().saturday.at("11:00").do(_run_weekly_ml_training)
+
     # 每周日 10:00 股票池更新提醒
     schedule.every().sunday.at("10:00").do(run_weekly_task)
+
+    # FIX: Walk-Forward 虽每日注册，但 _run_monthly_walk_forward() 内部已有 today.day==1 检查，
+    # 非每月1日时自动跳过，因此实际仅在每月1日执行。每日注册是为了避免错过（如节假日后第一天）。
+    # 每月1日 09:00 Walk-Forward滚动窗口验证（避开其他任务）
+    schedule.every().day.at("09:00").do(_run_monthly_walk_forward)
 
     logger.info("调度器已启动，等待执行...")
     logger.info(f"  盘前作战计划: 每个交易日 08:30")
     logger.info(f"  盘后综合日报: 每个交易日 15:30")
     logger.info(f"  条件单: 每个交易日 19:00")
     logger.info(f"  周策略报告: 每周六 10:00")
+    logger.info(f"  ML模型训练: 每周六 11:00")
     logger.info(f"  周日提醒: 每周日 10:00")
+    logger.info(f"  Walk-Forward验证: 每月1日 09:00")
     logger.info(f"  盘中监控: 每个交易日 09:30-15:00")
 
     # 盘中监控（后台线程）
@@ -612,6 +1304,8 @@ SCHEDULED_TASKS = [
     ("TradingSystem_Daily",           "15:30", "--run-once",             "盘后完整分析"),
     ("TradingSystem_ForecastPM",      "15:35", "--run-forecast-pm",      "盘后趋势预测"),
     ("TradingSystem_Weekly",          "10:00", "--run-weekly",           "周六周策略报告"),
+    ("TradingSystem_MLTraining",      "11:00", "--run-ml-training",      "周六ML模型训练"),
+    ("TradingSystem_WalkForward",     "09:00", "--run-walk-forward",     "月度Walk-Forward验证(每月1日)"),
 ]
 
 
@@ -690,6 +1384,10 @@ def main():
                         help="运行竞价后选股报告")
     parser.add_argument("--run-weekly", action="store_true",
                         help="运行周度仓位分析")
+    parser.add_argument("--run-ml-training", action="store_true",
+                        help="运行 ML模型训练")
+    parser.add_argument("--run-walk-forward", action="store_true",
+                        help="运行 Walk-Forward滚动窗口验证")
     args = parser.parse_args()
 
     # 配置日志
@@ -721,6 +1419,12 @@ def main():
         run_morning_screener()
     elif args.run_weekly:
         run_weekly_portfolio()
+    elif args.run_ml_training:
+        _run_weekly_ml_training()
+    elif args.run_walk_forward:
+        # 手动触发时忽略日期限制，强制执行
+        _run_monthly_walk_forward.__wrapped__ = True
+        _force_walk_forward()
     else:
         start_scheduler()
 

@@ -147,6 +147,75 @@ def calc_mfe_mae(trades_with_extremes: pd.DataFrame) -> dict:
 
 
 # ============================================================
+# 条件Sharpe / CVaR / 换手率
+# ============================================================
+
+def calc_conditional_sharpe(daily_returns: pd.Series) -> float:
+    """
+    条件夏普比率：只计算正收益日的Sharpe
+    
+    公式: mean(positive_returns) / std(positive_returns) * sqrt(252)
+    """
+    if daily_returns is None or len(daily_returns) < 2:
+        return 0.0
+    positive = daily_returns[daily_returns > 0]
+    if len(positive) < 2 or positive.std() == 0:
+        return 0.0
+    return float(positive.mean() / positive.std() * np.sqrt(252))
+
+
+def calc_cvar(daily_returns: pd.Series, confidence: float = 0.95) -> float:
+    """
+    CVaR（条件风险价值 / Expected Shortfall）
+    
+    95%置信度下的平均损失（取日收益率的5%分位数以下所有值的平均）
+    返回负值表示损失。
+    """
+    if daily_returns is None or len(daily_returns) < 2:
+        return 0.0
+    threshold = daily_returns.quantile(1 - confidence)
+    tail = daily_returns[daily_returns <= threshold]
+    if len(tail) == 0:
+        return float(threshold)
+    return float(tail.mean())
+
+
+def calc_turnover(trades: list, daily_nav: pd.Series, trading_days: int) -> dict:
+    """
+    换手率统计
+    
+    参数:
+        trades: 交易记录列表（每条含 price, shares 字段）
+        daily_nav: 每日净值序列
+        trading_days: 交易天数
+    
+    返回:
+        {"annual_turnover": float, "monthly_turnover": float, "total_trade_amount": float}
+    """
+    result = {"annual_turnover": 0.0, "monthly_turnover": 0.0, "total_trade_amount": 0.0}
+    if not trades or trading_days <= 0 or daily_nav is None or len(daily_nav) == 0:
+        return result
+
+    total_trade_amount = sum(
+        abs(t.get("price", 0) * t.get("shares", 0)) for t in trades
+    )
+    avg_nav = daily_nav.mean()
+    if avg_nav <= 0:
+        return result
+
+    years = trading_days / 252
+    months = trading_days / 21  # 约21个交易日/月
+
+    annual_turnover = total_trade_amount / avg_nav / years if years > 0 else 0
+    monthly_turnover = total_trade_amount / avg_nav / months if months > 0 else 0
+
+    result["annual_turnover"] = round(annual_turnover, 4)
+    result["monthly_turnover"] = round(monthly_turnover, 4)
+    result["total_trade_amount"] = round(total_trade_amount, 2)
+    return result
+
+
+# ============================================================
 # 月度收益
 # ============================================================
 
@@ -299,6 +368,40 @@ def generate_performance_report(equity_curve: pd.Series, trades: pd.DataFrame,
         "monthly_returns": monthly,
     }
 
+    # ─── 新增指标（独立try/except，不影响已有指标）───
+
+    # 条件Sharpe
+    try:
+        conditional_sharpe = calc_conditional_sharpe(daily_returns)
+        report["conditional_sharpe"] = round(conditional_sharpe, 2)
+    except Exception as e:
+        logger.warning(f"条件Sharpe计算失败: {e}")
+        report["conditional_sharpe"] = 0.0
+
+    # CVaR 95%
+    try:
+        cvar_95 = calc_cvar(daily_returns, confidence=0.95)
+        report["cvar_95"] = round(cvar_95, 4)
+    except Exception as e:
+        logger.warning(f"CVaR计算失败: {e}")
+        report["cvar_95"] = 0.0
+
+    # 换手率
+    try:
+        # 将 trades DataFrame 转为 list[dict] 供 calc_turnover 使用
+        trades_list = []
+        if not trades.empty:
+            trades_list = trades.to_dict("records")
+        turnover = calc_turnover(trades_list, equity_curve, trading_days)
+        report["annual_turnover"] = turnover["annual_turnover"]
+        report["monthly_turnover"] = turnover["monthly_turnover"]
+        report["total_trade_amount"] = turnover["total_trade_amount"]
+    except Exception as e:
+        logger.warning(f"换手率计算失败: {e}")
+        report["annual_turnover"] = 0.0
+        report["monthly_turnover"] = 0.0
+        report["total_trade_amount"] = 0.0
+
     # 基准对比
     if benchmark_curve is not None and not benchmark_curve.empty:
         bench_returns = benchmark_curve.pct_change().dropna()
@@ -334,6 +437,8 @@ def format_report_text(report: dict) -> str:
         f"  夏普比率:     {report['sharpe_ratio']:.2f}",
         f"  Sortino比率:  {report['sortino_ratio']:.2f}",
         f"  Calmar比率:   {report['calmar_ratio']:.2f}",
+        f"  条件Sharpe:   {report.get('conditional_sharpe', 0):.2f}",
+        f"  CVaR(95%):    {report.get('cvar_95', 0):.2%}",
         "",
         "  ─── 交易统计 ───",
         f"  交易次数:     {report['total_trades']}",
@@ -341,6 +446,9 @@ def format_report_text(report: dict) -> str:
         f"  盈亏比:       {report['profit_factor']:.2f}",
         f"  每笔期望:     {report['expectancy']:,.0f} 元",
         f"  平均持仓:     {report['avg_hold_days']:.0f} 天",
+        f"  年化换手率:   {report.get('annual_turnover', 0):.2f}",
+        f"  月均换手率:   {report.get('monthly_turnover', 0):.2f}",
+        f"  总交易金额:   {report.get('total_trade_amount', 0):,.0f} 元",
     ]
 
     # 基准对比

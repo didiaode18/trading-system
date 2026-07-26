@@ -38,6 +38,7 @@ sys.path.insert(0, BASE_DIR)
 
 import config
 from strategy.caopan_signal import CaopanEngine
+from strategy.market_regime import MarketRegimeDetector
 from strategy.chip_distribution import ChipAnalyzer, chip_summary
 from strategy.sector_flow import SectorMonitor, sector_summary
 from strategy.multi_factor import MultiFactorScorer, factor_summary
@@ -52,6 +53,39 @@ from output.report_charts import (
     generate_kline_chart, generate_fund_flow_chart,
     generate_position_pie, generate_sector_bar
 )
+from strategy.stock_screener import run_stock_screener, send_screener_email
+from strategy.capital_flow import CapitalFlowAnalyzer
+
+# 新数据模块（可选导入）
+try:
+    from trading_system.strategy.lhb_analyzer import LHBAnalyzer
+    HAS_LHB = True
+except:
+    HAS_LHB = False
+
+try:
+    from trading_system.strategy.margin_monitor import MarginMonitor
+    HAS_MARGIN = True
+except:
+    HAS_MARGIN = False
+
+try:
+    from trading_system.strategy.zt_monitor import ZTMonitor
+    HAS_ZT = True
+except:
+    HAS_ZT = False
+
+try:
+    from trading_system.strategy.holder_monitor import HolderMonitor
+    HAS_HOLDER = True
+except:
+    HAS_HOLDER = False
+
+try:
+    from trading_system.strategy.event_calendar import EventCalendar
+    HAS_CALENDAR = True
+except:
+    HAS_CALENDAR = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -60,14 +94,39 @@ OUTPUT_DIR = os.path.join(TRADING_SYSTEM_DIR, "output", "reports")
 
 
 # ============================================================
-# 数据获取
+# 数据获取（V2.0 性能优化：共享会话 + 批量拉取）
 # ============================================================
 
+_bs_logged_in = False  # baostock会话状态标记
+
+
+def _ensure_bs_login():
+    """确保baostock已登录（复用会话，避免每只股票重复login/logout）"""
+    global _bs_logged_in
+    if not _bs_logged_in:
+        import baostock as bs
+        bs.login()
+        _bs_logged_in = True
+
+
+def _bs_logout():
+    """报告全部完成后统一登出"""
+    global _bs_logged_in
+    if _bs_logged_in:
+        import baostock as bs
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        _bs_logged_in = False
+
+
 def fetch_stock_data(code: str, days: int = 500):
-    """获取K线数据"""
+    """获取K线数据（复用baostock会话，不再每次login/logout）"""
     try:
         import baostock as bs
-        lg = bs.login()
+        import pandas as pd
+        _ensure_bs_login()
         prefix = "sh" if code.startswith(("6", "5", "9")) else "sz"
         bs_code = f"{prefix}.{code}"
         end = datetime.date.today().strftime("%Y-%m-%d")
@@ -76,11 +135,9 @@ def fetch_stock_data(code: str, days: int = 500):
             bs_code, "date,open,high,low,close,volume,amount",
             start_date=start, end_date=end, frequency="d", adjustflag="2"
         )
-        import pandas as pd
         rows = []
         while rs.error_code == '0' and rs.next():
             rows.append(rs.get_row_data())
-        bs.logout()
         if not rows:
             return None
         df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount"])
@@ -92,11 +149,48 @@ def fetch_stock_data(code: str, days: int = 500):
         return None
 
 
+def fetch_batch_data(codes: list, days: int = 500) -> dict:
+    """批量获取多只股票K线数据（单次登录，顺序查询，最后统一登出）
+    
+    性能优化：避免N只股票做N次login/logout（原每次约2-3秒）
+    """
+    import pandas as pd
+    _ensure_bs_login()
+    import baostock as bs
+    
+    result = {}
+    end = datetime.date.today().strftime("%Y-%m-%d")
+    start = (datetime.date.today() - datetime.timedelta(days=days * 2)).strftime("%Y-%m-%d")
+    
+    for code in codes:
+        try:
+            prefix = "sh" if code.startswith(("6", "5", "9")) else "sz"
+            bs_code = f"{prefix}.{code}"
+            rs = bs.query_history_k_data_plus(
+                bs_code, "date,open,high,low,close,volume,amount",
+                start_date=start, end_date=end, frequency="d", adjustflag="2"
+            )
+            rows = []
+            while rs.error_code == '0' and rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                continue
+            df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount"])
+            for col in ["open", "high", "low", "close", "volume", "amount"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            result[code] = df.tail(days).reset_index(drop=True)
+        except Exception as e:
+            logger.error(f"批量获取{code}失败: {e}")
+    
+    return result
+
+
 def load_holdings() -> dict:
     """加载持仓"""
     NAME_MAP = {
-        "588000": "科创50", "603501": "豪威集团", "002558": "巨人网络",
-        "159205": "创业东财", "002185": "华天科技",
+        "588000": "科创50", "002415": "海康威视", "603501": "豪威集团",
+        "002409": "雅克科技", "002185": "华天科技", "600036": "招商银行",
+        "159205": "创业东财", "600276": "恒瑞医药", "603993": "洛阳钼业",
     }
     holdings_file = os.path.join(BASE_DIR, "holdings.json")
     if os.path.exists(holdings_file):
@@ -110,15 +204,35 @@ def load_holdings() -> dict:
 
 
 def run_full_analysis(holdings: dict) -> list:
-    """运行完整分析"""
+    """运行完整分析（V2.0: 批量拉取数据，避免重复登录）"""
     engine = CaopanEngine()
     results = []
+
+    # 大盘状态检测
+    market_regime = None
+    try:
+        from data.data_loader import load_daily_data, init_db
+        conn = init_db()
+        benchmark_df = load_daily_data(config.BENCHMARK_INDEX, conn, days=120)
+        if not benchmark_df.empty and len(benchmark_df) >= 60:
+            detector = MarketRegimeDetector()
+            market_regime = detector.detect(benchmark_df)
+        conn.close()
+    except Exception:
+        pass
+
+    # 批量获取所有持仓股票数据（单次登录）
+    codes = list(holdings.keys())
+    print(f"  批量获取{len(codes)}只股票数据...")
+    data_cache = fetch_batch_data(codes, days=500)
+    print(f"  成功获取{len(data_cache)}/{len(codes)}只")
+
     for code, info in holdings.items():
         name = info.get("name", code)
-        df = fetch_stock_data(code, days=500)
+        df = data_cache.get(code)
         if df is None or len(df) < 60:
             continue
-        result = engine.analyze(df, code=code, name=name)
+        result = engine.analyze(df, code=code, name=name, market_regime=market_regime)
         if "error" not in result:
             results.append(result)
     return results
@@ -189,7 +303,7 @@ def generate_morning_brief(results: list, holdings: dict) -> str:
 
     # 5. 仓位建议（P5精简版）
     try:
-        sizer = PositionSizer(total_capital=750000)
+        sizer = PositionSizer(total_capital=config.TOTAL_CAPITAL)
         plan = sizer.calc_positions(results, holdings)
         risk = plan.get("portfolio_risk", {})
         lines.append(f"\n  💼 仓位: 风险{risk.get('risk_level','-')} | 预估回撤{risk.get('max_drawdown_est',0):.1f}% | 配置{plan.get('total_allocated',0)/10000:.1f}万/{plan.get('total_capital',0)/10000:.1f}万")
@@ -209,10 +323,11 @@ def generate_morning_brief(results: list, holdings: dict) -> str:
 # 报告2: 盘后深度复盘 (15:30)
 # ============================================================
 
-def generate_evening_report(results: list, holdings: dict) -> str:
+def generate_evening_report(results: list, holdings: dict,
+                           sector_result=None, scored=None, plan=None) -> str:
     """
     盘后深度复盘 - 九大板块全量分析
-    直接调用caopan_runner的完整流程
+    V2.0: 支持传入已计算结果，避免重复计算
     """
     now = datetime.datetime.now()
     lines = []
@@ -262,9 +377,10 @@ def generate_evening_report(results: list, holdings: dict) -> str:
     # 五、板块轮动
     lines.append(f"\n  ━━ 五、板块轮动 ━━")
     try:
-        holdings_data = {r.get("code", ""): r.get("df_analyzed") for r in results if r.get("df_analyzed") is not None}
-        monitor = SectorMonitor()
-        sector_result = monitor.analyze(holdings_data, holdings)
+        if sector_result is None:
+            holdings_data = {r.get("code", ""): r.get("df_analyzed") for r in results if r.get("df_analyzed") is not None}
+            monitor = SectorMonitor()
+            sector_result = monitor.analyze(holdings_data, holdings)
         lines.append(sector_summary(sector_result))
     except Exception as e:
         lines.append(f"     异常: {e}")
@@ -272,8 +388,9 @@ def generate_evening_report(results: list, holdings: dict) -> str:
     # 六、多因子评分
     lines.append(f"\n  ━━ 六、多因子评分 ━━")
     try:
-        scorer = MultiFactorScorer()
-        scored = scorer.score_all(results)
+        if scored is None:
+            scorer = MultiFactorScorer()
+            scored = scorer.score_all(results)
         lines.append(factor_summary(scored))
     except Exception as e:
         lines.append(f"     异常: {e}")
@@ -281,8 +398,9 @@ def generate_evening_report(results: list, holdings: dict) -> str:
     # 七、仓位管理
     lines.append(f"\n  ━━ 七、仓位管理 ━━")
     try:
-        sizer = PositionSizer(total_capital=750000)
-        plan = sizer.calc_positions(results, holdings)
+        if plan is None:
+            sizer = PositionSizer(total_capital=config.TOTAL_CAPITAL)
+            plan = sizer.calc_positions(results, holdings)
         lines.append(position_summary(plan))
     except Exception as e:
         lines.append(f"     异常: {e}")
@@ -389,7 +507,7 @@ def generate_weekly_report(results: list, holdings: dict) -> str:
     # 3. 仓位再平衡建议
     lines.append(f"\n  ━━ 仓位再平衡 ━━")
     try:
-        sizer = PositionSizer(total_capital=750000)
+        sizer = PositionSizer(total_capital=config.TOTAL_CAPITAL)
         plan = sizer.calc_positions(results, holdings)
         rebalance = plan.get("rebalance", [])
         if rebalance:
@@ -448,11 +566,81 @@ def run_morning():
         # 图表
         charts = {"position_pie": generate_position_pie(holdings, results)}
 
+        # 涨停数据
+        zt_data = None
+        if HAS_ZT:
+            try:
+                zt_data = ZTMonitor().get_daily_report()
+            except Exception:
+                pass
+
+        # 解禁数据
+        release_data = None
+        if HAS_CALENDAR:
+            try:
+                release_data = EventCalendar().get_release_summary(days_ahead=30)
+            except Exception:
+                pass
+
         # 发送美观HTML邮件
         today = datetime.date.today().strftime("%Y-%m-%d")
-        html = build_morning_email(results, holdings, sector_result, plan, charts)
+        html = build_morning_email(results, holdings, sector_result, plan, charts,
+                                   zt_data=zt_data, release_data=release_data)
         _send_html_email(f"[操盘密码] 📋盘前作战计划 | {today}", html)
     return results
+
+
+def run_screener():
+    """运行选股引擎并发送选股报告邮件"""
+    print("\n" + "=" * 50)
+    print("  运行CANSLIM选股引擎...")
+    print("=" * 50)
+    holdings = load_holdings()
+
+    # 获取候选股票池数据（从SECTOR_CANDIDATES配置）
+    sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+    all_codes = set()
+    for sector_name, sector_info in sector_candidates.items():
+        stocks = sector_info.get("stocks", {})
+        all_codes.update(stocks.keys())
+    # 加入指数数据
+    all_codes.add("000300")
+
+    print(f"  候选股票池: {len(all_codes)}只")
+    # V2.0性能优化：批量拉取（单次登录）
+    raw_data = fetch_batch_data(list(all_codes), days=300)
+    data_dict = {}
+    for code, df in raw_data.items():
+        if df is not None and len(df) >= 60:
+            # 计算均线
+            df["ma5"] = df["close"].rolling(5).mean()
+            df["ma10"] = df["close"].rolling(10).mean()
+            df["ma20"] = df["close"].rolling(20).mean()
+            df["ma60"] = df["close"].rolling(60).mean()
+            df["ma20_slope"] = df["ma20"].diff(3)
+            data_dict[code] = df
+
+    print(f"  有效数据: {len(data_dict)}只")
+    if len(data_dict) < 5:
+        print("  ❌ 数据不足，无法运行选股")
+        return None
+
+    # 运行选股引擎
+    result = run_stock_screener(data_dict, holdings)
+    print(f"\n  ✅ 选股完成: {result['qualified_count']}只入选 / {result['total_candidates']}只候选")
+    if result["stock_pool"]:
+        for s in result["stock_pool"]:
+            print(f"     {s['code']} {s['name']} | 评分{s['factor_score']} | "
+                  f"买点{s['moderate_buy']} | 止损{s['stop_loss']}(-{s['stop_loss_pct']}%) | "
+                  f"{s.get('risk_level', '')}")
+
+    # 发送选股报告邮件
+    success = send_screener_email(result)
+    if success:
+        print(f"  📧 选股报告邮件已发送")
+    else:
+        print(f"  ⚠️ 选股报告邮件发送失败")
+    return result
 
 
 def run_evening():
@@ -462,15 +650,17 @@ def run_evening():
     holdings = load_holdings()
     results = run_full_analysis(holdings)
     if results:
-        # 文本报告（本地存档）
-        report = generate_evening_report(results, holdings)
-        print(report)
-        _save_report("evening", report)
-
-        # 准备数据
+        # V2.0: 先计算一次，文本报告和HTML邮件共用
         sector_result = _get_sector_result(results, holdings)
         scored = _get_factor_scores(results)
         plan = _get_position_plan(results, holdings)
+
+        # 文本报告（本地存档）
+        report = generate_evening_report(results, holdings,
+                                         sector_result=sector_result,
+                                         scored=scored, plan=plan)
+        print(report)
+        _save_report("evening", report)
         charts = {
             "fund_flow": generate_fund_flow_chart(results),
             "position_pie": generate_position_pie(holdings, results),
@@ -479,12 +669,87 @@ def run_evening():
 
         today = datetime.date.today().strftime("%Y-%m-%d")
 
+        # === 新增数据收集 ===
+        lhb_data = {}
+        if HAS_LHB:
+            try:
+                analyzer = LHBAnalyzer()
+                for stock in holdings:
+                    lhb_data[stock] = analyzer.analyze(stock, days=10)
+                logger.info(f"龙虎榜数据: {len(lhb_data)}只股票")
+            except Exception as e:
+                logger.warning(f"龙虎榜数据获取失败: {e}")
+
+        margin_data = {}
+        if HAS_MARGIN:
+            try:
+                monitor = MarginMonitor()
+                for stock in holdings:
+                    margin_data[stock] = monitor.calc_margin_signal(stock, days=10)
+                logger.info(f"融资融券数据: {len(margin_data)}只股票")
+            except Exception as e:
+                logger.warning(f"融资融券数据获取失败: {e}")
+
+        zt_data = None
+        if HAS_ZT:
+            try:
+                zt_monitor = ZTMonitor()
+                zt_data = zt_monitor.get_daily_report()
+                logger.info(f"涨停数据: {zt_data.get('summary', '')}")
+            except Exception as e:
+                logger.warning(f"涨停数据获取失败: {e}")
+
+        # flow_data — 从 CapitalFlowAnalyzer 获取
+        flow_data = {}
+        try:
+            cf = CapitalFlowAnalyzer()
+            for stock in holdings:
+                flow_data[stock] = cf.analyze_multi_level_flow(stock, days=5)
+            logger.info(f"资金流数据: {len(flow_data)}只股票")
+        except Exception as e:
+            logger.warning(f"资金流数据获取失败: {e}")
+
+        heatmap_html = None
+        try:
+            sector = SectorMonitor()
+            heatmap_html = sector.render_treemap_html()
+        except Exception as e:
+            logger.warning(f"板块热力图获取失败: {e}")
+
+        release_data = None
+        if HAS_CALENDAR:
+            try:
+                calendar = EventCalendar()
+                release_data = calendar.get_release_summary(days_ahead=30)
+                logger.info(f"解禁数据: {release_data.get('total_stocks', 0)}只即将解禁")
+            except Exception as e:
+                logger.warning(f"解禁数据获取失败: {e}")
+
+        holder_data = {}
+        if HAS_HOLDER:
+            try:
+                holder = HolderMonitor()
+                for stock in holdings:
+                    holder_data[stock] = holder.analyze(stock)
+                logger.info(f"股东户数数据: {len(holder_data)}只股票")
+            except Exception as e:
+                logger.warning(f"股东户数数据获取失败: {e}")
+
         # 第1封：盘后深度复盘（含图表）
-        html1 = build_evening_email(results, holdings, sector_result, scored, plan, charts)
+        html1 = build_evening_email(
+            results, holdings, sector_result, scored, plan, charts,
+            flow_data=flow_data if flow_data else None,
+            lhb_data=lhb_data if lhb_data else None,
+            margin_data=margin_data if margin_data else None,
+            zt_data=zt_data,
+            heatmap_html=heatmap_html,
+            release_data=release_data,
+            holder_data=holder_data if holder_data else None
+        )
         _send_html_email(f"[操盘密码] 📊盘后深度复盘 | {today}", html1)
 
         # 第2封：条件单操作计划（持仓+条件单+风控+纪律锁）
-        html2 = build_orders_email(results, holdings, plan)
+        html2 = build_orders_email(results, holdings, plan, release_data=release_data)
         _send_html_email(f"[操盘密码] 📋条件单操作计划 | {today}", html2)
 
         # 预警检查
@@ -517,8 +782,34 @@ def run_weekly():
         plan = _get_position_plan(results, holdings)
         charts = {"position_pie": generate_position_pie(holdings, results)}
 
+        # 龙虎榜周数据（30天）
+        lhb_data = {}
+        if HAS_LHB:
+            try:
+                analyzer = LHBAnalyzer()
+                for stock in holdings:
+                    lhb_data[stock] = analyzer.analyze(stock, days=30)
+                logger.info(f"龙虎榜周数据: {len(lhb_data)}只股票")
+            except Exception as e:
+                logger.warning(f"龙虎榜周数据获取失败: {e}")
+
+        # 融资融券周数据（30天）
+        margin_data = {}
+        if HAS_MARGIN:
+            try:
+                monitor = MarginMonitor()
+                for stock in holdings:
+                    margin_data[stock] = monitor.calc_margin_signal(stock, days=30)
+                logger.info(f"融资融券周数据: {len(margin_data)}只股票")
+            except Exception as e:
+                logger.warning(f"融资融券周数据获取失败: {e}")
+
         today = datetime.date.today().strftime("%Y-%m-%d")
-        html = build_weekly_email(results, holdings, sector_result, plan, charts)
+        html = build_weekly_email(
+            results, holdings, sector_result, plan, charts,
+            lhb_data=lhb_data if lhb_data else None,
+            margin_data=margin_data if margin_data else None
+        )
         _send_html_email(f"[操盘密码] 📅周策略报告 | {today}", html)
     return results
 
@@ -569,23 +860,34 @@ def _get_factor_scores(results: list):
 def _get_position_plan(results: list, holdings: dict):
     """获取仓位管理计划"""
     try:
-        sizer = PositionSizer(total_capital=750000)
+        sizer = PositionSizer(total_capital=config.TOTAL_CAPITAL)
         return sizer.calc_positions(results, holdings)
     except Exception:
         return None
 
 
 def _build_alert_html(alerts: list) -> str:
-    """构建紧急预警HTML邮件"""
+    """构建紧急预警HTML邮件（V2.0: 带紧急度评分+规则名称+触发条件，按紧急度降序）"""
     today = datetime.date.today().strftime("%Y-%m-%d")
     now = datetime.datetime.now().strftime("%H:%M")
+    # 按紧急度降序排列
+    alerts_sorted = sorted(alerts, key=lambda a: a.get("urgency_score", 0), reverse=True)
     items = ""
-    for a in alerts:
+    for a in alerts_sorted:
+        score = a.get('urgency_score', 0)
+        score_color = "#cf1322" if score >= 80 else "#d46b08" if score >= 60 else "#faad14"
         items += f"""
         <div style="border:1px solid #ffccc7;border-left:4px solid #ff4d4f;border-radius:8px;padding:12px 16px;margin:10px 0;background:#fff1f0">
-            <div style="font-weight:700;font-size:14px;color:#cf1322">{a.get('icon','🚨')} {a.get('name','')} ({a.get('code','')})</div>
-            <div style="font-size:13px;color:#333;margin-top:6px">{a.get('message','')}</div>
-            <div style="font-size:11px;color:#999;margin-top:4px">{a.get('level','')} | {now}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-weight:700;font-size:14px;color:#cf1322">{a.get('icon','🚨')} {a.get('name','')} ({a.get('code','')})</span>
+                <span style="background:{score_color};color:white;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:bold">紧急度: {score}/100</span>
+            </div>
+            <div style="font-size:13px;color:#333;margin-top:6px">{a.get('msg','')}</div>
+            <div style="margin-top:8px;padding:6px 10px;background:#fff7e6;border:1px solid #ffd591;border-radius:4px;font-size:12px">
+                <b style="color:#d46b08">触发规则:</b> <span style="color:#333">{a.get('rule_name','')}</span><br>
+                <b style="color:#d46b08">触发条件:</b> <span style="color:#666">{a.get('rule_detail','')}</span>
+            </div>
+            <div style="font-size:11px;color:#999;margin-top:6px">{a.get('level','')} | {a.get('time', now)}</div>
         </div>"""
 
     return f"""<!DOCTYPE html>
@@ -594,12 +896,12 @@ def _build_alert_html(alerts: list) -> str:
 <div style="max-width:700px;margin:0 auto">
     <div style="background:linear-gradient(135deg,#cf1322,#ff4d4f);color:white;padding:18px 25px;border-radius:12px 12px 0 0">
         <h1 style="margin:0;font-size:20px">⚠️ 紧急预警 ({len(alerts)}条)</h1>
-        <div style="font-size:12px;opacity:0.8;margin-top:5px">{today} {now} | 操盘密码V3.0</div>
+        <div style="font-size:12px;opacity:0.8;margin-top:5px">{today} {now} | 操盘密码V3.0 | 按紧急度排序</div>
     </div>
     <div style="background:white;padding:20px 25px;border-radius:0 0 12px 12px;box-shadow:0 4px 15px rgba(0,0,0,0.08)">
         {items}
         <div style="text-align:center;color:#999;font-size:11px;margin-top:15px;padding-top:10px;border-top:1px solid #eee">
-            请立即检查持仓，必要时手动干预
+            请立即检查持仓，必要时手动干预 | 紧急度: 90+=立即操作 / 70-89=尽快处理 / 50-69=密切关注
         </div>
     </div>
 </div>
@@ -622,7 +924,7 @@ def start_scheduler():
     print("  08:30 盘前作战计划")
     print("  15:30 盘后深度复盘")
     print("  周六 10:00 周策略报告")
-    print("  盘中: 智能预警(随盘后报告)")
+    print("  盘中: 每3分钟实时预警(独立循环)")
     print("=" * 50)
 
     schedule.every().day.at("08:30").do(run_morning)
@@ -674,19 +976,30 @@ def main():
     parser.add_argument("--morning", action="store_true", help="生成盘前作战计划")
     parser.add_argument("--evening", action="store_true", help="生成盘后深度复盘")
     parser.add_argument("--weekly", action="store_true", help="生成周策略报告")
+    parser.add_argument("--screener", action="store_true", help="运行选股引擎并发送报告")
+    parser.add_argument("--alert", action="store_true", help="启动盘中实时预警循环(每3分钟)")
     parser.add_argument("--install", action="store_true", help="安装Windows定时任务")
     args = parser.parse_args()
 
     if args.install:
         install_tasks()
+    elif args.alert:
+        from notify.alert_engine import run_alert_loop
+        holdings = load_holdings()
+        run_alert_loop(holdings=holdings)
     elif args.morning:
         run_morning()
     elif args.evening:
         run_evening()
+    elif args.screener:
+        run_screener()
     elif args.weekly:
         run_weekly()
     else:
         start_scheduler()
+
+    # 统一登出baostock会话
+    _bs_logout()
 
 
 if __name__ == "__main__":

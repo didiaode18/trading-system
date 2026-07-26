@@ -417,6 +417,8 @@ class IntradayMonitor:
                     "high": info.get("high", 0),
                     "low": info.get("low", 0),
                     "open": info.get("open", 0),
+                    # FIX: 修复放量急跌检测永远False的问题，添加缺失的volume字段
+                    "volume": info.get("volume", 0),
                 }
             return quotes
         except Exception as e:

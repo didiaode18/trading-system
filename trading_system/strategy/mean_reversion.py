@@ -183,7 +183,8 @@ class MeanReversionStrategy:
         if close > 0 and (high - low) > 0:
             lower_shadow = (min(close, open_p) - low) / (high - low)
             if lower_shadow > 0.6 and close > open_p:
-                conditions_met += 0.5
+                # FIX: 修复conditions_met int/float混用导致信号强度截断不一致，统一为整数
+                conditions_met += 1
                 reasons.append("长下影探底回升")
 
         # 判断是否满足入场条件

@@ -19,6 +19,7 @@ import os
 import datetime
 import logging
 import io
+import json
 
 # Windows控制台编码修复
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -39,21 +40,51 @@ now = datetime.datetime.now().strftime("%H:%M:%S")
 tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
 # ============================================================
-# 当前持仓（从券商截图更新，只需代码+名称+持仓数量+成本价）
+# 当前持仓（统一从 holdings.json 读取，消除硬编码不同步）
 # ============================================================
-holdings_list = [
-    {"code": "588000", "名称": "科创50", "赛道": "指数ETF", "数量": 318100, "成本": 1.953},
-    {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片", "数量": 800, "成本": 97.530},
-    {"code": "002558", "名称": "巨人网络", "赛道": "游戏", "数量": 1200, "成本": 31.082},
-    {"code": "159205", "名称": "创业东财", "赛道": "指数ETF", "数量": 1100, "成本": 1.759},
-    {"code": "002185", "名称": "华天科技", "赛道": "半导体封测", "数量": 100, "成本": -0.164},
+# 硬编码降级数据（当 holdings.json 不存在时使用）
+_FALLBACK_HOLDINGS = [
+    {"code": "588000", "名称": "科创50", "赛道": "指数ETF", "数量": 170100, "成本": 1.063},
+    {"code": "002415", "名称": "海康威视", "赛道": "AI视觉", "数量": 500, "成本": 29.124},
+    {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片", "数量": 400, "成本": 145.155},
+    {"code": "002409", "名称": "雅克科技", "赛道": "半导体材料", "数量": 400, "成本": 76.065},
+    {"code": "002185", "名称": "华天科技", "赛道": "半导体封测", "数量": 0, "成本": 0},
+    {"code": "600036", "名称": "招商银行", "赛道": "银行", "数量": 100, "成本": 42.42},
+    {"code": "159205", "名称": "创业东财", "赛道": "指数ETF", "数量": 3000, "成本": 1.389},
+    {"code": "600276", "名称": "恒瑞医药", "赛道": "创新药", "数量": 100, "成本": 59.05},
+    {"code": "603993", "名称": "洛阳钼业", "赛道": "有色资源", "数量": 400, "成本": 20.15},
 ]
+
+
+def _load_holdings_from_json():
+    """从 holdings.json 读取持仓列表，统一数据源消除多文件硬编码不同步"""
+    # FIX: 统一从holdings.json读取持仓，消除多文件硬编码不同步
+    holdings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'holdings.json')
+    try:
+        with open(holdings_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        result = []
+        for code, v in data.items():
+            result.append({
+                "code": code,
+                "名称": v.get("name", code),
+                "赛道": v.get("sector", "其他"),
+                "数量": v.get("shares", 0),
+                "成本": v.get("buy_price", 0),
+            })
+        return result
+    except Exception:
+        return _FALLBACK_HOLDINGS
+
+
+holdings_list = _load_holdings_from_json()
 
 # 主模式参数
 STOP_LOSS_PCT = 0.08       # 固定止损: 最新价跌8%
 DRAWDOWN_FROM_HIGH = 0.05  # 高点回落5%触发
 REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
-TOTAL_CAPITAL = 424000     # 总资金
+# FIX: 修复TOTAL_CAPITAL硬编码424000与config不一致，改为从 config 引用
+TOTAL_CAPITAL = config.TOTAL_CAPITAL     # 总资金（与 config.py 保持一致）
 MAX_DAILY_TRADES = 3       # 每日最大交易笔数
 MAX_SINGLE_POSITION = 0.25 # 单只最大仓位25%
 
@@ -105,21 +136,21 @@ def compute_indicators(df):
 
 
 # ============================================================
-# 条件单生成逻辑 V2（精简版：1必挂+1可选，趋势决定类型）
+# 条件单生成逻辑 V3（增强版：分档止损+互斥+去重+价格校验日志）
 # ============================================================
 def generate_condition_orders(holding, df, realtime_price):
     """
-    为单只持仓生成次日条件单（V2精简版）
+    为单只持仓生成次日条件单（V3增强版）
 
     规则:
-      - 所有持仓统一标配: 1张止损单(必挂) + 1张止盈单(可选)
-      - 止损三档自动匹配:
-          浮亏/浮盈<5%: 初始止损 = 成本×0.9
-          浮盈5%~15%: 保本止损 = 成本价
-          浮盈>15%: 移动止盈 = 阶段高点回落5%
-      - 多头趋势: 止损单 + 回落卖出止盈单
-      - 空头趋势: 只允许止损单，禁止任何买入/加仓，强制给出清仓建议
-      - 默认14:50尾盘触发，过滤盘中杂波
+      - 趋势≤ 2级(空头): 仅生成1张清仓单(现价×97%，14:50触发)，不重复生成止损单
+      - 浮亏状态(现价<成本): 止损价 = 现价 × 92%
+      - 浮盈<5%: 初始止损 = 成本×90%，若≥现价则改为现价×95%
+      - 浮盈5%-15%: 保本止损 = 成本×102%
+      - 浮盈>15%: 移动止盈 = 阶段高点×95%
+      - 止损/清仓单: 14:50尾盘确认
+      - 止盈单: 盘中实时触发
+      - 去重: 同标的不得出现2张方向相同、触发价相近(差距<2%)的卖出单
     """
     orders = []
     code = holding["code"]
@@ -137,36 +168,80 @@ def generate_condition_orders(holding, df, realtime_price):
         ma60 = price
 
     # 判断趋势方向
-    is_bullish = price > ma20 and ma20 > ma60  # 均线多头排列
-    is_bearish = price < ma20  # 空头趋势
+    is_bullish = price > ma20 and ma20 > ma60
+    is_bearish = price < ma20
 
     # 计算浮盈率
     pnl_pct = (price / cost - 1) * 100 if cost > 0 else 0
 
+    # 阶段高点（20日）
+    recent_high = df["high"].iloc[-20:].max() if len(df) >= 20 else price
+
     # ================================================================
-    # 止损单（必挂）—— 三档自动匹配
+    # 趋势判断: 空头趋势 → 仅生成1张清仓单，不重复生成止损单
     # ================================================================
-    if pnl_pct < 5:
-        # 第一档: 初始止损 = 成本×0.9（成本下10%）
+    if is_bearish and pnl_pct < -10:
+        # 深度空头: 清仓单
+        clear_price = round(price * 0.97, 3)
+        _log_price_check(code, name, "清仓", clear_price, price)
+        orders.append({
+            "类型": "清仓条件单(趋势破位)",
+            "优先级": "★★★必挂",
+            "证券代码": code,
+            "证券名称": name,
+            "方向": "卖出",
+            "触发价": clear_price,
+            "触发时间": "14:50",
+            "数量": qty,
+            "有效期": "3个交易日",
+            "说明": f"空头趋势(价格<MA20)，浮亏{pnl_pct:.1f}%，清仓=现价{price:.3f}×97%，禁止补仓",
+        })
+        return orders  # 清仓单优先级最高，不再生成其他单据
+
+    # ================================================================
+    # 止损单（必挂）—— 四档自动匹配
+    # ================================================================
+    if cost <= 0:
+        # 已回本持仓: 保护性止损 = 现价×85%
+        stop_price = round(price * 0.85, 3)
+        stop_type = "回本仓保护"
+        stop_note = f"已回本持仓，保护性止损=现价{price:.3f}×85%"
+    elif pnl_pct < 0:
+        # 浮亏状态: 止损价 = 现价 × 92%
+        stop_price = round(price * 0.92, 3)
+        stop_type = "浮亏保护"
+        stop_note = f"浮亏{pnl_pct:.1f}%，止损=现价{price:.3f}×92%(再跌8%离场)"
+    elif pnl_pct < 5:
+        # 浮盈<5%: 初始止损 = 成本×90%
         stop_price = round(cost * 0.9, 3)
         stop_type = "初始止损"
         stop_note = f"浮盈{pnl_pct:.1f}%<5%，初始止损=成本{cost:.3f}×90%"
+        # 止损价不能高于现价
+        if stop_price >= price:
+            stop_price = round(price * 0.95, 3)
+            stop_note += f"(调整:止损≥现价，改为现价{price:.3f}×95%)"
     elif pnl_pct < 15:
-        # 第二档: 保本止损 = 成本价（保证不亏本金）
-        stop_price = round(cost, 3)
+        # 浮盈5%-15%: 保本止损 = 成本×102%
+        stop_price = round(cost * 1.02, 3)
         stop_type = "保本止损"
-        stop_note = f"浮盈{pnl_pct:.1f}%(5%~15%)，保本止损=成本价{cost:.3f}"
+        stop_note = f"浮盈{pnl_pct:.1f}%(5%~15%)，保本止损=成本{cost:.3f}×102%"
+        if stop_price >= price:
+            stop_price = round(price * 0.95, 3)
+            stop_note += f"(调整:保本价≥现价，改为现价×95%)"
     else:
-        # 第三档: 移动止盈 = 阶段高点回落5%
-        recent_high = df["high"].iloc[-20:].max() if len(df) >= 20 else price
+        # 浮盈>15%: 移动止盈 = 阶段高点×95%
         stop_price = round(recent_high * 0.95, 3)
         stop_type = "移动止盈"
-        stop_note = f"浮盈{pnl_pct:.1f}%>15%，移动止盈=20日高{recent_high:.3f}回落5%"
+        stop_note = f"浮盈{pnl_pct:.1f}%>15%，移动止盈=20日高{recent_high:.3f}×95%"
+        if stop_price >= price:
+            stop_price = round(price * 0.95, 3)
+            stop_note += f"(调整:高点止损≥现价，改为现价×95%)"
 
-    # 止损单不能高于当前价（否则立即触发）
-    if stop_price >= price:
-        stop_price = round(price * 0.95, 3)
-        stop_note += f"（调整: 止损≥现价，改为现价×95%）"
+    # 价格校验日志
+    _log_price_check(code, name, "止损", stop_price, price)
+
+    # 触发时间: 止损单14:50尾盘确认，止盈单盘中实时
+    trigger_time = "盘中实时" if stop_type == "移动止盈" else "14:50"
 
     orders.append({
         "类型": f"止损单({stop_type})",
@@ -175,48 +250,66 @@ def generate_condition_orders(holding, df, realtime_price):
         "证券名称": name,
         "方向": "卖出",
         "触发价": stop_price,
-        "触发时间": "14:50",
+        "触发时间": trigger_time,
         "数量": qty,
         "有效期": "20个交易日",
         "说明": stop_note,
     })
 
     # ================================================================
-    # 按趋势方向决定第二张条件单
+    # 第二张条件单: 多头趋势加一张回落止盈，空头加一张减仓单
     # ================================================================
-    if is_bullish:
+    if is_bullish and pnl_pct > 5:
         # 多头趋势: 回落卖出止盈单（保护利润）
-        drawdown_price = round(price * (1 - DRAWDOWN_FROM_HIGH), 3)
-        orders.append({
-            "类型": "回落止盈",
-            "优先级": "★★建议",
-            "证券代码": code,
-            "证券名称": name,
-            "方向": "卖出",
-            "触发价": drawdown_price,
-            "监控方式": f"日高回落{int(DRAWDOWN_FROM_HIGH*100)}%",
-            "触发时间": "盘中实时",
-            "数量": qty,
-            "有效期": "10个交易日",
-            "说明": f"多头持有，从最高点回落5%({drawdown_price:.3f})锁定利润",
-        })
-    else:
-        # 空头趋势: 禁止任何买入/加仓，强制给出减仓/清仓建议
-        orders.append({
-            "类型": "强制减仓",
-            "优先级": "★★★必挂",
-            "证券代码": code,
-            "证券名称": name,
-            "方向": "卖出",
-            "触发价": round(price * 0.998, 3),
-            "触发时间": "14:50",
-            "数量": qty if is_bearish and pnl_pct < -10 else max(qty // 2, 100),
-            "有效期": "5个交易日",
-            "说明": f"空头趋势(价格<MA20)，浮盈{pnl_pct:.1f}%，"
-                    f"{'14:50清仓' if pnl_pct < -10 else '14:50减仓1/2'}，禁止补仓",
-        })
+        drawdown_price = round(recent_high * (1 - DRAWDOWN_FROM_HIGH), 3)
+        # 去重检测: 与止损单触发价差距<2%则跳过
+        if abs(drawdown_price - stop_price) / stop_price * 100 >= 2.0:
+            _log_price_check(code, name, "止盈", drawdown_price, price)
+            orders.append({
+                "类型": "回落止盈",
+                "优先级": "★★建议",
+                "证券代码": code,
+                "证券名称": name,
+                "方向": "卖出",
+                "触发价": drawdown_price,
+                "监控方式": f"日高回落{int(DRAWDOWN_FROM_HIGH*100)}%",
+                "触发时间": "盘中实时",
+                "数量": qty,
+                "有效期": "10个交易日",
+                "说明": f"多头持有，从最高点{recent_high:.3f}回落5%({drawdown_price:.3f})锁定利润",
+            })
+    elif is_bearish:
+        # 空头趋势(非深度): 减仓单
+        reduce_qty = max(qty // 2 // 100 * 100, 100)
+        reduce_price = round(price * 0.998, 3)
+        # 去重检测
+        if abs(reduce_price - stop_price) / stop_price * 100 >= 2.0:
+            _log_price_check(code, name, "减仓", reduce_price, price)
+            orders.append({
+                "类型": "强制减仓",
+                "优先级": "★★★必挂",
+                "证券代码": code,
+                "证券名称": name,
+                "方向": "卖出",
+                "触发价": reduce_price,
+                "触发时间": "14:50",
+                "数量": reduce_qty,
+                "有效期": "5个交易日",
+                "说明": f"空头趋势(价格<MA20)，浮盈{pnl_pct:.1f}%，14:50减仓{reduce_qty}股，禁止补仓",
+            })
 
     return orders
+
+
+def _log_price_check(code, name, order_type, trigger_price, current_price):
+    """价格校验日志输出"""
+    if order_type in ("止损", "清仓", "减仓"):
+        if trigger_price < current_price:
+            print(f"  [价格校验] {code} {name} {order_type}{trigger_price:.3f} < 现价{current_price:.3f} ✓")
+        else:
+            print(f"  [价格校验] {code} {name} {order_type}{trigger_price:.3f} ≥ 现价{current_price:.3f} ✗(已调整)")
+    elif order_type in ("止盈", "回落止盈"):
+        print(f"  [价格校验] {code} {name} {order_type}{trigger_price:.3f} 现价{current_price:.3f} ✓")
 
 
 # ============================================================

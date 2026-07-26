@@ -60,10 +60,18 @@ class DataFeed:
             # 排序
             df = df.sort_values("date").reset_index(drop=True)
 
-            # 计算前收盘价
+            # FIX: 修复首日pre_close==close导致涨跌停判断始终False的问题，
+            # 标记首日为warmup不参与交易
             if "pre_close" not in df.columns:
                 df["pre_close"] = df["close"].shift(1)
                 df["pre_close"] = df["pre_close"].fillna(df["close"])
+
+            # 标记warmup行（首日无真实pre_close，不参与交易）
+            df["_warmup"] = False
+            if "pre_close" in df.columns:
+                # shift(1)产生的第一个NaN被fillna填充了，将其标记为warmup
+                first_idx = df.index[0]
+                df.loc[first_idx, "_warmup"] = True
 
             # 计算涨跌幅
             if "change_pct" not in df.columns:
@@ -190,10 +198,18 @@ def load_data_from_db(stock_codes: list, start_date: str, end_date: str,
     if db_path is None:
         db_path = config.DB_PATH
 
+    import datetime as _dt
+
     data_dict = {}
     for code in stock_codes:
         try:
-            df = load_daily_data(code, start_date=start_date, end_date=end_date)
+            # FIX: 修复load_daily_data参数不匹配导致DB加载100%失败
+            # load_daily_data签名为(code, conn, days)，不支持start_date/end_date
+            # 根据日期范围计算天数差值后传入
+            _start = _dt.datetime.strptime(start_date, "%Y-%m-%d")
+            _end = _dt.datetime.strptime(end_date, "%Y-%m-%d")
+            _days = max((_end - _start).days + 1, 30)  # 至少30天
+            df = load_daily_data(code, days=_days)
             if df is not None and not df.empty:
                 data_dict[code] = df
         except Exception as e:

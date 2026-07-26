@@ -33,22 +33,71 @@ from strategy.recommend_engine import run_recommendation, generate_trading_plan
 from strategy.caopan_signal import CaopanEngine
 from output.caopan_chart import generate_caopan_chart
 
+# 新增面板模块导入（失败时降级）
+try:
+    from strategy.lhb_analyzer import LHBAnalyzer
+    HAS_LHB = True
+except Exception:
+    HAS_LHB = False
+
+try:
+    from strategy.margin_monitor import MarginMonitor
+    HAS_MARGIN = True
+except Exception:
+    HAS_MARGIN = False
+
+try:
+    from strategy.event_calendar import EventCalendar
+    HAS_CALENDAR = True
+except Exception:
+    HAS_CALENDAR = False
+
+try:
+    from strategy.capital_flow import CapitalFlowAnalyzer
+    HAS_CAPITAL_FLOW = True
+except Exception:
+    HAS_CAPITAL_FLOW = False
+
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
 
 # ============================================================
-# 一、持仓列表（只需代码+名称，无需成本价）
+# 一、持仓列表（统一从 holdings.json 读取，消除硬编码不同步）
 # ============================================================
-holdings_list = [
+# 硬编码降级数据（当 holdings.json 不存在时使用）
+_FALLBACK_HOLDINGS = [
+    {"code": "002409", "名称": "雅克科技", "赛道": "半导体材料"},
+    {"code": "002415", "名称": "海康威视", "赛道": "AI视觉"},
+    {"code": "159205", "名称": "创业东方财富", "赛道": "指数ETF"},
     {"code": "588000", "名称": "科创50", "赛道": "指数ETF"},
+    {"code": "600036", "名称": "招商银行", "赛道": "银行"},
+    {"code": "600276", "名称": "恒瑞医药", "赛道": "创新药"},
+    {"code": "601688", "名称": "华泰证券", "赛道": "券商"},
     {"code": "603501", "名称": "豪威集团", "赛道": "CIS芯片"},
-    {"code": "159205", "名称": "创业东财", "赛道": "指数ETF"},
-    {"code": "002185", "名称": "华天科技", "赛道": "半导体封测"},
-    {"code": "000858", "名称": "五粮液", "赛道": "白酒"},
+    {"code": "603993", "名称": "洛阳钼业", "赛道": "有色资源"},
 ]
 
+
+def _load_holdings_from_json():
+    """从 holdings.json 读取持仓列表，统一数据源消除多文件硬编码不同步"""
+    # FIX: 统一从holdings.json读取持仓，消除多文件硬编码不同步
+    holdings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'holdings.json')
+    try:
+        with open(holdings_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return [
+            {"code": code, "名称": v.get("name", code), "赛道": v.get("sector", "其他")}
+            for code, v in data.items()
+        ]
+    except Exception:
+        return _FALLBACK_HOLDINGS
+
+
+holdings_list = _load_holdings_from_json()
+
 # 主模式参数
-STOP_LOSS_PCT = 0.08       # 固定止损: 最新价跌8%
+# FIX: 修复止损比例与config不一致，统一使用config.INITIAL_STOP_LOSS_PCT(0.10)
+STOP_LOSS_PCT = config.INITIAL_STOP_LOSS_PCT  # 固定止损: 统一使用config配置的止损比例
 DRAWDOWN_FROM_HIGH = 0.05  # 高点回落5%触发
 REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
 
@@ -445,6 +494,71 @@ for item in holdings_list:
     }
 
 # ============================================================
+# 五B、新增面板数据获取（龙虎榜/融资融券/解禁/四级资金流）
+# ============================================================
+print(f"\n[扩展] 获取龙虎榜/融资融券/解禁/四级资金流数据...")
+
+# 龙虎榜数据
+lhb_results = {}
+if HAS_LHB:
+    try:
+        lhb = LHBAnalyzer()
+        for code_h in holdings:
+            try:
+                lhb_results[code_h] = lhb.analyze(code_h, days=10)
+            except Exception:
+                pass
+        print(f"  龙虎榜: {len(lhb_results)}只获取成功")
+    except Exception as e:
+        print(f"  龙虎榜: 获取失败({e})")
+
+# 融资融券数据
+margin_results = {}
+if HAS_MARGIN:
+    try:
+        margin = MarginMonitor()
+        for code_h in holdings:
+            try:
+                margin_results[code_h] = margin.calc_margin_signal(code_h, days=10)
+            except Exception:
+                pass
+        print(f"  融资融券: {len(margin_results)}只获取成功")
+    except Exception as e:
+        print(f"  融资融券: 获取失败({e})")
+
+# 解禁风险数据
+release_summary = {}
+release_risks = {}
+if HAS_CALENDAR:
+    try:
+        calendar = EventCalendar()
+        release_summary = calendar.get_release_summary(days_ahead=30)
+        for code_h in holdings:
+            try:
+                release_risks[code_h] = calendar.check_stock_release_risk(code_h)
+            except Exception:
+                pass
+        print(f"  解禁风险: {len(release_risks)}只获取成功")
+    except Exception as e:
+        print(f"  解禁风险: 获取失败({e})")
+
+# 四级资金流数据
+flow_results = {}
+pattern_results = {}
+if HAS_CAPITAL_FLOW:
+    try:
+        cf = CapitalFlowAnalyzer()
+        for code_h in holdings:
+            try:
+                flow_results[code_h] = cf.analyze_multi_level_flow(code_h, days=5)
+                pattern_results[code_h] = cf.detect_flow_pattern(code_h, days=5)
+            except Exception:
+                pass
+        print(f"  四级资金流: {len(flow_results)}只获取成功")
+    except Exception as e:
+        print(f"  四级资金流: 获取失败({e})")
+
+# ============================================================
 # 六、生成HTML报告
 # ============================================================
 print(f"\n[生成] 构建综合分析报告...")
@@ -488,6 +602,17 @@ td{{padding:7px 6px;border-bottom:1px solid #eee;text-align:center}}
 .mode-badge{{display:inline-block;background:#9c27b0;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;margin-left:8px}}
 .signal-list{{font-size:11px;color:#555;margin:5px 0;padding-left:15px}}
 .signal-list li{{margin:2px 0}}
+.signal-tag{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold}}
+.signal-bullish{{background:#27ae60;color:white}}
+.signal-bearish{{background:#e74c3c;color:white}}
+.signal-neutral{{background:#95a5a6;color:white}}
+.pattern-tag{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}}
+.pattern-accumulation{{background:#27ae60;color:white}}
+.pattern-distribution{{background:#e74c3c;color:white}}
+.pattern-washout{{background:#f39c12;color:white}}
+.flow-bar{{height:8px;border-radius:4px}}
+.flow-positive{{background:#e74c3c}}
+.flow-negative{{background:#27ae60}}
 </style></head><body><div class="container">
 <div class="header">
 <h1>📊 持仓综合分析报告 <span class="mode-badge">技术面+条件单</span></h1>
@@ -498,9 +623,31 @@ td{{padding:7px 6px;border-bottom:1px solid #eee;text-align:center}}
 
 # ---- 风险预警 ----
 html += '<h2>⚠️ 仓位风险预警</h2>'
-# 科创50仓位69.61%严重超限
-html += '<div class="alert alert-danger">🚨 <b>科创50仓位69.61%</b>，严重超出ETF单只上限20%！建议分批减仓至20%以内，释放资金分散配置。</div>'
-html += '<div class="alert alert-warning">⚡ 持仓集中度: 科创50(69.6%) + 德明利(19.1%) = <b>88.7%</b>集中在2只标的，风险极高。建议单只不超30%。</div>'
+
+# 动态计算仓位集中度（基于holdings.json的市值数据）
+try:
+    hjson_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'holdings.json')
+    with open(hjson_path, 'r', encoding='utf-8') as fj:
+        hjson = json.load(fj)
+    total_mv = sum(v.get('shares', 0) * v.get('current_price', 0) for v in hjson.values())
+    stock_mvs = {}
+    for k, v in hjson.items():
+        mv = v.get('shares', 0) * v.get('current_price', 0)
+        stock_mvs[k] = {'name': v.get('name', k), 'mv': mv, 'pct': mv / total_mv * 100 if total_mv > 0 else 0}
+    sorted_mvs = sorted(stock_mvs.items(), key=lambda x: x[1]['pct'], reverse=True)
+    # 显示超过20%的仓位预警
+    for code_w, info_w in sorted_mvs:
+        if info_w['pct'] > 20:
+            html += f'<div class="alert alert-danger">🚨 <b>{info_w["name"]}仓位{info_w["pct"]:.1f}%</b>，超出单只上限20%！建议分批减仓。</div>'
+    # 集中度预警：前2大持仓
+    if len(sorted_mvs) >= 2:
+        top2_pct = sorted_mvs[0][1]['pct'] + sorted_mvs[1][1]['pct']
+        top2_names = f"{sorted_mvs[0][1]['name']}({sorted_mvs[0][1]['pct']:.1f}%) + {sorted_mvs[1][1]['name']}({sorted_mvs[1][1]['pct']:.1f}%)"
+        if top2_pct > 60:
+            html += f'<div class="alert alert-warning">⚡ 持仓集中度: {top2_names} = <b>{top2_pct:.1f}%</b>集中在2只标的，风险较高。建议单只不超30%。</div>'
+    html += f'<div class="alert alert-info">💰 账户总市值: ¥{total_mv:,.2f} | 持仓{len(hjson)}只</div>'
+except Exception as e:
+    html += f'<div class="alert alert-warning">仓位数据读取异常: {e}</div>'
 
 # ---- 总览表 ----
 html += '<h2>一、实时行情 + 技术评分总览</h2>'
@@ -753,6 +900,145 @@ try:
 except Exception as e:
     html += f'<div class="alert alert-warning">操盘密码分析异常: {e}</div>'
 
+# ---- 面板七：龙虎榜/游资动向 ----
+html += '<h2>七、龙虎榜/游资动向</h2>'
+if HAS_LHB and lhb_results:
+    html += '<table><tr><th>股票</th><th>上榜次数</th><th>机构趋势</th><th>游资活跃度</th><th>信号</th></tr>'
+    for code_h, h in holdings.items():
+        lhb_r = lhb_results.get(code_h)
+        if not lhb_r:
+            continue
+        sig = lhb_r.get('signal', 'neutral')
+        sig_class = {'bullish': 'signal-bullish', 'bearish': 'signal-bearish'}.get(sig, 'signal-neutral')
+        sig_text = {'bullish': '看多', 'bearish': '看空', 'neutral': '中性'}.get(sig, sig)
+        trend_map = {'increasing': '↑ 上升', 'decreasing': '↓ 下降', 'neutral': '→ 平稳'}
+        trend_text = trend_map.get(lhb_r.get('institution_trend', 'neutral'), lhb_r.get('institution_trend', ''))
+        hot_score = lhb_r.get('hot_money_score', 0)
+        html += f'<tr><td><b>{h["名称"]}</b>({code_h})</td>'
+        html += f'<td>{lhb_r.get("lhb_count", 0)}</td>'
+        html += f'<td>{trend_text}</td>'
+        html += f'<td>{hot_score:.0f}分</td>'
+        html += f'<td><span class="signal-tag {sig_class}">{sig_text}</span></td></tr>'
+    html += '</table>'
+    # 风险预警
+    risk_stocks = [code_h for code_h, r in lhb_results.items() if r.get('risk_warning')]
+    if risk_stocks:
+        names = [holdings[c]["名称"] for c in risk_stocks if c in holdings]
+        html += f'<div class="alert alert-danger">🚨 龙虎榜风险预警: {", ".join(names)} 游资主导且上榜频繁，短线风险较高</div>'
+else:
+    html += '<div class="alert alert-warning">龙虎榜数据暂不可用</div>'
+
+# ---- 面板八：融资融券信号 ----
+html += '<h2>八、融资融券信号</h2>'
+if HAS_MARGIN and margin_results:
+    html += '<table><tr><th>股票</th><th>融资净买入天数</th><th>余额趋势</th><th>拐点</th><th>融券异常</th><th>信号</th></tr>'
+    for code_h, h in holdings.items():
+        mr = margin_results.get(code_h)
+        if not mr:
+            continue
+        sig = mr.get('signal', 'neutral')
+        sig_class = {'bullish': 'signal-bullish', 'bearish': 'signal-bearish'}.get(sig, 'signal-neutral')
+        sig_text = {'bullish': '看多', 'bearish': '看空', 'neutral': '中性'}.get(sig, sig)
+        trend_map = {'increasing': '↑ 上升', 'decreasing': '↓ 下降', 'neutral': '→ 平稳'}
+        trend_text = trend_map.get(mr.get('balance_trend', 'neutral'), mr.get('balance_trend', ''))
+        turning = '✅ 是' if mr.get('balance_turning') else '—'
+        short_anomaly = '⚠️ 异常' if mr.get('short_selling_anomaly') else '—'
+        html += f'<tr><td><b>{h["名称"]}</b>({code_h})</td>'
+        html += f'<td>{mr.get("net_buy_days", 0)}天</td>'
+        html += f'<td>{trend_text}</td>'
+        html += f'<td style="color:#4caf50">{turning}</td>'
+        html += f'<td style="color:#e74c3c">{short_anomaly}</td>'
+        html += f'<td><span class="signal-tag {sig_class}">{sig_text}</span></td></tr>'
+    html += '</table>'
+else:
+    html += '<div class="alert alert-warning">融资融券数据暂不可用</div>'
+
+# ---- 面板九：解禁风险预警 ----
+html += '<h2>九、解禁风险预警</h2>'
+if HAS_CALENDAR and release_risks:
+    has_any_release = any(r.get('has_release') for r in release_risks.values())
+    high_impact_stocks = [code_h for code_h, r in release_risks.items() if r.get('max_impact') == 'high']
+    if high_impact_stocks:
+        names = [holdings[c]["名称"] for c in high_impact_stocks if c in holdings]
+        html += f'<div class="alert alert-danger">🚨 高冲击解禁预警: {", ".join(names)}，建议回避新开仓</div>'
+    if has_any_release:
+        html += '<table><tr><th>股票</th><th>解禁日期</th><th>冲击等级</th><th>距今天数</th></tr>'
+        for code_h, h in holdings.items():
+            rr = release_risks.get(code_h)
+            if not rr or not rr.get('has_release'):
+                continue
+            for evt in rr.get('events', []):
+                impact = evt.get('impact_level', 'low')
+                impact_color = {'high': '#e74c3c', 'medium': '#ff9800', 'low': '#4caf50'}.get(impact, '#999')
+                impact_text = {'high': '高冲击', 'medium': '中冲击', 'low': '低冲击'}.get(impact, impact)
+                html += f'<tr><td><b>{h["名称"]}</b>({code_h})</td>'
+                html += f'<td>{evt.get("release_date", "")}</td>'
+                html += f'<td style="color:{impact_color};font-weight:bold">{impact_text}</td>'
+                html += f'<td>{evt.get("days_until_release", "")}天</td></tr>'
+        html += '</table>'
+    else:
+        html += '<div class="alert alert-success">✅ 持仓近30天内无解禁风险</div>'
+    # 市场解禁摘要
+    if release_summary and release_summary.get('total_stocks', 0) > 0:
+        html += f'<div style="font-size:11px;color:#666;margin-top:5px">📅 市场解禁: 未来30天共{release_summary.get("total_stocks", 0)}只标的解禁'
+        if release_summary.get('peak_week'):
+            html += f' | 高峰: {release_summary["peak_week"]}'
+        html += '</div>'
+else:
+    html += '<div class="alert alert-warning">解禁风险数据暂不可用</div>'
+
+# ---- 面板十：四级资金流向 ----
+html += '<h2>十、四级资金流向</h2>'
+if HAS_CAPITAL_FLOW and flow_results:
+    for code_h, h in holdings.items():
+        fr = flow_results.get(code_h)
+        if not fr or not fr.get('success'):
+            continue
+        pr = pattern_results.get(code_h, {})
+        pattern = pr.get('pattern', 'neutral')
+        pattern_class = {'accumulation': 'pattern-accumulation', 'distribution': 'pattern-distribution', 'washout': 'pattern-washout'}.get(pattern, '')
+        pattern_text = {'accumulation': '吸筹', 'distribution': '出货', 'washout': '洗盘', 'neutral': '无明显模式'}.get(pattern, pattern)
+        direction = fr.get('main_force_direction', 'neutral')
+        dir_map = {'buying': '🔴 主力买入', 'selling': '🟢 主力卖出', 'neutral': '→ 中性'}
+        dir_text = dir_map.get(direction, direction)
+
+        html += f'<div class="stock-card"><h3>{h["名称"]}({code_h}) <span style="font-size:12px;color:#888">{dir_text}</span>'
+        if pattern_class:
+            html += f' <span class="pattern-tag {pattern_class}">{pattern_text}</span>'
+        elif pattern == 'neutral':
+            html += f' <span class="pattern-tag" style="background:#95a5a6;color:white">{pattern_text}</span>'
+        html += '</h3>'
+
+        # 四级资金流柱状展示
+        levels = [
+            ('超大单', 'super_large', '#e74c3c'),
+            ('大单', 'large', '#ff7043'),
+            ('中单', 'medium', '#42a5f5'),
+            ('小单', 'small', '#66bb6a'),
+        ]
+        html += '<table><tr><th>级别</th><th>净流入</th><th>趋势</th><th>图示</th></tr>'
+        for label, key, color in levels:
+            level_data = fr.get(key, {})
+            net = level_data.get('net_inflow', 0)
+            trend = level_data.get('trend', 'neutral')
+            trend_text_map = {'increasing': '↑', 'decreasing': '↓', 'net_inflow': '净流入', 'net_outflow': '净流出', 'neutral': '→'}
+            trend_t = trend_text_map.get(trend, trend)
+            bar_width = min(abs(net) / 1e6 * 5, 100) if net != 0 else 0
+            bar_class = 'flow-positive' if net >= 0 else 'flow-negative'
+            net_color = '#e74c3c' if net >= 0 else '#27ae60'
+            html += f'<tr><td style="color:{color};font-weight:bold">{label}</td>'
+            html += f'<td style="color:{net_color}">{net:+,.0f}</td>'
+            html += f'<td>{trend_t}</td>'
+            html += f'<td><div class="flow-bar {bar_class}" style="width:{bar_width}px"></div></td></tr>'
+        html += '</table>'
+
+        # 模式描述
+        if pr.get('description') and pattern != 'neutral':
+            html += f'<div style="font-size:11px;color:#666;margin-top:5px">💡 {pr["description"]}</div>'
+        html += '</div>'
+else:
+    html += '<div class="alert alert-warning">四级资金流数据暂不可用</div>'
+
 # ---- footer ----
 html += f"""
 <div class="footer">
@@ -771,7 +1057,7 @@ with open(report_path, 'w', encoding='utf-8') as f:
     f.write(html)
 print(f"[保存] {report_path}")
 
-subject = f"[综合分析报告] 6只标的 技术面+条件单 | {today} {now[:5]}"
+subject = f"[综合分析报告] {len(holdings)}只标的 技术面+条件单 | {today} {now[:5]}"
 print(f"[发送] {subject}")
 result = send_email(subject, html)
 print(f"[结果] {'✅ 发送成功' if result else '❌ 发送失败'}")

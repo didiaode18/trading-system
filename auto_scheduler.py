@@ -24,6 +24,7 @@ import subprocess
 import datetime
 import logging
 import io
+import atexit
 
 # Windows控制台编码修复
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -42,12 +43,36 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
 
+# FIX: 修复 is_trading_day 缺少节假日判断，复用 scheduler.py 的 HOLIDAYS/WORKDAYS
+try:
+    sys.path.insert(0, os.path.join(BASE_DIR, 'trading_system'))
+    from scheduler import HOLIDAYS as _HOLIDAYS, WORKDAYS as _WORKDAYS
+    _HAS_HOLIDAY_DATA = True
+except Exception:
+    _HAS_HOLIDAY_DATA = False
+
 # 调度时间表
 SCHEDULE = {
     "盘后条件单": {"time": "15:30", "script": "daily_orders.py", "desc": "生成次日条件单+邮件推送"},
     "盘后分析报告": {"time": "15:35", "script": "generate_holdings_report.py", "desc": "技术分析+推荐标的报告"},
     "盘中自动执行": {"time": "09:25", "script": "qmt_trader.py", "desc": "QMT条件单自动监控执行"},
 }
+
+
+# FIX: 修复 subprocess.Popen 文件句柄未关闭的问题，保存引用并注册atexit关闭
+_qmt_file_handles = []
+
+
+def _close_qmt_handles():
+    """关闭QMT子进程的日志文件句柄"""
+    for fh in _qmt_file_handles:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_qmt_handles)
 
 
 def run_script(script_name: str, desc: str) -> bool:
@@ -95,11 +120,20 @@ def run_script(script_name: str, desc: str) -> bool:
 
 
 def is_trading_day() -> bool:
-    """判断今天是否为交易日（简化版：仅排除周末）"""
+    """判断今天是否为交易日（包含周末+法定节假日判断）"""
     today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # 调休上班日（周末补班）
+    if _HAS_HOLIDAY_DATA and today_str in _WORKDAYS:
+        return True
+
+    # 法定节假日
+    if _HAS_HOLIDAY_DATA and today_str in _HOLIDAYS:
+        return False
+
     if today.weekday() >= 5:  # 周六日
         return False
-    # TODO: 接入节假日API判断法定假日
     return True
 
 
@@ -162,11 +196,15 @@ def run_scheduler_daemon():
                         logger.info(f"[调度] ▶ 启动盘中自动执行...")
                         script_path = os.path.join(BASE_DIR, info["script"])
                         if os.path.exists(script_path):
+                            # FIX: 修复 subprocess.Popen 文件句柄未关闭，保存引用供atexit关闭
+                            fh_out = open("qmt_stdout.log", "a", encoding="utf-8")
+                            fh_err = open("qmt_stderr.log", "a", encoding="utf-8")
+                            _qmt_file_handles.extend([fh_out, fh_err])
                             subprocess.Popen(
                                 [PYTHON, script_path],
                                 cwd=BASE_DIR,
-                                stdout=open("qmt_stdout.log", "a", encoding="utf-8"),
-                                stderr=open("qmt_stderr.log", "a", encoding="utf-8"),
+                                stdout=fh_out,
+                                stderr=fh_err,
                             )
                             logger.info(f"[调度] QMT执行器已在后台启动")
                     else:

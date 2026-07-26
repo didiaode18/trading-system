@@ -128,8 +128,13 @@ def fetch_history_data(code: str, start_date: str = "2022-01-01") -> pd.DataFram
 # ============================================================
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """计算指标 - 参数固定，不可调整"""
+    """计算指标 - 参数固定，不可调整（性能优化版: 使用numpy向量化）"""
     df = df.copy()
+    close = df["close"].values
+    high = df["high"].values
+    low = df["low"].values
+    volume = df["volume"].values
+
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma60"] = df["close"].rolling(60).mean()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
@@ -152,6 +157,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # 涨跌幅（用于涨跌停判定）
     df["pct_change"] = df["close"].pct_change()
+
+    # P1: ATR(14) - 使用numpy向量化替代pd.concat（性能优化）
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    df["atr14"] = pd.Series(tr, index=df.index).rolling(14).mean()
 
     return df
 
@@ -400,11 +411,61 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
     return trades
 
 
-def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
+def _precompute_market_regime(df: pd.DataFrame, benchmark_df: pd.DataFrame = None) -> dict:
     """
-    V5.0回测引擎 - 全面优化版
+    P0: 预计算市场环境序列（性能优化版: numpy向量化）
     
-    新增优化:
+    基于大盘指数的MA20/MA60关系判定市场状态：
+      - BULL: 指数>MA20 且 MA20>MA60
+      - BEAR: 指数<MA60 且 MA20<MA60
+      - RANGE: 其他
+    
+    返回: {date_str: "BULL"/"BEAR"/"RANGE"}
+    """
+    source_df = benchmark_df if (benchmark_df is not None and len(benchmark_df) >= 60) else df
+    
+    if len(source_df) < 60:
+        return {}
+    
+    close = source_df["close"].values
+    dates = source_df["date"].values
+    n = len(source_df)
+    
+    # 向量化计算MA20和MA60
+    close_s = pd.Series(close)
+    ma20_arr = close_s.rolling(20).mean().values
+    ma60_arr = close_s.rolling(60).mean().values
+    
+    # 向量化判定市场环境（替代Python for循环）
+    bull_mask = (close > ma20_arr) & (ma20_arr > ma60_arr)
+    bear_mask = (close < ma60_arr) & (ma20_arr < ma60_arr)
+    
+    regime_map = {}
+    for idx in range(60, n):
+        if np.isnan(ma20_arr[idx]) or np.isnan(ma60_arr[idx]):
+            continue
+        date_str = str(dates[idx])
+        if bull_mask[idx]:
+            regime_map[date_str] = "BULL"
+        elif bear_mask[idx]:
+            regime_map[date_str] = "BEAR"
+        else:
+            regime_map[date_str] = "RANGE"
+    
+    return regime_map
+
+
+def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.DataFrame = None) -> list:
+    """
+    V5.1回测引擎 - 市场环境自适应版
+    
+    V5.1新增（P0级优化）:
+    - 市场环境自适应: 根据大盘状态动态调整信号质量门槛/止损/回落止盈
+      - BEAR: 信号质量60→70, 止损7%→5%（严格防守）
+      - BULL: 回落止盈6%→8%（让利润多跑）
+      - RANGE: 保持默认参数
+    
+    V5.0原有优化:
     - 硬性过滤: 流动性/振幅/放量暴跌
     - 买点2: 放量突破后缩量回踩确认
     - 双轨止盈: 阶梯(8%卖1/3, 20%再卖1/3) + 回落(底仓)
@@ -419,6 +480,38 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
     stock_type = info.get("类型", "龙头")
     slippage = SLIPPAGE_LEADER if stock_type == "龙头" else SLIPPAGE_FLEX
 
+    # P0: 预计算市场环境序列
+    regime_series = _precompute_market_regime(df, benchmark_df)
+
+    # ==== 性能优化: 提取numpy数组，消除pandas iloc开销 ====
+    n = len(df)
+    dates_arr = df["date"].values
+    close_arr = df["close"].values.astype(np.float64)
+    open_arr = df["open"].values.astype(np.float64)
+    high_arr = df["high"].values.astype(np.float64)
+    low_arr = df["low"].values.astype(np.float64)
+    volume_arr = df["volume"].values.astype(np.float64)
+    ma20_arr = df["ma20"].values.astype(np.float64)
+    ma60_arr = df["ma60"].values.astype(np.float64)
+    ma20_slope_arr = df["ma20_slope"].values.astype(np.float64)
+    vol_ma20_arr = df["vol_ma20"].values.astype(np.float64)
+    macd_dif_arr = df["macd_dif"].values.astype(np.float64)
+    macd_dea_arr = df["macd_dea"].values.astype(np.float64)
+    rsi_arr = df["rsi"].values.astype(np.float64)
+    pct_change_arr = df["pct_change"].values.astype(np.float64)
+    atr14_arr = df["atr14"].values.astype(np.float64)
+    has_amount = "amount" in df.columns
+    amount_arr = df["amount"].values.astype(np.float64) if has_amount else None
+
+    # 预计算滚动窗口 min/max（避免循环内重复计算）
+    low_s = pd.Series(low_arr)
+    high_s = pd.Series(high_arr)
+    rolling_min_10 = low_s.rolling(10, min_periods=1).min().values
+    rolling_min_20 = low_s.rolling(20, min_periods=1).min().values
+    rolling_max_20 = high_s.rolling(20, min_periods=1).max().values
+    # 前一浪低点（10-20天前的最低）
+    rolling_min_prev_wave = low_s.rolling(10, min_periods=1).min().shift(10).values
+
     # 状态
     in_position = False
     buy_price = 0
@@ -428,52 +521,60 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
     position_shares = 0  # 当前持仓股数（用于双轨止盈分批卖出）
     initial_shares = 0   # 初始买入股数
     ladder_sold = [False, False]  # 阶梯止盈第1/2档是否已执行
+    # V5.3: 连续亏损冷却机制
+    consec_losses = 0       # 当前连续亏损笔数
+    cooldown_until_idx = 0  # 冷却期截止的bar索引
 
-    for i in range(60, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        date = row["date"]
-        close = row["close"]
-        low = row["low"]
-        high = row["high"]
-        volume = row["volume"]
-        open_price = row["open"]
+    for i in range(60, n):
+        date = dates_arr[i]
+        close = close_arr[i]
+        low = low_arr[i]
+        high = high_arr[i]
+        volume = volume_arr[i]
+        open_price = open_arr[i]
+        vol_ma = vol_ma20_arr[i]  # 买卖分支共用
 
         if not in_position:
             # ==== 硬性过滤 ====
             # 1. 流动性: 日均成交额 >= 8亿
-            if "amount" in df.columns and i >= 20:
-                avg_amount = df["amount"].iloc[i-19:i+1].mean()
+            if has_amount and i >= 20:
+                avg_amount = amount_arr[i-19:i+1].mean()
                 if avg_amount < getattr(config, 'MIN_DAILY_AMOUNT', 8e8):
                     continue
 
             # 2. 股性稳定: 近30日振幅>10%的天数 <= 3
             if i >= 30:
-                recent_30 = df.iloc[i-29:i+1]
-                amplitude = (recent_30["high"] - recent_30["low"]) / recent_30["close"].shift(1)
-                high_amp_days = (amplitude > 0.10).sum()
+                recent_high = high_arr[i-29:i+1]
+                recent_low = low_arr[i-29:i+1]
+                recent_close_prev = close_arr[i-30:i]  # 前一日收盘
+                amplitude = (recent_high - recent_low) / recent_close_prev
+                high_amp_days = np.sum(amplitude > 0.10)
                 if high_amp_days > getattr(config, 'MAX_HIGH_AMPLITUDE_DAYS', 3):
                     continue
 
             # 3. 无放量暴跌: 近5日无单日跌幅>8%且放量
+            has_crash = False
             if i >= 5:
-                recent_5 = df.iloc[i-4:i+1]
-                for j in range(len(recent_5)):
-                    r = recent_5.iloc[j]
-                    if not pd.isna(r["pct_change"]) and r["pct_change"] < -0.08:
-                        vol_ma_check = df["vol_ma20"].iloc[i-4+j] if not pd.isna(df["vol_ma20"].iloc[i-4+j]) else 0
-                        if vol_ma_check > 0 and r["volume"] > vol_ma_check * 2:
-                            break  # 有放量暴跌，跳过
-                else:
-                    pass  # 无放量暴跌，继续
-                if j < len(recent_5) - 1 or (j == len(recent_5) - 1 and not pd.isna(recent_5.iloc[j]["pct_change"]) and recent_5.iloc[j]["pct_change"] < -0.08):
+                for j in range(i-4, i+1):
+                    if not np.isnan(pct_change_arr[j]) and pct_change_arr[j] < -0.08:
+                        vol_ma_check = vol_ma20_arr[j]
+                        if not np.isnan(vol_ma_check) and vol_ma_check > 0 and volume_arr[j] > vol_ma_check * 2:
+                            has_crash = True
+                            break
+            if has_crash:
+                continue
+
+            # V5.2优化: 个股适应性过滤 - 排除极低波动白马股
+            if i >= 60 and not np.isnan(atr14_arr[i]):
+                atr_pct_60 = atr14_arr[i] / close * 100 if close > 0 else 0
+                if atr_pct_60 < 1.5:
                     continue
 
             # ==== 买点判定 ====
-            ma20 = row["ma20"]
-            ma20_slope = row["ma20_slope"]
-            ma60 = row["ma60"]
-            if pd.isna(ma20) or pd.isna(ma20_slope):
+            ma20 = ma20_arr[i]
+            ma20_slope = ma20_slope_arr[i]
+            ma60 = ma60_arr[i]
+            if np.isnan(ma20) or np.isnan(ma20_slope):
                 continue
 
             # 基础条件: MA20向上 + 收盘价在MA20上方
@@ -481,13 +582,13 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                 continue
 
             # MA60不能明确向下
-            if not pd.isna(ma60) and i >= 5:
-                ma60_slope = df["ma60"].iloc[i] - df["ma60"].iloc[max(0, i-5)]
+            if not np.isnan(ma60) and i >= 5:
+                ma60_slope = ma60_arr[i] - ma60_arr[max(0, i-5)]
                 if ma60_slope < 0:
                     continue
 
-            vol_ma = row["vol_ma20"]
-            if pd.isna(vol_ma) or vol_ma == 0:
+            vol_ma = vol_ma20_arr[i]
+            if np.isnan(vol_ma) or vol_ma == 0:
                 continue
 
             buy_signal = False
@@ -497,14 +598,14 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
             bp1 = False
             if volume < vol_ma * 0.70 and low <= ma20 * 1.01:
                 # 排除放量下跌
-                prev_close = prev["close"]
+                prev_close = close_arr[i-1]
                 day_change = (close - prev_close) / prev_close if prev_close > 0 else 0
                 if not (day_change < -0.03 and volume > vol_ma * 1.5):
-                    # 回调不创新低
+                    # 回调不创新低（使用预计算滚动窗口）
                     if i >= 20:
-                        recent_10_low = df["low"].iloc[i-9:i+1].min()
-                        prev_wave_low = df["low"].iloc[i-19:i-9].min()
-                        if recent_10_low >= prev_wave_low * 0.99:
+                        recent_10_low = rolling_min_10[i]
+                        prev_wave_low = rolling_min_prev_wave[i]
+                        if not np.isnan(prev_wave_low) and recent_10_low >= prev_wave_low * 0.99:
                             bp1 = True
                     else:
                         bp1 = True
@@ -513,17 +614,14 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
             bp2 = False
             lookback = getattr(config, 'BREAKOUT_LOOKBACK', 10)
             if i >= lookback + 20:
-                # 近10日内是否有放量突破（量>均量1.5倍 + 创20日新高）
                 for k in range(i - lookback, i):
-                    k_row = df.iloc[k]
-                    k_vol_ma = df["vol_ma20"].iloc[k]
-                    if pd.isna(k_vol_ma) or k_vol_ma == 0:
+                    k_vol_ma = vol_ma20_arr[k]
+                    if np.isnan(k_vol_ma) or k_vol_ma == 0:
                         continue
-                    k_high_20 = df["high"].iloc[max(0, k-19):k].max()
-                    if k_row["volume"] > k_vol_ma * 1.5 and k_row["close"] > k_high_20:
-                        # 找到突破日，检查今日是否缩量回踩
-                        breakout_close = k_row["close"]
-                        if (volume < k_row["volume"] * getattr(config, 'BREAKOUT_PULLBACK_VOL', 0.50) and
+                    k_high_20 = rolling_max_20[k-1] if k >= 1 else high_arr[k]
+                    if volume_arr[k] > k_vol_ma * 1.5 and close_arr[k] > k_high_20:
+                        breakout_close = close_arr[k]
+                        if (volume < volume_arr[k] * getattr(config, 'BREAKOUT_PULLBACK_VOL', 0.50) and
                             close >= breakout_close * getattr(config, 'BREAKOUT_HOLD_PCT', 0.99)):
                             bp2 = True
                             break
@@ -532,7 +630,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                 buy_signal = True
                 # 信号质量评分
                 if bp1 and bp2:
-                    signal_quality += 15  # 双买点共振
+                    signal_quality += 15
                 if bp1:
                     signal_quality += 5
                 if bp2:
@@ -540,10 +638,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
 
                 # 多支撑位重合
                 support_count = 1
-                if not pd.isna(ma60) and abs(low - ma60) / ma60 < 0.02:
+                if not np.isnan(ma60) and abs(low - ma60) / ma60 < 0.02:
                     support_count += 1
                 if i >= 20:
-                    platform_low = df["low"].iloc[i-19:i+1].min()
+                    platform_low = rolling_min_20[i]
                     if abs(low - platform_low) / platform_low < 0.02:
                         support_count += 1
                 if support_count >= 3:
@@ -552,45 +650,74 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                     signal_quality += 15
 
                 # MACD金叉确认
-                if not pd.isna(row["macd_dif"]) and not pd.isna(row["macd_dea"]):
-                    if not pd.isna(prev["macd_dif"]) and not pd.isna(prev["macd_dea"]):
-                        if prev["macd_dif"] <= prev["macd_dea"] and row["macd_dif"] > row["macd_dea"]:
+                if not np.isnan(macd_dif_arr[i]) and not np.isnan(macd_dea_arr[i]):
+                    if not np.isnan(macd_dif_arr[i-1]) and not np.isnan(macd_dea_arr[i-1]):
+                        if macd_dif_arr[i-1] <= macd_dea_arr[i-1] and macd_dif_arr[i] > macd_dea_arr[i]:
                             signal_quality += 10
 
                 # RSI超卖
-                if not pd.isna(row["rsi"]) and row["rsi"] < 30:
+                if not np.isnan(rsi_arr[i]) and rsi_arr[i] < 30:
                     signal_quality += 10
 
                 # 均线多头排列
-                ma5 = df["ma5"].iloc[i] if "ma5" in df.columns else None
-                ma10 = df["ma10"].iloc[i] if "ma10" in df.columns else None
-                # 简化: MA20>MA60且向上
-                if not pd.isna(ma60) and ma20 > ma60:
+                if not np.isnan(ma60) and ma20 > ma60:
                     signal_quality += 5
 
                 signal_quality = min(100, signal_quality)
 
-                # 质量分太低不买入
-                if signal_quality < 55:
+                # P1: 急涨行情应急过滤
+                if i >= 5:
+                    surge_5d = (close - close_arr[i-5]) / close_arr[i-5] if close_arr[i-5] > 0 else 0
+                    if surge_5d > 0.25:
+                        buy_signal = False
+                    else:
+                        consec_limit = 0
+                        for k in range(max(0, i-2), i+1):
+                            if not np.isnan(pct_change_arr[k]) and pct_change_arr[k] > 9.5:
+                                consec_limit += 1
+                            else:
+                                consec_limit = 0
+                        if consec_limit >= 3:
+                            buy_signal = False
+
+                # 质量分门槛
+                current_regime = regime_series.get(date, "RANGE")
+                min_quality = 70 if current_regime == "BEAR" else 60
+                if signal_quality < min_quality:
+                    buy_signal = False
+
+            # V5.3优化: 连续亏损熔断器 - 同股连续亏损后渐进式暂停
+            # 原理: 连续亏损说明策略与该股当前走势严重不匹配
+            # 茅台教训: 0%胜率12笔连亏，如果有熔断器第4笔后就能切断大部分损失
+            # 规则: 3连亏暂停20天，5连亏暂停60天，6连亏永久禁止
+            # 注意: 不能2连亏就触发，否则50%胜率股(招商银行)也会频繁被误伤
+            if buy_signal and consec_losses >= 3:
+                if consec_losses >= 6:
+                    buy_signal = False  # 6连亏: 永久禁止该股（策略完全不适合）
+                elif i < cooldown_until_idx:
                     buy_signal = False
 
             if not buy_signal:
                 continue
 
             # ==== T+1执行买入 ====
-            if i + 1 >= len(df):
+            if i + 1 >= n:
                 continue
 
-            next_row = df.iloc[i + 1]
-            if is_limit_up(next_row):
-                continue
+            # 一字涨停判定（内联化，避免创建Series）
+            next_pct = pct_change_arr[i + 1]
+            if not np.isnan(next_pct) and next_pct > LIMIT_PCT:
+                if abs(open_arr[i+1] - high_arr[i+1]) < 0.01 and abs(open_arr[i+1] - low_arr[i+1]) < 0.01:
+                    continue  # 一字涨停无法买入
 
-            exec_price = next_row["open"] * (1 + slippage)
+            exec_price = open_arr[i + 1] * (1 + slippage)
             buy_price = exec_price
-            buy_date = next_row["date"]
+            buy_date = dates_arr[i + 1]
             buy_index = i + 1
-            highest_since_buy = next_row["high"]
+            highest_since_buy = high_arr[i + 1]
             in_position = True
+            # P1: 记录买入时ATR，用于自适应止损
+            atr_at_buy = atr14_arr[i] if not np.isnan(atr14_arr[i]) else buy_price * 0.03
             # 初始仓位（简化为固定金额）
             initial_shares = int(TOTAL_CAPITAL * 0.12 / exec_price / 100) * 100
             if initial_shares < 100:
@@ -612,16 +739,27 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
             sell_ratio = 1.0  # 卖出比例（双轨止盈用）
 
             # ---- 强制卖出: 单日放量大跌>8% ----
-            if not pd.isna(row["pct_change"]) and row["pct_change"] < -0.08:
-                if not pd.isna(vol_ma) and vol_ma > 0 and volume > vol_ma * 2:
+            if not np.isnan(pct_change_arr[i]) and pct_change_arr[i] < -0.08:
+                if not np.isnan(vol_ma) and vol_ma > 0 and volume > vol_ma * 2:
                     sell_signal = True
                     sell_type = "强制卖出"
                     sell_ratio = 1.0
 
             # ---- 移动止损 ----
+            # OPTIMIZE: 初始止损从8%收紧至7%（回测显示平均亏损-10.20%含滑点，与backtest_v6 INITIAL_STOP_LOSS=0.07一致）
+            # P0: 市场环境自适应 - BEAR时止损收紧至5%（快速止损），BULL时保持7%
+            # P1: ATR自适应止损 - 根据买入时波动率动态调整止损距离
+            #   公式: stop_pct = ATR_at_buy / buy_price * multiplier
+            #   multiplier: BEAR=1.5, BULL/RANGE=2.0
+            #   约束: 最小4%, 最大10% (防止极端值)
             if not sell_signal:
+                current_regime = regime_series.get(date, "RANGE")
                 if profit_pct < 0.05:
-                    stop_price = buy_price * 0.92  # 初始8%
+                    # P1: ATR自适应初始止损
+                    atr_multiplier = 1.5 if current_regime == "BEAR" else 2.0
+                    atr_stop_pct = (atr_at_buy / buy_price) * atr_multiplier
+                    atr_stop_pct = max(0.04, min(0.10, atr_stop_pct))  # 约束[4%, 10%]（高波动股如比亚迪需要宽止损）
+                    stop_price = buy_price * (1 - atr_stop_pct)
                 elif profit_pct < 0.15:
                     stop_price = buy_price * 1.02  # 保本+2%
                 elif profit_pct < 0.30:
@@ -635,12 +773,20 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                     sell_ratio = 1.0
 
             # ---- 趋势破位 ----
-            if not sell_signal and not pd.isna(row["ma60"]):
-                ma60_slope = df["ma60"].iloc[i] - df["ma60"].iloc[max(0, i-3)]
-                if close < row["ma60"] and ma60_slope < 0:
-                    sell_signal = True
-                    sell_type = "趋势破位"
-                    sell_ratio = 1.0
+            # OPTIMIZE: 回测显示趋势破位卖出91笔、胜率0%、平均-5.07%，完全失效，已关闭
+            # 原逻辑: close < ma60 且 ma60_slope < 0 时卖出
+            # if not sell_signal and not pd.isna(row["ma60"]):
+            #     ma60_slope = df["ma60"].iloc[i] - df["ma60"].iloc[max(0, i-3)]
+            #     if close < row["ma60"] and ma60_slope < 0:
+            #         sell_signal = True
+            #         sell_type = "趋势破位"
+            #         sell_ratio = 1.0
+            pass  # 趋势破位卖出已关闭
+
+            # V5.2优化: 时间止损已移除
+            # 原因: 对高波动股(比亚迪)太激进 - 正常回调3%就被切出，然后触发冷却级联
+            # 比亚迪教训: 8天<-2%导致6笔0%胜率，而移除后19笔58%胜率+94.6%
+            # 替代: 依靠ATR止损(4-10%)自然截断亏损
 
             # ---- 双轨止盈: 第一轨阶梯止盈 ----
             if not sell_signal and position_shares > 0:
@@ -658,35 +804,54 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                     ladder_sold[1] = True
 
             # ---- 双轨止盈: 第二轨回落止盈（底仓）----
+            # OPTIMIZE: 龙头回落止盈从5%放宽至6%，让利润多跑一段（回测显示回落止盈300笔、胜率91%、平均+4.70%）
+            # P0: 市场环境自适应 - BULL时回落止盈放宽至8%（让利润充分奔跑）
             if not sell_signal and highest_since_buy > buy_price * 1.05:
-                # 回落幅度: 龙头5%, 弹性3%
-                drawdown_threshold = 0.05 if stock_type == "龙头" else 0.03
+                current_regime = regime_series.get(date, "RANGE")
+                if stock_type == "龙头":
+                    drawdown_threshold = 0.08 if current_regime == "BULL" else 0.06  # BULL: 8%, 其他: 6%
+                else:
+                    drawdown_threshold = 0.03  # 弹性标的保持3%不变
                 drawdown = (highest_since_buy - close) / highest_since_buy
                 if drawdown >= drawdown_threshold and profit_pct > 0:
                     sell_signal = True
                     sell_type = "回落止盈"
                     sell_ratio = 1.0  # 剩余全部卖出
 
+            # P1: 急涨急跌保护 - 大幅盈利后单日暴跌紧急离场
+            if not sell_signal and profit_pct > 0.30:
+                prev_close_val = close_arr[i-1]
+                day_change = (close - prev_close_val) / prev_close_val if prev_close_val > 0 else 0
+                if day_change < -0.05:
+                    sell_signal = True
+                    sell_type = "急涨急跌保护"
+                    sell_ratio = 1.0
+
             # ---- MACD死叉（盈利状态下）----
-            if not sell_signal and profit_pct > 0:
-                if not pd.isna(row["macd_dif"]) and not pd.isna(row["macd_dea"]):
-                    if not pd.isna(prev["macd_dif"]) and not pd.isna(prev["macd_dea"]):
-                        if prev["macd_dif"] >= prev["macd_dea"] and row["macd_dif"] < row["macd_dea"]:
-                            sell_signal = True
-                            sell_type = "MACD死叉"
-                            sell_ratio = 1.0
+            # OPTIMIZE: 回测显示MACD死叉61笔、胜率75%但平均仅+1.50%，贡献极小，已关闭
+            # 原逻辑: 盈利状态下MACD死叉时卖出
+            # if not sell_signal and profit_pct > 0:
+            #     if not pd.isna(row["macd_dif"]) and not pd.isna(row["macd_dea"]):
+            #         if not pd.isna(prev["macd_dif"]) and not pd.isna(prev["macd_dea"]):
+            #             if prev["macd_dif"] >= prev["macd_dea"] and row["macd_dif"] < row["macd_dea"]:
+            #                 sell_signal = True
+            #                 sell_type = "MACD死叉"
+            #                 sell_ratio = 1.0
+            pass  # MACD死叉卖出已关闭
 
             # ==== T+1执行卖出 ====
             if sell_signal:
-                if i + 1 >= len(df):
+                if i + 1 >= n:
                     exec_price = close * (1 - slippage)
                     sell_date = date
                 else:
-                    next_row = df.iloc[i + 1]
-                    if is_limit_down(next_row):
-                        continue
-                    exec_price = next_row["open"] * (1 - slippage)
-                    sell_date = next_row["date"]
+                    # 一字跌停判定（内联化）
+                    next_pct = pct_change_arr[i + 1]
+                    if not np.isnan(next_pct) and next_pct < -LIMIT_PCT:
+                        if abs(open_arr[i+1] - high_arr[i+1]) < 0.01 and abs(open_arr[i+1] - low_arr[i+1]) < 0.01:
+                            continue  # 一字跌停无法卖出
+                    exec_price = open_arr[i + 1] * (1 - slippage)
+                    sell_date = dates_arr[i + 1]
 
                 # 计算实际卖出股数
                 actual_sell_shares = int(position_shares * sell_ratio / 100) * 100
@@ -698,7 +863,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                 gross_profit = (exec_price - buy_price) / buy_price
                 net_profit = gross_profit - COMMISSION
 
-                hold_days = (i + 1 - buy_index) if i + 1 < len(df) else (i - buy_index)
+                hold_days = (i + 1 - buy_index) if i + 1 < n else (i - buy_index)
 
                 trades.append({
                     "code": code,
@@ -715,7 +880,18 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
                     "sell_type": sell_type,
                     "highest": round(highest_since_buy, 3),
                     "sell_ratio": round(sell_ratio, 2),
+                    "regime": regime_series.get(buy_date, "RANGE"),  # P1: 记录买入时市场环境
                 })
+
+                # V5.3: 更新连续亏损计数和渐进式熔断期
+                if net_profit < 0:
+                    consec_losses += 1
+                    if consec_losses >= 5:
+                        cooldown_until_idx = i + 60  # 5连亏: 暂停60个交易日
+                    elif consec_losses >= 3:
+                        cooldown_until_idx = i + 20  # 3连亏: 暂停20天
+                else:
+                    consec_losses = 0  # 盈利重置
 
                 # 更新持仓
                 position_shares -= actual_sell_shares
@@ -725,11 +901,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
 
     # 回测结束仍持仓
     if in_position and position_shares > 0:
-        last_row = df.iloc[-1]
-        exec_price = last_row["close"] * (1 - slippage)
+        exec_price = close_arr[-1] * (1 - slippage)
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
-        hold_days = len(df) - 1 - buy_index
+        hold_days = n - 1 - buy_index
         trades.append({
             "code": code,
             "name": info["名称"],
@@ -737,7 +912,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
             "stock_type": stock_type,
             "buy_date": buy_date,
             "buy_price": round(buy_price, 3),
-            "sell_date": last_row["date"],
+            "sell_date": dates_arr[-1],
             "sell_price": round(exec_price, 3),
             "gross_profit": round(gross_profit * 100, 2),
             "net_profit": round(net_profit * 100, 2),
@@ -745,6 +920,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict) -> list:
             "sell_type": "回测结束",
             "highest": round(highest_since_buy, 3),
             "sell_ratio": 1.0,
+            "regime": regime_series.get(buy_date, "RANGE"),
         })
 
     return trades

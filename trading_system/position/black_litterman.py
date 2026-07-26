@@ -124,13 +124,8 @@ class BlackLittermanOptimizer:
         except np.linalg.LinAlgError:
             w_opt = w_eq
 
-        # ---- 7. 约束处理 ----
+        # ---- 7. 约束处理（迭代截断，归一化后不再超max_weight） ----
         w_opt = self._apply_constraints(w_opt)
-
-        # 归一化
-        w_sum = w_opt.sum()
-        if w_sum > 0:
-            w_opt = w_opt / w_sum
 
         # ---- 8. 输出 ----
         weights = {codes[i]: round(float(w_opt[i]), 4) for i in range(n)}
@@ -241,13 +236,15 @@ class BlackLittermanOptimizer:
         return P, Q, Omega
 
     def _apply_constraints(self, weights: np.ndarray) -> np.ndarray:
-        """应用权重约束"""
-        # 截断
-        weights = np.clip(weights, self.min_weight, self.max_weight)
-        # 归一化
-        w_sum = weights.sum()
-        if w_sum > 0:
-            weights = weights / w_sum
+        """应用权重约束（迭代截断法）"""
+        # FIX: 修复权重归一化后违反max_weight约束，采用迭代截断法
+        for _ in range(10):
+            weights = np.clip(weights, self.min_weight, self.max_weight)
+            w_sum = weights.sum()
+            if w_sum > 0:
+                weights = weights / w_sum
+            if np.all(weights <= self.max_weight + 1e-8):
+                break
         return weights
 
     def _interpret(self, weights, eq_weights, views) -> str:

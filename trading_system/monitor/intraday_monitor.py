@@ -105,6 +105,12 @@ class IntradayMonitor:
                     if not is_systemic:
                         # 非系统性急跌 → 暂停条件单（可能是洗盘）
                         self._paused_orders.add(code)
+                        # 联动风控引擎：写入盘中暂停标记
+                        self._notify_risk_engine("intraday_pause", {
+                            "reason": f"{order.get('name', '')}({code})盘中急跌{change_pct:.1%}",
+                            "code": code,
+                            "change_pct": round(change_pct, 4),
+                        })
                         alert = {
                             "type": "crash_protection",
                             "level": "critical",
@@ -112,14 +118,22 @@ class IntradayMonitor:
                             "name": order.get("name", ""),
                             "message": (
                                 f"🛡️ {order.get('name', '')}({code}) 盘中急跌{change_pct:.1%}，"
-                                f"非系统性风险，条件单已暂停（反洗盘保护）"
+                                f"非系统性风险，条件单已暂停（反洗盘保护），已联动风控引擎"
                             ),
                             "time": current_time,
                             "action": "pause_order",
                         }
                         alerts.append(alert)
                     else:
-                        # 系统性风险 → 保留条件单
+                        # 系统性风险 → 保留条件单，联动风控引擎降仓
+                        pct, avg = self._get_systemic_risk_stats(realtime_data)
+                        self._notify_risk_engine("systemic_risk", {
+                            "pct_down": round(pct, 4),
+                            "avg_drop": round(avg, 4),
+                        })
+                        logger.critical(
+                            f"系统性风险触发！{pct:.0%}股票跌幅超2%，已联动风控引擎"
+                        )
                         alert = {
                             "type": "systemic_risk",
                             "level": "critical",
@@ -127,7 +141,7 @@ class IntradayMonitor:
                             "name": order.get("name", ""),
                             "message": (
                                 f"🚨 {order.get('name', '')}({code}) 急跌{change_pct:.1%}，"
-                                f"检测到系统性风险，条件单保持激活"
+                                f"检测到系统性风险（{pct:.0%}股票跌>2%），已联动风控引擎"
                             ),
                             "time": current_time,
                             "action": "keep_active",
@@ -272,3 +286,47 @@ class IntradayMonitor:
             return False
 
         return down_count / total > 0.6
+
+    def _get_systemic_risk_stats(self, realtime_data: dict) -> tuple:
+        """
+        获取系统性风险统计信息（跌幅超2%的股票占比和平均跌幅）
+        返回: (pct_down, avg_drop)
+        """
+        if not realtime_data:
+            return (0.0, 0.0)
+
+        down_changes = []
+        total = 0
+        for code, rt in realtime_data.items():
+            prev_close = rt.get("prev_close", 0)
+            price = rt.get("price", 0)
+            if prev_close > 0 and price > 0:
+                total += 1
+                change = (price - prev_close) / prev_close
+                if change < -0.02:
+                    down_changes.append(change)
+
+        if total == 0:
+            return (0.0, 0.0)
+
+        pct_down = len(down_changes) / total
+        avg_drop = sum(down_changes) / len(down_changes) if down_changes else 0.0
+        return (pct_down, avg_drop)
+
+    def _notify_risk_engine(self, risk_event: str, details: dict):
+        """
+        联动风控引擎：将盘中风险事件写入风控状态持久化
+
+        参数:
+            risk_event: 风险事件类型，如 "systemic_risk", "intraday_pause"
+            details: 风险详情 dict
+        """
+        try:
+            # 延迟导入避免循环依赖
+            from risk.risk_control import UnifiedRiskEngine
+            engine = UnifiedRiskEngine()
+            engine.set_intraday_risk_flag(risk_event, details)
+            logger.info(f"[盘中监控] 已联动风控引擎: {risk_event}, 详情: {details}")
+        except Exception as e:
+            logger.error(f"[盘中监控] 联动风控引擎失败({risk_event}): {e}")
+

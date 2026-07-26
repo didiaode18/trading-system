@@ -101,7 +101,8 @@ class MonteCarloStressTest:
 
         for _ in range(self.n_simulations):
             # 随机打乱交易顺序
-            shuffled = self.rng.choice(returns, size=n_trades, replace=True)
+            # FIX: 修复Monte Carlo使用有放回抽样导致压力测试统计失真
+            shuffled = self.rng.permutation(returns)
             
             # 模拟资金曲线
             equity = initial_capital
@@ -149,7 +150,8 @@ class MonteCarloStressTest:
         # ---- 3. 破产概率（资金跌破50%）----
         ruin_count = 0
         for _ in range(self.n_simulations):
-            shuffled = self.rng.choice(returns, size=n_trades, replace=True)
+            # FIX: 修复Monte Carlo使用有放回抽样导致压力测试统计失真
+            shuffled = self.rng.permutation(returns)
             equity = initial_capital
             for r in shuffled:
                 equity *= (1 + r)
