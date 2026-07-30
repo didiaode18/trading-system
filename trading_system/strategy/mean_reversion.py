@@ -45,6 +45,55 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def calc_half_life(prices: pd.Series, lookback: int = 60) -> float:
+    """
+    V9.0 计算Ornstein-Uhlenbeck半衰期（来源: Ernest Chan《Algorithmic Trading》）
+    
+    原理: 对价格序列做AR(1)回归 ΔP = θ*(P_{t-1} - μ) + ε
+    半衰期 = -ln(2) / ln(1 + θ)
+    
+    解释:
+      - 半衰期 < 5天: 回归太快，信号已过期，不适合入场
+      - 半衰期 5~20天: 最佳均值回归窗口（匹配3天-4周持仓周期）
+      - 半衰期 > 20天: 回归太慢，实质是趋势行情，不适合均值回归
+    
+    返回: 半衰期天数（float），计算失败返回-1
+    """
+    if prices is None or len(prices) < max(20, lookback // 3):
+        return -1.0
+    
+    p = prices.tail(lookback).values.astype(np.float64)
+    p = p[~np.isnan(p)]
+    if len(p) < 20:
+        return -1.0
+    
+    # AR(1)回归: P_t = α + β*P_{t-1} + ε
+    # θ = β - 1 (均值回归速度)
+    y = np.diff(p)          # ΔP = P_t - P_{t-1}
+    x = p[:-1]              # P_{t-1}
+    
+    # OLS: y = θ*x + c  →  θ = cov(x,y) / var(x)
+    x_mean = x.mean()
+    x_demean = x - x_mean
+    var_x = np.dot(x_demean, x_demean)
+    if var_x < 1e-10:
+        return -1.0
+    
+    theta = np.dot(x_demean, y - y.mean()) / var_x
+    
+    # θ必须为负才表示均值回归（价格偏离后回归）
+    if theta >= 0:
+        return -1.0  # 无均值回归特性（趋势行情）
+    
+    # 半衰期 = -ln(2) / ln(1 + θ)
+    # 注意: θ∈(-1, 0) 时 ln(1+θ) < 0，半衰期为正
+    if theta <= -1:
+        return 0.5  # 极端回归，半衰期<1天
+    
+    half_life = -np.log(2) / np.log(1 + theta)
+    return max(0.5, half_life)
+
+
 class MeanReversionStrategy:
     """均值回归策略"""
 
@@ -61,6 +110,9 @@ class MeanReversionStrategy:
         self.volume_shrink_ratio = 0.60                  # 缩量标准
         self.volume_expand_ratio = 1.5                   # 放量标准
         self.min_conditions = 3                          # 最少满足条件数
+        # V9.0: 半衰期过滤参数 (Ernest Chan方法)
+        self.halflife_min = 5                            # 半衰期下限(天)
+        self.halflife_max = 20                           # 半衰期上限(天)
 
     def scan_reversion_signals(self, data_dict: dict, market_state: str = "normal",
                                 holdings: dict = None) -> list:
@@ -120,6 +172,15 @@ class MeanReversionStrategy:
         prev = df.iloc[-2] if len(df) > 1 else latest
 
         close = latest["close"]
+
+        # ---- V9.0 半衰期前置过滤 (Ernest Chan) ----
+        # 仅在半衰期∈[5,20]天时启用均值回归信号
+        half_life = calc_half_life(df["close"], lookback=60)
+        if half_life < 0:
+            return None  # 无均值回归特性（趋势行情），跳过
+        if half_life < self.halflife_min or half_life > self.halflife_max:
+            return None  # 半衰期不在最佳窗口，跳过
+
         conditions_met = 0
         reasons = []
 

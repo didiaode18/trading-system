@@ -474,9 +474,9 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     second_resistance = resistances[1][1] if len(resistances) > 1 else price * 1.20
 
     # ---- 买入区间 ----
-    # 理想买点: 回踩第一支撑位附近
+    # P2优化: 买点区间从0.5%扩展到2%，避免过窄导致无法成交
     buy_low = round(first_support * 0.995, 2)
-    buy_high = round(price * 1.005, 2)  # 不超过当前价+0.5%
+    buy_high = round(price * 1.02, 2)  # 不超过当前价+2%（给追入留合理空间）
 
     # 判断买点类型（V2增强: 回踩不破MA20确认 + 放量突破连续2日站稳）
     vol_ma20 = latest.get("vol_ma20", 0)
@@ -525,12 +525,14 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
             entry_type = "当前价附近可建仓"
 
     # ---- 止损价 ----
-    # 取ATR止损和固定8%止损中较高的
+    # P2优化: 止损与config统一，不再硬编码5%上限
     atr_stop = price - 2 * atr
     fixed_stop = price * (1 - STOP_LOSS_PCT)
     support_stop = first_support * 0.98  # 支撑位下方2%
     stop_loss = max(atr_stop, fixed_stop, support_stop)
-    stop_loss = round(min(stop_loss, price * 0.95), 2)  # 止损不超5%以上
+    # 止损不超过STOP_LOSS_PCT+2%（给ATR止损留余量，但不无限远）
+    max_stop_distance = price * (1 - STOP_LOSS_PCT - 0.02)
+    stop_loss = round(max(stop_loss, max_stop_distance), 2)
 
     # ---- 目标价 ----
     target_1 = round(first_resistance, 2)
@@ -744,7 +746,7 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
 # ============================================================
 # 批量推荐：扫描候选池，输出三级股票池
 # ============================================================
-def run_recommendation(candidate_data: list, top_n: int = 8) -> dict:
+def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list = None) -> dict:
     """
     批量运行推荐引擎 V2（三级池分级 + 操盘密码DK信号加分）
 
@@ -754,8 +756,9 @@ def run_recommendation(candidate_data: list, top_n: int = 8) -> dict:
       排除池: 空头趋势、踩雷、基本面差，永久禁止开仓
 
     参数:
-        candidate_data: [{"code", "name", "sector", "type", "df", "realtime_price", "realtime_change"}]
+        candidate_data: [{"code", "name", "sector", "type", "df", "realtime_price", "realtime_change", "fund_data"}]
         top_n: 核心池上限
+        held_sectors: 当前持仓赛道列表，同赛道推荐扣分（避免集中度风险）
 
     返回:
         {"recommended": [...], "watchlist": [...], "excluded": [...], "rejected_count", "total_scanned"}
@@ -828,6 +831,11 @@ def run_recommendation(candidate_data: list, top_n: int = 8) -> dict:
                     plan["caopan_dk"] = dk
             except Exception:
                 pass
+
+        # P0优化: 赛道去重——同赛道已有持仓→评分-15（降低集中度风险）
+        if held_sectors and item.get("sector") in held_sectors:
+            plan["total_score"] = max(0, plan.get("total_score", 0) - 15)
+            plan["sector_overlap_penalty"] = True
 
         results.append(plan)
 

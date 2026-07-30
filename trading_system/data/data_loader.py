@@ -107,12 +107,22 @@ def get_last_update_date(conn: sqlite3.Connection, code: str) -> str:
 _bs_session = {"logged_in": False}
 
 def _bs_login():
-    """确保 baostock 已登录"""
+    """确保 baostock 已登录（含断线重连机制）"""
     if not _bs_session["logged_in"]:
         lg = bs.login()
         if lg.error_code != '0':
             raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
         _bs_session["logged_in"] = True
+
+
+def _bs_reconnect():
+    """FIX: 断线重连 - 长时间运行时baostock可能断开连接，需重置会话状态"""
+    try:
+        bs.logout()
+    except Exception:
+        pass
+    _bs_session["logged_in"] = False
+    _bs_login()
 
 
 def _bs_logout():
@@ -150,6 +160,18 @@ def fetch_stock_daily_baostock(code: str, start_date: str = None,
         frequency="d",
         adjustflag="2"  # 前复权
     )
+
+    # FIX: 会话断开时自动重连重试一次（解决调度器长时间运行后连接失效问题）
+    if rs.error_code != '0' and 'login' in str(rs.error_msg).lower():
+        _bs_reconnect()
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,close,high,low,volume,amount",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2"
+        )
 
     if rs.error_code != '0':
         raise RuntimeError(f"baostock 查询失败 [{code}]: {rs.error_msg}")

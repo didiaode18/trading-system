@@ -427,18 +427,35 @@ class CapitalFlowAnalyzer:
 
     @staticmethod
     def _calc_flow_trend(values: np.ndarray) -> str:
-        """根据近几日数值判断趋势"""
+        """
+        P2优化: 资金流趋势判断（5值线性回归斜率 + 方向一致性）
+        原3值单调性判断噪声大，改为5值窗口+斜率方向+均值符号综合判定
+        """
         if len(values) < 2:
             return "neutral"
-        recent = values[-3:] if len(values) >= 3 else values
-        if all(recent[i] <= recent[i + 1] for i in range(len(recent) - 1)) and recent[-1] > 0:
+        # 取最近5个值（不足则取全部）
+        recent = values[-5:] if len(values) >= 5 else values
+        n = len(recent)
+
+        # 线性回归斜率（最小二乘法）
+        x = np.arange(n, dtype=float)
+        x_mean = x.mean()
+        y_mean = float(np.mean(recent))
+        slope = float(np.sum((x - x_mean) * (recent - y_mean)) / (np.sum((x - x_mean) ** 2) + 1e-10))
+
+        # 方向一致性：最近n个值中递增/递减的比例
+        diffs = np.diff(recent)
+        up_ratio = np.sum(diffs > 0) / len(diffs) if len(diffs) > 0 else 0.5
+
+        # 综合判定
+        avg_val = float(np.mean(recent))
+        if slope > 0 and up_ratio >= 0.6 and avg_val > 0:
             return "increasing"
-        if all(recent[i] >= recent[i + 1] for i in range(len(recent) - 1)) and recent[-1] < 0:
+        if slope < 0 and up_ratio <= 0.4 and avg_val < 0:
             return "decreasing"
-        avg = float(np.mean(recent))
-        if avg > 0:
+        if avg_val > 0:
             return "net_inflow"
-        elif avg < 0:
+        elif avg_val < 0:
             return "net_outflow"
         return "neutral"
 
@@ -563,6 +580,175 @@ class CapitalFlowAnalyzer:
         result["visualization_data"] = {"dates": dates, "bars": bars}
         return result
 
+    def analyze_flow_combined(self, stock_code: str, days: int = 10) -> tuple:
+        """
+        P0优化: 合并四级资金流分析+模式识别+价量背离，一次API请求完成三项分析
+        避免 analyze_multi_level_flow 和 detect_flow_pattern 各自独立调用导致重复请求
+
+        返回: (flow_result, pattern_result, divergence_result)
+        """
+        df = self._fetch_multi_level_flow_df(stock_code, days)
+        if df is None:
+            empty_flow = {
+                "super_large": {"net_inflow": 0, "trend": "neutral"},
+                "large": {"net_inflow": 0, "trend": "neutral"},
+                "medium": {"net_inflow": 0, "trend": "neutral"},
+                "small": {"net_inflow": 0, "trend": "neutral"},
+                "main_force_direction": "neutral",
+                "visualization_data": {"dates": [], "bars": []},
+                "success": False,
+            }
+            empty_pattern = {"pattern": "neutral", "confidence": 0.0, "days": 0, "description": "数据不足"}
+            empty_div = {"type": "none", "confidence": 0.0, "desc": "无明显背离"}
+            return empty_flow, empty_pattern, empty_div
+
+        flow_result = self._analyze_multi_level_from_df(df)
+        pattern_result = self._detect_flow_pattern_from_df(df)
+        divergence_result = self._detect_divergence_from_df(df)
+        return flow_result, pattern_result, divergence_result
+
+    def _analyze_multi_level_from_df(self, df: pd.DataFrame) -> dict:
+        """从已获取的DataFrame执行四级资金流分析（内部方法）"""
+        col_map = {
+            "super_large": self._find_flow_col(df, ["超大单"]),
+            "large": self._find_flow_col(df, ["大单"]),
+            "medium": self._find_flow_col(df, ["中单"]),
+            "small": self._find_flow_col(df, ["小单"]),
+        }
+        matched = {k: v for k, v in col_map.items() if v is not None}
+        if len(matched) < 2:
+            return {
+                "super_large": {"net_inflow": 0, "trend": "neutral"},
+                "large": {"net_inflow": 0, "trend": "neutral"},
+                "medium": {"net_inflow": 0, "trend": "neutral"},
+                "small": {"net_inflow": 0, "trend": "neutral"},
+                "main_force_direction": "neutral",
+                "visualization_data": {"dates": [], "bars": []},
+                "success": False,
+            }
+
+        date_col = self._find_flow_col(df, ["日期", "date", "时间"])
+        dates = [str(v) for v in df[date_col].tolist()] if date_col else [str(i) for i in range(len(df))]
+
+        result = {"success": True}
+        bars = []
+        main_net_total = 0.0
+
+        for level, col_name in matched.items():
+            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+            vals = df[col_name].dropna().values
+            net = round(float(vals[-1]), 2) if len(vals) >= 1 else 0.0
+            trend = self._calc_flow_trend(vals)
+            result[level] = {"net_inflow": net, "trend": trend}
+            if level in ("super_large", "large"):
+                tail_n = min(3, len(vals))
+                main_net_total += float(np.sum(vals[-tail_n:])) if tail_n > 0 else 0
+
+        if main_net_total > 0:
+            result["main_force_direction"] = "buying"
+        elif main_net_total < 0:
+            result["main_force_direction"] = "selling"
+        else:
+            result["main_force_direction"] = "neutral"
+
+        for level in ("super_large", "large", "medium", "small"):
+            if level not in result:
+                result[level] = {"net_inflow": 0, "trend": "neutral"}
+
+        for i, date_str in enumerate(dates):
+            main_val = 0.0
+            for lv in ("super_large", "large"):
+                cn = col_map.get(lv)
+                if cn and i < len(df):
+                    v = pd.to_numeric(df[cn].iloc[i], errors="coerce")
+                    if not pd.isna(v):
+                        main_val += float(v)
+            bars.append({"date": date_str, "type": "main_buy" if main_val >= 0 else "main_sell",
+                         "value": round(main_val, 2), "color": "yellow" if main_val >= 0 else "blue"})
+            retail_val = 0.0
+            for lv in ("medium", "small"):
+                cn = col_map.get(lv)
+                if cn and i < len(df):
+                    v = pd.to_numeric(df[cn].iloc[i], errors="coerce")
+                    if not pd.isna(v):
+                        retail_val += float(v)
+            bars.append({"date": date_str, "type": "retail_buy" if retail_val >= 0 else "retail_sell",
+                         "value": round(retail_val, 2), "color": "green" if retail_val >= 0 else "purple"})
+
+        result["visualization_data"] = {"dates": dates, "bars": bars}
+        return result
+
+    def _detect_flow_pattern_from_df(self, df: pd.DataFrame) -> dict:
+        """从已获取的DataFrame执行模式识别（内部方法）"""
+        empty_pattern = {"pattern": "neutral", "confidence": 0.0, "days": 0, "description": "数据不足"}
+
+        main_col = self._find_flow_col(df, ["主力净流入"])
+        super_col = self._find_flow_col(df, ["超大单"])
+        large_col = self._find_flow_col(df, ["大单"])
+
+        if main_col is None:
+            return empty_pattern
+
+        df[main_col] = pd.to_numeric(df[main_col], errors="coerce")
+        main_vals = df[main_col].dropna().values
+        if len(main_vals) < 3:
+            return empty_pattern
+
+        chg_col = self._find_flow_col(df, ["涨跌幅", "涨幅", "change"])
+        if chg_col is not None:
+            df[chg_col] = pd.to_numeric(df[chg_col], errors="coerce")
+            chg_vals = df[chg_col].dropna().values
+        else:
+            chg_vals = np.array([])
+
+        # 连续吸筹
+        consec_buy = 0
+        for v in reversed(main_vals):
+            if v > 0:
+                consec_buy += 1
+            else:
+                break
+        if consec_buy >= 3:
+            price_flat = True
+            if len(chg_vals) >= consec_buy:
+                if float(np.mean(chg_vals[-consec_buy:])) > 3.0:
+                    price_flat = False
+            if price_flat:
+                return {"pattern": "accumulation", "confidence": round(min(0.5 + consec_buy * 0.1, 0.95), 2),
+                        "days": consec_buy, "description": f"主力连续{consec_buy}日净买入但股价未明显上涨，疑似吸筹"}
+
+        # 集中出货
+        consec_sell = 0
+        for v in reversed(main_vals):
+            if v < 0:
+                consec_sell += 1
+            else:
+                break
+        if consec_sell >= 3:
+            price_flat = True
+            if len(chg_vals) >= consec_sell:
+                if float(np.mean(chg_vals[-consec_sell:])) < -3.0:
+                    price_flat = False
+            if price_flat:
+                return {"pattern": "distribution", "confidence": round(min(0.5 + consec_sell * 0.1, 0.95), 2),
+                        "days": consec_sell, "description": f"主力连续{consec_sell}日净卖出但股价未明显下跌，疑似出货"}
+
+        # 洗盘
+        if super_col is not None and large_col is not None:
+            df[super_col] = pd.to_numeric(df[super_col], errors="coerce")
+            df[large_col] = pd.to_numeric(df[large_col], errors="coerce")
+            super_vals = df[super_col].dropna().values
+            large_vals = df[large_col].dropna().values
+            min_len = min(len(super_vals), len(large_vals), 3)
+            if min_len >= 2:
+                super_buy_days = sum(1 for v in super_vals[-min_len:] if v > 0)
+                large_sell_days = sum(1 for v in large_vals[-min_len:] if v < 0)
+                if super_buy_days >= 2 and large_sell_days >= 2:
+                    return {"pattern": "washout", "confidence": round(min(0.4 + min(super_buy_days, large_sell_days) * 0.15, 0.85), 2),
+                            "days": min_len, "description": f"近{min_len}日超大单买入+大单卖出，疑似对倒洗盘"}
+
+        return {"pattern": "neutral", "confidence": 0.0, "days": 0, "description": "近期资金流无明显模式"}
+
     def detect_flow_pattern(self, stock_code: str, days: int = 10) -> dict:
         """
         资金流模式识别
@@ -676,6 +862,79 @@ class CapitalFlowAnalyzer:
                     }
 
         return {"pattern": "neutral", "confidence": 0.0, "days": 0, "description": "近期资金流无明显模式"}
+
+    def detect_price_volume_divergence(self, stock_code: str, days: int = 10) -> dict:
+        """
+        P1优化: 价量背离检测
+
+        规则:
+        - 顶背离: 价格创新高但主力资金净流出 → 警示信号
+        - 底背离: 价格创新低但主力资金净流入 → 潜在反转
+        - 量价背离: 价格上涨但成交量萎缩 → 上涨动力不足
+
+        返回: {"type": "top"/"bottom"/"volume_weak"/"none", "confidence": 0-1, "desc": str}
+        """
+        df = self._fetch_multi_level_flow_df(stock_code, days)
+        if df is None:
+            return {"type": "none", "confidence": 0.0, "desc": "无明显背离"}
+        return self._detect_divergence_from_df(df)
+
+    def _detect_divergence_from_df(self, df: pd.DataFrame) -> dict:
+        """从已获取的DataFrame执行价量背离检测（内部方法，避免重复API调用）"""
+        empty = {"type": "none", "confidence": 0.0, "desc": "无明显背离"}
+
+        main_col = self._find_flow_col(df, ["主力净流入"])
+        chg_col = self._find_flow_col(df, ["涨跌幅", "涨幅", "change"])
+        close_col = self._find_flow_col(df, ["收盘", "close", "最新价"])
+
+        if main_col is None:
+            return empty
+
+        df[main_col] = pd.to_numeric(df[main_col], errors="coerce")
+        main_vals = df[main_col].dropna().values
+        if len(main_vals) < 3:
+            return empty
+
+        # 获取价格数据
+        prices = None
+        if close_col is not None:
+            df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
+            prices = df[close_col].dropna().values
+        elif chg_col is not None:
+            df[chg_col] = pd.to_numeric(df[chg_col], errors="coerce")
+            chg_vals = df[chg_col].dropna().values
+            # 用涨跌幅累计代替绝对价格
+            prices = np.cumsum(chg_vals) if len(chg_vals) > 0 else None
+
+        if prices is None or len(prices) < 3:
+            return empty
+
+        n = min(len(main_vals), len(prices), 5)
+        recent_prices = prices[-n:]
+        recent_main = main_vals[-n:]
+
+        # 顶背离: 价格上行 + 主力净流出
+        price_rising = recent_prices[-1] > recent_prices[0]
+        main_outflow = np.sum(recent_main) < 0
+        if price_rising and main_outflow:
+            # 计算背离强度: 价格涨幅越大 + 流出越多 → 置信度越高
+            price_chg_pct = (recent_prices[-1] - recent_prices[0]) / (abs(recent_prices[0]) + 1e-8)
+            flow_intensity = abs(np.sum(recent_main)) / (abs(np.mean(np.abs(recent_main))) * n + 1e-8)
+            conf = min(0.5 + price_chg_pct * 5 + flow_intensity * 0.1, 0.9)
+            return {"type": "top", "confidence": round(conf, 2),
+                    "desc": f"近{n}日价格上涨但主力净流出，警惕顶背离"}
+
+        # 底背离: 价格下行 + 主力净流入
+        price_falling = recent_prices[-1] < recent_prices[0]
+        main_inflow = np.sum(recent_main) > 0
+        if price_falling and main_inflow:
+            price_chg_pct = (recent_prices[0] - recent_prices[-1]) / (abs(recent_prices[0]) + 1e-8)
+            flow_intensity = abs(np.sum(recent_main)) / (abs(np.mean(np.abs(recent_main))) * n + 1e-8)
+            conf = min(0.5 + price_chg_pct * 5 + flow_intensity * 0.1, 0.9)
+            return {"type": "bottom", "confidence": round(conf, 2),
+                    "desc": f"近{n}日价格下跌但主力净流入，潜在底背离"}
+
+        return empty
 
     def get_enhanced_flow_score(self, stock_code: str) -> float:
         """

@@ -29,10 +29,16 @@ import datetime
 import logging
 import argparse
 import subprocess
+import time as _time
 
 # 确保项目根目录在sys.path中
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
+# FIX P1-1: 将trading-system根目录也加入sys.path，支持子模块中 "from trading_system.xxx" 的绝对导入
+# （intraday_alert.py等使用 trading_system.strategy.xxx 路径，缺少此配置导致盘中异动预警持续报错）
+_PROJECT_BASE = os.path.dirname(PROJECT_ROOT)
+if _PROJECT_BASE not in sys.path:
+    sys.path.insert(0, _PROJECT_BASE)
 
 import config
 
@@ -43,6 +49,75 @@ except ImportError:
     HAS_SCHEDULE = False
 
 logger = logging.getLogger("scheduler")
+
+# ============================================================
+# P0: 心跳 + 单实例锁（防止调度器静默失效）
+# ============================================================
+
+HEARTBEAT_FILE = os.path.join(PROJECT_ROOT, "output", ".scheduler_heartbeat")
+PID_FILE = os.path.join(PROJECT_ROOT, "output", ".scheduler.pid")
+HEARTBEAT_STALE_SECONDS = 320  # 心跳超过320秒视为死亡（需>夜间sleep(300)，避免误判）
+
+
+def _write_heartbeat():
+    """写入心跳文件（当前时间戳 + PID）"""
+    try:
+        os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+        with open(HEARTBEAT_FILE, "w") as f:
+            f.write(f"{datetime.datetime.now().isoformat()}|{os.getpid()}")
+    except Exception:
+        pass
+
+
+def is_scheduler_alive() -> bool:
+    """检查调度器主循环是否存活（心跳文件是否在3分钟内更新）
+
+    用途: Windows任务计划CLI模式执行前调用，若主循环存活则跳过，避免双重执行。
+    """
+    try:
+        if not os.path.exists(HEARTBEAT_FILE):
+            return False
+        with open(HEARTBEAT_FILE, "r") as f:
+            content = f.read().strip()
+        ts_str = content.split("|")[0]
+        last_beat = datetime.datetime.fromisoformat(ts_str)
+        elapsed = (datetime.datetime.now() - last_beat).total_seconds()
+        return elapsed < HEARTBEAT_STALE_SECONDS
+    except Exception:
+        return False
+
+
+def _acquire_lock() -> bool:
+    """获取单实例锁（PID文件）。若已有存活实例则返回False。"""
+    try:
+        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            # 检查进程是否存活
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, old_pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                kernel32.CloseHandle(handle)
+                # 进程存活，再检查心跳
+                if is_scheduler_alive():
+                    return False  # 已有存活实例
+        # 写入当前PID
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception:
+        return True  # 异常时不阻塞启动
+
+
+def _release_lock():
+    """释放单实例锁"""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -169,8 +244,392 @@ def run_daily_task():
             pass
 
 
+def run_holdings_report_task():
+    """综合分析报告（16:15运行）—— 调用 generate_holdings_report.py 生成技术面+条件单报告
+
+    与盘后综合日报(15:30 main.py Step15 [盘后日报])的区别:
+      - [盘后日报]: 15步流程综合摘要(信号/ML/IC/资金/风控/展望)
+      - [综合分析报告]: 逐只持仓深度技术诊断(评分/趋势/条件单/龙虎榜/融资融券/资金流)
+    两者内容互补，不重复。
+    """
+    today = datetime.date.today()
+
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过综合分析报告")
+        return
+
+    logger.info(f"[{today}] 综合分析报告（16:15）...")
+
+    try:
+        # generate_holdings_report.py 是纯脚本（无函数入口），通过subprocess调用
+        PROJECT_BASE = os.path.dirname(PROJECT_ROOT)  # trading-system根目录
+        script_path = os.path.join(PROJECT_BASE, "generate_holdings_report.py")
+
+        if not os.path.exists(script_path):
+            logger.error(f"[{today}] 脚本不存在: {script_path}")
+            return
+
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", script_path],
+            cwd=PROJECT_BASE,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5分钟超时
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        if result.returncode == 0:
+            # 检查是否发送成功
+            if "✅ 发送成功" in (result.stdout or ""):
+                logger.info(f"[{today}] 综合分析报告发送成功")
+            else:
+                logger.warning(f"[{today}] 综合分析报告执行完成但未确认发送")
+            # 打印最后几行输出
+            output_lines = (result.stdout or "").strip().split("\n")
+            for line in output_lines[-3:]:
+                logger.info(f"  {line}")
+        else:
+            logger.error(f"[{today}] 综合分析报告失败(rc={result.returncode})")
+            if result.stderr:
+                logger.error(f"  错误: {result.stderr[-300:]}")
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"[{today}] 综合分析报告超时(>300秒)")
+    except Exception as e:
+        logger.error(f"[{today}] 综合分析报告异常: {e}", exc_info=True)
+
+    # FIX B2: 盘后仓位超限强制减仓单生成（解决“风控只拦新买不强制减仓”的P0缺陷）
+    try:
+        _generate_overlimit_reduce_orders()
+    except Exception as e:
+        logger.warning(f"[{today}] 仓位超限减仓单生成失败: {e}")
+    
+    # FIX P1: MarketRegime状态缓存（供风控引擎读取动态仓位上限）
+    try:
+        _cache_market_regime_state()
+    except Exception as e:
+        logger.warning(f"[{today}] MarketRegime缓存失败: {e}")
+
+
+def _cache_market_regime_state():
+    """FIX P1: 检测大盘状态并缓存到JSON，供UnifiedRiskEngine读取动态仓位上限
+
+    输出: trading_system/output/market_regime_state.json
+    消费方: risk_control.py RiskStateManager.get_market_position_cap()
+    """
+    import json as _json
+    try:
+        from strategy.market_regime import MarketRegimeDetector
+        from data.data_loader import init_db, load_daily_data
+
+        detector = MarketRegimeDetector()
+
+        # 加载沪深300日线作为基准
+        # FIX P1-2: data_loader无DataLoader类，改用模块级函数
+        benchmark_df = None
+        try:
+            _conn = init_db()
+            benchmark_df = load_daily_data("000300", _conn, days=120)
+            if benchmark_df is None or benchmark_df.empty or len(benchmark_df) < 60:
+                benchmark_df = load_daily_data("sh000300", _conn, days=120)
+            _conn.close()
+        except Exception:
+            pass
+
+        if benchmark_df is None or len(benchmark_df) < 60:
+            logger.info("  [MarketRegime] 基准数据不足，跳过缓存")
+            return
+
+        result = detector.detect(benchmark_df)
+
+        # 写入缓存文件
+        output_dir = os.path.join(PROJECT_ROOT, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        cache_file = os.path.join(output_dir, "market_regime_state.json")
+        with open(cache_file, "w", encoding="utf-8") as f:
+            _json.dump(result, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"  [MarketRegime] {result.get('detail', '')} → 已缓存")
+
+    except Exception as e:
+        logger.warning(f"  [MarketRegime] 检测失败: {e}")
+
+
+def _generate_overlimit_reduce_orders():
+    """FIX B2: 检查持仓集中度，对超限标的自动生成次日减仓执行单
+
+    规则:
+      - 个股 > 15% → 生成减仓至15%的卖出单
+      - ETF > 20% → 生成减仓至20%的卖出单
+      - 总仓位 > 90% → 全部持仓标记预警（不自动卖，仅日志）
+    输出: 追加到次日orders JSON，QMT执行器次日开盘执行
+    """
+    import json as _json
+
+    holdings_file = config.get_holdings_file()
+    if not os.path.exists(holdings_file):
+        return
+    with open(holdings_file, "r", encoding="utf-8") as f:
+        holdings = _json.load(f)
+
+    total_capital = getattr(config, 'TOTAL_CAPITAL', 1000000)
+    if total_capital <= 0:
+        return
+
+    MAX_STOCK_RATIO = 0.15
+    MAX_ETF_RATIO = 0.20
+    reduce_orders = []
+
+    for code, h in holdings.items():
+        shares = h.get("shares", 0)
+        buy_price = h.get("buy_price", 0)
+        if shares <= 0 or buy_price <= 0:
+            continue
+        market_value = shares * buy_price  # 用成本价估算（保守）
+        ratio = market_value / total_capital
+
+        is_etf = code.startswith("5") or code.startswith("15")
+        max_ratio = MAX_ETF_RATIO if is_etf else MAX_STOCK_RATIO
+
+        if ratio > max_ratio:
+            # 计算需减仓股数（减到上限，取整百）
+            target_value = total_capital * max_ratio
+            excess_value = market_value - target_value
+            reduce_shares = int(excess_value / buy_price / 100) * 100
+            if reduce_shares < 100:
+                continue
+            # 触发价: 用成本价×98%作为保护性触发（次日开盘若低于此价则执行）
+            trigger_price = round(buy_price * 0.98, 2)
+            reduce_orders.append({
+                "order_id": f"REDUCE_{code}",
+                "证券代码": code,
+                "证券名称": h.get("name", code),
+                "方向": "卖出",
+                "触发价": trigger_price,
+                "数量": reduce_shares,
+                "类型": "定价卖出",
+                "有效期": "1个交易日",
+                "触发时间": "09:30",
+                "优先级": "★★★必挂",
+                "说明": f"[仓位超限强制减仓] 当前占比{ratio*100:.1f}% > 上限{max_ratio*100:.0f}%, 减仓{reduce_shares}股至{max_ratio*100:.0f}%",
+            })
+            logger.warning(f"  [仓位超限] {h.get('name', code)} 占比{ratio*100:.1f}% > {max_ratio*100:.0f}% → 次日减仓{reduce_shares}股")
+
+    if not reduce_orders:
+        return
+
+    # 写入次日orders文件
+    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+    date_str = tomorrow.strftime("%Y%m%d")
+    output_dir = config.OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, f"orders_{date_str}.json")
+
+    # 追加到已有文件
+    existing_orders = []
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                existing_data = _json.load(f)
+            existing_orders = existing_data.get("orders", [])
+        except Exception:
+            pass
+
+    orders_json = {
+        "date": tomorrow.strftime("%Y-%m-%d"),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "overlimit_auto_reduce",
+        "total_capital": total_capital,
+        "max_daily_trades": 10,
+        "orders": existing_orders + reduce_orders,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        _json.dump(orders_json, f, ensure_ascii=False, indent=2)
+    logger.info(f"  [仓位超限] 强制减仓单已生成: {len(reduce_orders)}条 → {json_path}")
+
+
+# ============================================================
+# V9.0 P0-3: 集合竞价分析（09:25运行）
+# ============================================================
+
+def run_auction_analysis():
+    """V9.0 集合竞价分析（09:25运行）
+
+    竞价结束后获取持仓股开盘价/竞价量，判定:
+      - 高开>3% + 量能不足 → 警惕出货
+      - 低开<-2% + 放量 → 恐慌抛售预警
+      - 高开>5% → 紧急预警
+      - 低开<-3% → 紧急预警(开盘即亏损扩大)
+    """
+    today = datetime.date.today()
+    if not is_trading_day(today):
+        return
+
+    auction_cfg = getattr(config, 'AUCTION_CONFIG', {})
+    if not auction_cfg.get("enabled", True):
+        return
+
+    logger.info(f"[{today}] V9.0 集合竞价分析...")
+
+    try:
+        import json as _json
+        from data.realtime import fetch_realtime_batch
+
+        # 加载持仓
+        holdings_file = config.get_holdings_file()
+        holdings = {}
+        if os.path.exists(holdings_file):
+            with open(holdings_file, "r", encoding="utf-8") as f:
+                holdings = _json.load(f)
+        if not holdings:
+            return
+
+        codes = list(holdings.keys())
+        quotes = fetch_realtime_batch(codes)
+        if not quotes:
+            logger.warning(f"[{today}] 竞价分析: 行情获取失败")
+            return
+
+        alerts = []
+        high_warn = auction_cfg.get("high_open_warn_pct", 0.03)
+        high_extreme = auction_cfg.get("high_open_extreme_pct", 0.05)
+        low_warn = auction_cfg.get("low_open_warn_pct", -0.02)
+        low_extreme = auction_cfg.get("low_open_extreme_pct", -0.03)
+        vol_surge = auction_cfg.get("volume_surge_ratio", 3.0)
+        vol_weak = auction_cfg.get("volume_weak_ratio", 0.5)
+
+        for code, quote in quotes.items():
+            if code not in holdings:
+                continue
+            holding = holdings[code]
+            name = holding.get("name", quote.get("name", code))
+            open_price = quote.get("open", 0)
+            prev_close = quote.get("prev_close", 0)
+            volume = quote.get("volume", 0)  # 竞价量(手)
+            # FIX: avg_volume fallback - holdings中无此字段时从 volume 自身推断
+            avg_volume = holding.get("avg_volume", 0)
+
+            if open_price <= 0 or prev_close <= 0:
+                continue
+
+            open_gap = (open_price - prev_close) / prev_close
+            vol_ratio = volume / avg_volume if avg_volume > 0 else 1.0
+
+            # 高开 extreme
+            if open_gap >= high_extreme:
+                alerts.append({
+                    "level": "critical",
+                    "code": code, "name": name,
+                    "message": f"🚨 {name}({code}) 竞价高开+{open_gap*100:.1f}%! "
+                              f"极端高开，警惕出货/利好兑现 | 建议开盘减仓",
+                })
+            # 高开 + 量能不足
+            elif open_gap >= high_warn and vol_ratio < vol_weak:
+                alerts.append({
+                    "level": "warning",
+                    "code": code, "name": name,
+                    "message": f"⚠️ {name}({code}) 高开+{open_gap*100:.1f}%但量能不足"
+                              f"(量比{vol_ratio:.1f}) | 高开无力，警惕回落",
+                })
+            # 高开 + 放量（利好）
+            elif open_gap >= high_warn and vol_ratio > vol_surge:
+                alerts.append({
+                    "level": "info",
+                    "code": code, "name": name,
+                    "message": f"🟢 {name}({code}) 高开+{open_gap*100:.1f}% + 放量"
+                              f"(量比{vol_ratio:.1f}) | 主力有备而来，关注开盘后确认",
+                })
+            # 低开 extreme
+            elif open_gap <= low_extreme:
+                loss_pct = (open_price / holding.get("buy_price", open_price) - 1) * 100
+                alerts.append({
+                    "level": "critical",
+                    "code": code, "name": name,
+                    "message": f"🚨 {name}({code}) 竞价低开{open_gap*100:.1f}%! "
+                              f"开盘即亏损扩大(浮盈{loss_pct:.1f}%) | 建议开盘立即评估止损",
+                })
+            # 低开 + 放量
+            elif open_gap <= low_warn:
+                alerts.append({
+                    "level": "warning",
+                    "code": code, "name": name,
+                    "message": f"📉 {name}({code}) 竞价低开{open_gap*100:.1f}%"
+                              f"{' + 放量' if vol_ratio > vol_surge else ''} | "
+                              f"恐慌情绪，注意开盘后走势",
+                })
+
+        # 发送预警
+        if alerts:
+            logger.info(f"[{today}] 竞价分析: {len(alerts)}条预警")
+            for a in alerts:
+                logger.warning(f"  [竞价-{a['level']}] {a['message']}")
+
+            # 发邮件（仅critical或配置允许）
+            critical_alerts = [a for a in alerts if a["level"] == "critical"]
+            if critical_alerts and auction_cfg.get("alert_email", True):
+                try:
+                    from notify.email_notify import send_email
+                    subject = f"[竞价预警] {today} | {len(critical_alerts)}只持仓异常"
+                    html = "<div style='font-family:Microsoft YaHei;padding:20px'>"
+                    html += "<h2 style='color:#FF4D4F'>🚨 集合竞价预警</h2>"
+                    for a in alerts:
+                        color = "#FF4D4F" if a["level"] == "critical" else "#FA8C16"
+                        html += f"<p style='color:{color};font-size:14px'>{a['message']}</p>"
+                    html += "</div>"
+                    send_email(subject, html)
+                except Exception as e:
+                    logger.error(f"竞价预警邮件发送失败: {e}")
+        else:
+            logger.info(f"[{today}] 竞价分析: 持仓股开盘正常，无异常")
+
+    except Exception as e:
+        logger.error(f"[{today}] 竞价分析异常: {e}", exc_info=True)
+
+
+# ============================================================
+# V9.0 P2-1: 竞价轨迹采集（09:15启动后台线程）
+# ============================================================
+
+def run_auction_tracking_task():
+    """V9.0 竞价轨迹采集（09:15启动）
+
+    在后台线程中运行，09:15-09:25每30秒采样一次竞价价格/量，
+    识别轨迹形态（诱多/真实需求/抢筹），结果写入日志。
+    """
+    import threading
+
+    today = datetime.date.today()
+    if not is_trading_day(today):
+        return
+
+    track_cfg = getattr(config, 'AUCTION_TRACK_CONFIG', {})
+    if not track_cfg.get("enabled", True):
+        return
+
+    def _tracking_worker():
+        try:
+            from strategy.auction_monitor import run_auction_tracking
+            logger.info(f"[{today}] 竞价轨迹采集启动 (09:15-09:25)...")
+            result = run_auction_tracking()
+            if result:
+                logger.info(f"[{today}] 竞价轨迹采集完成: {len(result)}只股票")
+                for code, info in result.items():
+                    pattern = info.get("pattern", "unknown")
+                    label = info.get("label", "")
+                    logger.info(f"  {code}: {pattern} ({label})")
+            else:
+                logger.info(f"[{today}] 竞价轨迹采集: 无持仓或无数据")
+        except Exception as e:
+            logger.error(f"[{today}] 竞价轨迹采集异常: {e}", exc_info=True)
+
+    t = threading.Thread(target=_tracking_worker, name="AuctionTracking", daemon=True)
+    t.start()
+    logger.info(f"[{today}] 竞价轨迹采集线程已启动")
+
+
 def run_morning_screener():
-    """竞价后选股报告（09:25运行）—— 集合竞价结束后发送前瞻性选股，盘中可操作"""
+    """竞价后选股报告（09:25运行）—— 复用report_dispatcher.run_canslim()统一入口"""
     today = datetime.date.today()
 
     if not is_trading_day(today):
@@ -180,43 +639,16 @@ def run_morning_screener():
     logger.info(f"[{today}] 竞价后选股（09:25）...")
 
     try:
-        from data.data_loader import init_db, load_daily_data
-        from strategy.trend_strategy import compute_indicators
-        from strategy.stock_screener import run_stock_screener, send_screener_email
-        import json
-
-        conn = init_db()
-        # 加载数据（用前一日收盘数据 + 技术指标）
-        data_dict = {}
-        # 加载股票池 + 行业候选池的所有股票
-        all_codes = set(config.STOCK_POOL.keys())
-        sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
-        for sector_info in sector_candidates.values():
-            all_codes.update(sector_info.get("stocks", {}).keys())
-        all_codes.add(config.BENCHMARK_INDEX)  # 沉深300指数
-
-        for code in all_codes:
-            df = load_daily_data(code, conn, days=120)
-            if not df.empty and len(df) >= config.MA_SHORT:
-                df = compute_indicators(df)
-                data_dict[code] = df
-
-        # 加载持仓
-        holdings_file = config.get_holdings_file()
-        holdings = {}
-        if os.path.exists(holdings_file):
-            with open(holdings_file, "r", encoding="utf-8") as f:
-                holdings = json.load(f)
-
-        # 运行选股引擎（前瞻性模式）
-        result = run_stock_screener(data_dict, holdings)
-
-        # 发送选股邮件
-        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            send_screener_email(result)
+        # 统一入口：手动触发和定时触发调用同一函数，避免逻辑分叉
+        PROJECT_BASE = os.path.dirname(PROJECT_ROOT)  # trading-system根目录
+        if PROJECT_BASE not in sys.path:
+            sys.path.insert(0, PROJECT_BASE)
+        from report_dispatcher import run_canslim
+        result = run_canslim()
+        if result:
             logger.info(f"[{today}] 竞价选股报告发送成功 ({result['qualified_count']}只入选)")
-
-        conn.close()
+        else:
+            logger.warning(f"[{today}] 竞价选股未返回结果")
     except Exception as e:
         logger.error(f"[{today}] 竞价选股失败: {e}", exc_info=True)
 
@@ -380,6 +812,13 @@ def run_morning_reminder():
         logger.info(f"[{today}] 盘前条件单提醒发送成功"
                    f"（持仓{len(holdings)}只 + 买入推荐，共{len(signals)}条信号）")
 
+        # FIX: 同步生成QMT执行JSON，消除定时条件单与QMT执行器的断链
+        try:
+            from output.eastmoney_orders import _save_qmt_orders_json
+            _save_qmt_orders_json(signals, holdings, data_dict)
+        except Exception as e:
+            logger.warning(f"  QMT JSON生成失败(不影响邮件): {e}")
+
         conn.close()
     except Exception as e:
         logger.error(f"[{today}] 盘前提醒失败: {e}", exc_info=True)
@@ -453,9 +892,8 @@ def run_forecast_morning():
 
 
 def run_forecast_afternoon():
-    """盘后趋势预测（15:35）—— 已合并到盘后综合日报，此函数保留但不再单独发邮件"""
-    # V9.0报告重构: 盘后预测已合并到 main.py Step 14 -> 综合日报“明日展望”板块
-    logger.info("[盘后预测] 已合并到盘后综合日报，跳过独立发送")
+    """DEPRECATED: 盘后趋势预测已合并到盘后综合日报，本函数保留仅为CLI兼容"""
+    logger.info("[DEPRECATED] 盘后预测已合并到盘后综合日报(15:30)，无需独立运行")
     return
 
 
@@ -972,9 +1410,23 @@ def _run_monthly_walk_forward():
     today = datetime.date.today()
     if today.day != 1 and not getattr(_run_monthly_walk_forward, '__skip_day_check__', False):
         return
+    # FIX: 每月1日若逢周末/节假日则跳过
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过Walk-Forward验证")
+        return
 
     logger.info(f"[{today}] 🔄 开始月度Walk-Forward验证...")
     start_time = datetime.datetime.now()
+
+    # FIX P0: 每月1日重置月度回撤基准（与 risk_control.py 第6.5关联动）
+    try:
+        from risk.risk_control import RiskStateManager
+        _state_mgr = RiskStateManager()
+        _state_mgr.state["monthly_start_capital"] = getattr(config, 'TOTAL_CAPITAL', 731455)
+        _state_mgr.save()
+        logger.info(f"  [月度重置] monthly_start_capital = {config.TOTAL_CAPITAL:,.2f}")
+    except Exception as e:
+        logger.warning(f"  月度回撤基准重置失败: {e}")
 
     try:
         from data.data_loader import init_db, load_daily_data
@@ -1169,6 +1621,346 @@ def _force_walk_forward():
 _monitor_thread = None
 _monitor_instance = None
 
+# V4.0: 统一盘中预警冷却记录 {stock_code: last_send_time}
+_alert_cooldown = {}
+_ALERT_COOLDOWN_MINUTES = 30  # 同一股票30分钟内不重复发送
+
+
+def _generate_intraday_stop_orders(alerts: list, holdings_data: dict):
+    """FIX B1: 将止损类盘中预警自动转化为QMT执行JSON
+
+    仅对以下规则触发的预警生成卖出执行单:
+      - 止损线跌破 / 生命线跌破 / 单日暴跌 / 趋势降级
+    生成的JSON追加到当日orders文件，QMT执行器(09:25启动)会读取并执行。
+    """
+    import json as _json
+
+    STOP_RULES = ("止损", "跌破", "暴跌", "趋势降级", "清仓", "stop_loss")
+    stop_alerts = [
+        a for a in alerts
+        if any(kw in a.get("rule_name", "") or kw in a.get("msg", "") for kw in STOP_RULES)
+        and a.get("code") in holdings_data
+        and holdings_data[a["code"]].get("shares", 0) > 0
+    ]
+    if not stop_alerts:
+        return
+
+    today = datetime.date.today()
+    date_str = today.strftime("%Y%m%d")
+    output_dir = config.OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, f"orders_{date_str}.json")
+
+    # 读取已有orders文件（避免覆盖盘前生成的条件单）
+    existing_orders = []
+    existing_codes = set()
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                existing_data = _json.load(f)
+            existing_orders = existing_data.get("orders", [])
+            existing_codes = {o.get("证券代码", "") for o in existing_orders if o.get("方向") == "卖出"}
+        except Exception:
+            pass
+
+    new_orders = []
+    for a in stop_alerts:
+        code = a["code"]
+        if code in existing_codes:
+            continue  # 已有卖出单，不重复生成
+        h = holdings_data[code]
+        shares = h.get("shares", 0)
+        stop_loss = h.get("stop_loss", 0)
+        name = h.get("name", a.get("name", code))
+        # 触发价: 使用holdings中预设的stop_loss，若无则用现价×97%
+        trigger_price = stop_loss if stop_loss > 0 else 0
+        new_orders.append({
+            "order_id": f"ALERT_{date_str}_{code}",
+            "证券代码": code,
+            "证券名称": name,
+            "方向": "卖出",
+            "触发价": trigger_price,
+            "数量": shares,
+            "类型": "定价卖出",
+            "有效期": "1个交易日",
+            "触发时间": "盘中实时",
+            "优先级": "★★★必挂",
+            "说明": f"[盘中预警自动止损] {a.get('rule_name', '')}: {a.get('msg', '')}",
+        })
+        existing_codes.add(code)
+
+    if not new_orders:
+        return
+
+    orders_json = {
+        "date": today.strftime("%Y-%m-%d"),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "intraday_alert_auto_stop",
+        "total_capital": getattr(config, 'TOTAL_CAPITAL', 1000000),
+        "max_daily_trades": 10,
+        "orders": existing_orders + new_orders,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        _json.dump(orders_json, f, ensure_ascii=False, indent=2)
+    logger.info(f"  [统一预警] 🔴 自动止损执行JSON已生成: {len(new_orders)}条 → {json_path}")
+
+
+# V8.0: 分级变频门控（P0-2）
+_last_intraday_alert_time = None  # 上次实际执行时间
+
+
+def _gated_intraday_alert():
+    """V8.0 分级变频门控：根据监控级别决定是否实际执行统一预警扫描
+
+    级别对应频率:
+      - normal:    10分钟/次
+      - warning:    3分钟/次
+      - emergency:  1分钟/次
+    """
+    global _last_intraday_alert_time
+
+    esc_cfg = getattr(config, 'INTRADAY_ESCALATION_CONFIG', {})
+    normal_interval = esc_cfg.get('normal_interval_min', 10)
+    warning_interval = esc_cfg.get('warning_interval_min', 3)
+    emergency_interval = esc_cfg.get('emergency_interval_min', 1)
+
+    # 获取当前监控级别（从IntradayMonitor实例读取）
+    current_level = "normal"
+    if _monitor_instance and hasattr(_monitor_instance, 'get_alert_level'):
+        current_level = _monitor_instance.get_alert_level()
+
+    # 根据级别确定当前应执行的间隔
+    interval_map = {
+        "normal": normal_interval,
+        "warning": warning_interval,
+        "emergency": emergency_interval,
+    }
+    required_interval = interval_map.get(current_level, normal_interval)
+
+    # 检查距离上次执行是否已足够
+    now = datetime.datetime.now()
+    if _last_intraday_alert_time is not None:
+        elapsed_min = (now - _last_intraday_alert_time).total_seconds() / 60
+        if elapsed_min < required_interval:
+            return  # 未到间隔，跳过
+
+    # 执行实际扫描
+    _last_intraday_alert_time = now
+    if current_level != "normal":
+        logger.info(f"[变频监控] 级别={current_level}, 间隔={required_interval}min, 执行扫描")
+    run_unified_intraday_alert()
+
+
+def run_unified_intraday_alert():
+    """V4.0 统一盘中预警（合并原异动预警+决策报告+深度预警，每10分钟一次）
+
+    设计原则:
+      - 三源合一: 异动预警(intraday_alert) + 决策报告(intraday_decision) + 深度预警(alert_engine)
+      - 去重冷却: 同一股票30分钟内只发一次邮件
+      - 仅紧急发送: urgency_score>=70 或 level=critical/high 才触发邮件
+      - 决策报告不再独立发邮件，仅记录日志供盘后回溯
+    """
+    today = datetime.date.today()
+
+    if not is_trading_day(today):
+        return
+
+    now = datetime.datetime.now()
+    if now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 15:
+        return
+    # 午休跳过
+    if now.hour == 12 or (now.hour == 11 and now.minute > 30):
+        return
+
+    logger.info(f"[{today}] 统一盘中预警扫描 ({now.strftime('%H:%M')})...")
+
+    # ---- 源1: 持仓深度预警（alert_engine 11大规则）----
+    urgent_alerts = []
+    try:
+        import json as _json
+        from notify.alert_engine import AlertEngine, send_alert_email, _fetch_and_analyze
+        holdings_data = {}
+        try:
+            with open(config.HOLDINGS_FILE, "r", encoding="utf-8") as f:
+                holdings_data = _json.load(f)
+        except Exception:
+            pass
+
+        # FIX: 将股票池(core_pool+watch_pool)纳入盘中监控，消除选股结果与盘中预警的盲区
+        try:
+            pool_file = os.path.join(config.PROJECT_ROOT, "stock_pool.json")
+            if os.path.exists(pool_file):
+                with open(pool_file, "r", encoding="utf-8") as pf:
+                    pool_data = _json.load(pf)
+                for pool_key in ("core_pool", "watch_pool"):
+                    for code, info in pool_data.get(pool_key, {}).items():
+                        if code not in holdings_data:
+                            # 股票池标的以零仓位加入监控（触发DK/均线/涨跌停等技术规则）
+                            holdings_data[code] = {
+                                "name": info.get("名称", code),
+                                "shares": 0,
+                                "buy_price": 0,
+                                "stop_loss": 0,
+                                "sector": info.get("赛道", ""),
+                            }
+        except Exception:
+            pass
+
+        if holdings_data:
+            engine = AlertEngine(holdings=holdings_data)
+            results = _fetch_and_analyze(holdings_data)
+            if results:
+                triggered = engine.check_alerts(results)
+                if triggered:
+                    critical = [a for a in triggered if a.get("level") in ("critical", "high")]
+                    logger.info(f"  [深度预警] 触发{len(triggered)}条(critical/high: {len(critical)}条)")
+                    urgent_alerts.extend(critical)
+    except Exception as e:
+        logger.warning(f"  [深度预警] 异常: {e}")
+
+    # ---- 源2: 盘中异动预警（准涨停/突破/联动）----
+    try:
+        from strategy.intraday_alert import run_intraday_alert
+        result = run_intraday_alert(send_email=False)  # V4.0: 不再独立发邮件
+        if result.get("success"):
+            n_zt = len(result.get('near_zt_stocks', []))
+            n_break = len(result.get('breakout_stocks', []))
+            n_cascade = len(result.get('sector_cascade', []))
+            n_gene = len(result.get('zt_gene_alerts', []))
+            if n_zt + n_break + n_cascade + n_gene > 0:
+                logger.info(f"  [异动预警] 准涨停{n_zt} 突破{n_break} 联动{n_cascade} 基因{n_gene}")
+            # 将准涨停/突破转化为urgent_alerts格式（仅持仓相关的）
+            for stock in result.get('near_zt_stocks', []):
+                urgent_alerts.append({
+                    "level": "high", "name": stock.get("name", ""),
+                    "code": stock.get("code", ""), "urgency_score": 75,
+                    "msg": f"准涨停: {stock.get('reason', '')}",
+                    "rule_name": "盘中异动-准涨停", "icon": "🚀",
+                })
+    except Exception as e:
+        logger.warning(f"  [异动预警] 异常: {e}")
+
+    # ---- 源3: 盘中决策报告（仅日志，不发邮件）----
+    try:
+        from strategy.intraday_decision import run_intraday_decision
+        result = run_intraday_decision(send_email_flag=False)  # V4.0: 不再独立发邮件
+        if result.get("success"):
+            decisions = result.get("decisions", [])
+            danger = sum(1 for d in decisions if d.get("score", 0) <= -3)
+            locked = sum(1 for d in decisions if d.get("add_locked"))
+            if danger > 0 or locked > 0:
+                logger.info(f"  [决策报告] {len(decisions)}只标的, 风险{danger}只, 加仓锁{locked}只")
+            # 将紧急卖出建议转化为urgent_alerts
+            for d in decisions:
+                if d.get("score", 0) <= -3:
+                    urgent_alerts.append({
+                        "level": "high", "name": d.get("name", ""),
+                        "code": d.get("code", ""), "urgency_score": 72,
+                        "msg": f"紧急卖出: {d.get('action', '')}",
+                        "rule_name": "盘中决策-紧急卖出", "icon": "🔴",
+                    })
+    except Exception as e:
+        logger.warning(f"  [决策报告] 异常: {e}")
+
+    # ---- 去重 + 冷却过滤 ----
+    if not urgent_alerts:
+        return
+
+    # V3.0: 为所有预警附加holdings_info（供邮件过滤shares>0）
+    for a in urgent_alerts:
+        if "holdings_info" not in a:
+            code = a.get("code", "")
+            info = holdings_data.get(code, {})
+            buy_price = info.get("buy_price", 0) or info.get("cost", 0)
+            cur_price = info.get("current_price", 0)
+            a["holdings_info"] = {
+                "buy_price": buy_price,
+                "current_price": cur_price,
+                "stop_loss": info.get("stop_loss", 0),
+                "shares": info.get("shares", 0),
+                "pnl_pct": round((cur_price - buy_price) / buy_price * 100, 1) if buy_price > 0 and cur_price > 0 else 0,
+            }
+
+    # 按(code)去重 — V3.0同标的只保留最高紧急度
+    by_code = {}
+    for a in urgent_alerts:
+        code = a.get("code", "")
+        if code not in by_code or a.get("urgency_score", 0) > by_code[code].get("urgency_score", 0):
+            by_code[code] = a
+    deduped = list(by_code.values())
+
+    # 30分钟冷却过滤
+    filtered = []
+    for a in deduped:
+        code = a.get("code", "")
+        last_time = _alert_cooldown.get(code)
+        if last_time and (now - last_time).total_seconds() < _ALERT_COOLDOWN_MINUTES * 60:
+            continue  # 冷却中，跳过
+        filtered.append(a)
+
+    if not filtered:
+        logger.info(f"  [统一预警] 全部处于冷却期，跳过发送")
+        return
+
+    # 按紧急度排序
+    filtered.sort(key=lambda a: a.get("urgency_score", 0), reverse=True)
+
+    # 发送统一预警邮件
+    try:
+        from notify.alert_engine import send_alert_email
+        send_alert_email(filtered)
+        # 更新冷却记录
+        for a in filtered:
+            _alert_cooldown[a.get("code", "")] = now
+        logger.info(f"  [统一预警] 📧 邮件已发送({len(filtered)}条)")
+    except Exception as e:
+        logger.warning(f"  [统一预警] 邮件发送失败: {e}")
+
+    # FIX B1: 止损类预警自动生成QMT执行JSON，消除"预警发了但止损没执行"的断链
+    try:
+        _generate_intraday_stop_orders(filtered, holdings_data)
+    except Exception as e:
+        logger.warning(f"  [统一预警] 止损执行JSON生成失败(不影响邮件): {e}")
+
+
+# V4.0: 保留原函数名作为兼容别名（CLI --run-intraday-alert/--run-intraday-decision 仍可用）
+def run_intraday_alert_task():
+    """兼容入口 → 转发到统一预警"""
+    run_unified_intraday_alert()
+
+
+def run_intraday_decision_task():
+    """兼容入口 → 转发到统一预警"""
+    run_unified_intraday_alert()
+
+
+def run_alert_engine_task():
+    """兼容入口 → 转发到统一预警"""
+    run_unified_intraday_alert()
+
+
+def run_zt_gene_task():
+    """涨停基因跟踪（09:26竞价结束后运行）"""
+    today = datetime.date.today()
+
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过涨停基因跟踪")
+        return
+
+    logger.info(f"[{today}] 涨停基因跟踪（竞价后）...")
+
+    try:
+        from strategy.zt_gene_tracker import run_zt_gene_tracking
+        result = run_zt_gene_tracking()
+        if result.get("success"):
+            logger.info(f"[{today}] 涨停基因跟踪完成: "
+                       f"连板候选{len(result.get('candidates', []))}只, "
+                       f"已连板{len(result.get('continued_zt', []))}只")
+        else:
+            logger.warning(f"[{today}] 涨停基因跟踪未成功")
+    except Exception as e:
+        logger.error(f"[{today}] 涨停基因跟踪异常: {e}", exc_info=True)
+
 
 def start_intraday_monitor():
     """启动盘中监控（后台线程）"""
@@ -1237,16 +2029,38 @@ def start_scheduler():
         logger.info("或使用Windows任务计划程序手动配置")
         return
 
+    # P0: 单实例锁，防止多进程并发
+    if not _acquire_lock():
+        logger.warning("已有调度器实例在运行（心跳正常），本次启动跳过")
+        return
+
     logger.info("=" * 50)
-    logger.info("  交易系统定时调度器 V3.0 (报告重构版)")
+    logger.info("  交易系统定时调度器 V3.1 (守护增强版)")
     logger.info(f"  启动时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  PID: {os.getpid()}")
     logger.info("=" * 50)
 
     # 每个交易日 08:30 盘前作战计划（合并原盘前预测+操作清单+持仓快览）
     schedule.every().day.at("08:30").do(run_forecast_morning)
 
+    # V2.5: 每个交易日 09:26 涨停基因跟踪（竞价结束后）
+    schedule.every().day.at("09:26").do(run_zt_gene_task)
+
+    # V9.0: 每个交易日 09:25 集合竞价分析（持仓股高开/低开预警）
+    # FIX: 注册顺序提前于选股报告，竞价分析对时效性更敏感
+    schedule.every().day.at("09:25").do(run_auction_analysis)
+
+    # V3.1: 每个交易日 09:25 竞价后选股报告（修复: 原来只在CLI模式可用，未注册到调度器）
+    schedule.every().day.at("09:25").do(run_morning_screener)
+
+    # V9.0 P2-1: 每个交易日 09:15 竞价轨迹采集（后台线程，09:15-09:25多点采样）
+    schedule.every().day.at("09:15").do(run_auction_tracking_task)
+
     # 每个交易日 15:30 盘后分析（数据更新+信号+综合日报）
     schedule.every().day.at("15:30").do(run_daily_task)
+
+    # V4.1: 每个交易日 16:15 综合分析报告（技术面深度诊断+条件单，与盘后日报互补）
+    schedule.every().day.at("16:15").do(run_holdings_report_task)
 
     # 每个交易日 19:00 条件单（统一发送，方便提前挂单）
     schedule.every().day.at("19:00").do(run_morning_reminder)
@@ -1267,7 +2081,10 @@ def start_scheduler():
 
     logger.info("调度器已启动，等待执行...")
     logger.info(f"  盘前作战计划: 每个交易日 08:30")
+    logger.info(f"  竞价选股报告: 每个交易日 09:25")
+    logger.info(f"  涨停基因跟踪: 每个交易日 09:26")
     logger.info(f"  盘后综合日报: 每个交易日 15:30")
+    logger.info(f"  综合分析报告: 每个交易日 16:15")
     logger.info(f"  条件单: 每个交易日 19:00")
     logger.info(f"  周策略报告: 每周六 10:00")
     logger.info(f"  ML模型训练: 每周六 11:00")
@@ -1279,17 +2096,46 @@ def start_scheduler():
     schedule.every().day.at("09:30").do(start_intraday_monitor)
     schedule.every().day.at("15:01").do(stop_intraday_monitor)
 
-    while True:
-        schedule.run_pending()
+    # V8.0: 统一盘中预警（分级变频: 正常10分钟/预警3分钟/紧急1分钟）
+    # 每分钟注册一次，内部通过 _should_run_intraday_alert() 门控决定是否实际执行
+    for hour in range(9, 15):
+        for minute in range(0, 60):
+            # 跳过09:30之前和11:30-13:00午休
+            if hour == 9 and minute < 35:
+                continue
+            if hour == 11 and minute > 30:
+                continue
+            if hour == 12:
+                continue
+            if hour == 14 and minute > 55:
+                continue
+            time_str = f"{hour:02d}:{minute:02d}"
+            schedule.every().day.at(time_str).do(_gated_intraday_alert)
 
-        # 非交易时段降低检查频率
-        now = datetime.datetime.now()
-        if now.hour >= 16 or (now.hour < 8):
-            import time
-            time.sleep(300)
-        else:
-            import time
-            time.sleep(60)
+    logger.info(f"  统一盘中预警: 每个交易日 09:35-14:55 分级变频(正常10min/预警3min/紧急1min)")
+
+    # P0: 启动时立即写入心跳
+    _write_heartbeat()
+
+    try:
+        while True:
+            schedule.run_pending()
+            # P0: 每次循环写入心跳（供外部监控和CLI去重检查）
+            _write_heartbeat()
+
+            # 非交易时段降低检查频率
+            now = datetime.datetime.now()
+            if now.hour >= 20 or (now.hour < 8):
+                _time.sleep(300)
+            else:
+                _time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("调度器收到中断信号，正常退出")
+    except Exception as e:
+        logger.error(f"调度器主循环异常: {e}", exc_info=True)
+    finally:
+        _release_lock()
+        logger.info("调度器已停止")
 
 
 # ============================================================
@@ -1298,11 +2144,13 @@ def start_scheduler():
 
 # 所有定时任务定义: (任务名, 时间, 命令行参数, 说明)
 SCHEDULED_TASKS = [
-    ("TradingSystem_MorningReminder", "19:00", "--run-morning-reminder", "盘前条件单提醒(前晚)"),
-    ("TradingSystem_ForecastAM",      "08:30", "--run-forecast-am",      "盘前趋势预测"),
+    ("TradingSystem_MorningReminder", "19:00", "--run-morning-reminder", "条件单(晚间挂单)"),
+    ("TradingSystem_ForecastAM",      "08:30", "--run-forecast-am",      "盘前作战计划"),
+    ("TradingSystem_AuctionTrack",    "09:15", "--run-auction-track",    "V9.0竞价轨迹采集"),
+    ("TradingSystem_AuctionAnalysis", "09:25", "--run-auction-analysis", "V9.0集合竞价分析"),
     ("TradingSystem_Screener",        "09:25", "--run-screener",         "竞价后选股报告"),
     ("TradingSystem_Daily",           "15:30", "--run-once",             "盘后完整分析"),
-    ("TradingSystem_ForecastPM",      "15:35", "--run-forecast-pm",      "盘后趋势预测"),
+    ("TradingSystem_HoldingsReport",  "16:15", "--run-holdings-report",  "综合分析报告(技术面+条件单)"),
     ("TradingSystem_Weekly",          "10:00", "--run-weekly",           "周六周策略报告"),
     ("TradingSystem_MLTraining",      "11:00", "--run-ml-training",      "周六ML模型训练"),
     ("TradingSystem_WalkForward",     "09:00", "--run-walk-forward",     "月度Walk-Forward验证(每月1日)"),
@@ -1388,6 +2236,14 @@ def main():
                         help="运行 ML模型训练")
     parser.add_argument("--run-walk-forward", action="store_true",
                         help="运行 Walk-Forward滚动窗口验证")
+    parser.add_argument("--run-intraday-alert", action="store_true",
+                        help="运行盘中异动预警扫描")
+    parser.add_argument("--run-intraday-decision", action="store_true",
+                        help="运行盘中实时决策报告")
+    parser.add_argument("--run-zt-gene", action="store_true",
+                        help="运行涨停基因跟踪")
+    parser.add_argument("--run-holdings-report", action="store_true",
+                        help="运行综合分析报告(技术面+条件单)")
     args = parser.parse_args()
 
     # 配置日志
@@ -1407,26 +2263,43 @@ def main():
         install_windows_task()
     elif args.uninstall:
         uninstall_windows_task()
-    elif args.run_once:
-        run_daily_task()
-    elif args.run_forecast_am:
-        run_forecast_morning()
-    elif args.run_forecast_pm:
-        run_forecast_afternoon()
-    elif args.run_morning_reminder:
-        run_morning_reminder()
-    elif args.run_screener:
-        run_morning_screener()
-    elif args.run_weekly:
-        run_weekly_portfolio()
-    elif args.run_ml_training:
-        _run_weekly_ml_training()
-    elif args.run_walk_forward:
-        # 手动触发时忽略日期限制，强制执行
-        _run_monthly_walk_forward.__wrapped__ = True
-        _force_walk_forward()
     else:
-        start_scheduler()
+        # P1: CLI一次性任务执行前检查主循环是否存活，避免双重执行
+        _ONE_SHOT_TASKS = {
+            'run_once': run_daily_task,
+            'run_forecast_am': run_forecast_morning,
+            'run_forecast_pm': run_forecast_afternoon,
+            'run_morning_reminder': run_morning_reminder,
+            'run_screener': run_morning_screener,
+            'run_weekly': run_weekly_portfolio,
+            'run_ml_training': _run_weekly_ml_training,
+            'run_intraday_alert': run_intraday_alert_task,
+            'run_intraday_decision': run_intraday_decision_task,
+            'run_zt_gene': run_zt_gene_task,
+            'run_holdings_report': run_holdings_report_task,
+        }
+        dispatched = False
+        for arg_name, func in _ONE_SHOT_TASKS.items():
+            if getattr(args, arg_name, False):
+                dispatched = True
+                # P1: 心跳去重 —— 主循环存活时跳过（它会在同一时间触发同一任务）
+                if is_scheduler_alive():
+                    logger.info(f"[P1去重] 调度器主循环存活，跳过CLI任务: --{arg_name.replace('_', '-')}")
+                else:
+                    logger.info(f"[CLI执行] 主循环未运行，执行: --{arg_name.replace('_', '-')}")
+                    func()
+                break
+
+        if not dispatched:
+            # Walk-Forward特殊处理（手动触发忽略日期限制）
+            if args.run_walk_forward:
+                if is_scheduler_alive():
+                    logger.info("[P1去重] 调度器主循环存活，跳过CLI任务: --run-walk-forward")
+                else:
+                    _run_monthly_walk_forward.__wrapped__ = True
+                    _force_walk_forward()
+            else:
+                start_scheduler()
 
 
 if __name__ == "__main__":

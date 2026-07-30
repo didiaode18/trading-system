@@ -217,7 +217,7 @@ canvas {{ width: 100% !important; height: 300px !important; }}
        印花税{report.get('total_stamp_tax', 0):,.0f}元 = 
        合计{report.get('total_cost', 0):,.0f}元</p>
     <p>生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 
-       高胜率A股交易操作系统 V7.1</p>
+       高胜率A股交易操作系统 V9.0</p>
 </div>
 </div>
 

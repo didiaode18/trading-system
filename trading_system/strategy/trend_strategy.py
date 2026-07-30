@@ -99,13 +99,53 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # ---- 量价背离检测（近5日价格新高但成交量萎缩）----
-    df["vol_price_divergence"] = False
-    for i in range(5, len(df)):
-        recent_5 = df.iloc[i-4:i+1]
-        price_new_high = recent_5["close"].iloc[-1] >= recent_5["close"].max()
-        vol_shrinking = recent_5["volume"].iloc[-1] < recent_5["volume"].mean() * 0.8
-        if price_new_high and vol_shrinking:
-            df.iloc[i, df.columns.get_loc("vol_price_divergence")] = True
+    # FIX: 向量化替代for循环+iloc，消除O(n)的pandas开销
+    rolling_max_5 = df["close"].rolling(5).max()
+    rolling_vol_mean_5 = df["volume"].rolling(5).mean()
+    df["vol_price_divergence"] = (
+        (df["close"] >= rolling_max_5) &
+        (df["volume"] < rolling_vol_mean_5 * 0.8)
+    )
+
+    # ---- V9.0: 缺口分析（P2-4）----
+    gap_cfg = getattr(config, 'GAP_CONFIG', {})
+    min_gap_pct = gap_cfg.get("min_gap_pct", 0.005)
+    breakaway_vol_ratio = gap_cfg.get("breakaway_vol_ratio", 2.0)
+    exhaustion_consecutive = gap_cfg.get("exhaustion_consecutive_gaps", 3)
+    exhaustion_vol_spike = gap_cfg.get("exhaustion_vol_spike", 2.5)
+
+    # 缺口标记: 当日最低 > 前日最高 = 向上跳空; 当日最高 < 前日最低 = 向下跳空
+    prev_high = df["high"].shift(1)
+    prev_low = df["low"].shift(1)
+    prev_close = df["close"].shift(1)
+
+    # 缺口幅度
+    gap_up_pct = (df["low"] - prev_high) / prev_close
+    gap_down_pct = (prev_low - df["high"]) / prev_close
+
+    df["gap_up"] = gap_up_pct > min_gap_pct
+    df["gap_down"] = gap_down_pct > min_gap_pct
+
+    # 缺口类型分类: common / breakaway / exhaustion
+    df["gap_type"] = "none"
+    vol_ma = df["volume"].rolling(20).mean()
+
+    for i in range(1, len(df)):
+        if df.iloc[i]["gap_up"] or df.iloc[i]["gap_down"]:
+            cur_vol = df.iloc[i]["volume"]
+            avg_vol = vol_ma.iloc[i] if not pd.isna(vol_ma.iloc[i]) else cur_vol
+            vol_r = cur_vol / avg_vol if avg_vol > 0 else 1.0
+
+            # 连续缺口计数（近N日内）
+            lookback = max(0, i - exhaustion_consecutive)
+            recent_gaps = df.iloc[lookback:i]["gap_up"].sum() + df.iloc[lookback:i]["gap_down"].sum()
+
+            if recent_gaps >= exhaustion_consecutive - 1 and vol_r > exhaustion_vol_spike:
+                df.iloc[i, df.columns.get_loc("gap_type")] = "exhaustion"
+            elif vol_r > breakaway_vol_ratio:
+                df.iloc[i, df.columns.get_loc("gap_type")] = "breakaway"
+            else:
+                df.iloc[i, df.columns.get_loc("gap_type")] = "common"
 
     return df
 
@@ -145,6 +185,24 @@ def is_trend_up(df: pd.DataFrame) -> bool:
 # ============================================================
 # 二、买点信号判定
 # ============================================================
+
+def calc_atr_stop_pct(df: pd.DataFrame, multiplier: float = 2.0) -> float:
+    """
+    V9.0 ATR自适应止损（来源: Ernest Chan《Algorithmic Trading》）
+    公式: stop_pct = clip(ATR(14) / close * multiplier, 0.05, 0.10)
+    - 高波动股(ATR大) → 宽止损，避免被洗出
+    - 低波动股(ATR小) → 紧止损，快速认错
+    约束: 最小5%, 最大10% (A股涨跌停制度下的合理范围)
+    """
+    if df is None or len(df) < 15:
+        return getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)  # fallback
+    atr_val = df["atr"].iloc[-1] if "atr" in df.columns else None
+    close_val = df["close"].iloc[-1]
+    if atr_val is None or pd.isna(atr_val) or close_val <= 0:
+        return getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)
+    stop_pct = (atr_val / close_val) * multiplier
+    return max(0.05, min(0.10, stop_pct))  # 约束[5%, 10%]
+
 
 def _calc_risk_reward(buy_price: float, stop_loss: float, df: pd.DataFrame) -> tuple:
     """
@@ -253,11 +311,13 @@ def check_buy_signal(df: pd.DataFrame) -> dict:
 
     # 信号触发！
     buy_price = close
-    stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
+    # V9.0: ATR自适应止损替代固定百分比 (Ernest Chan方法)
+    atr_stop_pct = calc_atr_stop_pct(df_ind)
+    stop_loss = buy_price * (1 - atr_stop_pct)
 
     # ---- 强制盈亏比准入检查（V2.0核心规则）----
     risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
-    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # OPTIMIZE: 原2.5降至2.0，解决事件驱动引擎无交易问题
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # config中为2.5，默认值2.0仅在config缺失时生效
     if risk_reward < min_rr:
         result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
                            f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")
@@ -427,11 +487,13 @@ def check_breakout_buy_signal(df: pd.DataFrame) -> dict:
 
     # 信号触发！
     buy_price = close
-    stop_loss = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
+    # V9.0: ATR自适应止损替代固定百分比 (Ernest Chan方法)
+    atr_stop_pct = calc_atr_stop_pct(df_ind)
+    stop_loss = buy_price * (1 - atr_stop_pct)
 
     # ---- 强制盈亏比准入检查（V2.0核心规则）----
     risk_reward, target_price = _calc_risk_reward(buy_price, stop_loss, df_ind)
-    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # OPTIMIZE: 原2.5降至2.0，解决事件驱动引擎无交易问题
+    min_rr = getattr(config, 'MIN_RISK_REWARD_RATIO', 2.0)  # config中为2.5，默认值2.0仅在config缺失时生效
     if risk_reward < min_rr:
         result["reason"] = (f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，"
                            f"拦截（目标{target_price:.2f}/止损{stop_loss:.2f}）")
@@ -531,7 +593,7 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
                 })
                 return result
 
-    # ---- 1.5 时间止损（V6.0新增）: 持仓超45天且浮盈<3%则卖出 ----
+    # ---- 1.5 时间止损（V6.0新增）: 持仓超MAX_HOLD_DAYS交易日且浮盈不足则卖出 ----
     max_hold_days = getattr(config, 'MAX_HOLD_DAYS', 0)
     time_stop_profit = getattr(config, 'TIME_STOP_PROFIT', 0.03)
     if max_hold_days > 0 and current_position:
@@ -539,13 +601,15 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
         if buy_date_str:
             try:
                 buy_dt = pd.Timestamp(buy_date_str)
-                hold_days = (pd.Timestamp(latest["date"]) - buy_dt).days
+                # FIX: 用K线数据中的实际交易日数，而非自然日
+                # 原Bug: .days返回自然日(含周末节假日)，20自然日≈14交易日，导致时间止损提前30%触发
+                hold_days = int((df_ind["date"] > buy_date_str).sum())
                 if hold_days >= max_hold_days and profit_pct < time_stop_profit:
                     result.update({
                         "signal": True,
                         "sell_type": "time_stop",
                         "sell_price": round(close, 2),
-                        "reason": f"时间止损: 持仓{hold_days}天>={max_hold_days}天, 浮盈{profit_pct:.2%}<{time_stop_profit:.0%}, 资金效率低"
+                        "reason": f"时间止损: 持仓{hold_days}交易日>={max_hold_days}交易日, 浮盈{profit_pct:.2%}<{time_stop_profit:.0%}, 资金效率低"
                     })
                     return result
             except (ValueError, TypeError):

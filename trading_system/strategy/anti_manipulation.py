@@ -681,8 +681,354 @@ class AntiManipulationAnalyzer:
         return result
 
     # ============================================================
-    # 批量分析
+    # 盘中止损洗盘识别（V3.0新增 - 供alert_engine R5联动）
     # ============================================================
+
+    def detect_stop_loss_wash(self, code: str, df: pd.DataFrame,
+                              stop_loss: float, current_price: float,
+                              market_change_pct: float = 0.0,
+                              sector_change_pct: float = 0.0) -> dict:
+        """
+        盘中止损触及时的洗盘概率评估（轻量级，适合实时调用）
+
+        核心逻辑:
+          1. 假突破检测: 价格触及止损后已收回止损上方 → 高概率洗盘
+          2. 量能衰减: 触及止损时放量但非持续恐慌性抛售 → 洗盘
+          3. 被动跌破: 大盘/板块整体回调带动，个股相对强度未破坏 → 洗盘
+          4. 支撑完整: MA20/MA60未破，趋势结构完好 → 洗盘
+          5. 真破位特征: 连续放量+板块崩塌+均线全破 → 非洗盘
+
+        参数:
+            code: 股票代码
+            df: 含技术指标的日线DataFrame（至少20根）
+            stop_loss: 止损价
+            current_price: 当前实时价格
+            market_change_pct: 大盘(沪深300)当日涨跌幅(%)
+            sector_change_pct: 所属板块当日涨跌幅(%)
+
+        返回:
+            {
+                "is_likely_wash": bool,      # 是否大概率洗盘
+                "wash_probability": float,    # 洗盘概率(0-1)
+                "should_block_stop": bool,    # 是否建议拦截止损
+                "reasons": list,             # 判定依据列表
+                "risk_factors": list,        # 风险因素（支持止损的理由）
+                "suggested_action": str,     # 建议操作
+            }
+        """
+        result = {
+            "is_likely_wash": False,
+            "wash_probability": 0.0,
+            "should_block_stop": False,
+            "reasons": [],
+            "risk_factors": [],
+            "suggested_action": "",
+        }
+
+        if df.empty or len(df) < 20 or stop_loss <= 0 or current_price <= 0:
+            result["suggested_action"] = "数据不足，按正常止损执行"
+            return result
+
+        wash_score = 0.0  # 洗盘概率累加（满分1.0）
+        risk_score = 0.0  # 真破位概率累加
+        reasons = []
+        risk_factors = []
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else latest
+
+        # ---- 因子1: 假突破检测（权重最高 0.45）----
+        # 当前价已收回止损上方 → 极强洗盘信号
+        if current_price > stop_loss:
+            recover_pct = (current_price - stop_loss) / stop_loss
+            if recover_pct > 0.02:  # 收回2%以上 → 强假突破
+                wash_score += 0.45
+                reasons.append(f"假突破确认: 已收回止损上方{recover_pct*100:.1f}%(强信号)")
+            elif recover_pct > 0.01:  # 收回1%-2%
+                wash_score += 0.35
+                reasons.append(f"假突破确认: 已收回止损上方{recover_pct*100:.1f}%")
+            else:
+                wash_score += 0.20
+                reasons.append(f"触及后微幅收回(仅{recover_pct*100:.2f}%)")
+        else:
+            # 仍在止损下方，检查日内是否曾收回
+            day_low = latest.get("low", current_price)
+            if day_low < stop_loss and current_price > day_low * 1.02:
+                wash_score += 0.10
+                reasons.append("日内探底后有回升迹象")
+            risk_factors.append("当前仍在止损下方")
+
+        # ---- 因子2: 量能模式（权重 0.25）----
+        vol_ma20 = df["volume"].tail(20).mean() if "volume" in df.columns else 0
+        today_vol = latest.get("volume", 0)
+        if vol_ma20 > 0 and today_vol > 0:
+            vol_ratio = today_vol / vol_ma20
+            if vol_ratio > 2.5:
+                # 极端放量: 可能是恐慌抛售（真破位）也可能是对倒洗盘
+                # 关键区分: 放量但价格收回 → 洗盘; 放量且价格持续下方 → 出货
+                if current_price > stop_loss:
+                    wash_score += 0.15
+                    reasons.append(f"放量{vol_ratio:.1f}倍但价格已收回(对倒洗盘特征)")
+                else:
+                    risk_score += 0.20
+                    risk_factors.append(f"放量{vol_ratio:.1f}倍且价格未收回(恐慌抛售)")
+            elif vol_ratio < 1.2:
+                # 缩量触及止损 → 非恐慌性，洗盘概率大
+                wash_score += 0.25
+                reasons.append(f"缩量触及(量比{vol_ratio:.2f}<1.2，非恐慌性抛售)")
+            else:
+                # 温和放量，中性
+                wash_score += 0.05
+        else:
+            # 无成交量数据，给中性分
+            wash_score += 0.05
+
+        # ---- 因子3: 被动跌破（权重 0.20）----
+        # 大盘/板块整体下跌带动，个股相对强度未破坏
+        stock_change = 0.0
+        if latest["close"] > 0:
+            # V3.1: 用最新K线收盘价（昨日）作为基准，而非前天
+            stock_change = (current_price - latest["close"]) / latest["close"] * 100
+
+        if market_change_pct < -1.0 or sector_change_pct < -1.5:
+            # 大盘/板块明显下跌
+            relative_strength = stock_change - market_change_pct
+            if relative_strength > 0:  # 个股跌幅小于大盘
+                wash_score += 0.20
+                reasons.append(f"被动跌破: 大盘{market_change_pct:.1f}%，个股相对强度+{relative_strength:.1f}%")
+            elif relative_strength > -1.0:  # 个股略弱于大盘但差距不大
+                wash_score += 0.10
+                reasons.append(f"板块联动下跌(大盘{market_change_pct:.1f}%，相对强度{relative_strength:.1f}%)")
+            else:
+                risk_score += 0.10
+                risk_factors.append(f"个股弱于大盘(相对强度{relative_strength:.1f}%)")
+        else:
+            # 大盘正常，个股独立下跌 → 更可能是自身问题
+            if stock_change < -3:
+                risk_score += 0.10
+                risk_factors.append(f"大盘正常但个股独立下跌{stock_change:.1f}%")
+
+        # ---- 因子4: 趋势支撑完整性（权重 0.20）----
+        ma20 = latest.get("ma20", 0)
+        ma60 = latest.get("ma60", 0) if "ma60" in df.columns else 0
+        if pd.isna(ma20):
+            ma20 = 0
+        if pd.isna(ma60):
+            ma60 = 0
+
+        support_intact = 0
+        if ma20 > 0 and current_price > ma20:
+            support_intact += 1
+        if ma60 > 0 and current_price > ma60:
+            support_intact += 1
+        # 检查MA20是否仍在上行（趋势未破坏）
+        if len(df) >= 5 and "ma20" in df.columns:
+            ma20_5ago = df["ma20"].iloc[-5]
+            if not pd.isna(ma20_5ago) and ma20 > ma20_5ago:
+                support_intact += 1  # MA20仍上行
+
+        if support_intact >= 2:
+            wash_score += 0.20
+            reasons.append(f"趋势支撑完好(MA20/MA60未破，结构健康)")
+        elif support_intact == 1:
+            wash_score += 0.10
+            reasons.append("部分支撑仍在")
+        else:
+            risk_score += 0.15
+            risk_factors.append("均线支撑已全面失守")
+
+        # ---- 综合判定 ----
+        # 真破位硬否决: 连续放量下跌+均线全破 → 无论洗盘分多高都不拦
+        consecutive_vol_drop = 0
+        if len(df) >= 3 and "volume" in df.columns:
+            for i in range(-3, 0):
+                row = df.iloc[i]
+                prev_row = df.iloc[i - 1]
+                if row["close"] < prev_row["close"] and row["volume"] > vol_ma20 * 1.3:
+                    consecutive_vol_drop += 1
+
+        hard_reject = (consecutive_vol_drop >= 3 and support_intact == 0)
+        if hard_reject:
+            risk_score += 0.30
+            risk_factors.append(f"连续{consecutive_vol_drop}日放量下跌+均线全破(真破位)")
+
+        # 最终概率（V3.1: 假突破强信号时降低风险因子惩罚权重）
+        # 当价格已明确收回止损上方>2%时，趋势因素不应完全抵消假突破信号
+        if current_price > stop_loss * 1.02:
+            # 强假突破: 风险惩罚降低到30%
+            wash_probability = min(0.95, max(0.05, wash_score - risk_score * 0.3))
+        else:
+            wash_probability = min(0.95, max(0.05, wash_score - risk_score * 0.5))
+        is_likely_wash = wash_probability >= 0.55 and not hard_reject
+        should_block = wash_probability >= 0.60 and not hard_reject
+
+        result["is_likely_wash"] = is_likely_wash
+        result["wash_probability"] = round(wash_probability, 2)
+        result["should_block_stop"] = should_block
+        result["reasons"] = reasons
+        result["risk_factors"] = risk_factors
+
+        # 生成建议
+        if should_block:
+            result["suggested_action"] = "高概率洗盘，建议暂不执行止损，等待15分钟确认"
+        elif is_likely_wash:
+            result["suggested_action"] = "疑似洗盘，建议观望，若5分钟内未收回止损则执行"
+        elif hard_reject:
+            result["suggested_action"] = "真破位特征明确，坚决执行止损"
+        else:
+            result["suggested_action"] = "洗盘概率不高，建议按纪律执行止损"
+
+        logger.info(f"[反洗盘] {code} 止损触及评估: 洗盘概率{wash_probability:.0%} | "
+                    f"{'拦截' if should_block else '不拦截'} | {result['suggested_action']}")
+
+        return result
+
+    # ============================================================
+    # V9.0 P1-3: 主力四阶段判定（吸筹/洗盘/拉升/出货）
+    # ============================================================
+
+    def classify_main_force_stage(self, code: str, df: pd.DataFrame,
+                                   holding: dict = None) -> dict:
+        """
+        判定主力操作阶段（V9.0 P1-3）
+
+        四阶段:
+          吸筹期: 底部横盘>20天 + 换手率温和 + OBV上升
+          洗盘期: 急跌缩量 + 快速收回 + 不破关键均线
+          拉升期: 连续阳线 + 突破平台 + 量增价升
+          出货期: 高位放量滞涨 + 内外盘失衡
+
+        返回:
+            {
+                "stage": "accumulation"/"wash"/"markup"/"distribution"/"unknown",
+                "confidence": float,
+                "detail": str,
+                "signal": str,  # 操作建议
+            }
+        """
+        stage_cfg = getattr(config, 'MAIN_FORCE_STAGE_CONFIG', {})
+        result = {
+            "stage": "unknown",
+            "confidence": 0.3,
+            "detail": "数据不足",
+            "signal": "正常操作",
+        }
+
+        if df is None or len(df) < 30:
+            return result
+
+        close = df["close"]
+        volume = df["volume"]
+        high = df["high"]
+        low = df["low"]
+
+        vol_ma20 = volume.tail(20).mean()
+        price_current = close.iloc[-1]
+        price_20ago = close.iloc[-20]
+        high_60 = high.tail(60).max() if len(df) >= 60 else high.max()
+        low_60 = low.tail(60).min() if len(df) >= 60 else low.min()
+
+        # 位置判定: 当前价在60日区间中的位置
+        price_range = high_60 - low_60
+        position_pct = (price_current - low_60) / price_range if price_range > 0 else 0.5
+
+        # --- 吸筹期判定 ---
+        accum_days = stage_cfg.get("accumulation_min_days", 20)
+        turnover_range = stage_cfg.get("accumulation_turnover_range", [1.0, 3.0])
+        # 底部横盘: 近20日振幅<10% + 位于低位
+        recent_range = (high.tail(accum_days).max() - low.tail(accum_days).min()) / low.tail(accum_days).min()
+        is_bottom = position_pct < 0.3
+        is_consolidating = recent_range < 0.10
+
+        # OBV趋势
+        obv = self._compute_obv(df)
+        obv_rising = obv[-1] > obv[-10] if len(obv) >= 10 else False
+
+        if is_bottom and is_consolidating and obv_rising:
+            result.update({
+                "stage": "accumulation",
+                "confidence": 0.7,
+                "detail": f"底部横盘{accum_days}天(振幅{recent_range*100:.1f}%) + OBV上升 | 吸筹末期",
+                "signal": "前瞻关注: 吸筹末期，突破平台后可介入",
+            })
+            return result
+
+        # --- 拉升期判定 ---
+        markup_days = stage_cfg.get("markup_min_consecutive_up", 3)
+        markup_vol = stage_cfg.get("markup_vol_increase", 1.5)
+        # 连续阳线
+        consecutive_up = 0
+        for i in range(len(df) - 1, max(len(df) - 10, -1), -1):
+            if close.iloc[i] > df["open"].iloc[i]:
+                consecutive_up += 1
+            else:
+                break
+        # 量增
+        recent_vol = volume.tail(3).mean()
+        vol_increasing = recent_vol > vol_ma20 * markup_vol
+        # 均线多头
+        ma5 = close.tail(5).mean()
+        ma20 = close.tail(20).mean()
+        ma_bullish = ma5 > ma20 and price_current > ma5
+
+        if consecutive_up >= markup_days and vol_increasing and ma_bullish:
+            result.update({
+                "stage": "markup",
+                "confidence": 0.75,
+                "detail": f"连续{consecutive_up}阳 + 量增{recent_vol/vol_ma20:.1f}倍 + 均线多头 | 拉升期",
+                "signal": "持有: 拉升期不轻易卖出，跟踪移动止损",
+            })
+            return result
+
+        # --- 出货期判定 ---
+        dist_vol_ratio = stage_cfg.get("distribution_high_vol_ratio", 2.0)
+        dist_stagnation = stage_cfg.get("distribution_stagnation", 0.01)
+        is_high = position_pct > 0.7
+        high_vol = volume.iloc[-1] > vol_ma20 * dist_vol_ratio
+        today_change = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] if len(close) > 1 else 0
+        stagnation = abs(today_change) < dist_stagnation
+
+        if is_high and high_vol and stagnation:
+            result.update({
+                "stage": "distribution",
+                "confidence": 0.7,
+                "detail": f"高位(位置{position_pct*100:.0f}%) + 放量{volume.iloc[-1]/vol_ma20:.1f}倍 + 滞涨{today_change*100:.2f}% | 出货期",
+                "signal": "警告: 出货期特征，建议分批减仓",
+            })
+            return result
+
+        # --- 洗盘期判定 ---
+        # 急跌缩量 + 位于中位 + 不破MA20
+        today_drop = today_change < -0.02
+        vol_shrink = volume.iloc[-1] < vol_ma20 * 0.7
+        above_ma20 = price_current > ma20 * 0.97  # 不破MA20的3%
+
+        if today_drop and vol_shrink and above_ma20 and position_pct > 0.3:
+            result.update({
+                "stage": "wash",
+                "confidence": 0.65,
+                "detail": f"急跌{today_change*100:.1f}% + 缩量{volume.iloc[-1]/vol_ma20:.1f}倍 + 不破MA20 | 洗盘期",
+                "signal": "持有: 洗盘特征，不宜恐慌卖出",
+            })
+            return result
+
+        result["detail"] = f"位置{position_pct*100:.0f}% | 无明确阶段特征"
+        return result
+
+    def _compute_obv(self, df: pd.DataFrame) -> np.ndarray:
+        """计算OBV能量潮"""
+        close = df["close"].values
+        volume = df["volume"].values
+        obv = np.zeros(len(close))
+        for i in range(1, len(close)):
+            if close[i] > close[i - 1]:
+                obv[i] = obv[i - 1] + volume[i]
+            elif close[i] < close[i - 1]:
+                obv[i] = obv[i - 1] - volume[i]
+            else:
+                obv[i] = obv[i - 1]
+        return obv
+
 
     def batch_analyze(self, data_dict: dict, holdings: dict = None) -> dict:
         """

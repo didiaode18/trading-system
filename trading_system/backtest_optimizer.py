@@ -297,7 +297,8 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                 else:
                     stop_price = buy_price * (1 + p["profit_lock_2"])
 
-                if close <= stop_price:
+                # FIX: 用盘中最低价判定止损触发（与backtest_real.py B5修复保持一致）
+                if low <= stop_price:
                     sell_signal = True
                     sell_type = "止损"
                     sell_ratio = 1.0
@@ -333,9 +334,10 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                     ladder_sold[1] = True
 
             # ---- 双轨止盈: 回落（可配置）----
+            # FIX: 用盘中最低价计算回撤（实盘条件单盘中触发）
             if not sell_signal and highest_since_buy > buy_price * 1.05:
                 drawdown_threshold = p["drawdown_leader"] if stock_type == "龙头" else p["drawdown_flex"]
-                drawdown = (highest_since_buy - close) / highest_since_buy
+                drawdown = (highest_since_buy - low) / highest_since_buy
                 if drawdown >= drawdown_threshold and profit_pct > 0:
                     sell_signal = True
                     sell_type = "回落止盈"

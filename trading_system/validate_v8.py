@@ -1,5 +1,5 @@
 """
-V8.0 全模块真实数据验证脚本
+V9.0 全模块真实数据验证脚本
 ============================
 用6.5年真实A股数据验证所有新模块：
 1. 回测引擎V2（含滑点/手续费/T+1）
@@ -429,7 +429,7 @@ def generate_report_email():
 
     html = f"""
     <html><body style="font-family:Microsoft YaHei,sans-serif;padding:20px">
-    <h1>📊 V8.0 全模块真实数据验证报告</h1>
+    <h1>📊 V9.0 全模块真实数据验证报告</h1>
     <p>验证时间: {RESULTS['timestamp']}</p>
     <p>数据: 45只股票 × 1586交易日 (2020-01-02 ~ 2026-07-21)</p>
     
@@ -490,14 +490,14 @@ def generate_report_email():
     {warn_html}
     
     <hr>
-    <p style="color:gray">高胜率A股交易操作系统 V8.0 | 验证引擎自动生成</p>
+    <p style="color:gray">高胜率A股交易操作系统 V9.0 | 验证引擎自动生成</p>
     </body></html>
     """
 
     # 发送邮件
     try:
         from notify.email_notify import send_email
-        subject = f"V8.0验证报告 | 回测夏普{bt.get('sharpe_ratio', 0):.2f} | " \
+        subject = f"V9.0验证报告 | 回测夏普{bt.get('sharpe_ratio', 0):.2f} | " \
                   f"因子{fac.get('computed_factors', 0)}个 | " \
                   f"错误{len(errors)}个"
         send_email(subject, html)
@@ -512,7 +512,7 @@ def generate_report_email():
             from email.mime.multipart import MIMEMultipart
 
             msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"V8.0验证报告 | 夏普{bt.get('sharpe_ratio', 0):.2f}"
+            msg["Subject"] = f"V9.0验证报告 | 夏普{bt.get('sharpe_ratio', 0):.2f}"
             msg["From"] = config.EMAIL_SENDER
             msg["To"] = config.EMAIL_RECEIVER
             msg.attach(MIMEText(html, "html", "utf-8"))
@@ -531,7 +531,7 @@ if __name__ == "__main__":
     total_start = time.time()
 
     print("=" * 60)
-    print("  V8.0 全模块真实数据验证")
+    print("  V9.0 全模块真实数据验证")
     print("  数据: 45只股票 × 6.5年A股日线")
     print("=" * 60)
 

@@ -267,7 +267,13 @@ def run_event_driven_backtest(data_dict, initial_capital=None):
 
 
 def run_real_backtest(data_dict):
-    """运行真实环境回测（V2/V5对比）"""
+    """运行真实环境回测（V2/V5对比）- 复用run_full_backtest统一实现"""
+    try:
+        from run_full_backtest import run_real_backtest as _run_real_backtest
+        return _run_real_backtest(data_dict)
+    except ImportError:
+        pass
+    # Fallback: 直接调用backtest_real
     try:
         from backtest_real import backtest_stock_v4, backtest_stock_v5, analyze_trades, TEST_STOCKS
 
@@ -562,7 +568,7 @@ tr:nth-child(even) {{ background: #f8f9fa; }}
 
         <div class="footer">
             本报告由交易系统自动生成 | 仅供参考，不构成投资建议<br>
-            股市有风险，投资需谨慎 | 高胜率A股交易操作系统 V8.0
+            股市有风险，投资需谨慎 | 高胜率A股交易操作系统 V9.0
         </div>
     </div>
 </div>

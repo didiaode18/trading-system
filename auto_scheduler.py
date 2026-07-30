@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-交易系统自动化调度器 V1.0
+交易系统自动化调度器 V2.0
 ========================
-一键启动全流程自动化:
-  盘后(15:30) → 生成条件单 + 分析报告 + 邮件推送
-  盘中(09:25) → 启动QMT条件单监控执行
+单一职责: QMT条件单自动执行（09:25启动）
+
+❗ 重要说明 (V2.0):
+  本调度器已精简为QMT自动执行的唯一入口。
+  盘后条件单、盘后分析报告等功能已统一由 trading_system/scheduler.py 负责。
+  原 SCHEDULE 中的"盘后条件单"和"盘后分析报告"已移除，避免与主调度器重复触发。
 
 使用方式:
-  python auto_scheduler.py              # 常驻运行（推荐）
-  python auto_scheduler.py --once       # 只执行一次盘后任务
+  python auto_scheduler.py              # 常驻运行（仅QMT执行）
+  python auto_scheduler.py --once       # 只执行一次QMT任务
   python auto_scheduler.py --setup      # 生成Windows计划任务配置说明
 
-Windows计划任务（替代方案）:
-  任务1: 每日15:30运行 python daily_orders.py（生成条件单）
-  任务2: 每日15:35运行 python generate_holdings_report.py（分析报告）
-  任务3: 每日09:25运行 python qmt_trader.py（盘中自动执行）
+Windows计划任务:
+  任务: 每日09:25运行 python qmt_trader.py（盘中自动执行）
 """
 
 import os
@@ -52,10 +53,9 @@ except Exception:
     _HAS_HOLIDAY_DATA = False
 
 # 调度时间表
+# V2.0: 仅保留QMT执行（盘后条件单/分析报告已统一由scheduler.py负责）
 SCHEDULE = {
-    "盘后条件单": {"time": "15:30", "script": "daily_orders.py", "desc": "生成次日条件单+邮件推送"},
-    "盘后分析报告": {"time": "15:35", "script": "generate_holdings_report.py", "desc": "技术分析+推荐标的报告"},
-    "盘中自动执行": {"time": "09:25", "script": "qmt_trader.py", "desc": "QMT条件单自动监控执行"},
+    "盘中自动执行": {"time": "09:25", "script": "qmt_trader.py", "desc": "QMT条件单自动监控执行", "overlap": None},
 }
 
 
@@ -138,29 +138,19 @@ def is_trading_day() -> bool:
 
 
 def run_after_close_tasks():
-    """盘后任务：条件单 + 分析报告"""
+    """DEPRECATED: 盘后任务已统一由 scheduler.py 负责，本函数保留仅为兼容"""
+    logger.warning("[DEPRECATED] 盘后任务已统一由 trading_system/scheduler.py 负责")
+    logger.warning("[DEPRECATED] 请改用: python trading_system/scheduler.py --run-once")
     logger.info("=" * 60)
-    logger.info(f"  盘后自动任务 | {datetime.date.today()}")
+    logger.info(f"  (DEPRECATED) 盘后自动任务 | {datetime.date.today()}")
     logger.info("=" * 60)
-
-    if not is_trading_day():
-        logger.info("[调度] 今日非交易日，跳过")
-        return
-
-    # 1. 生成条件单
-    run_script("daily_orders.py", "生成次日条件单")
-
-    # 2. 生成分析报告
-    time.sleep(3)  # 间隔3秒避免baostock频率限制
-    run_script("generate_holdings_report.py", "技术分析报告")
-
-    logger.info("\n[调度] 盘后任务全部完成 ✅")
+    logger.info("本功能已废弃，不再执行。")
 
 
 def run_scheduler_daemon():
-    """常驻调度守护进程"""
+    """常驻调度守护进程（V2.0: 仅QMT执行）"""
     logger.info("=" * 60)
-    logger.info("  交易系统自动化调度器 V1.0")
+    logger.info("  交易系统自动化调度器 V2.0 (QMT专用)")
     logger.info(f"  启动时间: {datetime.datetime.now()}")
     logger.info(f"  调度计划:")
     for name, info in SCHEDULE.items():
@@ -231,24 +221,14 @@ def print_setup_guide():
 ║  ─────────────────────────                             ║
 ║  打开: Win+R → taskschd.msc                           ║
 ║                                                        ║
-║  任务1 - 盘后条件单 (每日15:30)                       ║
-║  ─────────────────────────────                         ║
-║  程序: {python}
-║  参数: daily_orders.py                                 ║
-║  起始于: {base_dir}
-║                                                        ║
-║  任务2 - 分析报告 (每日15:35)                         ║
-║  ─────────────────────────────                         ║
-║  程序: {python}
-║  参数: generate_holdings_report.py                     ║
-║  起始于: {base_dir}
-║                                                        ║
-║  任务3 - QMT自动执行 (每日09:25)                      ║
+║  任务 - QMT自动执行 (每日09:25)                      ║
 ║  ─────────────────────────────                         ║
 ║  程序: {python}
 ║  参数: qmt_trader.py                                   ║
 ║  起始于: {base_dir}
 ║                                                        ║
+║  注意: 盘后条件单/分析报告已统一由 scheduler.py 负责  ║
+║  无需在此配置                                          ║
 ╠══════════════════════════════════════════════════════════╣
 ║  QMT开通步骤（东方财富）:                             ║
 ║  1. 联系东方财富客户经理申请QMT权限（门槛50万）       ║

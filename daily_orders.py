@@ -33,7 +33,8 @@ from notify.email_notify import send_email
 from data.realtime import fetch_realtime_batch
 from data.data_loader import fetch_stock_daily_baostock, _bs_logout
 from strategy.recommend_engine import run_recommendation, generate_trading_plan
-from risk.risk_control import RiskGate, RISK_CONFIG
+# FIX B4: 统一使用UnifiedRiskEngine替代已废弃的RiskGate
+from risk.risk_control import UnifiedRiskEngine, RISK_CONFIG
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -58,8 +59,8 @@ _FALLBACK_HOLDINGS = [
 
 def _load_holdings_from_json():
     """从 holdings.json 读取持仓列表，统一数据源消除多文件硬编码不同步"""
-    # FIX: 统一从holdings.json读取持仓，消除多文件硬编码不同步
-    holdings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'holdings.json')
+    # FIX: 统一使用config.get_holdings_file()路径解析，与主调度器保持一致
+    holdings_file = config.get_holdings_file()
     try:
         with open(holdings_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -71,6 +72,8 @@ def _load_holdings_from_json():
                 "赛道": v.get("sector", "其他"),
                 "数量": v.get("shares", 0),
                 "成本": v.get("buy_price", 0),
+                "stop_loss": v.get("stop_loss", 0),  # FIX B3: 携带预设止损价
+                "buy_date": v.get("buy_date", ""),   # FIX B8: 携带买入日期(时间止损)
             })
         return result
     except Exception:
@@ -80,7 +83,7 @@ def _load_holdings_from_json():
 holdings_list = _load_holdings_from_json()
 
 # 主模式参数
-STOP_LOSS_PCT = 0.08       # 固定止损: 最新价跌8%
+STOP_LOSS_PCT = config.INITIAL_STOP_LOSS_PCT  # FIX B3: 统一从 config 读取(10%)，消除与config的8%vs10%不一致
 DRAWDOWN_FROM_HIGH = 0.05  # 高点回落5%触发
 REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
 # FIX: 修复TOTAL_CAPITAL硬编码424000与config不一致，改为从 config 引用
@@ -199,6 +202,36 @@ def generate_condition_orders(holding, df, realtime_price):
         return orders  # 清仓单优先级最高，不再生成其他单据
 
     # ================================================================
+    # V2.5: 涨停保护机制 —— 当日涨停时不生成止损单，改为"涨停次日止盈单"
+    # 背景: 雅克科技2026-07-20涨停后手动卖出，系统应自动生成次日止盈单
+    # ================================================================
+    today_change_pct = 0
+    if len(df) >= 2:
+        prev_close = df["close"].iloc[-2]
+        if prev_close > 0:
+            today_change_pct = (price / prev_close - 1) * 100
+
+    if today_change_pct >= 9.5:  # 当日涨停（主板≥9.5%）
+        # 涨停板不触发止损，改为生成"次日止盈单"
+        next_day_stop = round(price * 0.97, 3)  # 次日从涨停价回落3%触发
+        _log_price_check(code, name, "涨停止盈", next_day_stop, price)
+        orders.append({
+            "类型": "涨停次日止盈",
+            "优先级": "★★★必挂",
+            "证券代码": code,
+            "证券名称": name,
+            "方向": "卖出",
+            "触发价": next_day_stop,
+            "触发时间": "盘中实时",
+            "数量": qty,
+            "有效期": "1个交易日",
+            "说明": f"今日涨停(+{today_change_pct:.1f}%)，次日从涨停价{price:.3f}回落3%({next_day_stop:.3f})锁利。"
+                     f"若次日继续涨停则不触发，继续持有。",
+        })
+        # 涨停时不再生成普通止损单
+        return orders
+
+    # ================================================================
     # 止损单（必挂）—— 四档自动匹配
     # ================================================================
     if cost <= 0:
@@ -207,10 +240,18 @@ def generate_condition_orders(holding, df, realtime_price):
         stop_type = "回本仓保护"
         stop_note = f"已回本持仓，保护性止损=现价{price:.3f}×85%"
     elif pnl_pct < 0:
-        # 浮亏状态: 止损价 = 现价 × 92%
-        stop_price = round(price * 0.92, 3)
-        stop_type = "浮亏保护"
-        stop_note = f"浮亏{pnl_pct:.1f}%，止损=现价{price:.3f}×92%(再跌8%离场)"
+        # FIX B3: 浮亏状态优先使用holdings.json预设止损价，消除多处硬编码不一致
+        # FIX P2: 止损线只升不降（Ratchet原则）—— 硬止损 = 成本×90% 为绝对底线
+        hard_floor = round(cost * (1 - STOP_LOSS_PCT), 3)  # 原始硬止损（成本×90%）
+        preset_stop = holding.get("stop_loss", 0)
+        if preset_stop > 0 and preset_stop < price:
+            stop_price = round(max(preset_stop, hard_floor), 3)  # 不低于硬止损底线
+            stop_type = "预设止损"
+            stop_note = f"浮亏{pnl_pct:.1f}%，预设止损{preset_stop:.3f}，硬止损底线{hard_floor:.3f}，取高者"
+        else:
+            stop_price = hard_floor  # FIX P2: 浮亏时直接使用硬止损，不再用price×90%下移
+            stop_type = "硬止损"
+            stop_note = f"浮亏{pnl_pct:.1f}%，硬止损=成本{cost:.3f}×{1-STOP_LOSS_PCT:.0%}={hard_floor:.3f}(止损线只升不降)"
     elif pnl_pct < 5:
         # 浮盈<5%: 初始止损 = 成本×90%
         stop_price = round(cost * 0.9, 3)
@@ -241,7 +282,11 @@ def generate_condition_orders(holding, df, realtime_price):
     _log_price_check(code, name, "止损", stop_price, price)
 
     # 触发时间: 止损单14:50尾盘确认，止盈单盘中实时
+    # V3.1: 止损缓冲确认机制 — 触及止损价后不立即触发，等待5-10分钟确认
     trigger_time = "盘中实时" if stop_type == "移动止盈" else "14:50"
+    buffer_note = ""
+    if stop_type not in ("移动止盈",):
+        buffer_note = " | 缓冲确认:触及后等10分钟，仍在止损下方才执行(防插针洗盘)"
 
     orders.append({
         "类型": f"止损单({stop_type})",
@@ -253,8 +298,36 @@ def generate_condition_orders(holding, df, realtime_price):
         "触发时间": trigger_time,
         "数量": qty,
         "有效期": "20个交易日",
-        "说明": stop_note,
+        "说明": stop_note + buffer_note,
     })
+
+    # ================================================================
+    # FIX B8: 时间止损 —— 持仓超过MAX_HOLD_DAYS且浮盈<5%则强制离场
+    # 背景: 科创50持仓409天浮亏-47.5%, 豪威集团435天浮亏-12.4%, 时间止损从未生效
+    # ================================================================
+    buy_date_str = holding.get("buy_date", "")
+    if buy_date_str and pnl_pct < 5:
+        try:
+            buy_dt = datetime.datetime.strptime(buy_date_str, "%Y-%m-%d").date()
+            hold_days = (datetime.date.today() - buy_dt).days
+            max_hold = getattr(config, 'MAX_HOLD_DAYS', 20)
+            if hold_days > max_hold:
+                time_stop_price = round(price * 0.99, 3)  # 次日开盘即卖（现价×99%保护性触发）
+                _log_price_check(code, name, "时间止损", time_stop_price, price)
+                orders.append({
+                    "类型": "时间止损(超期强制离场)",
+                    "优先级": "★★★必挂",
+                    "证券代码": code,
+                    "证券名称": name,
+                    "方向": "卖出",
+                    "触发价": time_stop_price,
+                    "触发时间": "09:30",
+                    "数量": qty,
+                    "有效期": "1个交易日",
+                    "说明": f"持仓{hold_days}天 > 上限{max_hold}天，浮盈{pnl_pct:.1f}%<5%，时间止损强制离场",
+                })
+        except (ValueError, TypeError):
+            pass  # buy_date格式异常时跳过
 
     # ================================================================
     # 第二张条件单: 多头趋势加一张回落止盈，空头加一张减仓单
@@ -320,8 +393,8 @@ def health_inspection(holdings_with_price, all_data):
     持仓风险四级巡检，返回按紧急程度排序的结果
     等级: 危险 > 预警 > 关注 > 健康
     """
-    gate = RiskGate(total_capital=TOTAL_CAPITAL)
-    # 构建 RiskGate 需要的 holdings dict
+    gate = UnifiedRiskEngine(total_capital=TOTAL_CAPITAL)  # FIX B4: 统一风控引擎
+    # 构建 UnifiedRiskEngine 需要的 holdings dict
     holdings_dict = {}
     for h in holdings_with_price:
         code = h["code"]
@@ -467,6 +540,9 @@ print(f"\n[条件单] 生成次日操作计划...")
 all_orders = []
 for h in holdings_list:
     code = h["code"]
+    # FIX P3: 跳过已清仓持仓（shares=0），避免生成0股无效条件单
+    if h["数量"] <= 0:
+        continue
     if code in all_data:
         rt_price = quotes.get(code, {}).get("price", 0)
         orders = generate_condition_orders(h, all_data[code], rt_price)
@@ -542,7 +618,7 @@ for r in health_results:
 
 # ---- 风控预警 ----
 html += '<h2>⚠️ 风控状态</h2>'
-gate = RiskGate(total_capital=TOTAL_CAPITAL)
+gate = UnifiedRiskEngine(total_capital=TOTAL_CAPITAL)  # FIX B4: 统一风控引擎
 total_mv = sum(h["市值"] for h in holdings_with_price)
 cash_ratio = (TOTAL_CAPITAL - total_mv) / TOTAL_CAPITAL * 100
 html += f'<div class="alert alert-info">总仓位: {total_mv/TOTAL_CAPITAL*100:.1f}% | 现金: {cash_ratio:.1f}% | '

@@ -69,11 +69,25 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None, consensus_results:
         sector = holding.get("sector", "其他")
         stock_type = holding.get("stock_type", "龙头")
 
+        # FIX P3: 跳过已清仓持仓（shares=0或buy_price=0），避免除零崩溃
+        if shares <= 0 or buy_price <= 0:
+            continue
+
+        # P2: 成本价合理性校验 - buy_price > current_price×5 视为摊薄成本异常
+        if current_price > 0 and buy_price > current_price * 5:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[成本异常] {code}({holding.get('name','')}) buy_price={buy_price:.3f} "
+                f">> current_price={current_price:.3f}, 跳过止损/浮亏计算"
+            )
+            # 用现价替代成本，避免误判浮亏-88%触发深亏锁
+            buy_price = current_price
+
         market_value = shares * current_price
         cost_value = shares * buy_price
         pnl = market_value - cost_value
         pnl_pct = (current_price / buy_price - 1) * 100
-        position_ratio = market_value / total_capital * 100
+        position_ratio = market_value / total_capital * 100 if total_capital > 0 else 0
 
         total_market_value += market_value
         total_cost += cost_value
@@ -322,6 +336,42 @@ def generate_optimization(position_analysis: list, sector_allocation: list,
                 "recover_amount": round(recover, 0),
                 "priority": priority,
                 "reason": "亏损较大，减半控制风险"
+            })
+            priority += 1
+
+    # 规则4: 时间止损（持仓>MAX_HOLD_DAYS且浮盈<5% → 全量清仓）
+    # FIX P1: 科创50持仓409天/豪威435天，时间止损从未生效，新增此规则
+    max_hold_days = getattr(config, 'MAX_HOLD_DAYS', 20)
+    already_actioned = {a["code"] for a in actions}
+    for pos in position_analysis:
+        if pos["code"] in already_actioned:
+            continue
+        if pos["shares"] <= 0:
+            continue
+        # 从holdings中获取buy_date
+        holding_data = holdings.get(pos["code"], {})
+        buy_date_str = holding_data.get("buy_date", "")
+        if not buy_date_str:
+            continue
+        try:
+            buy_dt = datetime.date.fromisoformat(buy_date_str)
+            # FIX: 自然日转交易日估算（原Bug: 直接用自然日对比交易日限制，导致提前30%触发）
+            natural_days = (datetime.date.today() - buy_dt).days
+            hold_days = int(natural_days * 5 / 7)  # 交易日估算
+        except (ValueError, TypeError):
+            continue
+        if hold_days > max_hold_days and pos["pnl_pct"] < 5:
+            sell_shares = pos["shares"]
+            recover = sell_shares * pos["current_price"]
+            actions.append({
+                "action": "时间止损清仓",
+                "code": pos["code"],
+                "name": pos["name"],
+                "detail": f"持仓{hold_days}天>上限{max_hold_days}天，浮盈{pos['pnl_pct']:.1f}%<5%",
+                "shares": sell_shares,
+                "recover_amount": round(recover, 0),
+                "priority": priority,
+                "reason": f"超期持仓{hold_days}天，资金效率极低，强制离场释放资金"
             })
             priority += 1
 

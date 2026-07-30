@@ -3,7 +3,7 @@
 ======================
 严格遵循三大原则:
 1. 无未来函数: 信号在T日收盘后计算，T+1日开盘执行
-2. 真实交易环境: 手续费0.3% + 滑点(龙头0.2%/弹性0.5%) + 涨跌停过滤 + T+1
+2. 真实交易环境: 手续费0.16%(佣金万3双边+印花税千1) + 滑点(龙头0.2%/弹性0.5%) + 涨跌停过滤 + T+1
 3. 参数极简: 只保留核心参数，不过度拟合
 
 V5.0新增优化:
@@ -14,7 +14,7 @@ V5.0新增优化:
 - 信号质量评分: 多支撑重合+MACD金叉+RSI超卖
 
 交易环境配置:
-- 佣金+印花税: 买卖合计0.3% (commission=0.003)
+- 佣金+印花税: 买卖合计0.16% (佣金万3双边+印花税千1卖出)
 - 滑点: 龙头0.2%, 弹性0.5%
 - 成交规则: T日收盘判断信号 → T+1开盘价成交
 - 涨跌停: 一字涨停无法买入, 一字跌停无法卖出
@@ -40,14 +40,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 一、交易环境参数（不可过度调整）
+# 一、交易环境参数（从 config 读取，禁止硬编码）
 # ============================================================
 
-COMMISSION = 0.003       # 买卖合计手续费（佣金+印花税）
+COMMISSION = config.COMMISSION_RATE * 2 + config.STAMP_TAX_RATE  # 买卖合计(佣金双边+印花税单边) ≈ 0.0016
 SLIPPAGE_LEADER = 0.002  # 龙头股滑点 0.2%
 SLIPPAGE_FLEX = 0.005    # 弹性股滑点 0.5%
 RISK_PER_TRADE = 0.02    # 单笔风险2%本金
-TOTAL_CAPITAL = 760000   # 总资金
+TOTAL_CAPITAL = config.TOTAL_CAPITAL  # 总资金(从 config 读取)
 LIMIT_PCT = 0.095        # 涨跌停判定阈值（9.5%以上视为一字板）
 
 # ============================================================
@@ -87,7 +87,7 @@ def fetch_history_data(code: str, start_date: str = "2022-01-01") -> pd.DataFram
     """通过baostock获取历史日线数据（前复权）"""
     import baostock as bs
 
-    if code.startswith("6") or code.startswith("9") or code == "000300":
+    if code.startswith("6") or code.startswith("9") or code.startswith("5") or code == "000300":
         bs_code = f"sh.{code}"
     else:
         bs_code = f"sz.{code}"
@@ -201,7 +201,7 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
     - T+1日开盘价执行（加滑点）
     - T+1日如果是涨跌停则无法成交，信号作废
     - T+1规则：买入当天不能卖出
-    - 手续费0.3%，滑点按股票类型
+    - 手续费0.16%，滑点按股票类型
     
     version: "v2"=原始规则, "v4"=优化规则
     """
@@ -318,7 +318,8 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                 else:
                     stop_price = buy_price * 1.22  # 锁定22%
 
-            if close <= stop_price:
+            # FIX B5: 用盘中最低价判定止损触发（实盘条件单是盘中实时触发，非收盘价）
+            if low <= stop_price:
                 sell_signal = True
                 sell_type = "止损"
 
@@ -338,12 +339,13 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                             sell_type = "MACD死叉"
 
             # 4. 回落止盈
+            # FIX: 用盘中最低价计算回撤（实盘条件单盘中触发，非收盘价）
             if not sell_signal and highest_since_buy > buy_price:
                 if version == "v2":
                     threshold = 0.03 if stock_type == "弹性" else 0.05
                 else:
                     threshold = 0.04 if stock_type == "弹性" else 0.055
-                drawdown = (highest_since_buy - close) / highest_since_buy
+                drawdown = (highest_since_buy - low) / highest_since_buy
                 if drawdown >= threshold:
                     sell_signal = True
                     sell_type = "回落止盈"
@@ -758,7 +760,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     # P1: ATR自适应初始止损
                     atr_multiplier = 1.5 if current_regime == "BEAR" else 2.0
                     atr_stop_pct = (atr_at_buy / buy_price) * atr_multiplier
-                    atr_stop_pct = max(0.04, min(0.10, atr_stop_pct))  # 约束[4%, 10%]（高波动股如比亚迪需要宽止损）
+                    atr_stop_pct = max(0.05, min(0.10, atr_stop_pct))  # 约束[5%, 10%]（与trend_strategy.py calc_atr_stop_pct一致）
                     stop_price = buy_price * (1 - atr_stop_pct)
                 elif profit_pct < 0.15:
                     stop_price = buy_price * 1.02  # 保本+2%
@@ -767,7 +769,8 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                 else:
                     stop_price = buy_price * 1.22  # 锁定22%
 
-                if close <= stop_price:
+                # FIX: 用盘中最低价判定止损触发（与V4 L322一致，实盘条件单盘中实时触发，非收盘价）
+                if low <= stop_price:
                     sell_signal = True
                     sell_type = "止损"
                     sell_ratio = 1.0
@@ -812,7 +815,8 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     drawdown_threshold = 0.08 if current_regime == "BULL" else 0.06  # BULL: 8%, 其他: 6%
                 else:
                     drawdown_threshold = 0.03  # 弹性标的保持3%不变
-                drawdown = (highest_since_buy - close) / highest_since_buy
+                # FIX: 用盘中最低价计算回撇（与V4 L348一致，实盘条件单盘中触发）
+                drawdown = (highest_since_buy - low) / highest_since_buy
                 if drawdown >= drawdown_threshold and profit_pct > 0:
                     sell_signal = True
                     sell_type = "回落止盈"
@@ -951,10 +955,13 @@ def analyze_trades(all_trades: list) -> dict:
     profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
     expectancy = np.mean([t["net_profit"] for t in all_trades])
 
-    # 累计收益（复利）
+    # 累计收益（按实际仓位比例贡献，避免多股票并行交易的全额复利失真）
+    # FIX: 原算法将20只股票的独立交易按顺序全额复利，导致数字虚高数千%
+    # 正确: 每笔交易仅用~12%资金，对总资金贡献 = net_profit% × 12%
+    position_ratio = 0.12  # 与 backtest_stock_v5 中 TOTAL_CAPITAL*0.12 一致
     cumulative = 1.0
     for t in all_trades:
-        cumulative *= (1 + t["net_profit"] / 100)
+        cumulative *= (1 + t["net_profit"] / 100 * position_ratio)
     cumulative_pct = (cumulative - 1) * 100
 
     avg_hold = np.mean([t["hold_days"] for t in all_trades])
@@ -1098,7 +1105,7 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 .warn{{background:#fff3cd;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #ffc107}}
 </style></head><body><div class="container">
 <h1>📊 策略优化对比报告（真实环境回测 {title_tag}）</h1>
-<p>回测区间: 2022-07 ~ {today} | 标的: 20只 | 手续费0.3% | 滑点0.2%/0.5% | T+1 | 涨跌停过滤</p>
+<p>回测区间: 2022-07 ~ {today} | 标的: 20只 | 手续费0.16% | 滑点0.2%/0.5% | T+1 | 涨跌停过滤</p>
 
 <div class="cards">
 <div class="card"><div class="v" style="color:{delta_color(wr_d)}">{wr_d:+.1f}%</div><div class="l">胜率变化</div></div>
@@ -1139,7 +1146,7 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 <tr><td>时间止损</td><td>无</td><td>45天+浮盈<3%</td><td>提高资金效率</td></tr>
 </table>
 
-<div class="warn">⚠️ <b>回测环境</b>: 手续费0.3%(买卖合计) | 滑点:龙头0.2%/弹性0.5% | T+1执行 | 涨跌停过滤 | 信号T日收盘计算→T+1开盘执行（无未来函数）</div>
+<div class="warn">⚠️ <b>回测环境</b>: 手续费0.16%(佣金万3双边+印花税千1) | 滑点:龙头0.2%/弹性0.5% | T+1执行 | 涨跌停过滤 | 信号T日收盘计算→T+1开盘执行（无未来函数）</div>
 
 <h2>🎯 卖出原因统计（{title_tag}）</h2>
 <table><tr><th>原因</th><th>次数</th><th>胜率</th><th>平均净收益</th></tr>{sell_rows}</table>

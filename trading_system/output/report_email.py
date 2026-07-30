@@ -31,7 +31,7 @@ def _wrap_html(title: str, subtitle: str, body: str) -> str:
 <body style="margin:0;padding:0;background:#f0f2f5;font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif">
 <div style="max-width:900px;margin:0 auto;padding:15px">
     <!-- 头部 -->
-    <div style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);color:white;padding:22px 30px;border-radius:12px 12px 0 0">
+    <div style="background:#1a1a2e;color:white;padding:22px 30px;border-radius:12px 12px 0 0">
         <h1 style="margin:0;font-size:22px;font-weight:700">{title}</h1>
         <div style="font-size:12px;opacity:0.75;margin-top:6px">{today} {now} | {subtitle}</div>
     </div>
@@ -41,7 +41,7 @@ def _wrap_html(title: str, subtitle: str, body: str) -> str:
     </div>
     <!-- 底部 -->
     <div style="text-align:center;color:#999;font-size:11px;margin-top:12px;padding:8px">
-        操盘密码V3.0 自动生成 | 仅供参考，不构成投资建议 | 股市有风险，投资需谨慎
+        操盘密码V9.0 自动生成 | 仅供参考，不构成投资建议 | 股市有风险，投资需谨慎
     </div>
 </div>
 </body></html>"""
@@ -59,15 +59,19 @@ def _section(title: str, content: str, icon: str = "📊") -> str:
 
 
 def _metric_cards(metrics: list) -> str:
-    """生成指标卡片行 metrics: [(label, value, color), ...]"""
-    cards = ""
+    """生成指标卡片行 metrics: [(label, value, color), ...] (QQ邮箱兼容: table布局)"""
+    n = len(metrics)
+    if n == 0:
+        return ""
+    width_pct = 100 // n
+    cells = ""
     for label, value, color in metrics:
-        cards += f"""
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        cells += f"""
+        <td style="width:{width_pct}%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">{label}</div>
             <div style="font-size:18px;font-weight:700;color:{color};margin-top:3px">{value}</div>
-        </div>"""
-    return f'<div style="display:flex;flex-wrap:wrap;gap:6px">{cards}</div>'
+        </td>"""
+    return f'<table style="width:100%;border-collapse:separate;border-spacing:6px 0"><tr>{cells}</tr></table>'
 
 
 def _alert_box(text: str, level: str = "warning") -> str:
@@ -404,9 +408,9 @@ def _order_card(num: int, title: str, code: str, name: str, direction: str,
 
     return f"""
     <div style="border:1px solid #e8e8e8;border-left:4px solid {border_color};border-radius:8px;padding:14px 16px;margin:10px 0">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="margin-bottom:8px">
             <span style="font-weight:700;font-size:13px;color:#333">#{num} {title} | {code} {name} | <span style="color:{dir_color}">{direction}</span></span>
-            <span style="font-size:11px;background:{border_color};color:white;padding:2px 8px;border-radius:10px">{badge}</span>
+            <span style="float:right;font-size:11px;background:{border_color};color:white;padding:2px 8px;border-radius:10px">{badge}</span>
         </div>
         <table style="width:100%;font-size:12px;border-collapse:collapse">
             <tr><td style="padding:4px 0;color:#888;width:80px">触发价</td><td style="font-weight:700;color:#e74c3c;font-size:14px">{trigger_price:.3f} 元</td></tr>
@@ -483,7 +487,7 @@ def build_operation_summary(results: list, holdings: dict) -> str:
                 order_count += 1  # 清仓单
 
     summary = f"""
-    <div style="background:linear-gradient(135deg,#fff1f0,#fff7e6);border:1px solid #ffccc7;border-radius:10px;padding:16px 20px">
+    <div style="background:#fff1f0;border:1px solid #ffccc7;border-radius:10px;padding:16px 20px">
         <div style="font-weight:700;font-size:14px;color:#cf1322;margin-bottom:10px">⭐ 明日操作摘要</div>
         <div style="font-size:13px;line-height:2;color:#333">
             <b>必须执行:</b> {order_count}条必挂条件单（止损+时间单），开盘前全部设好<br>
@@ -573,16 +577,16 @@ def _build_multi_level_flow_section(flow_data: dict) -> str:
     for key, label in [("super_large", "超大单"), ("large", "大单"), ("medium", "中单"), ("small", "小单")]:
         info = levels.get(key, {})
         net = info.get("net_inflow", 0)
-        arrow = "\u2b06\ufe0f" if net > 0 else ("\u2b07\ufe0f" if net < 0 else "\u27a1\ufe0f")
+        arrow = "⬆️" if net > 0 else ("⬇️" if net < 0 else "➡️")
         color = "#e74c3c" if net > 0 else ("#27ae60" if net < 0 else "#999")
         cards += f"""
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">{label}</div>
             <div style="font-size:16px;font-weight:700;color:{color};margin-top:3px">{arrow} {net/10000:+.0f}万</div>
-        </div>"""
-
+        </td>"""
+    
     html = f"""
-    <div style="display:flex;flex-wrap:wrap;gap:6px">{cards}</div>
+    <table style="width:100%;border-collapse:separate;border-spacing:6px 0"><tr>{cards}</tr></table>
     <div style="margin-top:10px;font-size:13px">
         <span style="font-weight:700">主力方向:</span> <span style="color:{dir_color};font-weight:700">{dir_arrow} {main_dir}</span>
         <span style="margin-left:16px;font-weight:700">资金模式:</span>
@@ -614,25 +618,25 @@ def _build_lhb_section(lhb_data: dict) -> str:
     hot_color = "#e74c3c" if hot_score >= 70 else ("#f39c12" if hot_score >= 40 else "#52c41a")
 
     html = f"""
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+    <table style="width:100%;border-collapse:separate;border-spacing:6px 0;margin-bottom:10px"><tr>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">上榜次数</div>
             <div style="font-size:20px;font-weight:700;color:#f0a500;margin-top:3px">{count}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">机构趋势</div>
             <div style="font-size:14px;font-weight:700;color:{inst_color};margin-top:3px">{inst_trend}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">游资活跃度</div>
             <div style="font-size:14px;font-weight:700;color:{hot_color};margin-top:3px">{hot_score}分</div>
             <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:{hot_color};width:{hot_bar_w}%;height:100%;border-radius:4px"></div></div>
-        </div>
-        <div style="flex:1;min-width:100px;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">信号</div>
             <div style="font-size:14px;font-weight:700;color:{s_color};margin-top:3px">{s_name}</div>
-        </div>
-    </div>"""
+        </td>
+    </tr></table>"""
     if desc:
         html += f'<div style="font-size:12px;color:#666;margin-top:6px">{desc}</div>'
     if risk:
@@ -662,25 +666,25 @@ def _build_margin_section(margin_data: dict) -> str:
     conf_bar_w = min(int(confidence * 100), 100)
 
     html = f"""
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+    <table style="width:100%;border-collapse:separate;border-spacing:6px 0;margin-bottom:10px"><tr>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">净买入天数</div>
             <div style="font-size:20px;font-weight:700;color:#1a5276;margin-top:3px">{net_days}天</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">余额趋势</div>
             <div style="font-size:14px;font-weight:700;color:{trend_color};margin-top:3px">{trend}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:{s_bg};border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">信号</div>
             <div style="font-size:14px;font-weight:700;color:{s_color};margin-top:3px">{s_name}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:25%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">置信度</div>
             <div style="font-size:14px;font-weight:700;color:#1a5276;margin-top:3px">{confidence:.0%}</div>
             <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:#1a5276;width:{conf_bar_w}%;height:100%;border-radius:4px"></div></div>
-        </div>
-    </div>"""
+        </td>
+    </tr></table>"""
     alerts = []
     if turning:
         alerts.append("\u26a0\ufe0f \u4f59\u989d\u62d0\u70b9\u51fa\u73b0\uff0c\u53ef\u80fd\u53d8\u76d8")
@@ -721,12 +725,12 @@ def _build_zt_section(zt_data: dict) -> str:
                 count = 1
             bar_w = min(count * 20, 100)
             bars += f"""
-            <div style="display:flex;align-items:center;margin:3px 0;font-size:12px">
-                <span style="width:60px;font-weight:700;color:#e74c3c">{level}板</span>
-                <div style="flex:1;background:#fff1f0;border-radius:4px;height:18px;margin:0 8px;position:relative">
-                    <div style="background:#e74c3c;width:{bar_w}%;height:100%;border-radius:4px"></div>
-                </div>
-                <span style="width:30px;text-align:right;font-weight:700">{count}</span>
+            <div style="margin:3px 0;font-size:12px">
+                <span style="display:inline-block;width:60px;font-weight:700;color:#e74c3c;vertical-align:middle">{level}板</span>
+                <span style="display:inline-block;width:70%;background:#fff1f0;border-radius:4px;height:18px;vertical-align:middle;position:relative">
+                    <span style="display:inline-block;background:#e74c3c;width:{bar_w}%;height:18px;border-radius:4px"></span>
+                </span>
+                <span style="display:inline-block;width:30px;text-align:right;font-weight:700;vertical-align:middle">{count}</span>
             </div>"""
         html += bars + '</div>'
 
@@ -777,20 +781,20 @@ def _build_release_section(release_data: dict) -> str:
     peak = release_data.get("peak_week", "")
 
     html = f"""
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+    <table style="width:100%;border-collapse:separate;border-spacing:6px 0;margin-bottom:10px"><tr>
+        <td style="width:33%;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">解禁总数</div>
             <div style="font-size:20px;font-weight:700;color:#e67e22;margin-top:3px">{total}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:33%;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">高冲击</div>
             <div style="font-size:20px;font-weight:700;color:#e74c3c;margin-top:3px">{len(high_impact)}</div>
-        </div>
-        <div style="flex:1;min-width:100px;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:33%;background:#fff7e6;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">高峰周</div>
             <div style="font-size:14px;font-weight:700;color:#e67e22;margin-top:3px">{peak or '--'}</div>
-        </div>
-    </div>"""
+        </td>
+    </tr></table>"""
 
     if high_impact:
         html += '<div style="font-weight:700;font-size:12px;color:#cf1322;margin:8px 0 4px">\u26a0\ufe0f \u9ad8\u51b2\u51fb\u89e3\u7981\u80a1:</div>'
@@ -826,17 +830,17 @@ def _build_holder_section(holder_data: dict) -> str:
     conc_bar_w = min(int(concentration), 100)
 
     html = f"""
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
-        <div style="flex:1;min-width:120px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+    <table style="width:100%;border-collapse:separate;border-spacing:6px 0;margin-bottom:10px"><tr>
+        <td style="width:50%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">股东户数趋势</div>
             <div style="font-size:14px;font-weight:700;color:{trend_color};margin-top:3px">{trend}</div>
-        </div>
-        <div style="flex:1;min-width:120px;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;margin:4px">
+        </td>
+        <td style="width:50%;background:#f8f9fa;border-radius:8px;padding:12px 8px;text-align:center;border:3px solid transparent">
             <div style="font-size:11px;color:#888">筹码集中度</div>
             <div style="font-size:16px;font-weight:700;color:#8e44ad;margin-top:3px">{concentration:.0f}%</div>
             <div style="background:#eee;border-radius:4px;height:6px;margin-top:4px"><div style="background:#8e44ad;width:{conc_bar_w}%;height:100%;border-radius:4px"></div></div>
-        </div>
-    </div>"""
+        </td>
+    </tr></table>"""
     if block_signal:
         html += f'<div style="font-size:12px;color:#666;margin:6px 0"><b>\u5927\u5b97\u4ea4\u6613:</b> {block_signal}</div>'
     if risk:
@@ -922,7 +926,7 @@ def build_morning_email(results: list, holdings: dict, sector_result: dict = Non
     if charts and charts.get("position_pie"):
         body += _section("仓位分布", f'<img src="{charts["position_pie"]}" style="width:100%;max-width:400px;border-radius:8px">', "🥧")
 
-    return _wrap_html("📋 盘前作战计划", "操盘密码V3.0 | 30秒看完今天怎么操作", body)
+    return _wrap_html("📋 盘前作战计划", "操盘密码V9.0 | 30秒看完今天怎么操作", body)
 
 
 def build_evening_email(results: list, holdings: dict, sector_result: dict = None,
@@ -1050,7 +1054,7 @@ def build_evening_email(results: list, holdings: dict, sector_result: dict = Non
     if risk_html:
         body += _section("风险提示", risk_html, "⚠️")
 
-    return _wrap_html("📊 盘后深度复盘", f"操盘密码V3.0 | {len(results)}只标的全量分析", body)
+    return _wrap_html("📊 盘后深度复盘", f"操盘密码V9.0 | {len(results)}只标的全量分析", body)
 
 
 def build_orders_email(results: list, holdings: dict, plan: dict = None,
@@ -1085,7 +1089,7 @@ def build_orders_email(results: list, holdings: dict, plan: dict = None,
             risk_content += _alert_box("✅ 近期无高冲击解禁股，解禁风险较低", "success")
     body += _section("风控状态", risk_content, "🛡️")
 
-    return _wrap_html("📋 条件单操作计划", f"操盘密码V3.0 | 总资金{750000/10000:.0f}万 | 持{len([r for r in results if holdings.get(r.get('code',''),{}).get('shares',0)])}只", body)
+    return _wrap_html("📋 条件单操作计划", f"操盘密码V9.0 | 总资金{750000/10000:.0f}万 | 持{len([r for r in results if holdings.get(r.get('code',''),{}).get('shares',0)])}只", body)
 
 
 def build_weekly_email(results: list, holdings: dict, sector_result: dict = None,
@@ -1165,4 +1169,4 @@ def build_weekly_email(results: list, holdings: dict, sector_result: dict = None
     if charts and charts.get("position_pie"):
         body += _section("仓位分布", f'<img src="{charts["position_pie"]}" style="width:100%;max-width:400px;border-radius:8px">', "🥧")
 
-    return _wrap_html("📅 周策略报告", f"操盘密码V3.0 | 第{datetime.date.today().isocalendar()[1]}周", body)
+    return _wrap_html("📅 周策略报告", f"操盘密码V9.0 | 第{datetime.date.today().isocalendar()[1]}周", body)

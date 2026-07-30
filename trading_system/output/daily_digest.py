@@ -310,8 +310,64 @@ def _build_action_list(holdings, data_dict, signals_map):
     return html
 
 
+def _detect_daily_kline_pattern(df) -> str:
+    """V9.0: 日K线形态识别（最近1-3根K线）"""
+    if df is None or len(df) < 3:
+        return ""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    o, h, l, c = last["open"], last["high"], last["low"], last["close"]
+    body = abs(c - o)
+    full_range = h - l
+    if full_range == 0:
+        return ""
+    body_ratio = body / full_range
+
+    # 十字星: 实体<10%振幅
+    if body_ratio < 0.1:
+        return "十字星"
+    # 锤子线: 下影线>2倍实体，上影线极短
+    lower_shadow = min(o, c) - l
+    upper_shadow = h - max(o, c)
+    if lower_shadow > body * 2 and upper_shadow < body * 0.3 and body_ratio > 0.1:
+        return "锤子线"
+    # 吞没形态
+    prev_body = abs(prev["close"] - prev["open"])
+    if c > o and prev["close"] < prev["open"] and body > prev_body * 1.2:
+        return "看涨吞没"
+    if c < o and prev["close"] > prev["open"] and body > prev_body * 1.2:
+        return "看跌吞没"
+    # 大阳/大阴线
+    if body_ratio > 0.7:
+        return "大阳线" if c > o else "大阴线"
+    return ""
+
+
+def _estimate_main_phase(df) -> str:
+    """V9.0: 主力四阶段估算（基于近20日量价关系）"""
+    if df is None or len(df) < 20:
+        return ""
+    recent = df.tail(20)
+    price_chg = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
+    vol_first_half = recent["volume"].iloc[:10].mean()
+    vol_second_half = recent["volume"].iloc[10:].mean()
+    vol_ratio = vol_second_half / vol_first_half if vol_first_half > 0 else 1.0
+
+    if price_chg > 0.05 and vol_ratio > 1.3:
+        return "拉升期"  # 价涨量增
+    elif price_chg > 0.03 and vol_ratio < 0.8:
+        return "控盘期"  # 价涨量缩(高度控盘)
+    elif abs(price_chg) < 0.05 and vol_ratio < 0.9:
+        return "吸筹期"  # 横盘缩量
+    elif price_chg < -0.05 and vol_ratio > 1.2:
+        return "出货期"  # 价跌量增
+    elif price_chg < -0.03 and vol_ratio < 0.8:
+        return "洗盘期"  # 价跌量缩
+    return ""
+
+
 def _build_wave_health(holdings, data_dict):
-    """板块3: 趋势健康度（每只票的波段诊断）"""
+    """板块3: 趋势健康度（每只票的波段诊断 + V9.0形态/阶段/缺口）"""
     cards = []
 
     for code, pos in holdings.items():
@@ -350,6 +406,26 @@ def _build_wave_health(holdings, data_dict):
         # 支撑压力
         support, resistance = _get_support_resistance(df)
 
+        # ---- V9.0: K线形态 + 主力阶段 + 缺口 ----
+        kline_pat = _detect_daily_kline_pattern(df)
+        main_phase = _estimate_main_phase(df)
+        gap_type = row.get("gap_type", "none") if hasattr(row, 'get') else "none"
+        gap_up = row.get("gap_up", False) if hasattr(row, 'get') else False
+        gap_down = row.get("gap_down", False) if hasattr(row, 'get') else False
+
+        v9_tags = []
+        if kline_pat:
+            v9_tags.append(f"K线:{kline_pat}")
+        if main_phase:
+            phase_color = {"拉升期": "#d32f2f", "控盘期": "#2e7d32", "吸筹期": "#1565c0",
+                           "出货期": "#ff6f00", "洗盘期": "#6a1b9a"}.get(main_phase, "#666")
+            v9_tags.append(f"<span style='color:{phase_color};font-weight:600'>主力:{main_phase}</span>")
+        if gap_up or gap_down:
+            gap_label = {"breakaway": "突破缺口", "exhaustion": "衰竭缺口", "common": "普通缺口"}.get(gap_type, "缺口")
+            gap_dir = "↑" if gap_up else "↓"
+            v9_tags.append(f"缺口{gap_dir}:{gap_label}")
+        v9_line = f"<br>V9.0: {' | '.join(v9_tags)}" if v9_tags else ""
+
         # 结论
         if wave["status"] == "上升波段":
             conclusion = "趋势完好，持有等目标"
@@ -367,7 +443,7 @@ def _build_wave_health(holdings, data_dict):
         <div class="title">{code} {name} <span class="badge" style="background:{wave['color']}">{wave['status']}</span></div>
         <div class="detail">
             均线: {ma_desc} | 量价: {vol_desc}<br>
-            支撑: {support:.2f} | 压力: {resistance:.2f} | MA20: {ma20:.2f} | MA60: {ma60:.2f}<br>
+            支撑: {support:.2f} | 压力: {resistance:.2f} | MA20: {ma20:.2f} | MA60: {ma60:.2f}{v9_line}<br>
             <b>结论: {conclusion}</b>
         </div>
     </div>""")

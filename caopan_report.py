@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-操盘密码报告调度器 V1.0
+操盘密码报告工具 V2.0 (CLI手动模式)
 ========================
-整合P0-P5全部模块，按「4+1」体系定时输出分析报告
+整合P0-P5全部模块，按「4+1」体系输出分析报告
+
+❗ 重要说明 (V2.0):
+  本文件已降级为CLI手动报告生成工具，不再作为常驻调度器。
+  定时任务已统一由 trading_system/scheduler.py 负责。
+  请勿将本文件与 scheduler.py 同时作为调度器运行，避免重复发送邮件。
 
 报告体系:
-  1. [08:30] 盘前作战计划 - 板块方向+操作清单+关键价位+仓位建议
-  2. [15:30] 盘后深度复盘 - 九大板块全量分析(趋势/DK/资金/筹码/板块/多因子/仓位/预警/持仓)
-  3. [19:00] 条件单 - 东方财富智能条件单+止损止盈价位
-  4. [周六 10:00] 周策略报告 - 本周绩效+板块轮动+仓位再平衡+下周计划
-  5. [盘中实时] 紧急预警 - 仅critical/high级别(止损/DK强信号/跌停)
+  1. [盘前] 盘前作战计划 - 板块方向+操作清单+关键价位+仓位建议
+  2. [盘后] 盘后深度复盘 - 九大板块全量分析(趋势/DK/资金/筹码/板块/多因子/仓位/预警/持仓)
+  3. [周报] 周策略报告 - 本周绩效+板块轮动+仓位再平衡+下周计划
+  4. [选股] CANSLIM选股报告 - 三层候选池+实时融合+涨停复盘
 
-运行:
-  python caopan_report.py                # 启动调度器
+运行(CLI手动模式):
   python caopan_report.py --morning      # 立即生成盘前报告
   python caopan_report.py --evening      # 立即生成盘后报告
   python caopan_report.py --weekly       # 立即生成周报
-  python caopan_report.py --install      # 安装Windows定时任务
+  python caopan_report.py --screener     # 运行选股引擎
+  python caopan_report.py --alert        # 启动盘中实时预警循环(每3分钟)
 """
 
 import sys
@@ -55,6 +59,9 @@ from output.report_charts import (
 )
 from strategy.stock_screener import run_stock_screener, send_screener_email
 from strategy.capital_flow import CapitalFlowAnalyzer
+from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
+from strategy.pool_manager import PoolManager
+from data.realtime import fetch_realtime_batch
 
 # 新数据模块（可选导入）
 try:
@@ -183,6 +190,46 @@ def fetch_batch_data(codes: list, days: int = 500) -> dict:
             logger.error(f"批量获取{code}失败: {e}")
     
     return result
+
+
+def _merge_realtime_row(df, quote: dict):
+    """将实时行情融合到baostock历史DataFrame最后一行
+    
+    逻辑（复用caopan_realtime_report.py的merge_realtime模式）:
+      - 如果最后一行已是今日 → 更新close/high/low/volume
+      - 否则 → 追加今日新行
+    """
+    import pandas as pd
+    if not quote or quote.get("price", 0) <= 0:
+        return df
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    price = quote["price"]
+    high = quote.get("high", price)
+    low = quote.get("low", price)
+    volume = quote.get("volume", 0) * 100  # 手→股
+
+    if len(df) > 0 and df["date"].iloc[-1] == today_str:
+        # 更新当日数据
+        df = df.copy()
+        df.iloc[-1, df.columns.get_loc("close")] = price
+        df.iloc[-1, df.columns.get_loc("high")] = max(high, df["high"].iloc[-1])
+        df.iloc[-1, df.columns.get_loc("low")] = min(low, df["low"].iloc[-1])
+        if volume > 0:
+            df.iloc[-1, df.columns.get_loc("volume")] = volume
+    else:
+        # 追加当日数据
+        prev_close = df["close"].iloc[-1] if len(df) > 0 else price
+        new_row = {
+            "date": today_str,
+            "open": quote.get("open", prev_close),
+            "high": high,
+            "low": low,
+            "close": price,
+            "volume": volume,
+            "amount": quote.get("amount", 0) * 10000,
+        }
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    return df
 
 
 def load_holdings() -> dict:
@@ -332,7 +379,7 @@ def generate_evening_report(results: list, holdings: dict,
     now = datetime.datetime.now()
     lines = []
     lines.append(f"{'═' * 60}")
-    lines.append(f"  📊 操盘密码 V3.0 盘后深度复盘")
+    lines.append(f"  📊 操盘密码 V9.0 盘后深度复盘")
     lines.append(f"  {now.strftime('%Y-%m-%d %H:%M')} | {len(results)}只标的")
     lines.append(f"{'═' * 60}")
 
@@ -443,6 +490,60 @@ def generate_evening_report(results: list, holdings: dict,
         total_pnl = (total_value - total_cost) / total_cost * 100
         lines.append(f"     {'─'*40}")
         lines.append(f"     总盈亏: {total_pnl:+.1f}% | 市值{total_value/10000:.1f}万")
+
+    # 十、V9.0盘口综合（K线形态 + 主力阶段 + 缺口分析）
+    lines.append(f"\n  ━━ 十、V9.0盘口综合 ━━")
+    for r in results:
+        df = r.get("df_analyzed")
+        if df is None or len(df) < 20:
+            continue
+        name = r.get("name", "")
+        tags = []
+        # K线形态
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        o, h, l, c = last["open"], last["high"], last["low"], last["close"]
+        body = abs(c - o)
+        full_range = h - l
+        if full_range > 0:
+            body_ratio = body / full_range
+            if body_ratio < 0.1:
+                tags.append("K线:十字星")
+            elif (min(o, c) - l) > body * 2 and (h - max(o, c)) < body * 0.3:
+                tags.append("K线:锤子线")
+            elif c > o and prev["close"] < prev["open"] and body > abs(prev["close"] - prev["open"]) * 1.2:
+                tags.append("K线:看涨吞没")
+            elif c < o and prev["close"] > prev["open"] and body > abs(prev["close"] - prev["open"]) * 1.2:
+                tags.append("K线:看跌吞没")
+            elif body_ratio > 0.7:
+                tags.append(f"K线:{'大阳线' if c > o else '大阴线'}")
+        # 主力阶段
+        recent = df.tail(20)
+        price_chg = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
+        vol_h1 = recent["volume"].iloc[:10].mean()
+        vol_h2 = recent["volume"].iloc[10:].mean()
+        vol_r = vol_h2 / vol_h1 if vol_h1 > 0 else 1.0
+        if price_chg > 0.05 and vol_r > 1.3:
+            tags.append("主力:拉升期")
+        elif price_chg > 0.03 and vol_r < 0.8:
+            tags.append("主力:控盘期")
+        elif abs(price_chg) < 0.05 and vol_r < 0.9:
+            tags.append("主力:吸筹期")
+        elif price_chg < -0.05 and vol_r > 1.2:
+            tags.append("主力:出货期")
+        elif price_chg < -0.03 and vol_r < 0.8:
+            tags.append("主力:洗盘期")
+        # 缺口
+        gap_type = last.get("gap_type", "none") if hasattr(last, 'get') else "none"
+        gap_up = last.get("gap_up", False) if hasattr(last, 'get') else False
+        gap_down = last.get("gap_down", False) if hasattr(last, 'get') else False
+        if gap_up or gap_down:
+            gap_label = {"breakaway": "突破缺口", "exhaustion": "衰竭缺口", "common": "普通缺口"}.get(gap_type, "缺口")
+            tags.append(f"缺口{'↑' if gap_up else '↓'}:{gap_label}")
+        if tags:
+            lines.append(f"     {name:<8} {' | '.join(tags)}")
+    if not any(r.get("df_analyzed") is not None and len(r.get("df_analyzed", [])) >= 20 for r in results):
+        lines.append("     (数据不足，跳过)")
 
     lines.append(f"\n{'═' * 60}")
     return "\n".join(lines)
@@ -591,24 +692,81 @@ def run_morning():
 
 
 def run_screener():
-    """运行选股引擎并发送选股报告邮件"""
+    """运行选股引擎并发送选股报告邮件
+    
+    V2.2: 三层候选池架构
+      第1层: SECTOR_CANDIDATES 静态配置池（29只，8大赛道）
+      第2层: PoolManager 观察池（动态维护，最多10只）
+      第3层: scan_market_hot_stocks 全市场动态扫描（最多15只）
+    """
     print("\n" + "=" * 50)
     print("  运行CANSLIM选股引擎...")
     print("=" * 50)
     holdings = load_holdings()
 
-    # 获取候选股票池数据（从SECTOR_CANDIDATES配置）
+    # ---- 第1层: 静态配置池 ----
     sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
     all_codes = set()
     for sector_name, sector_info in sector_candidates.items():
         stocks = sector_info.get("stocks", {})
         all_codes.update(stocks.keys())
+    static_count = len(all_codes)
+
+    # ---- 第2层: PoolManager观察池 ----
+    pm = PoolManager()
+    watch_codes = pm.get_watch_codes()
+    pool_new = 0
+    for code in watch_codes:
+        if code not in all_codes:
+            all_codes.add(code)
+            pool_new += 1
+    if pool_new > 0:
+        print(f"  观察池补充: +{pool_new}只 (PoolManager)")
+
+    # ---- 第3层: 全市场动态扫描 ----
+    scan_new = 0
+    try:
+        scan_result = scan_market_hot_stocks(total_max=15)
+        if scan_result.get("success"):
+            new_codes = merge_scan_results_to_pool(scan_result, all_codes)
+            # 最多追加15只动态发现股（控制baostock拉取耗时）
+            for code in new_codes[:15]:
+                all_codes.add(code)
+                scan_new += 1
+            if scan_new > 0:
+                top3 = [f"{d['code']} {d['name']}({d['change_pct']:+.1f}%)"
+                        for d in scan_result['details'][:3]]
+                cache_tag = "(缓存)" if scan_result.get("from_cache") else ""
+                print(f"  动态扫描补充{cache_tag}: +{scan_new}只 | 强势股: {', '.join(top3)}")
+        else:
+            print(f"  动态扫描: 未成功（非盘中/网络异常），使用已有候选池")
+    except Exception as e:
+        logger.warning(f"  动态扫描异常: {e}，继续使用已有候选池")
+
     # 加入指数数据
     all_codes.add("000300")
+    print(f"  候选股票池: {len(all_codes)}只 "
+          f"(静态{static_count} + 观察池{pool_new} + 动态{scan_new} + 指数1)")
 
-    print(f"  候选股票池: {len(all_codes)}只")
     # V2.0性能优化：批量拉取（单次登录）
     raw_data = fetch_batch_data(list(all_codes), days=300)
+
+    # V2.1: 融合盘中实时行情（腾讯行情API），确保选股基于最新市场状态
+    realtime_codes = [c for c in all_codes if c != "000300"]  # 指数不需要实时融合
+    quotes = fetch_realtime_batch(realtime_codes)
+    merged_count = 0
+    if quotes:
+        for code, df in raw_data.items():
+            if df is None or df.empty:
+                continue
+            quote = quotes.get(code)
+            if quote and quote.get("price", 0) > 0:
+                raw_data[code] = _merge_realtime_row(df, quote)
+                merged_count += 1
+        print(f"  实时行情融合: {merged_count}/{len(quotes)}只 (腾讯行情API)")
+    else:
+        print(f"  实时行情: 未获取到（非盘中时间或网络异常），使用历史数据")
+
     data_dict = {}
     for code, df in raw_data.items():
         if df is not None and len(df) >= 60:
@@ -627,12 +785,87 @@ def run_screener():
 
     # 运行选股引擎
     result = run_stock_screener(data_dict, holdings)
-    print(f"\n  ✅ 选股完成: {result['qualified_count']}只入选 / {result['total_candidates']}只候选")
+    buy_count = result.get('buy_recommend_count', 0)
+    watch_count = result.get('watch_only_count', 0)
+    min_buy = result.get('min_buy_score', 50)
+    print(f"\n  ✅ 选股完成: {result['qualified_count']}只输出 / {result['total_candidates']}只候选")
+    print(f"     ★推荐买入: {buy_count}只 | 仅观察: {watch_count}只 | 买入线: {min_buy}分")
     if result["stock_pool"]:
-        for s in result["stock_pool"]:
-            print(f"     {s['code']} {s['name']} | 评分{s['factor_score']} | "
-                  f"买点{s['moderate_buy']} | 止损{s['stop_loss']}(-{s['stop_loss_pct']}%) | "
-                  f"{s.get('risk_level', '')}")
+        for i, s in enumerate(result["stock_pool"], 1):
+            tag = "★推荐" if s.get('is_buy_recommend') else "观察"
+            if s.get('is_buy_recommend'):
+                print(f"     {i:2d}. [{tag}] {s['code']} {s['name']} | 评分{s['factor_score']} | "
+                      f"买点{s['moderate_buy']} | 止损{s['stop_loss']}(-{s['stop_loss_pct']}%)")
+            else:
+                print(f"     {i:2d}. [{tag}] {s['code']} {s['name']} | 评分{s['factor_score']} | "
+                      f"{s.get('watch_reason', '')}")
+
+    # V2.2: 选股后同步更新PoolManager观察池（将入选股加入观察池）
+    try:
+        pool_result = pm.update_pool_weekly(data_dict, screener_result=result)
+        if pool_result.get("promoted") or pool_result.get("demoted"):
+            print(f"  股票池更新: 升级{len(pool_result['promoted'])}只, "
+                  f"降级{len(pool_result['demoted'])}只, "
+                  f"过期{len(pool_result['expired'])}只")
+    except Exception as e:
+        logger.warning(f"  PoolManager更新异常(不影响选股): {e}")
+
+    # V2.4: 涨停复盘集成
+    zt_report = None
+    if getattr(config, 'ZT_MONITOR_ENABLED', True):
+        try:
+            from trading_system.strategy.zt_monitor import ZTMonitor
+            zt_monitor = ZTMonitor()
+            zt_report = zt_monitor.get_daily_report()
+            if zt_report and zt_report.get("ladder", {}).get("total_zt", 0) > 0:
+                ladder = zt_report["ladder"]
+                print(f"\n  📈 涨停复盘: 涨停{ladder['total_zt']}只 / 炸板{ladder['total_zb']}只 | "
+                      f"封板率{ladder['zt_rate']:.0%} | 最高{ladder['max_consecutive']}板")
+                # 板块热度Top3
+                heat_top3 = zt_report.get("sector_heat", [])[:3]
+                if heat_top3:
+                    heat_str = ", ".join(f"{h['sector_name']}({h['zt_count']}只)" for h in heat_top3)
+                    print(f"     热门板块: {heat_str}")
+                # 连板龙头
+                if ladder.get("top_stocks"):
+                    top_str = ", ".join(f"{s['name']}({s['consecutive_days']}板)" for s in ladder["top_stocks"][:3])
+                    print(f"     连板龙头: {top_str}")
+                # 与候选池交集
+                zt_codes = set(s["code"] for s in zt_monitor.get_zt_pool())
+                pool_codes = set(s["code"] for s in result.get("stock_pool", []))
+                overlap = zt_codes & pool_codes
+                if overlap:
+                    print(f"     ★涨停股已在观察池: {', '.join(overlap)}")
+                result["zt_report"] = zt_report
+            else:
+                print(f"  涨停复盘: 当日无涨停数据（非交易日或数据未更新）")
+        except Exception as e:
+            logger.warning(f"  涨停复盘异常(不影响选股): {e}")
+
+    # V2.5: 涨停基因跟踪集成
+    zt_gene_result = None
+    if getattr(config, 'ZT_GENE_ENABLED', True):
+        try:
+            from trading_system.strategy.zt_gene_tracker import ZTGeneTracker
+            gene_tracker = ZTGeneTracker()
+            zt_gene_result = gene_tracker.track_lianban_candidates()
+            if zt_gene_result and zt_gene_result.get("success"):
+                candidates = zt_gene_result.get("candidates", [])
+                continued = zt_gene_result.get("continued_zt", [])
+                if candidates or continued:
+                    print(f"\n  [涨停基因] 昨日涨停{zt_gene_result['prev_zt_count']}只 | "
+                          f"连板候选{len(candidates)}只 | 已连板{len(continued)}只")
+                    if continued:
+                        cont_str = ", ".join(f"{s['name']}({s['consecutive_days']}板)" for s in continued[:3])
+                        print(f"     已连板: {cont_str}")
+                    if candidates:
+                        cand_str = ", ".join(f"{s['name']}(高开{s.get('open_pct', 0):.1f}%)" for s in candidates[:3])
+                        print(f"     连板候选: {cand_str}")
+                    result["zt_gene"] = zt_gene_result
+            else:
+                print(f"  涨停基因: 无有效跟踪数据")
+        except Exception as e:
+            logger.warning(f"  涨停基因异常(不影响选股): {e}")
 
     # 发送选股报告邮件
     success = send_screener_email(result)
@@ -748,9 +981,9 @@ def run_evening():
         )
         _send_html_email(f"[操盘密码] 📊盘后深度复盘 | {today}", html1)
 
-        # 第2封：条件单操作计划（持仓+条件单+风控+纪律锁）
-        html2 = build_orders_email(results, holdings, plan, release_data=release_data)
-        _send_html_email(f"[操盘密码] 📋条件单操作计划 | {today}", html2)
+        # V2.0: 条件单已统一由 scheduler.py 19:00 发送，本处不再重复发送
+        # html2 = build_orders_email(results, holdings, plan, release_data=release_data)
+        # _send_html_email(f"[操盘密码] 📋条件单操作计划 | {today}", html2)
 
         # 预警检查
         alert_engine = AlertEngine(holdings=holdings)
@@ -896,7 +1129,7 @@ def _build_alert_html(alerts: list) -> str:
 <div style="max-width:700px;margin:0 auto">
     <div style="background:linear-gradient(135deg,#cf1322,#ff4d4f);color:white;padding:18px 25px;border-radius:12px 12px 0 0">
         <h1 style="margin:0;font-size:20px">⚠️ 紧急预警 ({len(alerts)}条)</h1>
-        <div style="font-size:12px;opacity:0.8;margin-top:5px">{today} {now} | 操盘密码V3.0 | 按紧急度排序</div>
+        <div style="font-size:12px;opacity:0.8;margin-top:5px">{today} {now} | 操盘密码V9.0 | 按紧急度排序</div>
     </div>
     <div style="background:white;padding:20px 25px;border-radius:0 0 12px 12px;box-shadow:0 4px 15px rgba(0,0,0,0.08)">
         {items}
@@ -909,31 +1142,27 @@ def _build_alert_html(alerts: list) -> str:
 
 
 def start_scheduler():
-    """启动定时调度"""
-    try:
-        import schedule
-        import time
-    except ImportError:
-        print("请安装schedule: pip install schedule")
-        return
-
+    """DEPRECATED: 调度功能已统一由 trading_system/scheduler.py 负责
+    
+    本函数保留仅为兼容，不再注册任何定时任务。
+    请使用:
+      python trading_system/scheduler.py  # 启动主调度器
+      python caopan_report.py --morning   # CLI手动生成报告
+    """
     print("=" * 50)
-    print("  操盘密码报告调度器 V1.0")
-    print(f"  启动: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("  ⚠️  本调度器已废弃 (V2.0)")
+    print("  定时任务已统一由 trading_system/scheduler.py 负责")
+    print("  如需手动生成报告，请使用:")
+    print("    python caopan_report.py --morning")
+    print("    python caopan_report.py --evening")
+    print("    python caopan_report.py --weekly")
+    print("    python caopan_report.py --screener")
     print("=" * 50)
-    print("  08:30 盘前作战计划")
-    print("  15:30 盘后深度复盘")
-    print("  周六 10:00 周策略报告")
-    print("  盘中: 每3分钟实时预警(独立循环)")
-    print("=" * 50)
-
-    schedule.every().day.at("08:30").do(run_morning)
-    schedule.every().day.at("15:30").do(run_evening)
-    schedule.every().saturday.at("10:00").do(run_weekly)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    print("\n正在启动主调度器 scheduler.py ...")
+    # 转发到主调度器
+    import subprocess
+    scheduler_path = os.path.join(TRADING_SYSTEM_DIR, "scheduler.py")
+    subprocess.run([sys.executable, scheduler_path], cwd=TRADING_SYSTEM_DIR)
 
 
 def install_tasks():

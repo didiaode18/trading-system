@@ -115,6 +115,33 @@ def fetch_realtime_tencent(codes: list) -> dict:
                     if price <= 0:
                         continue
                     
+                    # V9.0: 内外盘（主动买/主动卖）
+                    outer_vol = float(fields[7]) if len(fields) > 7 and fields[7] else 0  # 外盘(手)
+                    inner_vol = float(fields[8]) if len(fields) > 8 and fields[8] else 0  # 内盘(手)
+                    
+                    # V9.0: 买卖五档盘口
+                    bid1_price = float(fields[9]) if len(fields) > 9 and fields[9] else 0
+                    bid1_vol = float(fields[10]) if len(fields) > 10 and fields[10] else 0
+                    ask1_price = float(fields[11]) if len(fields) > 11 and fields[11] else 0
+                    ask1_vol = float(fields[12]) if len(fields) > 12 and fields[12] else 0
+                    bid2_vol = float(fields[14]) if len(fields) > 14 and fields[14] else 0
+                    ask2_vol = float(fields[16]) if len(fields) > 16 and fields[16] else 0
+                    bid3_vol = float(fields[18]) if len(fields) > 18 and fields[18] else 0
+                    ask3_vol = float(fields[20]) if len(fields) > 20 and fields[20] else 0
+                    bid4_vol = float(fields[22]) if len(fields) > 22 and fields[22] else 0
+                    ask4_vol = float(fields[24]) if len(fields) > 24 and fields[24] else 0
+                    bid5_vol = float(fields[26]) if len(fields) > 26 and fields[26] else 0
+                    ask5_vol = float(fields[28]) if len(fields) > 28 and fields[28] else 0
+                    
+                    # V9.0: VWAP均价线 = 成交额(万)*10000 / (成交量(手)*100)
+                    vwap = (amount * 100.0 / volume) if volume > 0 else price
+                    
+                    # V9.0: 委比 = (委买总量-委卖总量)/(委买+委卖)
+                    total_bid = bid1_vol + bid2_vol + bid3_vol + bid4_vol + bid5_vol
+                    total_ask = ask1_vol + ask2_vol + ask3_vol + ask4_vol + ask5_vol
+                    order_ratio = ((total_bid - total_ask) / (total_bid + total_ask)
+                                   if (total_bid + total_ask) > 0 else 0)
+                    
                     results[code] = {
                         "price": price,
                         "prev_close": prev_close,
@@ -129,6 +156,17 @@ def fetch_realtime_tencent(codes: list) -> dict:
                         "name": fields[1],
                         "time": update_time,
                         "source": "tencent",
+                        # V9.0 新增字段
+                        "vwap": round(vwap, 3),
+                        "outer_vol": outer_vol,
+                        "inner_vol": inner_vol,
+                        "bid1_price": bid1_price,
+                        "bid1_vol": bid1_vol,
+                        "ask1_price": ask1_price,
+                        "ask1_vol": ask1_vol,
+                        "total_bid_vol": total_bid,
+                        "total_ask_vol": total_ask,
+                        "order_ratio": round(order_ratio, 4),
                     }
                 except (ValueError, IndexError) as e:
                     logger.debug(f"腾讯API解析异常: {e}")

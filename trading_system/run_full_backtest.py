@@ -803,7 +803,7 @@ tr:nth-child(even) {{ background: #f8f9fa; }}
 
         <div class="footer">
             本报告由交易系统自动生成 | 仅供参考，不构成投资建议<br>
-            股市有风险，投资需谨慎 | 高胜率A股交易操作系统 V8.0 | {today}
+            股市有风险，投资需谨慎 | 高胜率A股交易操作系统 V9.0 | {today}
         </div>
     </div>
 </div>

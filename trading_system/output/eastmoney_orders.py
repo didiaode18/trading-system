@@ -989,6 +989,73 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
     return send_email(subject, html_content)
 
 
+def _save_qmt_orders_json(signals: list, holdings: dict = None, data_dict: dict = None):
+    """FIX: 定时条件单同步生成QMT执行JSON，消除定时(eastmoney)与手动(daily_orders)两套条件单断链问题
+
+    输出格式与 daily_orders.py 生成的 orders_{date}.json 完全兼容，
+    QMT执行器(qmt_trader.py)可直接读取。
+    """
+    import json as _json
+
+    if holdings is None:
+        holdings = {}
+    if data_dict is None:
+        data_dict = {}
+
+    # 复用已有逻辑生成条件单
+    all_orders = []
+    for code, sig in signals:
+        holding = holdings.get(code)
+        data_df = data_dict.get(code)
+        orders = _map_signal_to_order(code, sig, holding, data_df)
+        all_orders.extend(orders)
+
+    if not all_orders:
+        return
+
+    # 转换为QMT执行器期望的格式
+    today = datetime.date.today()
+    date_str = today.strftime("%Y%m%d")
+    qmt_orders = []
+    for idx, order in enumerate(all_orders, 1):
+        direction = "买入" if order.get("order_type", "").startswith("buy") else "卖出"
+        order_type_cn = ORDER_TYPES.get(order.get("order_type", ""), order.get("order_type_cn", "定价卖出"))
+        priority_map = {1: "★★★必挂", 2: "★★建议", 3: "★参考"}
+        qmt_orders.append({
+            "order_id": f"ORD_{date_str}_{idx:03d}",
+            "证券代码": order.get("code", ""),
+            "证券名称": order.get("name", ""),
+            "方向": direction,
+            "触发价": order.get("trigger_price", 0),
+            "数量": order.get("shares", 0),
+            "类型": order_type_cn,
+            "有效期": order.get("validity", "10个交易日"),
+            "触发时间": order.get("trigger_time", ""),
+            "优先级": priority_map.get(order.get("priority", 2), "★★建议"),
+            "说明": order.get("notes", ""),
+        })
+
+    orders_json = {
+        "date": today.strftime("%Y-%m-%d"),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "scheduler_eastmoney_orders",
+        "total_capital": getattr(config, 'TOTAL_CAPITAL', 1000000),
+        "max_daily_trades": 10,
+        "orders": qmt_orders,
+    }
+
+    # 保存到 trading_system/output/orders_{date}.json
+    output_dir = config.OUTPUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, f"orders_{date_str}.json")
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            _json.dump(orders_json, f, ensure_ascii=False, indent=2)
+        logger.info(f"[条件单] QMT执行文件已生成: {json_path} ({len(qmt_orders)}条)")
+    except Exception as e:
+        logger.warning(f"[条件单] QMT JSON保存失败: {e}")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     print("=" * 50)

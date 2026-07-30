@@ -364,6 +364,36 @@ class MarginMonitor:
         confidence = 0.3
         desc_parts = []
 
+        # P1优化: 融资余额与价格背离检测
+        price_margin_divergence = "none"
+        try:
+            price_pct_5d = self._get_price_change_pct(stock_code, days=5)
+            if len(df) >= 5:
+                mb_start = df["margin_balance"].iloc[-5]
+                mb_end = df["margin_balance"].iloc[-1]
+                margin_chg_pct = (mb_end - mb_start) / mb_start if mb_start > 0 else 0
+                # 顶背离: 价格上涨但融资余额下降
+                if price_pct_5d > 0.02 and margin_chg_pct < -0.01:
+                    price_margin_divergence = "top"
+                    desc_parts.append(f"⚠️融资余额与价格顶背离(价格+{price_pct_5d:.1%}但融资{margin_chg_pct:.1%})")
+                # 底背离: 价格下跌但融资余额上升
+                elif price_pct_5d < -0.02 and margin_chg_pct > 0.01:
+                    price_margin_divergence = "bottom"
+                    desc_parts.append(f"融资余额与价格底背离(价格{price_pct_5d:.1%}但融资+{margin_chg_pct:.1%}，杠杆资金逆势布局)")
+        except Exception:
+            pass
+
+        # P1优化: 融资余额急降阈值预警
+        balance_drop_alert = False
+        if len(df) >= 5:
+            mb_5d_ago = df["margin_balance"].iloc[-5]
+            mb_now = df["margin_balance"].iloc[-1]
+            if mb_5d_ago > 0:
+                drop_pct = (mb_5d_ago - mb_now) / mb_5d_ago
+                if drop_pct > 0.05:  # 5日融资余额降幅超5%
+                    balance_drop_alert = True
+                    desc_parts.append(f"⚠️融资余额5日急降{drop_pct:.1%}，杠杆资金撤离")
+
         if net_buy_days >= NET_BUY_MIN_DAYS and balance_trend == "increasing":
             signal = "bullish"
             confidence = min(0.9, 0.5 + net_buy_days * 0.05)
@@ -380,6 +410,16 @@ class MarginMonitor:
             confidence = max(confidence, min(0.85, 0.5 + short_anomaly_pct * 0.3))
             desc_parts.append(f"融券余额异常增加{short_anomaly_pct:.1%}（做空预警）")
 
+        # 背离和急降也影响信号
+        if price_margin_divergence == "top" or balance_drop_alert:
+            if signal != "bearish":
+                signal = "cautious"
+            confidence = max(confidence, 0.6)
+        elif price_margin_divergence == "bottom":
+            if signal == "neutral":
+                signal = "bullish"
+            confidence = max(confidence, 0.55)
+
         if not desc_parts:
             desc_parts.append("融资融券数据无明显信号")
 
@@ -395,6 +435,8 @@ class MarginMonitor:
             "balance_trend": balance_trend,
             "balance_turning": balance_turning,
             "short_selling_anomaly": short_selling_anomaly,
+            "price_margin_divergence": price_margin_divergence,
+            "balance_drop_alert": balance_drop_alert,
             "signal": signal,
             "confidence": round(confidence, 3),
             "description": description,

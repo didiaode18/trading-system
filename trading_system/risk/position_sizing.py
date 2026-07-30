@@ -84,6 +84,18 @@ class PositionSizer:
         capital = self.cfg["total_capital"]
         holdings = holdings or {}
 
+        # FIX P1: 策略失效检测器联动——降级时仓位缩放
+        strategy_scale = 1.0
+        try:
+            from risk.risk_control import StrategyFailureDetector
+            _detector = StrategyFailureDetector()
+            _status = _detector.get_status()
+            strategy_scale = _status.get("position_scale", 1.0)
+            if strategy_scale < 1.0:
+                logger.warning(f"[策略失效] level={_status['level']}, 仓位缩放={strategy_scale}")
+        except Exception:
+            pass
+
         # 1. 筛选可操作标的（排除下跌趋势）
         candidates = []
         for r in results:
@@ -106,6 +118,12 @@ class PositionSizer:
 
         for r in candidates:
             pos = self._calc_single_position(r, capital, holdings)
+            # FIX P1: 策略失效时统一缩放
+            if strategy_scale < 1.0 and pos["suggested_shares"] > 0:
+                scaled = max(100, int(pos["suggested_shares"] * strategy_scale // 100) * 100)
+                pos["suggested_shares"] = scaled
+                pos["suggested_amount"] = scaled * pos["close"]
+                pos["position_pct"] = round(pos["suggested_amount"] / capital * 100, 1) if capital > 0 else 0
             if pos["suggested_shares"] > 0:
                 positions.append(pos)
                 total_allocated += pos["suggested_amount"]
@@ -191,6 +209,14 @@ class PositionSizer:
         max_shares = int(capital * self.cfg["max_position_pct"] / close)
         min_shares = int(capital * self.cfg["min_position_pct"] / close)
         suggested_shares = max(0, min(suggested_shares, max_shares))
+
+        # FIX P1: 单笔风险预算硬上限（2%本金）
+        # 所有调整（DK加强/波动率）之后，强制钳位确保 max_loss ≤ 2% capital
+        if risk_per_share > 0:
+            hard_max_shares = int(capital * self.cfg["max_risk_per_trade"] / risk_per_share)
+            if suggested_shares > hard_max_shares:
+                logger.info(f"[风险预算] {code} 股数{suggested_shares}→{hard_max_shares}(2%硬上限)")
+                suggested_shares = hard_max_shares
 
         # 如果低于最小仓位，设为0（不值得开仓）
         if suggested_shares < min_shares * 0.5:

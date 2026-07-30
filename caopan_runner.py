@@ -251,7 +251,7 @@ def _print_final_report(results: list, holdings: dict):
         return
 
     print(f"\n{'═' * 60}")
-    print(f"  📊 操盘密码 V2.0 最终分析报告")
+    print(f"  📊 操盘密码 V9.0 最终分析报告")
     print(f"  生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'═' * 60}")
 

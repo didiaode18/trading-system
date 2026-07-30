@@ -106,7 +106,7 @@ class RiskStateManager:
             "last_trade_date": "",          # 上次交易日期
             "sell_cooldown": {},            # {code: "解禁日期"} 卖出后冷却
             "weekly_force_reduce": False,   # 周熔断强制减仓标记
-            "total_capital": 424000,        # 总资金
+            "total_capital": getattr(config, 'TOTAL_CAPITAL', 424000),  # 总资金（FIX P3: 从 config 读取）
             "intraday_risk_flags": {},      # 盘中风险标记 {flag: {"time": ISO时间, "details": dict}}
         }
         # FIX: 修复 _load_state 裸except吞没状态损坏异常的问题
@@ -169,6 +169,82 @@ class RiskStateManager:
         if unlock and datetime.date.today().isoformat() < unlock:
             return True, f"{code}冷却期中（{unlock}解禁）"
         return False, ""
+
+    # FIX P1: 渐进加仓恢复规则（深亏后禁止一次性满仓）
+    # 3档恢复路径: 30% → 45% → 60% → 解除
+    RECOVERY_TIERS = [
+        {"max_position": 0.30, "condition": "深亏未恢复(浮亏>15%)"},
+        {"max_position": 0.45, "condition": "本月已实现盈亏≥0"},
+        {"max_position": 0.60, "condition": "连续2周盈利"},
+        {"max_position": 1.00, "condition": "完全恢复"},
+    ]
+
+    def get_recovery_position_cap(self) -> Tuple[float, str]:
+        """
+        获取当前恢复阶段允许的仓位上限
+
+        返回: (max_position_ratio, description)
+        规则:
+          - 总浮亏>15%: 最高30%仓位（当前状态）
+          - 本月已实现盈亏≥0: 最高45%
+          - 连续2周盈利: 最高60%
+          - 否则: 不限制
+        """
+        total_capital = self.state.get("total_capital", 424000)
+        monthly_start = self.state.get("monthly_start_capital", total_capital)
+
+        # 计算当前回撤深度
+        if monthly_start > 0:
+            drawdown_from_month = (monthly_start - total_capital) / monthly_start
+        else:
+            drawdown_from_month = 0
+
+        # Tier 0: 深亏未恢复
+        if drawdown_from_month > 0.15 or total_capital < monthly_start * 0.85:
+            return 0.30, f"深亏恢复期(回撤{drawdown_from_month*100:.1f}%), 仓位上饨30%"
+
+        # Tier 1: 本月已实现盈亏≥0
+        monthly_pnl = self.state.get("monthly_pnl", 0)
+        weekly_pnl = self.state.get("weekly_pnl", 0)
+        consecutive_profit_weeks = self.state.get("consecutive_profit_weeks", 0)
+
+        if consecutive_profit_weeks >= 2:
+            return 0.60, f"连续{consecutive_profit_weeks}周盈利, 仓位上饨60%"
+        elif monthly_pnl >= 0 and drawdown_from_month <= 0.15:
+            return 0.45, "本月盈亏持平, 仓位上饨45%"
+
+        # 默认不限制
+        return 1.00, "无恢复限制"
+
+    def get_market_position_cap(self) -> Tuple[float, str]:
+        """
+        读取MarketRegimeDetector缓存，返回市场状态对应的仓位上限
+        FIX P1: MarketRegime→执行层联动
+
+        返回: (max_position_ratio, description)
+        """
+        regime_file = os.path.join(os.path.dirname(STATE_FILE), "market_regime_state.json")
+        try:
+            if os.path.exists(regime_file):
+                with open(regime_file, "r", encoding="utf-8") as f:
+                    regime = json.load(f)
+                state = regime.get("state", "RANGE")
+                max_pos = regime.get("position_advice", {}).get("max_position", 0.60)
+                detail = regime.get("detail", "")
+                # 缓存超过2天则不可信
+                detect_time = regime.get("detect_time", "")
+                if detect_time:
+                    from datetime import datetime as _dt
+                    try:
+                        detect_dt = _dt.strptime(detect_time, "%Y-%m-%d %H:%M")
+                        if (_dt.now() - detect_dt).days > 2:
+                            return 1.00, "市场状态缓存过期(>2天)"
+                    except ValueError:
+                        pass
+                return max_pos, f"市场{state}, 仓位上饨{max_pos:.0%}"
+        except Exception as e:
+            logger.debug(f"market_regime_state读取失败: {e}")
+        return 1.00, "无市场状态限制"
 
 
 # ============================================================
@@ -488,11 +564,11 @@ class RiskGate:
             print(f"拦截: {result['reason']}")
     """
 
-    def __init__(self, total_capital: float = 424000, allowed_pool: set = None):
+    def __init__(self, total_capital: float = None, allowed_pool: set = None):
         self.cfg = RISK_CONFIG
-        self.total_capital = total_capital
+        self.total_capital = total_capital or getattr(config, 'TOTAL_CAPITAL', 424000)  # FIX P3: 统一从 config 读取
         self.state_mgr = RiskStateManager()
-        self.state_mgr.state["total_capital"] = total_capital
+        self.state_mgr.state["total_capital"] = self.total_capital  # FIX P3: 用解析后的值
         # 允许交易的股票池（核心池+观察池），不在池内的标的禁止买入
         self.allowed_pool = allowed_pool  # None=不限制, set=只允许池内标的
 
@@ -804,7 +880,8 @@ class RiskGate:
                 "position_ratio": round(position_ratio * 100, 1),
                 "over_limit": over_limit,
                 "reduce_shares": reduce_shares,
-                "stop_loss": round(cost * 0.9, 3) if level in ("关注", "预警") else round(price * 0.92, 3),
+                "stop_loss": round(cost * 0.9, 3) if level in ("关注", "预警")
+                             else round(max(cost * 0.9, price * 0.92), 3),  # FIX P2: Ratchet原则，不低于成本×90%
             })
 
         # 按紧急程度排序（危险在前）
@@ -816,7 +893,7 @@ class RiskGate:
 # 便捷函数（供报告生成器/条件单调用）
 # ============================================================
 def quick_risk_check(signal: dict, holdings: dict,
-                     total_capital: float = 424000,
+                     total_capital: float = None,
                      market_info: dict = None) -> dict:
     """
     快速风控校验（一行调用）
@@ -831,7 +908,7 @@ def quick_risk_check(signal: dict, holdings: dict,
     return engine.check_buy(signal, holdings, market_info)
 
 
-def quick_inspect(holdings: dict, total_capital: float = 424000) -> List[dict]:
+def quick_inspect(holdings: dict, total_capital: float = None) -> List[dict]:
     """快速持仓巡检"""
     engine = UnifiedRiskEngine(total_capital=total_capital)
     return engine.inspect_holdings(holdings)
@@ -973,6 +1050,16 @@ class UnifiedRiskEngine:
         code = trade_plan.get("code", "")
         price = trade_plan.get("price", 0)
         shares = trade_plan.get("shares", 0)
+
+        # FIX P1: 策略降级时强制缩放仓位（degrade=0.5, 恢复期=0.5）
+        if sf_scale < 1.0 and shares > 0:
+            scaled = max(100, int(shares * sf_scale // 100) * 100)
+            result["warnings"].append(
+                f"[策略失效缩放] scale={sf_scale:.1f}, {shares}→{scaled}股"
+            )
+            shares = scaled
+            trade_plan = {**trade_plan, "shares": scaled}
+            result["adjusted_shares"] = scaled
         sector = trade_plan.get("sector", "")
         stock_type = trade_plan.get("stock_type", "龙头")
         amount = shares * price
@@ -1003,6 +1090,49 @@ class UnifiedRiskEngine:
                 f"仓位过高: 当前{current_position_ratio:.1%} >= {near_full:.0%}，"
                 f"禁止新开仓（只允许减仓）"
             )
+
+        # ===== 关卡0.8: 渐进加仓恢复约束（FIX P1）=====
+        # 深亏后禁止一次性满仓，必须分档恢复
+        recovery_cap, recovery_desc = self.state_mgr.get_recovery_position_cap()
+        if recovery_cap < 1.0:
+            # 买入后的预期仓位
+            new_position_ratio = (current_position_ratio * total_capital + amount) / total_capital
+            if new_position_ratio > recovery_cap:
+                # 计算允许的最大买入金额
+                allowed_amount = max(0, recovery_cap * total_capital - current_position_ratio * total_capital)
+                allowed_shares = int(allowed_amount / price / 100) * 100 if price > 0 else 0
+                if allowed_shares < 100:
+                    return self._block_result(
+                        f"[渐进加仓] {recovery_desc}，"
+                        f"当前仓位{current_position_ratio:.1%}已达上饨{recovery_cap:.0%}，禁止买入"
+                    )
+                # 缩股到允许范围
+                shares = min(shares, allowed_shares)
+                trade_plan = {**trade_plan, "shares": shares}
+                amount = shares * price
+                result["adjusted_shares"] = shares
+                result["warnings"].append(
+                    f"[渐进加仓] {recovery_desc}，缩股至{shares}股"
+                )
+
+        # ===== 关卡0.9: MarketRegime动态仓位上限（FIX P1）=====
+        # BEAR→30% / RANGE→60% / BULL→90%
+        market_cap, market_desc = self.state_mgr.get_market_position_cap()
+        if market_cap < 1.0:
+            current_ratio_after = (current_position_ratio * total_capital + amount) / total_capital
+            if current_ratio_after > market_cap:
+                allowed_amt = max(0, market_cap * total_capital - current_position_ratio * total_capital)
+                mkt_shares = int(allowed_amt / price / 100) * 100 if price > 0 else 0
+                if mkt_shares < 100:
+                    return self._block_result(
+                        f"[MarketRegime] {market_desc}，"
+                        f"当前仓位{current_position_ratio:.1%}已达上饨，禁止买入"
+                    )
+                shares = min(shares, mkt_shares)
+                trade_plan = {**trade_plan, "shares": shares}
+                amount = shares * price
+                result["adjusted_shares"] = shares
+                result["warnings"].append(f"[MarketRegime] {market_desc}，缩股至{shares}")
 
         # ===== 关卡0.5: 股票池外拦截 =====
         if self.allowed_pool is not None and code not in self.allowed_pool:
@@ -1199,9 +1329,14 @@ class UnifiedRiskEngine:
         max_single_loss = cfg.get("max_single_loss_ratio",
                                     getattr(config, 'MAX_SINGLE_LOSS_RATIO', 0.02))
         if max_loss_ratio > max_single_loss:
+            # FIX P1: 从警告升级为强制缩股（单笔风险≤2%本金硬约束）
+            safe_shares = int(total_capital * max_single_loss / (price - stop_loss)) if price > stop_loss else shares
+            safe_shares = max(100, (safe_shares // 100) * 100)
             result["warnings"].append(
-                f"单笔亏损偏大: {max_loss_ratio:.2%} > {max_single_loss:.0%}"
+                f"单笔风险{max_loss_ratio:.2%}>{max_single_loss:.0%}，"
+                f"强制缩股: {shares}→{safe_shares}"
             )
+            result["adjusted_shares"] = safe_shares
             result["level"] = "yellow" if result["level"] == "green" else result["level"]
 
         # ===== 全部通过 =====
@@ -1325,6 +1460,18 @@ class UnifiedRiskEngine:
                 f"本周亏损{abs(weekly_pnl)/self.total_capital:.1%}≥{weekly_limit:.0%}，"
                 f"强制降仓+暂停{cfg.get('weekly_loss_pause_days', 3)}天"
             )
+
+        # 第6.5关：月度回撤硬限制（5%）
+        # FIX P0: 从110万亏到73万(-33.6%)过程中无任何月度熔断，新增此关卡
+        monthly_start = self.state_mgr.state.get("monthly_start_capital", self.total_capital)
+        if monthly_start > 0:
+            monthly_dd = (monthly_start - self.total_capital) / monthly_start
+            monthly_dd_limit = cfg.get("monthly_drawdown_limit", 0.05)
+            if monthly_dd >= monthly_dd_limit:
+                return self._block(
+                    f"月度回撤{monthly_dd*100:.1f}%≥{monthly_dd_limit*100:.0f}%，"
+                    f"本月禁止新开仓（防守优先）"
+                )
 
         # 第7关：浮亏加仓绝对拦截
         if cfg.get("block_add_on_loss", True) and code in holdings:
@@ -1513,7 +1660,7 @@ class UnifiedRiskEngine:
                 "position_ratio": round(position_ratio * 100, 1),
                 "over_limit": over_limit, "reduce_shares": reduce_shares,
                 "stop_loss": round(cost * 0.9, 3) if level in ("关注", "预警")
-                             else round(price * 0.92, 3),
+                             else round(max(cost * 0.9, price * 0.92), 3),  # FIX P2: Ratchet原则
             })
         results.sort(key=lambda x: x["urgency"])
         return results

@@ -18,8 +18,8 @@ import os
 # ============================================================
 # 一、资金与账户配置
 # ============================================================
-TOTAL_CAPITAL = 714_324.76     # 总资金（根据实际账户总资产）
-AVAILABLE_CASH = 138.56          # 当前可用资金（用于选股仓位计算）
+TOTAL_CAPITAL = 731_455.43     # 总资金（根据实际账户总资产）
+AVAILABLE_CASH = 297.43          # 当前可用资金（用于选股仓位计算）
 CASH_RESERVE_RATIO = 0.10        # 最低现金保留比例（10%安全垫）
 
 # ============================================================
@@ -61,7 +61,7 @@ FULL_POSITION_THRESHOLD = 0.90   # 仓位>=90%时禁止任何买入/加仓
 NEAR_FULL_POSITION = 0.80        # 仓位>=80%时只允许减仓不允许新开仓
 
 # 个股硬性筛选标准
-MIN_DAILY_AMOUNT = 8e8           # 日均成交额下限（8亿元）
+MIN_DAILY_AMOUNT = 5e8           # 日均成交额下限（5亿元，V2.3降低避免中小盘龙头被误杀）
 MAX_HIGH_AMPLITUDE_DAYS = 3      # 近30日振幅>10%的天数上限
 CRASH_THRESHOLD = -0.08          # 单日暴跌阈值（-8%）
 CRASH_VOLUME_RATIO = 2.0         # 暴跌放量倍数（量>均量2倍）
@@ -76,6 +76,13 @@ SECTOR_MA60_ABOVE_RATIO = 0.60   # 板块内站稳MA60的股票占比>60%才算�
 # ============================================================
 # 二’、全赛道选股候选池（按行业分组，选股引擎从中筛选）
 # ============================================================
+
+# V2.3: 退市/停牌黑名单（硬过滤，任何情况下不参与选股）
+# 包括已退市、吸收合并、长期停牌等不可交易股票
+DELISTED_STOCKS = {
+    "601989",  # 中国重工 - 2025年被中国船舶(600150)吸收合并退市
+}
+
 # 主力赛道为半导体，但参考行情与策略可配置其他行业
 # 选股引擎会根据行业强弱动态分配名额
 SECTOR_CANDIDATES = {
@@ -101,7 +108,7 @@ SECTOR_CANDIDATES = {
             "600118": {"名称": "中国卫星", "细分": "卫星导航", "类型": "弹性"},
             "000768": {"名称": "中航西飞", "细分": "军用飞机", "类型": "龙头"},
             "600893": {"名称": "航发动力", "细分": "航空发动机", "类型": "龙头"},
-            "601989": {"名称": "中国重工", "细分": "军工船舶", "类型": "弹性"},
+            "600150": {"名称": "中国船舶", "细分": "军工船舶", "类型": "龙头"},
         }
     },
     # --- AI/数字经济（配额15%）---
@@ -161,18 +168,61 @@ SECTOR_CANDIDATES = {
 # 选股引擎配置
 SCREENER_CONFIG = {
     "max_stocks_per_sector": 3,     # 每个行业最多入选3只
-    "min_score": 45,                # CANSLIM最低入选分
-    "total_max": 10,                # 总入选上限
+    "min_score": 40,                # CANSLIM排序参考分（V2.4: 不再作为硬性淘汰门槛）
+    "min_buy_score": 50,            # V2.4: 买入推荐分界线（兼容旧逻辑，V2.7起由动态线替代）
+    "min_buy_score_weak": 35,       # V2.7: 弱势/震荡市买入线（market_state=down/weak/neutral）
+    "min_buy_score_strong": 45,     # V2.8: 强势市买入线（回测验证: 45分WR=44.9% > 50分WR=43.9%，降低5分增加有效信号）
+    "total_max": 10,                # 固定输出10只（V2.4: 无论评分高低必须输出前10）
     "prefer_strong_sector": True,   # 优先从强势赛道中选
     "sector_dynamic_adjust": True,  # 根据行情动态调整行业配额
+    "cooldown_days": 1,             # V2.7: 冷却期从2天缩短为1天（避免唯一达标股被排除）
 }
 
 # 新闻/政策风控配置（仅做风控刹车+选股过滤，不产生买卖信号）
 NEWS_MONITOR_ENABLED = True          # 是否启用新闻监控
 NEWS_LOOKBACK_HOURS = 24             # 只看最近24小时新闻
+
+# V2.4: 资金异动加分配置（龙虎榜+主力资金流）
+LHB_NET_BUY_THRESHOLD = 5000e4       # 龙虎榜净买入阈值（5000万）→+3分
+FUND_FLOW_CONSECUTIVE_DAYS = 3       # 主力资金连续净流入天数→+2分
+FUND_FLOW_BONUS_MAX = 5              # 资金异动加分上限
+
+# V2.4: 涨停复盘配置
+ZT_MONITOR_ENABLED = True            # 是否在选股报告中集成涨停复盘
+ZT_SECTOR_HOT_THRESHOLD = 3          # 板块热度阈值（涨停≥3只即为热门）
 NEWS_MAX_PER_STOCK = 10              # 每只股票最多拉取10条新闻
 NEWS_FILTER_IN_SCREENER = True       # 选股时是否过滤level>=2的新闻股
 NEWS_ALERT_IN_EMAIL = True           # 邮件中是否显示新闻预警
+
+# V2.5: 盘中异动预警配置
+INTRADAY_ALERT_ENABLED = True        # 是否启用盘中异动预警
+ALERT_MIN_CHANGE_PCT = 7.0           # 准涨停最低涨幅阈值(%)
+ALERT_MIN_VOL_RATIO = 1.5            # 最低量比（资金关注度）
+ALERT_MIN_AMOUNT = 3e8               # 最低成交额(3亿)
+ALERT_MAX_PRICE = 300                # 最高股价过滤
+ALERT_MIN_PRICE = 3                  # 最低股价过滤
+ALERT_SECTOR_CASCADE_THRESHOLD = 2   # 板块联动触发阈值（同板块≥2只涨停）
+ALERT_SECTOR_FOLLOWER_MIN_PCT = 5.0  # 跟涨候选最低涨幅(%)
+ALERT_SECTOR_FOLLOWER_MAX_PCT = 9.0  # 跟涨候选最高涨幅(%)
+ALERT_MAX_COUNT = 15                 # 单次最多预警数量
+ALERT_SCAN_INTERVAL = 10             # 扫描间隔(分钟) V2.6: 30->10分钟提升时效
+
+# V2.6: 放量突破启动检测配置
+ALERT_BREAKOUT_ENABLED = True        # 是否启用放量突破检测
+ALERT_BREAKOUT_MIN_CHANGE = 3.0      # 突破检测最低涨幅(%)
+ALERT_BREAKOUT_MAX_CHANGE = 7.0      # 突破检测最高涨幅(%)(超过7%归入准涨停)
+ALERT_BREAKOUT_MIN_VOL_RATIO = 2.0   # 突破检测最低量比
+ALERT_BREAKOUT_MIN_AMOUNT = 2e8      # 突破检测最低成交额(2亿)
+ALERT_BREAKOUT_MAX_COUNT = 10        # 突破检测最多输出数量
+ALERT_FIRST_TRIGGER_ONLY = True      # 同一标的当日首次触发才推送，后续不重复
+ALERT_SCREENER_INTRADAY = True       # 是否启用盘中选股增量扫描
+ALERT_ZT_GENE_LINKAGE = True         # 是否启用涨停基因联动预警
+
+# V2.5: 涨停基因跟踪配置
+ZT_GENE_ENABLED = True               # 是否启用涨停基因跟踪
+ZT_GENE_MIN_OPEN_PCT = 3.0           # 连板候选最低高开幅度(%)
+ZT_GENE_MIN_VOL_RATIO = 2.0          # 连板候选最低量比
+ZT_GENE_TRACK_DAYS = 3               # 跟踪最近N天涨停股
 
 
 # ============================================================
@@ -418,6 +468,55 @@ def get_holdings_file() -> str:
         return _HOLDINGS_FILE_LEGACY
     return HOLDINGS_FILE  # 默认新路径（用于创建）
 
+
+def load_holdings(validated: bool = True) -> dict:
+    """
+    加载持仓数据（带成本价合理性校验）
+
+    校验规则:
+      - buy_price <= 0 或 shares <= 0: 已清仓，跳过
+      - buy_price > current_price × 5: 疑似摊薄成本/除权前旧价，标记异常并跳过止损计算
+
+    参数:
+        validated: 是否执行成本价校验（默认True）
+
+    返回:
+        持仓字典 {code: {name, shares, buy_price, ...}}
+    """
+    import json as _json
+    holdings_file = get_holdings_file()
+    if not _os.path.exists(holdings_file):
+        return {}
+    try:
+        with open(holdings_file, "r", encoding="utf-8") as f:
+            holdings = _json.load(f)
+    except Exception:
+        return {}
+
+    if not validated:
+        return holdings
+
+    # 成本价合理性校验
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+    for code, info in list(holdings.items()):
+        if not isinstance(info, dict):
+            continue
+        buy_price = info.get("buy_price", 0) or info.get("cost", 0)
+        current_price = info.get("current_price", 0)
+        shares = info.get("shares", 0)
+        if shares <= 0 or buy_price <= 0:
+            continue
+        # ETF/股票成本价 > 现价×5 → 疑似摊薄成本或除权前旧价
+        if current_price > 0 and buy_price > current_price * 5:
+            _logger.warning(
+                f"[成本异常] {code}({info.get('name','')}) buy_price={buy_price:.3f} "
+                f">> current_price={current_price:.3f} (比值{buy_price/current_price:.1f}x), "
+                f"疑似摊薄成本/除权前旧价, 已标记跳过止损计算"
+            )
+            info["_cost_anomaly"] = True
+    return holdings
+
 # 确保必要目录存在
 for _d in (DATA_DIR, LOG_DIR, OUTPUT_DIR):
     _os.makedirs(_d, exist_ok=True)
@@ -507,6 +606,83 @@ ANTI_WASH_CONFIG = {
     "volume_spike_extra": 0.03,       # 放量急跌额外放宽3%止损
     "soft_stop_mode": True,           # 软止损模式: 仅预警不挂单
     "soft_stop_buffer": 0.03,         # 软止损价格下移3%缓冲
+}
+
+# ============================================================
+# 十五''、盘中梯度减仓预警配置（P0-1: 浮亏加速扩大时强制预警+条件单）
+# ============================================================
+GRADIENT_REDUCE_CONFIG = {
+    # 梯度减仓阈值（浮亏比例 → 建议减仓比例）
+    "levels": [
+        {"loss_pct": -0.05, "reduce_ratio": 1/3, "level": "warning",  "label": "浮亏5%减仓1/3"},
+        {"loss_pct": -0.08, "reduce_ratio": 1/2, "level": "critical", "label": "浮亏8%减仓1/2"},
+        {"loss_pct": -0.10, "reduce_ratio": 1.0, "level": "emergency","label": "浮亏10%清仓"},
+    ],
+    # 连续阴跌触发（非单日暴跌，而是温水煮蛙式下跌）
+    "consecutive_decline_days": 3,       # 连续N日下跌
+    "consecutive_decline_total": -0.05,  # 累计跌幅超此值 → 触发减仓1/3
+    # 单日放量暴跌（不等收盘，盘中直接触发）
+    "intraday_crash_pct": -0.05,         # 盘中跌超5%
+    "intraday_crash_vol_ratio": 2.0,     # 且量>均量2倍 → 立即减仓1/2
+    # 条件单生成
+    "generate_condition_order": True,    # 是否自动生成东方财富条件单
+    "order_output_dir": "output",        # 条件单输出目录
+    # 冷却（同一标的同一级别当日只触发一次）
+    "cooldown_per_level": True,
+}
+
+# ============================================================
+# 十五'''、盘中监控分级变频配置（P0-2: 急跌时自动提升扫描频率）
+# ============================================================
+INTRADAY_ESCALATION_CONFIG = {
+    # 三级监控频率
+    "normal_interval_min": 10,     # 正常状态: 10分钟/次
+    "warning_interval_min": 3,     # 预警状态: 3分钟/次
+    "emergency_interval_min": 1,   # 紧急状态: 1分钟/次
+    # 升级条件（满足任一即升级）
+    "warning_triggers": {
+        "holding_drop_pct": -3.0,      # 持仓股日内跌>3%
+        "market_drop_pct": -1.5,       # 大盘跌>1.5%
+        "approaching_stop_loss": 0.02, # 距止损线<2%
+    },
+    "emergency_triggers": {
+        "holding_drop_pct": -5.0,      # 持仓股日内跌>5%
+        "stop_loss_touched": True,     # 已触及止损线
+        "market_drop_pct": -2.5,       # 大盘跌>2.5%
+    },
+    # 降级条件（连续N次扫描无异常则降回正常）
+    "downgrade_after_clear": 3,    # 连续3次无异常 → 降回正常频率
+}
+
+# ============================================================
+# 十五''''、反洗盘分场景缓冲配置（P0-3: 真跌快速确认，洗盘保留缓冲）
+# ============================================================
+SMART_BUFFER_CONFIG = {
+    # 场景判定条件
+    "true_decline": {
+        # 满足以下>=3条判定为"真跌"，缓冲缩短
+        "conditions": [
+            "volume_shrinking",       # 缩量下跌（量<均量0.7倍）
+            "ma_bearish",             # 均线空头（MA5<MA10<MA20）
+            "market_weak",            # 大盘走弱（跌>0.5%）
+            "sector_declining",       # 板块联动下跌（同赛道>=2只跌>2%）
+            "consecutive_days",       # 连续2日以上下跌
+        ],
+        "min_conditions": 3,          # 满足>=3条 → 真跌
+        "buffer_minutes": 3,          # 真跌: 缓冲仅3分钟
+    },
+    "wash_trading": {
+        # 满足以下>=2条判定为"洗盘"，保留长缓冲
+        "conditions": [
+            "volume_spike",           # 放量急跌（量>均量2倍）
+            "fast_rebound",           # 快速收回（5分钟内收回止损上方）
+            "market_stable",          # 大盘稳定（涨跌<0.5%）
+            "sector_strong",          # 板块未联动（同赛道其他股未跌）
+        ],
+        "min_conditions": 2,          # 满足>=2条 → 洗盘
+        "buffer_minutes": 15,         # 洗盘: 保留15分钟缓冲
+    },
+    "default_buffer_minutes": 8,      # 无法判定时: 折中8分钟
 }
 
 # ============================================================
@@ -651,4 +827,124 @@ CAOPAN_CONFIG = {
         "life_line_fast": [8, 10, 13, 15, 20],
         "life_line_slow": [25, 30, 34, 40, 50, 60],
     },
+}
+
+# ============================================================
+# 二十三、V9.0 看盘策略增强配置（VWAP/盘口/竞价/量比）
+# ============================================================
+
+# --- P0-1: VWAP均价线监控 ---
+VWAP_CONFIG = {
+    "enabled": True,
+    "bearish_deviation_pct": -0.015,   # 价格低于VWAP 1.5% → 空头控盘预警
+    "bearish_persist_cycles": 3,        # 连续N个轮询周期低于VWAP → 确认走弱
+    "bullish_deviation_pct": 0.03,      # 价格高于VWAP 3% → 超买偏离提示
+    "vwap_break_alert": True,           # 从VWAP上方跌破到下方 → 即时预警
+}
+
+# --- P0-2: 盘口强弱监控 ---
+ORDERBOOK_CONFIG = {
+    "enabled": True,
+    "heavy_sell_outer_ratio": 0.35,     # 外盘占比<35% + 跌>2% → 抛压沉重(真跌)
+    "strong_buy_outer_ratio": 0.65,     # 外盘占比>65% + 价格平/微跌 → 资金承接(洗盘)
+    "ask_pressure_ratio": 5.0,          # 卖一量 > 买一量×5 → 压盘吸筹
+    "bid_withdraw_pct": 0.20,           # 买一量比上轮<20% → 托盘撤退
+    "order_ratio_bearish": -0.30,       # 委比<-30% → 卖压偏重
+    "order_ratio_bullish": 0.30,        # 委比>30% → 买压偏重
+}
+
+# --- P0-3: 集合竞价分析 ---
+AUCTION_CONFIG = {
+    "enabled": True,
+    "high_open_warn_pct": 0.03,         # 高开>3% → 警惕出货
+    "high_open_extreme_pct": 0.05,      # 高开>5% → 紧急预警
+    "low_open_warn_pct": -0.02,         # 低开<-2% → 恐慌预警
+    "low_open_extreme_pct": -0.03,      # 低开<-3% → 紧急预警(开盘即亏损扩大)
+    "volume_surge_ratio": 3.0,          # 竞价量 > 5日均量×3 → 主力有备而来
+    "volume_weak_ratio": 0.5,           # 竞价量 < 5日均量×0.5 → 量能不足(高开无力)
+    "alert_email": True,                # 异常时发送邮件
+}
+
+# --- P0-4: 开盘30分钟定性 + 尾盘异动 ---
+PHASE_CONFIG = {
+    "enabled": True,
+    # 开盘定性
+    "opening_end_time": "10:00",        # 开盘阶段结束时间
+    "high_open_low_walk_pct": 0.01,     # 高开>1%后转跌 → 出货信号
+    "low_open_high_walk_pct": -0.01,    # 低开<-1%后转涨 → 吸筹信号
+    "opening_vol_ratio": 0.25,          # 前30分钟量占全天>25% → 主力有备
+    # 尾盘异动
+    "closing_start_time": "14:45",      # 尾盘阶段开始时间
+    "closing_surge_pct": 1.5,           # 尾盘5分钟涨>1.5% → 次日高开概率
+    "closing_plunge_pct": -1.5,         # 尾盘5分钟跌>1.5% → 次日风险预警
+    "closing_vol_ratio": 2.0,           # 尾盘量比>2 → 确认异动有效
+}
+
+# --- P1-1: 量比异动 ---
+VOL_RATIO_CONFIG = {
+    "enabled": True,
+    "surge_threshold": 3.0,             # 量比>3 → 异动
+    "stagnation_change_pct": 1.0,       # 量比>3 + 涨幅<1% → 放量滞涨(出货)
+    "bottom_volume_pct": 3.0,           # 量比>3 + 低位 → 底部放量(关注)
+    "high_level_profit_pct": 5.0,       # 浮盈>5%时放量滞涨 → 出货嫌疑
+}
+
+# --- P1-2: K线形态识别 ---
+KLINE_PATTERN_CONFIG = {
+    "enabled": True,
+    "min_body_ratio": 0.3,              # 实体占振幅最小比例(十字星判定)
+    "long_shadow_ratio": 2.0,           # 影线>实体2倍 → 长影线
+    "doji_body_pct": 0.10,              # 实体<振幅10% → 十字星
+    "engulfing_ratio": 1.2,             # 吞没: 今实体>昨实体×1.2
+    "three_crows_min_drop": -0.02,      # 三只乌鸦: 每根跌幅>2%
+    "alert_email_on_top": True,         # 顶部形态发邮件
+    "lookback_days": 5,                 # 形态识别回看天数
+}
+
+# --- P1-3: 主力四阶段 ---
+MAIN_FORCE_STAGE_CONFIG = {
+    "enabled": True,
+    # 吸筹期特征
+    "accumulation_min_days": 20,        # 底部横盘最少天数
+    "accumulation_turnover_range": [1.0, 3.0],  # 换手率温和区间(%)
+    "accumulation_obv_rising": True,    # OBV趋势上升
+    # 拉升期特征
+    "markup_min_consecutive_up": 3,     # 连续阳线最少天数
+    "markup_vol_increase": 1.5,         # 量增(>均量1.5倍)
+    # 出货期特征
+    "distribution_high_vol_ratio": 2.0, # 高位放量(>均量2倍)
+    "distribution_stagnation": 0.01,    # 涨幅<1%(滞涨)
+    "distribution_inner_dominant": 0.6, # 内盘占比>60%
+}
+
+# --- P2-1: 竞价轨迹采集 ---
+AUCTION_TRACK_CONFIG = {
+    "enabled": True,
+    "sample_interval_sec": 30,          # 采样间隔(秒)
+    "start_time": "09:15",              # 采集开始时间
+    "end_time": "09:25",                # 采集结束时间
+    "fake_high_open_drop": 0.02,        # 先高后低: 高开回落>2% → 诱多
+    "real_demand_rise": 0.01,           # 先低后高: 上移>1% → 真实需求
+    "rush_buy_acceleration": 0.5,       # 量能加速>50% → 抢筹
+}
+
+# --- P2-3: 分时形态识别 ---
+INTRADAY_PATTERN_CONFIG = {
+    "enabled": True,
+    "min_data_points": 30,              # 最少数据点(30分钟)才开始识别
+    "m_head_peak_diff_pct": 0.003,      # M头: 两峰差<0.3%
+    "m_head_neckline_break": -0.005,    # M头: 跌破颈线0.5%确认
+    "stair_min_steps": 3,               # 阶梯: 最少3级台阶
+    "stair_min_rise_pct": 0.005,        # 阶梯: 每级上涨>0.5%
+    "v_reversal_drop_pct": -0.03,       # V反: 急跌>3%
+    "v_reversal_bounce_pct": 0.02,      # V反: 5分钟反弹>2%
+}
+
+# --- P2-4: 缺口分析 ---
+GAP_CONFIG = {
+    "enabled": True,
+    "min_gap_pct": 0.005,               # 最小有效缺口(0.5%)
+    "breakaway_vol_ratio": 2.0,         # 突破缺口: 量比>2
+    "exhaustion_consecutive_gaps": 3,   # 连续N个同向缺口 → 衰竭
+    "exhaustion_vol_spike": 2.5,        # 衰竭缺口: 量异常放大>2.5倍
 }

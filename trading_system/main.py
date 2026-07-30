@@ -1,5 +1,5 @@
 """
-高胜率A股交易操作系统 V3.0 - 主程序入口
+高胜率A股交易操作系统 V9.0 - 主程序入口
 =========================================
 每日一键运行流程:
   1. 增量更新所有股票池日线数据
@@ -231,7 +231,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     """
     start_time = datetime.datetime.now()
     logger.info("=" * 60)
-    logger.info(f"  高胜率A股交易操作系统 V3.0")
+    logger.info(f"  高胜率A股交易操作系统 V9.0")
     logger.info(f"  运行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
@@ -1009,7 +1009,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V3.0")
+    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V9.0")
     parser.add_argument("--no-update", action="store_true",
                         help="跳过数据更新，使用已有数据")
     parser.add_argument("--report", action="store_true",

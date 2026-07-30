@@ -219,7 +219,8 @@ def generate_dk_signals_v2(df: pd.DataFrame, stock_code: str = "") -> pd.DataFra
     vol_ma_period = CFG["dk_volume_ma_period"]
     false_days = CFG["dk_false_signal_days"]
     min_medium = CFG["dk_min_strength_medium"]
-    cross_freq_threshold = CFG.get("market_cross_freq_threshold", 4)  # 从5降到4，减少震荡市假信号
+    # FIX B7: 震荡市屏蔽阈值硬上限=4，避免config中5导致震荡市假信号过多
+    cross_freq_threshold = min(CFG.get("market_cross_freq_threshold", 4), 4)
 
     # 量能均线
     df["vol_ma20"] = df["volume"].rolling(vol_ma_period).mean()
@@ -581,7 +582,7 @@ def detect_market_environment(df: pd.DataFrame) -> dict:
 
     latest = df.iloc[-1]
     cross_freq = latest.get("cross_freq_20d", 0)
-    threshold = CFG.get("market_cross_freq_threshold", 4)
+    threshold = min(CFG.get("market_cross_freq_threshold", 4), 4)  # FIX B7: 硬上限=4
     vol_period = CFG["market_vol_period"]
 
     # 20日波动率
@@ -794,10 +795,21 @@ class CaopanEngine:
                 dk_grade = "filtered_rr_regime"
                 logger.info(f"[{code}] BEAR环境盈亏比二次过滤: {rr['risk_reward_1']:.2f} < {effective_min_rr}")
 
+        # P1优化: 趋势→仓位映射表（明确告知用户不同趋势等级对应的操作仓位）
+        trend_position_map = {
+            5: {"max_position": 80, "action": "满仓持有/加仓", "desc": "强上升趋势，可重仓参与"},
+            4: {"max_position": 60, "action": "持有/小幅加仓", "desc": "弱上升，适度参与"},
+            3: {"max_position": 40, "action": "轻仓观望/高抛低吸", "desc": "震荡市，控制仓位"},
+            2: {"max_position": 20, "action": "减仓/禁止新开仓", "desc": "弱下跌，防守为主"},
+            1: {"max_position": 0, "action": "清仓/空仓等待", "desc": "强下跌，禁止任何买入"},
+        }
+        position_guide = trend_position_map.get(trend_level, trend_position_map[3])
+
         return {
             "code": code, "name": name,
             "trend_level": trend_level,
             "trend_desc": trend_desc,
+            "position_guide": position_guide,
             "ll_fast": round(latest.get("ll_fast", 0), 3),
             "ll_slow": round(latest.get("ll_slow", 0), 3),
             "ll_fast_direction": "↑" if latest.get("ll_fast_slope", 0) > 0 else "↓",
@@ -889,7 +901,7 @@ class CaopanEngine:
             # BULL环境: 放宽震荡市屏蔽
             # 原始 generate_dk_signals_v2 中震荡市(trend==3)被屏蔽的信号，
             # 在BULL环境下允许 trend_level>=3 的D点通过（恢复被震荡屏蔽的信号）
-            cross_freq_threshold = CFG.get("market_cross_freq_threshold", 4)
+            cross_freq_threshold = min(CFG.get("market_cross_freq_threshold", 4), 4)  # FIX B7: 硬上限=4
             for i in range(1, len(df)):
                 row = df.iloc[i]
                 trend = int(row.get("trend_level", 3))
@@ -1146,10 +1158,11 @@ class CaopanEngine:
                 elif row.get("top_divergence", False):
                     sell, reason = True, "顶背离止盈"
 
-                # 6. LL1追踪止盈（仅盈利>5%后，从高点回落>10%才触发，给足空间）
+                # 6. LL1追踪止盈（仅盈利>5%后，从高点回落>7%触发）
+                # FIX B6: 回撤阈值从10%降至7%，避免利润回吐过多才触发止盈
                 elif close < ll_fast and gain_pct > 0.05:
                     pullback_from_high = (highest_since_buy - close) / highest_since_buy if highest_since_buy > 0 else 0
-                    if pullback_from_high > 0.10:
+                    if pullback_from_high > 0.07:
                         sell, reason = True, "LL1追踪止盈(回吐保护)"
 
                 if sell:

@@ -1,9 +1,14 @@
 """
 模型训练管线
 ============
-- XGBoost分类器训练（含时序交叉验证）
+- XGBoost / LightGBM / sklearn GBM 分类器训练（含时序交叉验证）
 - 滚动窗口训练（120天训练，预测未来5天）
 - 模型持久化（joblib）
+
+【V9.0新增】
+- LightGBM梯度提升因子增强（来源: Stefan Jansen《ML for Algorithmic Trading》）
+- 相比XGBoost: 训练速度更快、叶子节点分裂策略更适合金融因子非线性组合
+- 参数约束: max_depth=4防过拟合, min_child_samples=50适配小样本股票池
 
 【修复说明】
 - 使用 TimeSeriesSplit 替代 KFold，避免金融时序未来数据泄露
@@ -39,7 +44,11 @@ class ModelTrainer:
         trainer.save(model, "xgb_v1")
     """
 
-    def __init__(self, model_type: str = "xgboost"):
+    def __init__(self, model_type: str = "lightgbm"):
+        """
+        参数:
+            model_type: "lightgbm"(默认,V9.0推荐) / "xgboost" / "sklearn"
+        """
         self.model_type = model_type
         self.model = None
         self.feature_importance = None
@@ -68,7 +77,9 @@ class ModelTrainer:
         # 震荡期(label=0)是重要的"不操作"信号，模型需要学习
         y_train = y.copy()
 
-        if self.model_type == "xgboost":
+        if self.model_type == "lightgbm":
+            self.model = self._train_lightgbm(X, y_train, cv_folds, temporal_weights)
+        elif self.model_type == "xgboost":
             self.model = self._train_xgboost(X, y_train, cv_folds, temporal_weights)
         else:
             self.model = self._train_sklearn(X, y_train, cv_folds, temporal_weights)
@@ -100,6 +111,74 @@ class ModelTrainer:
         # 组合权重 = 类别权重 × 时间权重
         combined = class_weights * time_weights
         return combined
+
+    def _train_lightgbm(self, X, y, cv_folds, temporal_weights=None):
+        """
+        V9.0 LightGBM梯度提升因子增强
+        来源: Stefan Jansen《Machine Learning for Algorithmic Trading》
+        
+        优势(vs XGBoost):
+          - 叶子节点分裂(leaf-wise)更适合金融因子的非线性交互
+          - 训练速度快2-3x，支持更大规模滚动训练
+          - 内置类别不平衡处理(is_unbalance)
+        
+        参数设计原则:
+          - max_depth=4: 金融数据噪声大，深树过拟合
+          - min_child_samples=50: 股票池小(~20只)，每叶最少50样本防过拟合
+          - num_leaves=15: 配合depth=4，约東复杂度
+          - feature_fraction=0.7: 随机了集防过拟合
+          - lambda_l1/l2: 正则化抑制噪声因子
+        """
+        try:
+            import lightgbm as lgb
+            from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        except ImportError:
+            logger.warning("lightgbm未安装，回退到XGBoost")
+            return self._train_xgboost(X, y, cv_folds, temporal_weights)
+
+        # 组合权重（类别平衡 × 时间衰减）
+        sample_weights = self._compute_combined_weights(y, temporal_weights)
+
+        n_classes = len(y.unique())
+        model = lgb.LGBMClassifier(
+            n_estimators=150,
+            max_depth=4,               # 浅树防过拟合
+            num_leaves=15,             # 约東复杂度
+            learning_rate=0.05,        # 小学习率+多树 = 更稳定
+            min_child_samples=50,      # 每叶最少50样本
+            subsample=0.8,
+            subsample_freq=5,
+            colsample_bytree=0.7,      # 因子随机子集
+            reg_alpha=0.1,             # L1正则
+            reg_lambda=1.0,            # L2正则
+            random_state=42,
+            verbose=-1,
+            objective="multiclass" if n_classes > 2 else "binary",
+        )
+
+        # TimeSeriesSplit时序交叉验证
+        tscv = TimeSeriesSplit(n_splits=cv_folds)
+        try:
+            scores = cross_val_score(
+                model, X, y, cv=tscv, scoring="f1_macro",
+                fit_params={"sample_weight": sample_weights}
+            )
+            logger.info(f"LightGBM CV F1-macro: {scores.mean():.3f} ± {scores.std():.3f}")
+        except Exception as e:
+            logger.warning(f"LightGBM交叉验证失败: {e}")
+
+        # 全量训练（带组合权重）
+        model.fit(X, y, sample_weight=sample_weights)
+
+        # 特征重要性
+        self.feature_importance = pd.Series(
+            model.feature_importances_, index=X.columns
+        ).sort_values(ascending=False)
+
+        logger.info(f"LightGBM Top5因子: {list(self.feature_importance.head(5).index)}")
+        self._log_classification_report(model, X, y)
+
+        return model
 
     def _train_xgboost(self, X, y, cv_folds, temporal_weights=None):
         """训练XGBoost"""
