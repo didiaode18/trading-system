@@ -47,7 +47,10 @@ MAX_PYRAMID_ADDS = 3  # 最多加仓3次
 
 
 class PyramidManager:
-    """金字塔加仓管理器"""
+    """金字塔加仓管理器
+
+    注意: 本模块未接入实盘流程，加仓以 R18/决策报告为准且需过风控。
+    """
 
     def __init__(self, levels: list = None, max_adds: int = MAX_PYRAMID_ADDS):
         self.levels = levels or PYRAMID_LEVELS

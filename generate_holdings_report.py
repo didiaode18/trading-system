@@ -64,6 +64,16 @@ try:
 except Exception:
     HAS_CAPITAL_FLOW = False
 
+# 任务#1新增: 回本计划/板块背离/候选三源合并（失败时降级，不影响报告主流程）
+try:
+    from strategy.recovery_planner import build_recovery_plan, track_progress
+    from strategy.sector_divergence import (
+        load_sector_cache, detect_divergence, get_coarse_sector_map, merge_report_candidates
+    )
+    HAS_REPORT_EXT = True
+except Exception:
+    HAS_REPORT_EXT = False
+
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
 
@@ -100,6 +110,7 @@ def _load_holdings_from_json():
                 "buy_price": v.get("buy_price", 0),
                 "highest": v.get("highest", 0),
                 "stop_loss_cfg": v.get("stop_loss", 0),
+                "stock_type": v.get("stock_type", "龙头"),
             }
             for code, v in data.items()
         ]
@@ -112,7 +123,8 @@ holdings_list = _load_holdings_from_json()
 # 主模式参数
 # FIX: 修复止损比例与config不一致，统一使用config.INITIAL_STOP_LOSS_PCT(0.10)
 STOP_LOSS_PCT = config.INITIAL_STOP_LOSS_PCT  # 固定止损: 统一使用config配置的止损比例
-DRAWDOWN_FROM_HIGH = 0.05  # 高点回落5%触发
+# FIX: 回落止盈从硬编码5%改为按stock_type从config.DRAWDOWN_STOP读取（龙头7%/成长6%/弹性5%）
+_TYPE_TO_DRAWDOWN_KEY = {"龙头": "龙头稳健", "弹性": "高弹性", "成长": "成长赛道"}
 REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
 
 # ============================================================
@@ -297,6 +309,19 @@ def analyze_technical(df, realtime_price=None):
     # ---- 综合评分 (0-100) ----
     composite = 50 + trend_score * 8 + momentum_score * 6
     composite = max(0, min(100, composite))
+    # V3.2回测诊断: Composite在熊市完全反向(高分+0.85% < 低分+2.70%)
+    # 修复: 熊市中反转信号(低分=超卖反弹机会)，仅影响文字提示不影响分数
+    _composite_regime_note = ""
+    try:
+        from trading_system.strategy.market_regime import detect_market_regime
+        _regime_info = detect_market_regime()
+        _cur_regime = _regime_info.get("regime", "range") if isinstance(_regime_info, dict) else "range"
+    except Exception:
+        _cur_regime = "range"
+    if _cur_regime == "bear" and composite >= 65:
+        _composite_regime_note = "⚠️熊市高分警告: 回测显示熊市中强势股常为补跌对象，注意回调风险"
+    elif _cur_regime == "bear" and composite <= 35:
+        _composite_regime_note = "💡熊市低分提示: 超卖反弹机会，但仅限轻仓短线，严格止损"
 
     # ---- 趋势方向文字 ----
     # V2.8回测优化: 增加超买/超卖提示（回测显示composite>=70的标的20日胜率47% < composite<30的50%，高分别代表超买）
@@ -357,6 +382,7 @@ def analyze_technical(df, realtime_price=None):
         "first_resistance": round(first_resistance, 3),
         "hold_suggest": hold_suggest,
         "hold_reason": hold_reason,
+        "regime_note": _composite_regime_note,  # V3.2: 熊市反转提示
     }
 
 
@@ -420,22 +446,82 @@ except:
 # ============================================================
 # 四B、五层选股引擎扫描候选池
 # ============================================================
-print(f"\n[选股] 五层引擎扫描SECTOR_CANDIDATES候选池...")
+print(f"\n[选股] 三源候选构建: 静态池 + stock_pool观察池 + scan_cache动态扫描...")
 held_codes = set(codes)
 
-# 收集所有非持仓候选股
-candidate_stocks = []
+def _is_tradable_code(_c):
+    """排除创业板300/科创板688（与现状逻辑一致）"""
+    return not _c.startswith("300") and not _c.startswith("688")
+
+# 源①: config.SECTOR_CANDIDATES 静态候选池（现状逻辑保留）
+_static_candidates = []
 for sector_name, sector_info in config.SECTOR_CANDIDATES.items():
     for code_c, info_c in sector_info.get("stocks", {}).items():
-        if code_c not in held_codes and not code_c.startswith("300") and not code_c.startswith("688"):
-            candidate_stocks.append({
+        if code_c not in held_codes and _is_tradable_code(code_c):
+            _static_candidates.append({
                 "code": code_c,
                 "name": info_c.get("名称", code_c),
                 "sector": info_c.get("细分", sector_name),
                 "type": info_c.get("类型", "龙头"),
             })
 
-print(f"[选股] 共{len(candidate_stocks)}只非持仓候选股")
+# 源②: stock_pool.json core_pool+watch_pool（每项type标"观察池"，失败降级跳过）
+_pool_candidates = []
+try:
+    _pool_file = os.path.join(config.PROJECT_ROOT, "stock_pool.json")
+    with open(_pool_file, "r", encoding="utf-8") as _pf:
+        _pool_data = json.load(_pf)
+    for _src_key in ("core_pool", "watch_pool"):
+        for code_c, info_c in (_pool_data.get(_src_key, {}) or {}).items():
+            if code_c not in held_codes and _is_tradable_code(code_c):
+                _pool_candidates.append({
+                    "code": code_c,
+                    "name": info_c.get("名称", code_c),
+                    "sector": info_c.get("赛道", ""),
+                    "type": "观察池",
+                })
+except Exception as _pe:
+    print(f"[选股] stock_pool.json读取失败(降级跳过): {_pe}")
+
+# 源③: data/scan_cache.json 动态扫描（校验时间戳≤24h，按当日涨幅取前10，失败降级跳过）
+_scan_candidates = []
+try:
+    _scan_file = os.path.join(config.PROJECT_ROOT, "data", "scan_cache.json")
+    with open(_scan_file, "r", encoding="utf-8") as _sf:
+        _scan_data = json.load(_sf)
+    _scan_ts_str = _scan_data.get("saved_at", "") or (_scan_data.get("data", {}) or {}).get("scan_time", "")
+    _scan_ok = False
+    try:
+        _scan_ts = datetime.datetime.strptime(_scan_ts_str[:19], "%Y-%m-%d %H:%M:%S")
+        _scan_ok = (datetime.datetime.now() - _scan_ts).total_seconds() <= 24 * 3600
+    except Exception:
+        _scan_ok = False
+    if _scan_ok:
+        _scan_details = ((_scan_data.get("data", {}) or {}).get("details", []) or [])
+        _scan_details = sorted(_scan_details, key=lambda x: x.get("change_pct", 0), reverse=True)
+        for _sd in _scan_details[:10]:
+            code_c = _sd.get("code", "")
+            if code_c and code_c not in held_codes and _is_tradable_code(code_c):
+                _scan_candidates.append({
+                    "code": code_c,
+                    "name": _sd.get("name", code_c),
+                    "sector": _sd.get("sector", ""),
+                    "type": "动态扫描",
+                })
+    else:
+        print(f"[选股] scan_cache时间戳缺失或超24h，跳过动态扫描源")
+except Exception as _se:
+    print(f"[选股] scan_cache.json读取失败(降级跳过): {_se}")
+
+# 三源合并去重（静态池优先→观察池→动态扫描），截断到 REPORT_CANDIDATE_MAX
+candidate_stocks = merge_report_candidates(
+    _static_candidates, _pool_candidates, _scan_candidates,
+    held_codes=held_codes,
+    max_total=getattr(config, "REPORT_CANDIDATE_MAX", 20),
+) if HAS_REPORT_EXT else _static_candidates
+
+print(f"[选股] 共{len(candidate_stocks)}只非持仓候选股 "
+      f"(静态{len(_static_candidates)}/观察池{len(_pool_candidates)}/动态扫描{len(_scan_candidates)})")
 
 # 批量获取候选股实时价
 cand_codes = [c["code"] for c in candidate_stocks]
@@ -489,7 +575,7 @@ except:
 print(f"[选股] 数据就绪{len(candidate_data)}只，运行五层筛选...")
 # P0优化: 传入当前持仓赛道列表，同赛道推荐扣分
 _held_sectors = list(set(h.get("赛道", "") for h in holdings_list if h.get("赛道")))
-rec_result = run_recommendation(candidate_data, top_n=3, held_sectors=_held_sectors)
+rec_result = run_recommendation(candidate_data, top_n=5, held_sectors=_held_sectors)
 recommendations = rec_result["recommended"]
 watchlist = rec_result["watchlist"]
 
@@ -499,12 +585,23 @@ for r in recommendations:
     print(f"  ✅ {r['code']} {r['name']} [{r['sector']}] 评分{r['total_score']} | "
           f"买入{plan['buy_low']}-{plan['buy_high']} | 止损{plan['stop_loss']} | "
           f"盈亏比{plan['risk_reward']}:1 | 仓位{plan['position_pct']}%")
-for w in watchlist[:3]:
+for w in watchlist[:12]:
     print(f"  👀 {w['code']} {w['name']} [{w['sector']}] 评分{w['total_score']} | {w['trend_dir']}")
 
 # ============================================================
 # 五、构建完整数据（增强版：含成本/盈亏/止盈/操作建议）
 # ============================================================
+
+# [前瞻] 获取隔夜外盘联动数据
+try:
+    from trading_system.strategy.overnight_linkage import OvernightLinkage
+    _overnight = OvernightLinkage()
+    overnight_data = _overnight.fetch_global_indices()
+    print(f"[外盘] 获取成功: {len(overnight_data.get('indices', {}))}个指数 | 偏向: {overnight_data.get('overall_bias', 'N/A')}")
+except Exception as e:
+    overnight_data = {"available": False}
+    print(f"[外盘] 获取失败(不影响报告): {e}")
+
 holdings = {}
 for item in holdings_list:
     code = item["code"]
@@ -527,13 +624,20 @@ for item in holdings_list:
 
     # 主模式: 止损 = 最新价 × (1-STOP_LOSS_PCT)
     stop_loss = round(latest * (1 - STOP_LOSS_PCT), 2) if latest > 0 else 0
-    drawdown_trigger = round(high * (1 - DRAWDOWN_FROM_HIGH), 2) if high > 0 else 0
-    rebound_trigger = round(low * (1 + REBOUND_FROM_LOW), 2) if low > 0 else 0
 
     # 成本/持仓数据
     shares = item.get("shares", 0)
     buy_price = item.get("buy_price", 0)
     highest_hist = item.get("highest", 0)
+
+    # FIX: 回落触发改用持仓历史最高价（而非当日high），比例从config.DRAWDOWN_STOP按stock_type读取
+    _stock_type = item.get("stock_type", "龙头")
+    _dd_key = _TYPE_TO_DRAWDOWN_KEY.get(_stock_type, "龙头稳健")
+    _dd_pct = config.DRAWDOWN_STOP.get(_dd_key, 0.07)
+    _ref_high = max(highest_hist, high) if highest_hist > 0 else high  # 持仓期间最高 vs 当日最高取大
+    drawdown_trigger = round(_ref_high * (1 - _dd_pct), 2) if _ref_high > 0 else 0
+    rebound_trigger = round(low * (1 + REBOUND_FROM_LOW), 2) if low > 0 else 0
+
     pnl_pct = ((latest - buy_price) / buy_price * 100) if buy_price > 0 and latest > 0 else 0
     pnl_amount = (latest - buy_price) * shares if buy_price > 0 and latest > 0 else 0
     market_value = latest * shares if latest > 0 else 0
@@ -543,6 +647,9 @@ for item in holdings_list:
         hard_floor = round(buy_price * (1 - STOP_LOSS_PCT), 2)
         if stop_loss < hard_floor:
             stop_loss = hard_floor
+    # FIX P0: 止损价上限保护 —— 止损价永远不能高于现价（深度浮亏/除权后Ratchet会反转）
+    if stop_loss > 0 and latest > 0 and stop_loss >= latest:
+        stop_loss = round(latest * (1 - STOP_LOSS_PCT), 2)
 
     # 技术分析数据
     tech = tech_analysis.get(code, {"valid": False})
@@ -646,6 +753,8 @@ for item in holdings_list:
         "换手率": turnover,
         "止损价": stop_loss,
         "回落触发": drawdown_trigger,
+        "回落基准": _ref_high,
+        "回落比例": _dd_pct,
         "反弹触发": rebound_trigger,
         "价格状态": price_status,
         "行情时间": quote_time,
@@ -840,6 +949,63 @@ try:
 except Exception:
     pass
 
+# --- 6. 回本计划 + 板块背离检测（任务#1新增，失败降级不影响主流程） ---
+recovery_plan = None
+sector_divergence = None
+_rp_holdings_input = []
+try:
+    _rp_holdings_input = [
+        {
+            "code": _c,
+            "name": _h.get("名称", _c),
+            "shares": _h.get("数量", 0),
+            "price": _h.get("最新", 0),
+            "sector": _h.get("赛道", ""),
+            "市值": _h.get("市值", 0),
+        }
+        for _c, _h in holdings.items() if _h.get("数量", 0) > 0
+    ]
+except Exception:
+    pass
+
+if HAS_REPORT_EXT:
+    try:
+        recovery_plan = build_recovery_plan(
+            _rp_holdings_input,
+            current_mv,
+            getattr(config, "RECOVERY_TARGET_AMOUNT", 0),
+            months=getattr(config, "RECOVERY_PLAN_MONTHS", (3, 6, 12)),
+            forecast_results=forecast_results,
+        )
+        print(f"  回本计划: 缺口{getattr(config, 'RECOVERY_TARGET_AMOUNT', 0)/10000:.0f}万 | "
+              f"所需组合收益{recovery_plan.get('required_return_pct', 0)*100:.1f}%")
+        # 进度快照落盘（失败不影响报告）
+        try:
+            track_progress(
+                current_mv,
+                getattr(config, "RECOVERY_TARGET_AMOUNT", 0),
+                getattr(config, "RECOVERY_PLAN_FILE",
+                        os.path.join(config.PROJECT_ROOT, "output", "recovery_progress.json")),
+            )
+        except Exception:
+            pass
+    except Exception as _rpe:
+        recovery_plan = None
+        print(f"  回本计划: 计算失败({_rpe})")
+
+    try:
+        _sec_cache_path = os.path.join(config.PROJECT_ROOT, "data", "sector_rotation_cache.json")
+        _sec_cache = load_sector_cache(_sec_cache_path)
+        sector_divergence = detect_divergence(_rp_holdings_input, _sec_cache)
+        if sector_divergence.get("available"):
+            print(f"  板块背离: 滞涨{len(sector_divergence.get('lagging_positions', []))}只 | "
+                  f"未覆盖热点{sector_divergence.get('missed_hotspots', [])}")
+        else:
+            print(f"  板块背离: 赛道轮动缓存不可用（过期或缺失）")
+    except Exception as _sde:
+        sector_divergence = None
+        print(f"  板块背离: 检测失败({_sde})")
+
 # ============================================================
 # 六、生成HTML报告
 # ============================================================
@@ -909,16 +1075,14 @@ td{{padding:7px 6px;border-bottom:1px solid #eee;text-align:center}}
 # ---- 风险预警 ----
 html += '<h2>⚠️ 仓位风险预警</h2>'
 
-# 动态计算仓位集中度（基于holdings.json的市值数据）
+# 动态计算仓位集中度
+# FIX P1: 改用实时行情市值（原 Bug: 用holdings.json静态current_price，盘中偏差>3%）
 try:
-    hjson_path = config.get_holdings_file()
-    with open(hjson_path, 'r', encoding='utf-8') as fj:
-        hjson = json.load(fj)
-    total_mv = sum(v.get('shares', 0) * v.get('current_price', 0) for v in hjson.values())
+    total_mv = sum(h.get('市值', 0) for h in holdings.values())
     stock_mvs = {}
-    for k, v in hjson.items():
-        mv = v.get('shares', 0) * v.get('current_price', 0)
-        stock_mvs[k] = {'name': v.get('name', k), 'mv': mv, 'pct': mv / total_mv * 100 if total_mv > 0 else 0}
+    for k, h in holdings.items():
+        mv = h.get('市值', 0)
+        stock_mvs[k] = {'name': h.get('名称', k), 'mv': mv, 'pct': mv / total_mv * 100 if total_mv > 0 else 0}
     sorted_mvs = sorted(stock_mvs.items(), key=lambda x: x[1]['pct'], reverse=True)
     # 显示超过20%的仓位预警
     for code_w, info_w in sorted_mvs:
@@ -930,9 +1094,66 @@ try:
         top2_names = f"{sorted_mvs[0][1]['name']}({sorted_mvs[0][1]['pct']:.1f}%) + {sorted_mvs[1][1]['name']}({sorted_mvs[1][1]['pct']:.1f}%)"
         if top2_pct > 60:
             html += f'<div class="alert alert-warning">⚡ 持仓集中度: {top2_names} = <b>{top2_pct:.1f}%</b>集中在2只标的，风险较高。建议单只不超30%。</div>'
-    html += f'<div class="alert alert-info">💰 账户总市值: ¥{total_mv:,.2f} | 持仓{len(hjson)}只</div>'
+    html += f'<div class="alert alert-info">💰 账户总市值: ¥{total_mv:,.2f} | 持仓{len(holdings)}只</div>'
 except Exception as e:
     html += f'<div class="alert alert-warning">仓位数据读取异常: {e}</div>'
+
+# ---- 隔夜外盘前瞻板块 ----
+try:
+    if overnight_data.get("available"):
+        html += _overnight.get_summary_html()
+except Exception:
+    pass  # 外盘板块渲染失败不影响报告
+
+# ---- 零、回本目标计划（任务#1新增） ----
+try:
+    html += '<h2>零、回本目标计划</h2>'
+    if recovery_plan and recovery_plan.get("available"):
+        _rp_gap = recovery_plan["target_gap"]
+        _rp_tv = recovery_plan["total_value"]
+        _rp_req = recovery_plan["required_return_pct"]
+        _rp_prog = _rp_tv / (_rp_tv + _rp_gap) * 100 if (_rp_tv + _rp_gap) > 0 else 0
+        _rp_bar_w = max(2, min(100, _rp_prog))
+        html += '<div style="background:#fafafa;border:1px solid #e8e8e8;border-radius:8px;padding:14px 18px;margin:10px 0">'
+        html += f'<b>回本缺口:</b> <span style="color:#cf1322;font-weight:bold;font-size:15px">{_rp_gap/10000:.1f}万元</span>'
+        html += f'<span style="color:#888;margin-left:12px">当前市值 {_rp_tv/10000:.1f}万</span>'
+        html += f'<span style="color:#888;margin-left:12px">所需组合收益 <b style="color:#cf1322">+{_rp_req*100:.1f}%</b></span>'
+        html += f'<div style="background:#eee;border-radius:4px;height:14px;margin-top:8px;position:relative">'
+        html += f'<div style="background:linear-gradient(90deg,#52c41a,#1976d2);width:{_rp_bar_w:.1f}%;height:14px;border-radius:4px"></div></div>'
+        html += f'<div style="font-size:11px;color:#666;margin-top:4px">回本进度 {_rp_prog:.1f}%（已达成 = 当前市值 / (当前市值+缺口)）</div>'
+        html += '</div>'
+
+        # 逐只目标价表
+        html += '<table><tr><th>代码</th><th>名称</th><th>现价</th><th>目标价</th><th>所需涨幅</th><th>仓位权重</th><th>可行性</th></tr>'
+        for _st in recovery_plan.get("stock_targets", []):
+            _feas_color = "#ff9800" if _st.get("need_swap") else "#4caf50"
+            _res_note = f"<br><span style='color:#999;font-size:10px'>压力位{_st['resistance']:.2f}</span>" if _st.get("resistance", 0) > 0 else ""
+            html += f'<tr><td>{_st["code"]}</td><td><b>{_st["name"]}</b></td>'
+            html += f'<td>{_st["price"]:.2f}</td>'
+            html += f'<td style="color:#cf1322;font-weight:bold">{_st["target_price"]:.2f}</td>'
+            html += f'<td style="color:#cf1322">+{_st["required_gain_pct"]:.1f}%</td>'
+            html += f'<td>{_st["weight"]*100:.1f}%</td>'
+            html += f'<td style="color:{_feas_color};font-size:11px">{"⚠️" + _st["feasibility"] if _st.get("need_swap") else "✅" + _st["feasibility"]}{_res_note}</td></tr>'
+        html += '</table>'
+
+        # 三档期限月化要求表
+        html += '<table style="width:60%"><tr><th>回本期限</th><th>月化要求收益</th><th>评级</th></tr>'
+        for _hz in recovery_plan.get("horizons", []):
+            _rt = _hz["rating"]
+            _rt_color = "#cf1322" if _rt == "激进" else ("#ff9800" if _rt == "偏积极" else "#4caf50")
+            html += f'<tr><td>{_hz["months"]}个月</td>'
+            html += f'<td style="font-weight:bold">+{_hz["monthly_required_pct"]:.2f}%/月</td>'
+            html += f'<td style="color:{_rt_color};font-weight:bold">{_rt}</td></tr>'
+        html += '</table>'
+
+        html += f'<div class="alert alert-danger">⚠️ <b>风险提示:</b> {"%.0f" % (_rp_gap/10000)}万回本目标需组合上涨约+{_rp_req*100:.0f}%，属于<b>激进目标</b>。'
+        html += '以上仅为数学计算展示，不构成任何收益承诺，系统不会因此产生自动交易。请优先控制回撤，切勿为回本而放大仓位或频繁交易。</div>'
+    elif recovery_plan is not None:
+        html += '<div class="alert alert-success">✅ 回本目标已达成或无缺口，无需回本计划</div>'
+    else:
+        html += '<div class="alert alert-warning">回本计划模块不可用（导入或计算失败），已降级跳过</div>'
+except Exception as _rp_render_e:
+    html += f'<div class="alert alert-warning">回本计划渲染失败: {_rp_render_e}</div>'
 
 # ---- 总览表 ----
 html += '<h2>一、持仓综合总览（行情+盈亏+操作建议）</h2>'
@@ -1017,6 +1238,22 @@ except Exception as e:
 # ---- 📋 今日操作执行清单（前移: 紧急操作指令优先展示） ----
 html += '<h2>📋 今日操作执行清单</h2>'
 
+# 五档仓位状态（任务#1新增）: ≤10%清仓/≤35%轻仓/≤65%标准/≤85%重仓/>85%满仓
+try:
+    def _pos_tier(_p):
+        if _p <= 0.10:
+            return "清仓"
+        if _p <= 0.35:
+            return "轻仓"
+        if _p <= 0.65:
+            return "标准"
+        if _p <= 0.85:
+            return "重仓"
+        return "满仓"
+    html += f'<div class="alert alert-info">📊 仓位状态: 当前仓位{current_pct*100:.0f}%（{_pos_tier(current_pct)}档）→ 目标{target_pct*100:.0f}%（{_pos_tier(target_pct)}档）</div>'
+except Exception:
+    pass
+
 # 大盘状态卡片
 if regime_result:
     _state = regime_result["state"]
@@ -1092,12 +1329,142 @@ if need_reduce > 0.02 and reduce_amount > 5000:
 else:
     html += '<div style="background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;padding:12px 16px;margin:10px 0;color:#389e0d;font-weight:bold">✅ 今日无需减仓操作，维持现有仓位</div>'
 
+# 加仓分支（任务#1新增）: 当前仓位显著低于目标且存在推荐候选时，输出买入指令表
+try:
+    if current_pct < target_pct - 0.02 and recommendations:
+        _add_total = (target_pct - current_pct) * _CAPITAL
+        html += f'<p style="color:#389e0d;font-weight:bold;margin:12px 0">📈 可加仓: 当前仓位{current_pct:.0%}低于目标{target_pct:.0%}，可增配约{_add_total/10000:.1f}万元（以下为候选，需人工确认后手动执行）</p>'
+        html += '''<table style="width:100%;border-collapse:collapse;font-size:12px;margin:8px 0">
+<tr style="background:#f6ffed"><th style="padding:8px;border:1px solid #b7eb8f">代码</th><th style="padding:8px;border:1px solid #b7eb8f">名称</th><th style="padding:8px;border:1px solid #b7eb8f">买入区间</th><th style="padding:8px;border:1px solid #b7eb8f">止损价</th><th style="padding:8px;border:1px solid #b7eb8f">建议股数</th><th style="padding:8px;border:1px solid #b7eb8f">预估金额</th></tr>'''
+        for _ar in recommendations[:3]:
+            _ap = _ar.get("plan") or {}
+            _a_bl = _ap.get("buy_low", 0)
+            _a_bh = _ap.get("buy_high", 0)
+            _a_sl = _ap.get("stop_loss", 0)
+            _a_price = _ar.get("price", 0) or _a_bh
+            if _a_price <= 0:
+                continue
+            # 建议股数 = plan.position_pct(% × 总资金) / 参考价，取整100股
+            _a_pos_pct = _ap.get("position_pct", 0) or 0
+            _a_shares = int(_a_pos_pct / 100.0 * _CAPITAL / _a_price / 100) * 100
+            if _a_shares <= 0:
+                _a_shares = 100
+            _a_range = f"{_a_bl:.2f}~{_a_bh:.2f}" if _a_bl > 0 and _a_bh > 0 else f"{_a_price*0.98:.2f}~{_a_price*1.01:.2f}(参考)"
+            _a_sl_str = f"{_a_sl:.2f}" if _a_sl > 0 else f"{_a_price*0.95:.2f}(-5%)"
+            html += f'<tr><td style="padding:6px;border:1px solid #f0f0f0;text-align:center">{_ar.get("code", "")}</td>'
+            html += f'<td style="padding:6px;border:1px solid #f0f0f0"><b>{_ar.get("name", "")}</b><br><span style="color:#888;font-size:11px">{_ar.get("sector", "")} 评分{_ar.get("total_score", 0)}</span></td>'
+            html += f'<td style="padding:6px;border:1px solid #f0f0f0;text-align:center;color:#1976d2;font-weight:bold">{_a_range}</td>'
+            html += f'<td style="padding:6px;border:1px solid #f0f0f0;text-align:center;color:#e74c3c">{_a_sl_str}</td>'
+            html += f'<td style="padding:6px;border:1px solid #f0f0f0;text-align:center;font-weight:bold">{_a_shares}股</td>'
+            html += f'<td style="padding:6px;border:1px solid #f0f0f0;text-align:center">{_a_shares*_a_price:,.0f}元</td></tr>'
+        html += '</table>'
+        html += '<p style="color:#888;font-size:11px;margin:4px 0">ℹ️ 加仓仅在仓位低于目标2%以上时提示，买入前请确认大盘状态与个股买点，不追高。</p>'
+except Exception as _add_e:
+    html += f'<div class="alert alert-warning">加仓建议生成异常: {_add_e}</div>'
+
+# 逐只一句话决策矩阵（任务#1新增）: 重仓=评分≥70且赛道非weak；清仓=评分<30或破止损；其余=持有
+try:
+    _dm_weak = set((sector_divergence or {}).get("weak_sectors", [])) if (sector_divergence and sector_divergence.get("available")) else set()
+    _dm_cmap = get_coarse_sector_map() if HAS_REPORT_EXT else {}
+    html += '<h3 style="font-size:14px;color:#1565c0;margin-top:15px">🎯 逐只一句话决策矩阵</h3>'
+    html += '<table><tr><th>代码</th><th>名称</th><th>综合评分</th><th>所属赛道</th><th>一句话决策</th></tr>'
+    for _code, _h in holdings.items():
+        if _h.get("数量", 0) <= 0:
+            continue
+        _dm_tech = _h.get("技术", {})
+        _dm_comp = _dm_tech.get("composite", 0) if _dm_tech.get("valid") else 0
+        _dm_coarse = _dm_cmap.get(_h.get("赛道", ""), _h.get("赛道", ""))
+        _dm_latest = _h.get("最新", 0)
+        _dm_stop = _h.get("止损价", 0)
+        if _dm_comp >= 70 and _dm_coarse not in _dm_weak:
+            _dm_action, _dm_color = "重仓持有（评分强势且赛道非弱势）", "#389e0d"
+        elif _dm_comp < 30 or (_dm_stop > 0 and _dm_latest > 0 and _dm_latest <= _dm_stop):
+            _dm_action, _dm_color = "清仓（评分过低或已破止损）", "#cf1322"
+        else:
+            _dm_action, _dm_color = f"持有（评分{_dm_comp}）", "#1976d2"
+        html += f'<tr><td>{_code}</td><td><b>{_h.get("名称", _code)}</b></td>'
+        html += f'<td style="font-weight:bold">{_dm_comp}</td>'
+        html += f'<td>{_dm_coarse or "—"}</td>'
+        html += f'<td style="color:{_dm_color};font-weight:bold">{_dm_action}</td></tr>'
+    html += '</table>'
+except Exception as _dm_e:
+    html += f'<div class="alert alert-warning">决策矩阵生成异常: {_dm_e}</div>'
+
 # 反冲动锁警告
 if anti_impulse_warnings:
     _warn_names = ", ".join(set(f"{w['name']}({w['direction']})" for w in anti_impulse_warnings[:5]))
     html += f'''<div style="background:#fff2e8;border:1px solid #ffbb96;border-radius:6px;padding:12px 16px;margin:10px 0;color:#d4380d">
 <b>⚠️ 反冲动锁警告:</b> 检测到{anti_impulse_warnings[0].get("date","")}有操作记录: {_warn_names}<br>
 <span style="font-size:12px">如今日建议方向与昨日操作相反，请冷静24小时再决策，避免情绪化反复操作。</span></div>'''
+
+# ---- 板块轮动与调仓建议（任务#1新增） ----
+try:
+    html += '<h2>🔄 板块轮动与调仓建议</h2>'
+    if sector_divergence is None or not sector_divergence.get("available"):
+        html += '<div class="alert alert-warning">板块数据不可用（缓存过期），跳过背离分析</div>'
+    else:
+        _sd_scores = sector_divergence.get("holding_sector_scores", {})
+        _sd_lag = sector_divergence.get("lagging_positions", [])
+        _sd_missed = sector_divergence.get("missed_hotspots", [])
+        _sd_top = sector_divergence.get("top_strong_sectors", [])
+        _sd_cmap = get_coarse_sector_map() if HAS_REPORT_EXT else {}
+
+        # 持仓赛道评分对照表
+        html += '<table><tr><th>代码</th><th>名称</th><th>持仓赛道</th><th>粗赛道</th><th>赛道评分</th><th>状态</th></tr>'
+        _sd_weak_set = set(sector_divergence.get("weak_sectors", []))
+        for _code, _h in holdings.items():
+            if _h.get("数量", 0) <= 0:
+                continue
+            _raw_sector = _h.get("赛道", "")
+            _coarse_s = _sd_cmap.get(_raw_sector, _raw_sector)
+            _s_score = _sd_scores.get(_code)
+            _s_score_str = f"{_s_score:.1f}" if _s_score is not None else "中性"
+            if _coarse_s in _sd_weak_set:
+                _s_state, _s_color = "弱势", "#cf1322"
+            elif _s_score is None:
+                _s_state, _s_color = "中性", "#999"
+            else:
+                _s_state, _s_color = "正常", "#389e0d"
+            html += f'<tr><td>{_code}</td><td><b>{_h.get("名称", _code)}</b></td>'
+            html += f'<td>{_raw_sector}</td><td>{_coarse_s}</td>'
+            html += f'<td style="font-weight:bold">{_s_score_str}</td>'
+            html += f'<td style="color:{_s_color};font-weight:bold">{_s_state}</td></tr>'
+        html += '</table>'
+
+        # 背离警示: 滞涨暴露 + 今日最强3赛道
+        if _sd_lag:
+            _lag_names = "、".join(f'{lp["name"]}({_sd_cmap.get(lp.get("sector",""), lp.get("sector",""))}·建议减{lp["建议减持金额"]/10000:.1f}万/{lp["建议减持股数"]}股)' for lp in _sd_lag)
+            html += f'<div class="alert alert-danger">⚠️ <b>板块背离警示:</b> 持仓暴露于滞涨赛道: {_lag_names}</div>'
+        if _sd_top:
+            html += f'<div class="alert alert-info">🔥 今日最强3赛道: {"、".join(_sd_top)}'
+            if _sd_missed:
+                html += f' | 持仓未覆盖热点: {"、".join(_sd_missed)}'
+            html += '</div>'
+
+        # 减持X → 关注Y 建议行（Y从 recommendations/watchlist 按强势赛道筛选）
+        _sd_strong_set = set(sector_divergence.get("strong_sectors", []))
+        _sd_hot_picks = []
+        for _cand in list(recommendations or []) + list(watchlist or []):
+            _c_coarse = _sd_cmap.get(_cand.get("sector", ""), _cand.get("sector", ""))
+            if _c_coarse in _sd_strong_set and _cand not in _sd_hot_picks:
+                _sd_hot_picks.append(_cand)
+        if _sd_lag:
+            for _lp in _sd_lag[:3]:
+                _y_txt = ""
+                if _sd_hot_picks:
+                    _yp = _sd_hot_picks.pop(0)
+                    _y_txt = f'{_yp.get("name", "")}({_yp.get("code", "")}·评分{_yp.get("total_score", 0)})'
+                html += '<div style="background:#f0f7ff;border:1px solid #b3d9ff;border-radius:6px;padding:10px 14px;margin:8px 0">'
+                html += f'🔁 减持 <b style="color:#cf1322">{_lp["name"]}</b>（约{_lp["建议减持金额"]/10000:.1f}万元/{_lp["建议减持股数"]}股，{_lp.get("原因", "赛道弱势")}）'
+                if _y_txt:
+                    html += f' → 关注 <b style="color:#389e0d">{_y_txt}</b>'
+                else:
+                    html += ' → 暂无强势赛道候选可替换，建议先减持后等待买点'
+                html += '</div>'
+        elif not _sd_missed:
+            html += '<div class="alert alert-success">✅ 持仓赛道与市场热点无显著背离，无需板块调仓</div>'
+except Exception as _sd_e:
+    html += f'<div class="alert alert-warning">板块轮动分析渲染失败: {_sd_e}</div>'
 
 # ---- 逐只详细分析 ----
 html += '<h2>二、逐只技术分析 + 操作建议 + 条件单</h2>'
@@ -1179,6 +1546,16 @@ for code, h in holdings.items():
     _avg_cost_after = (cost_price * shares + add_trigger_price * add_shares) / (shares + add_shares) if (shares + add_shares) > 0 else cost_price
     add_stop_loss = round(_avg_cost_after * (1 - STOP_LOSS_PCT), 3)
 
+    # 隔夜外盘条件单提示（仅当行业影响分>=3时显示）
+    _overnight_hint = ""
+    try:
+        if overnight_data.get("available"):
+            _hint = _overnight.get_condition_hint_for_sector(h.get("赛道", ""))
+            if _hint:
+                _overnight_hint = f'<div style="background:#fff8e1;border:1px solid #ffcc02;border-radius:4px;padding:8px 12px;margin:8px 0;font-size:12px">{_hint}</div>'
+    except Exception:
+        pass
+
     # 操作建议背景色
     if "止损" in action or "清仓" in action:
         advice_bg = "#fff5f5"
@@ -1231,8 +1608,9 @@ for code, h in holdings.items():
 <tr><td><b>① 止损单</b></td><td style="color:#e74c3c;font-weight:bold">触发价 {h['止损价']:.3f}，委托价 {h['止损价']*0.995:.3f}（最新价×{1-STOP_LOSS_PCT:.0%}）</td><td>★★★必挂</td><td>20天</td></tr>
 <tr><td><b>② 止盈单(减仓)</b></td><td style="color:#1976d2;font-weight:bold">触发价 {tp1:.3f}，卖出{shares//2}股（{tp_basis}）</td><td>★★建议</td><td>15天</td></tr>
 <tr><td><b>③ 止盈单(清仓)</b></td><td style="color:#1976d2">触发价 {tp2:.3f}，全部清仓</td><td>★可选</td><td>20天</td></tr>
-<tr><td><b>④ 回落卖出</b></td><td style="color:#ff9800">日高{h['最高']:.3f}回落至 {h['回落触发']:.3f} 卖出</td><td>★★建议</td><td>10天</td></tr>
+<tr><td><b>④ 回落卖出</b></td><td style="color:#ff9800">最高{h.get('回落基准', h['最高']):.3f}回落{h.get('回落比例', 0.07)*100:.0f}%至 {h['回落触发']:.3f} 卖出</td><td>★★建议</td><td>10天</td></tr>
 </table>
+{_overnight_hint}
 
 <div style="background:#eef6ff;border:1px solid #b3d9ff;border-radius:6px;padding:10px 14px;margin:10px 0">
 <b style="color:#1565c0;font-size:13px">[ADD] 加仓计划</b>
@@ -1249,9 +1627,10 @@ for code, h in holdings.items():
 </div>"""
 
 # ---- V2.7: 次日开盘调仓计划 ----
-REBALANCE_SCORE_GAP = 20  # 评分差门槛，低于此值不生成调仓建议
-REBALANCE_SELL_THRESHOLD = 40  # 卖出门槛
-REBALANCE_BUY_THRESHOLD = 65  # 买入门槛
+# V3.2回测诊断: 调仓增益为-0.85%(202次调仓全部负增益)，收紧卖出条件+买入追高过滤
+REBALANCE_SCORE_GAP = 25  # V3.2: 评分差门槛从20升至25（减少无效调仓）
+REBALANCE_SELL_THRESHOLD = 30  # V3.2: 卖出门槛从40降至30（仅极端弱势才卖）
+REBALANCE_BUY_THRESHOLD = 70  # V3.2: 买入门槛从65升至70（更严格筛选）
 REBALANCE_MAX_POSITION_RATIO = 0.15  # 单只仓位上限15%
 REBALANCE_TRADE_COST_RATE = 0.0015  # 交易成本(印花税+佣金)
 
@@ -1279,6 +1658,20 @@ try:
         })
 
     # 收集候选池评分(观察池+推荐)
+    # 任务#1修复: 从 candidate_data 的 df 补入 momentum_5d（近5日涨幅，%），
+    # 使 V3.2 追高过滤(>5%不买)真实生效（此前候选构造从未填充该键，过滤恒不触发）
+    _momentum_5d_map = {}
+    for _cd in candidate_data:
+        try:
+            _cdf = _cd.get("df")
+            if _cdf is not None and len(_cdf) >= 6:
+                _c_prev = float(_cdf["close"].iloc[-6])
+                if _c_prev > 0:
+                    _momentum_5d_map[_cd.get("code", "")] = round(
+                        (float(_cdf["close"].iloc[-1]) / _c_prev - 1) * 100, 2)
+        except Exception:
+            pass
+
     _rebalance_candidates = []
     for _rb_w in (watchlist or []):
         _rb_plan = _rb_w.get("plan") or {}
@@ -1292,6 +1685,7 @@ try:
             "buy_high": _rb_plan.get("buy_high", 0),
             "stop_loss": _rb_plan.get("stop_loss", 0),
             "target_1": _rb_plan.get("target_1", 0),
+            "momentum_5d": _momentum_5d_map.get(_rb_w.get("code", ""), 0),
         })
     for _rb_r in (recommendations or []):
         _rb_plan = _rb_r.get("plan") or {}
@@ -1305,6 +1699,7 @@ try:
             "buy_high": _rb_plan.get("buy_high", 0),
             "stop_loss": _rb_plan.get("stop_loss", 0),
             "target_1": _rb_plan.get("target_1", 0),
+            "momentum_5d": _momentum_5d_map.get(_rb_r.get("code", ""), 0),
         })
 
     # 排序: 持仓按评分升序(最低在前), 候选按评分降序(最高在前)
@@ -1315,6 +1710,7 @@ try:
     _sell_list = []
     _buy_list = []
     _has_rebalance = False
+    _momentum_blocked = False  # 任务#1新增: 记录追高过滤拦截状态，供未触发原因展示
 
     if _rebalance_holdings and _rebalance_candidates:
         _worst = _rebalance_holdings[0]
@@ -1324,7 +1720,13 @@ try:
         if (_worst["score"] < REBALANCE_SELL_THRESHOLD and
             _best["score"] > REBALANCE_BUY_THRESHOLD and
             _score_gap >= REBALANCE_SCORE_GAP):
-            _has_rebalance = True
+            # V3.2: 买入端追高过滤 - 近5日涨幅>5%的不买（避免追高）
+            _best_momentum = _best.get("momentum_5d", 0)
+            if _best_momentum > 5:
+                _has_rebalance = False  # 最佳候选近期涨幅过大，不调仓
+                _momentum_blocked = True
+            else:
+                _has_rebalance = True
 
             # 卖出计划: 评分<40的全部清仓, 40-50的减仓50%
             for _sh in _rebalance_holdings:
@@ -1459,8 +1861,27 @@ try:
         _max_gap = 0
         if _rebalance_holdings and _rebalance_candidates:
             _max_gap = _rebalance_candidates[0]["score"] - _rebalance_holdings[0]["score"]
-        html += f'<div class="alert alert-success">[OK] 当前持仓评分均衡，无需调仓（最大评分差{_max_gap:.0f}分 < {REBALANCE_SCORE_GAP}分门槛）</div>'
-        print(f"  [SWAP] 无调仓信号（最大评分差{_max_gap:.0f}<{REBALANCE_SCORE_GAP}）")
+        # 任务#1新增: 输出未触发原因（仅拼接现有变量文案，V3.2阈值与判定逻辑不变）
+        _rb_reasons = []
+        if not _rebalance_holdings:
+            _rb_reasons.append("无有效技术评分的持仓")
+        if not _rebalance_candidates:
+            _rb_reasons.append("候选池无候选标的（观察池/推荐为空）")
+        if _rebalance_holdings and _rebalance_candidates:
+            _worst_h = _rebalance_holdings[0]
+            _best_c = _rebalance_candidates[0]
+            _gap_v = _best_c["score"] - _worst_h["score"]
+            if _worst_h["score"] >= REBALANCE_SELL_THRESHOLD:
+                _rb_reasons.append(f"最差持仓{_worst_h['name']}评分{_worst_h['score']:.0f} ≥ 卖出门槛{REBALANCE_SELL_THRESHOLD}")
+            if _best_c["score"] <= REBALANCE_BUY_THRESHOLD:
+                _rb_reasons.append(f"最优候选{_best_c['name']}评分{_best_c['score']:.0f} ≤ 买入门槛{REBALANCE_BUY_THRESHOLD}")
+            if _gap_v < REBALANCE_SCORE_GAP:
+                _rb_reasons.append(f"评分差{_gap_v:.0f}分 < 门槛{REBALANCE_SCORE_GAP}分")
+        if _momentum_blocked:
+            _rb_reasons.append("最优候选近5日涨幅>5%（追高过滤拦截）")
+        _rb_reason_txt = "；".join(_rb_reasons) if _rb_reasons else "未满足调仓条件"
+        html += f'<div class="alert alert-success">[OK] 当前持仓评分均衡，无需调仓（最大评分差{_max_gap:.0f}分 < {REBALANCE_SCORE_GAP}分门槛）<br><span style="font-size:11px;color:#666">未触发原因: {_rb_reason_txt}</span></div>'
+        print(f"  [SWAP] 无调仓信号（最大评分差{_max_gap:.0f}<{REBALANCE_SCORE_GAP} | 原因: {_rb_reason_txt}）")
 except Exception as _rb_e:
     html += f'<div class="alert alert-warning">[WARN] 调仓计划生成异常: {_rb_e}</div>'
     print(f"  [WARN] 调仓计划异常: {_rb_e}")
@@ -1532,7 +1953,7 @@ if recommendations:
     if watchlist:
         html += '<h3 style="font-size:14px;color:#ff9800;margin-top:15px">👀 观察池（未达买入标准，等待更好价格）</h3>'
         html += '<table><tr><th>代码</th><th>名称</th><th>赛道</th><th>综合评分</th><th>趋势状态</th><th>入选理由</th><th>关注价位区间</th><th>未达标原因</th></tr>'
-        for w in watchlist[:8]:
+        for w in watchlist[:12]:
             # 未通过原因
             watch_reason = w.get("watch_reason", "")
             if not watch_reason:
@@ -1576,7 +1997,7 @@ if recommendations:
             html += f'<td style="color:#1976d2;font-weight:bold">{price_range}</td>'
             html += f'<td style="font-size:11px;color:#999">{watch_reason}</td></tr>'
         html += '</table>'
-        html += f'<div style="font-size:11px;color:#888;margin-top:4px">📌 观察池共{len(watchlist)}只，展示前{min(8, len(watchlist))}只 | “关注价位”为建议挂单区间，到达时可考虑建仓</div>'
+        html += f'<div style="font-size:11px;color:#888;margin-top:4px">📌 观察池共{len(watchlist)}只，展示前{min(12, len(watchlist))}只 | “关注价位”为建议挂单区间，到达时可考虑建仓</div>'
 else:
     html += '<div class="alert alert-warning">⛔ 当前无符合五层筛选标准的推荐标的。候选池均处于弱势或盈亏比不达标，建议空仓等待。</div>'
 

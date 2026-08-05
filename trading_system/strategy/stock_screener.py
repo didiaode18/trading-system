@@ -35,6 +35,7 @@ CANSLIM量化对应（A股适配版）:
 """
 
 import os
+import json
 import sys
 import logging
 import datetime
@@ -61,6 +62,29 @@ FUNDAMENTAL_DATA = {}
 
 # V2.3-P2: 全市场RPS排名缓存（每次运行加载一次）
 _MARKET_RPS_CACHE = None  # [float] 全市场60日涨幅列表
+
+# V3.0: 隔夜外盘联动缓存（每次运行加载一次）
+_OVERNIGHT_CACHE = None
+
+def _get_overnight_data() -> dict:
+    """获取隔夜外盘数据（缓存，避免每只股票重复请求）"""
+    global _OVERNIGHT_CACHE
+    if _OVERNIGHT_CACHE is not None:
+        return _OVERNIGHT_CACHE
+    try:
+        from trading_system.strategy.overnight_linkage import OvernightLinkage
+        ol = OvernightLinkage()
+        _OVERNIGHT_CACHE = ol.fetch_global_indices()
+    except Exception:
+        _OVERNIGHT_CACHE = {"available": False}
+    return _OVERNIGHT_CACHE
+
+def _get_stock_sector(code: str) -> str:
+    """从SECTOR_CANDIDATES反查股票所属赛道"""
+    for sector_name, sector_info in config.SECTOR_CANDIDATES.items():
+        if code in sector_info.get("stocks", {}):
+            return sector_name
+    return ""
 
 
 def _load_market_rps() -> list:
@@ -439,7 +463,10 @@ def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
             return result
     
     # ---- 3. 股性稳定: 近30日振幅>10%的天数 <= 3 ----
+    # FIX P2: 科创板/创业板20%涨跌幅板下，10%振幅属常态，上限放宽至MAX_HIGH_AMPLITUDE_DAYS_20CM(5)
     max_amp_days = getattr(config, 'MAX_HIGH_AMPLITUDE_DAYS', 3)
+    if str(code).startswith(("300", "301", "688")):
+        max_amp_days = getattr(config, 'MAX_HIGH_AMPLITUDE_DAYS_20CM', max_amp_days)
     if len(df) >= 30:
         recent_30 = df.iloc[-30:]
         amplitude = (recent_30["high"] - recent_30["low"]) / recent_30["close"].shift(1)
@@ -569,7 +596,6 @@ def filter_strong_sectors(data_dict: dict, lookback: int = 20) -> dict:
 
         # 判定赛道状态
         is_valid = ma60_ratio >= ma60_ratio_threshold and avg_ma20_slope > 0
-        is_weak = ma20_ratio < 0.3 and ma60_ratio < 0.3  # MA20/MA60占比都低 = 弱势
 
         sectors.append({
             "sector": sector,
@@ -584,8 +610,22 @@ def filter_strong_sectors(data_dict: dict, lookback: int = 20) -> dict:
         })
 
     sectors.sort(key=lambda x: x["score"], reverse=True)
-    strong = [s["sector"] for s in sectors if s["score"] >= 60 and s["is_valid"]]
-    weak = [s["sector"] for s in sectors if (s["score"] < 40) or (not s["is_valid"] and s["ma60_ratio"] < 0.3)]
+    # FIX P2: 强/弱阈值改为从 SCREENER_CONFIG 读取（保留默认值，不在config.py新增键）
+    _strong_th = getattr(config, 'SCREENER_CONFIG', {}).get("sector_strong_score", 60)
+    _weak_th = getattr(config, 'SCREENER_CONFIG', {}).get("sector_weak_score", 40)
+    strong = [s["sector"] for s in sectors if s["score"] >= _strong_th and s["is_valid"]]
+    weak = [s["sector"] for s in sectors if (s["score"] < _weak_th) or (not s["is_valid"] and s["ma60_ratio"] < 0.3)]
+
+    # V3.2: 缓存赛道评分供行业轮动加分使用
+    try:
+        _rot_cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                       'data', 'sector_rotation_cache.json')
+        _rot_scores = {s["sector"]: s["score"] for s in sectors}
+        with open(_rot_cache_path, 'w', encoding='utf-8') as _rf:
+            json.dump({"sector_scores": _rot_scores, "strong": strong, "weak": weak,
+                       "updated": datetime.datetime.now().isoformat()}, _rf, ensure_ascii=False)
+    except Exception:
+        pass
 
     return {"sectors": sectors, "strong": strong, "weak": weak}
 
@@ -600,7 +640,7 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     
     技术面可量化部分:
     - N因子（新事物/新高）20分：股价创近60日新高、突破形态
-    - S因子（供给需求/量价）20分：缩量回踩MA20、放量突破
+    - S因子（供给需求/量价）V3.2: 满分从20降至10，放量突破升权/缩量回踩降权
     - L因子（领涨龙头）20分：RPS相对强弱、行业内涨幅排名
     - C/A/I因子（基本面）20分：从FUNDAMENTAL_DATA读取
     - M因子（大盘方向）20分：从check_market_direction传入
@@ -677,62 +717,65 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
             n_score += 8  # 已突破新高
         factors["N_新事物"] = min(n_score, 20)
 
-    # ---- S因子：供给需求/量价配合（20分）----
+    # ---- S因子：供给需求/量价配合（V3.2: 满分从20降至10）----
+    # V3.2回测诊断: S因子IC=-0.28%(整体), 牛市-1.43%, 占总分20%权重无效
+    # 修复: ①满分压缩至10 ②"缩量回踩"降权(牛市反向) ③"放量突破"升权
     s_score = 0
     vol = latest["volume"]
     vol_ma20 = df["volume"].iloc[-20:].mean()
     vol_ratio = vol / vol_ma20 if vol_ma20 > 0 else 1
 
-    # ★ 核心买点：缩量回踩20日均线（V3增强: 回踩不破确认）
+    # ★ 放量突破（V3.2升权: 回测显示放量突破是唯一正向信号）
+    high_60d_for_breakout = df["high"].iloc[-60:].max() if len(df) >= 60 else current_price
+    is_near_high = current_price >= high_60d_for_breakout * 0.98
+    if vol_ratio > 1.5 and current_price > prev["close"] and is_near_high:
+        s_score += 7   # 放量突破60日新高（核心买点，V3.2: 从10升至7/10满分）
+        signals.append("★放量突破新高")
+        logger.info(f"  [买点] {code} 放量突破: vol_ratio={vol_ratio:.2f} price={current_price:.2f} high60={high_60d_for_breakout:.2f}")
+    elif vol_ratio > 1.5 and current_price > prev["close"]:
+        s_score += 4   # 放量上涨但未突破新高
+        signals.append("放量上涨")
+    elif vol_ratio > 1.2 and current_price > prev["close"]:
+        s_score += 2   # 温和放量
+
+    # 缩量回踩MA20（V3.2降权: 牛市中“缩量回踩”常意味无人问津而非蓄势）
     if "ma20" in df.columns and not pd.isna(latest.get("ma20", None)):
         ma20_val = latest["ma20"]
         dist_to_ma20 = (current_price - ma20_val) / ma20_val
-        day_low = latest.get("low", current_price)  # 盘中最低价
-
-        # 缩量：成交量较20日均量萎缩30%以上
+        day_low = latest.get("low", current_price)
         is_shrink = vol_ratio < 0.7
-        # 回踩不破确认：盘中最低触及MA20附近（≤MA20×1.01）
         touch_ma20 = day_low <= ma20_val * 1.01
-        # 收盘站稳：收盘价仍在MA20上方（不破位）
         hold_above_ma20 = current_price > ma20_val
-        # 价格在MA20附近（-3%到+2%）
         is_pullback = -0.03 <= dist_to_ma20 <= 0.02
 
         if is_shrink and touch_ma20 and hold_above_ma20:
-            s_score += 20  # 完美缩量回踩MA20不破（核心买点）
-            signals.append("★缩量回踩MA20不破")
-            logger.info(f"  [买点] {code} 缩量回踩MA20不破: low={day_low:.2f} MA20={ma20_val:.2f} close={current_price:.2f} vol_ratio={vol_ratio:.2f}")
-        elif is_shrink and is_pullback and hold_above_ma20:
-            s_score += 16  # 缩量+MA20附近+站稳（次优买点）
+            s_score += 3   # V3.2: 从20降至3（缩量回踩在牛市反向，仅保留微弱加分）
             signals.append("缩量回踩MA20")
+        elif is_shrink and is_pullback and hold_above_ma20:
+            s_score += 2   # V3.2: 从16降至2
         elif is_pullback and hold_above_ma20:
-            s_score += 12  # 回踩MA20但未缩量
-            signals.append("回踩MA20")
-        elif is_shrink and -0.05 <= dist_to_ma20 <= 0.05:
-            s_score += 8   # 缩量但在MA20附近稍远
+            s_score += 1   # V3.2: 从12降至1
 
-    # 放量突破（V3增强: 需确认突破60日新高，避免假突破）
-    high_60d_for_breakout = df["high"].iloc[-60:].max() if len(df) >= 60 else current_price
-    is_near_high = current_price >= high_60d_for_breakout * 0.98  # 接近或突破60日新高
-    if vol_ratio > 1.5 and current_price > prev["close"] and is_near_high:
-        s_score += 10
-        signals.append("放量突破新高")
-        logger.info(f"  [买点] {code} 放量突破: vol_ratio={vol_ratio:.2f} price={current_price:.2f} high60={high_60d_for_breakout:.2f}")
-    elif vol_ratio > 1.5 and current_price > prev["close"]:
-        s_score += 6   # 放量上涨但未突破新高（降级）
-        signals.append("放量上涨")
-    elif vol_ratio > 1.2 and current_price > prev["close"]:
-        s_score += 4
-
-    # 下跌缩量（健康的量价关系）
+    # 下跌缩量（健康的量价关系，保留微弱加分）
     if current_price < prev["close"] and vol_ratio < 0.7:
-        s_score += 5
+        s_score += 1
         signals.append("下跌缩量")
 
-    factors["S_供需"] = min(s_score, 20)
-    # V2.8回测优化: 弱势市场下S因子打折（回测显示S因子差值=-0.10%，弱势市“缩量回踩”常意味着无人问津而非蓄势）
-    if is_weak_market and factors["S_供需"] > 10:
-        factors["S_供需"] = int(factors["S_供需"] * 0.7)  # 弱势市打七折
+    factors["S_供需"] = min(s_score, 10)  # V3.2: 上限从20压缩到10
+    # V2.8回测优化: 弱势市场下S因子打折
+    if is_weak_market and factors["S_供需"] > 5:
+        factors["S_供需"] = int(factors["S_供需"] * 0.7)
+
+    # V3.2: 换手率修正（知识库规则: 3-10%健康, >15%过度换手扣分）
+    try:
+        _turnover = float(latest.get("turnover", 0) or 0)
+        if _turnover > 15:
+            factors["S_供需"] = max(0, factors["S_供需"] - 3)
+            signals.append(f"换手率{_turnover:.0f}%过高-3")
+        elif 3 <= _turnover <= 10:
+            factors["S_供需"] = min(10, factors["S_供需"] + 1)
+    except (TypeError, ValueError):
+        pass
 
     # ---- L因子：领涨龙头/相对强弱（20分）----
     l_score = 0
@@ -817,21 +860,38 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     elif has_inst is False:
         cai_score -= 2
 
-    # V2.7: 无有效基本面数据时给中性基础分（8/20）
-    # 判定标准：三个字段均无正向信号视为"无有效数据"（解决FundamentalAnalyzer返回全零的问题）
+    # V2.7: 无有效基本面数据时给中性基础分（V3.2: 从固定8分改为动量代理4-12分）
+    # V3.2回测诊断: 固定8分导致80%+股票无区分度，改用“20日动量”作为基本面代理
     has_positive_signal = (
         (eps_q is not None and eps_q > 0) or
         (eps_3y is not None and eps_3y > 0) or
         (has_inst is True)
     )
     if not has_positive_signal:
-        cai_score = 8  # 中性基础分：不奖不罚，避免股票因数据全零而天然少20分
-        signals.append("CAI中性(无正向数据)")
+        # V3.2: 动量代理 - 20日涨幅>10%给10分, 5-10%给8分, 0-5%给6分, <0%给4分
+        _proxy_chg = (current_price / df["close"].iloc[-21] - 1) * 100 if len(df) >= 21 else 0
+        if _proxy_chg > 10:
+            cai_score = 10
+        elif _proxy_chg > 5:
+            cai_score = 8
+        elif _proxy_chg > 0:
+            cai_score = 6
+        else:
+            cai_score = 4
+        signals.append(f"CAI动量代理({_proxy_chg:+.0f}%)")
 
     factors["CAI_基本面"] = max(0, min(cai_score, 20))
 
-    # ---- 综合评分 ----
-    total = factors["N_新事物"] + factors["S_供需"] + factors["L_龙头"] + factors["CAI_基本面"]
+    # ---- 综合评分（V3.2: IC动态降权）----
+    # 读取IC历史，对持续负IC的因子自动降权
+    _ic_weights = _get_ic_factor_weights()
+    _n_w = _ic_weights.get("N_新事物", 1.0)
+    _s_w = _ic_weights.get("S_供需", 1.0)
+    _l_w = _ic_weights.get("L_龙头", 1.0)
+    _cai_w = _ic_weights.get("CAI_基本面", 1.0)
+    _p_w = _ic_weights.get("P_前瞻", 1.0)
+    total = (factors["N_新事物"] * _n_w + factors["S_供需"] * _s_w +
+             factors["L_龙头"] * _l_w + factors["CAI_基本面"] * _cai_w)
 
     # ---- 前瞻性预测加分（0-10分）----
     # V2.8回测优化: P因子从0-20缩减为0-10（回测显示P因子高分组20d=+1.38% vs 低分组=+2.09%，差=-0.72%，负相关）
@@ -839,24 +899,147 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     prediction = predict_forward(df, code)
     factors["P_前瞻"] = min(prediction["score"], 10)  # 上限从20压缩到10
     signals.extend(prediction["signals"])
-    total += factors["P_前瞻"]
 
-    # ---- V2.3-P1: 周线共振验证（日线MA50≈周线MA10）----
-    # 周线MA10向上时日线买点才有效，否则过滤假突破
+    # ---- V3.0: 外盘前瞻加分（0-3分，叠加到P因子）----
+    # 约束: 只加不减 | P因子上限仍为10 | 下跌市无效（系统性风险优先）
+    if market_state != "down":
+        _on_data = _get_overnight_data()
+        if _on_data.get("available"):
+            _sector = _get_stock_sector(code)
+            if _sector:
+                _impact = _on_data.get("sector_impacts", {}).get(_sector, {})
+                _foreign_bonus = min(max(_impact.get("score", 0), 0), config.OVERNIGHT_MAX_BONUS)
+                if _foreign_bonus > 0:
+                    factors["P_前瞻"] = min(factors["P_前瞻"] + _foreign_bonus, 10)
+                    signals.append(f"外盘利好+{_foreign_bonus:.0f}({_impact.get('reason', '')})")
+
+    total += factors["P_前瞻"] * _p_w
+
+    # ---- V2.3-P1: 周线共振验证（V3.2增强: 多时间框架确认）----
+    # 日线MA20 + 周线MA10(MA50) + 月线MA5(MA100) 三重共振
     weekly_bonus = 0
     if len(df) >= 55:
         ma50 = df["close"].rolling(50).mean()
         ma50_now = ma50.iloc[-1]
         ma50_5d_ago = ma50.iloc[-6] if len(ma50) >= 6 else ma50_now
         if not pd.isna(ma50_now) and not pd.isna(ma50_5d_ago):
-            if ma50_now > ma50_5d_ago and current_price > ma50_now:
-                weekly_bonus = 5  # 周线趋势向上+价格在周线上方
+            weekly_up = ma50_now > ma50_5d_ago and current_price > ma50_now
+            weekly_down = ma50_now < ma50_5d_ago and current_price < ma50_now
+            
+            if weekly_up:
+                weekly_bonus = 5
                 signals.append("周线共振↑")
-            elif ma50_now < ma50_5d_ago and current_price < ma50_now:
-                weekly_bonus = -5  # 周线向下+价格在下方，减分
+            elif weekly_down:
+                weekly_bonus = -5
                 signals.append("周线偏弱↓")
+            
+            # V3.2: 月线确认（MA100向上 = 月线趋势）
+            if len(df) >= 105:
+                ma100 = df["close"].rolling(100).mean()
+                ma100_now = ma100.iloc[-1]
+                ma100_10d_ago = ma100.iloc[-11] if len(ma100) >= 11 else ma100_now
+                if not pd.isna(ma100_now) and not pd.isna(ma100_10d_ago):
+                    monthly_up = ma100_now > ma100_10d_ago and current_price > ma100_now
+                    monthly_down = ma100_now < ma100_10d_ago and current_price < ma100_now
+                    
+                    # 三重共振: 日线MA20上 + 周线上 + 月线上 → 额外+3
+                    ma20_val = df["close"].rolling(20).mean().iloc[-1]
+                    daily_up = not pd.isna(ma20_val) and current_price > ma20_val
+                    
+                    if weekly_up and monthly_up and daily_up:
+                        weekly_bonus += 3  # 三重共振加分
+                        signals.append("★三重共振(日+周+月)")
+                    elif weekly_down and monthly_down:
+                        weekly_bonus -= 2  # 周月双弱额外减分
+                        signals.append("周月双弱↓")
     factors["W_周线"] = weekly_bonus
     total += weekly_bonus
+
+    # ---- V3.2: 均值回归加分（弱势市场专用）----
+    # 回测诊断: 熊市/震荡市中趋势策略失效，均值回归有效
+    # 条件: RSI<30 + 触及布林带下轨 + 缩量企稳 → +5分
+    mr_bonus = 0
+    if is_weak_market and len(df) >= 20:
+        try:
+            _rsi = df["close"].diff().apply(lambda x: max(x, 0)).rolling(14).mean() / \
+                   (df["close"].diff().abs().rolling(14).mean() + 1e-10) * 100
+            _rsi_now = _rsi.iloc[-1] if not pd.isna(_rsi.iloc[-1]) else 50
+            _bb_mid = df["close"].rolling(20).mean().iloc[-1]
+            _bb_std = df["close"].rolling(20).std().iloc[-1]
+            _bb_lower = _bb_mid - 2 * _bb_std if not pd.isna(_bb_std) else _bb_mid
+            _vol_ma5 = df["volume"].rolling(5).mean().iloc[-1]
+            _vol_now = df["volume"].iloc[-1]
+            
+            _mr_conditions = 0
+            if _rsi_now < 30:
+                _mr_conditions += 1
+            if current_price <= _bb_lower * 1.02:
+                _mr_conditions += 1
+            if _vol_now < _vol_ma5 * 0.7:  # 缩量企稳
+                _mr_conditions += 1
+            
+            if _mr_conditions >= 2:
+                mr_bonus = 5
+                signals.append(f"均值回归+5(RSI={_rsi_now:.0f},触下轨)")
+            elif _mr_conditions == 1 and _rsi_now < 25:
+                mr_bonus = 3
+                signals.append(f"超卖反弹+3(RSI={_rsi_now:.0f})")
+        except Exception:
+            pass
+    factors["MR_回归"] = mr_bonus
+    total += mr_bonus
+
+    # ---- V3.2: 事件日历调整（财报/解禁/回购）----
+    # 财报前5天减分，解禁前10天减分，回购/股权激励加分
+    event_adj = 0
+    try:
+        from strategy.event_calendar import EventCalendar
+        _evt_cal = EventCalendar()
+        _evt_risk = _evt_cal.check_event_risk(code, days_ahead=10)
+        if _evt_risk.get("block_buy"):
+            event_adj = -10  # 高风险事件（财报/解禁）
+            signals.append(f"事件风险-10({_evt_risk.get('suggestion', '')})")
+        elif _evt_risk.get("risk_level") == "medium":
+            event_adj = -5
+            signals.append("事件风险-5(中等级)")
+        # 正面事件加分（回购/股权激励）
+        for evt in _evt_risk.get("events", []):
+            if evt.get("type") in ("buyback", "equity_incentive"):
+                event_adj += 3
+                signals.append(f"正面事件+3({evt.get('type')})")
+                break
+    except Exception:
+        pass
+    factors["E_事件"] = event_adj
+    total += event_adj
+
+    # ---- V3.2: 北向资金/主力资金流加分 ----
+    # 北向资金连续流入+个股主力净流入 → 聪明钱信号
+    flow_bonus = 0
+    try:
+        flow_bonus = _get_capital_flow_bonus(code)
+        if flow_bonus > 0:
+            signals.append(f"资金流+{flow_bonus}(北向/主力)")
+        elif flow_bonus < 0:
+            signals.append(f"资金流{flow_bonus}(流出)")
+    except Exception:
+        pass
+    factors["F_资金"] = flow_bonus
+    total += flow_bonus
+
+    # ---- V3.2: 行业轮动加分/减分 ----
+    # 强势赛道+3，弱势赛道-3，基于sector_rotation模块
+    sector_rot_adj = 0
+    try:
+        sector_rot_adj = _get_sector_rotation_adj(code)
+        if sector_rot_adj > 0:
+            signals.append(f"强势赛道+{sector_rot_adj}")
+        elif sector_rot_adj < 0:
+            signals.append(f"弱势赛道{sector_rot_adj}")
+    except Exception:
+        pass
+    factors["R_轮动"] = sector_rot_adj
+    total += sector_rot_adj
 
     return {
         "total_score": round(total, 1),
@@ -867,6 +1050,269 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         "change_60d": round(change_60d, 2),
         "prediction": prediction,
     }
+
+
+# ============================================================
+# IC动态降权辅助（V3.2新增）
+# ============================================================
+_IC_WEIGHTS_CACHE = None
+_IC_WEIGHTS_CACHE_TIME = 0
+
+def _get_ic_factor_weights() -> dict:
+    """读取IC历史，返回各CANSLIM因子的权重乘数
+    
+    规则:
+    - IC持续为负(5天<-0.02) → 权重0.5（已降权但保留微弱信号）
+    - IC衰减(5天|IC|<0.02) → 权重0.7
+    - 正常 → 权重1.0
+    
+    缓存: 每小时刷新一次（避免每只股票重复读取JSON）
+    """
+    global _IC_WEIGHTS_CACHE, _IC_WEIGHTS_CACHE_TIME
+    import time
+    now = time.time()
+    if _IC_WEIGHTS_CACHE is not None and (now - _IC_WEIGHTS_CACHE_TIME) < 3600:
+        return _IC_WEIGHTS_CACHE
+    
+    weights = {"N_新事物": 1.0, "S_供需": 1.0, "L_龙头": 1.0, "CAI_基本面": 1.0, "P_前瞻": 1.0}
+    try:
+        ic_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               'data', 'ic_history.json')
+        if os.path.exists(ic_path):
+            with open(ic_path, 'r', encoding='utf-8') as f:
+                ic_data = json.load(f)
+            for factor_key, display_name in [("N", "N_新事物"), ("S", "S_供需"),
+                                             ("L", "L_龙头"), ("CAI", "CAI_基本面"),
+                                             ("P", "P_前瞻")]:
+                records = ic_data.get(factor_key, ic_data.get(display_name, []))
+                if len(records) >= 5:
+                    recent_ics = [r['ic'] if isinstance(r, dict) else r for r in records[-5:]]
+                    avg_ic = sum(recent_ics) / len(recent_ics)
+                    if avg_ic < -0.02:
+                        weights[display_name] = 0.5  # IC持续为负 → 半权
+                    elif all(abs(ic) < 0.02 for ic in recent_ics):
+                        weights[display_name] = 0.7  # IC衰减 → 7折
+    except Exception:
+        pass  # 读取失败不影响正常评分
+    
+    _IC_WEIGHTS_CACHE = weights
+    _IC_WEIGHTS_CACHE_TIME = now
+    return weights
+
+
+def record_canslim_ic(all_scores: list, data_dict: dict, forward_days: int = 20):
+    """V3.2: 记录CANSLIM五因子IC到ic_history.json
+    
+    在每日选股完成后调用，计算各因子得分与forward_days后收益的Rank IC。
+    键名为 "N", "S", "L", "CAI", "P"，与_get_ic_factor_weights()读取逻辑匹配。
+    
+    参数:
+        all_scores: [{"code": str, "factors": {"N_新事物": float, ...}, "total_score": float}]
+        data_dict: {code: DataFrame} 用于计算forward return
+        forward_days: 前看收益天数
+    """
+    try:
+        import scipy.stats as stats
+    except ImportError:
+        # 无scipy时用简化版rank相关
+        stats = None
+
+    if not all_scores or len(all_scores) < 5:
+        return  # 样本不足
+
+    # 计算每只股票的forward return
+    factor_returns = []  # [(factor_dict, forward_return)]
+    for item in all_scores:
+        code = item.get("code", "")
+        factors = item.get("factors", {})
+        df = data_dict.get(code)
+        if df is None or len(df) < forward_days + 1:
+            continue
+        # 用最新收盘价 vs forward_days前的收盘价
+        current_close = df["close"].iloc[-1]
+        past_close = df["close"].iloc[-(forward_days + 1)]
+        if past_close <= 0:
+            continue
+        fwd_return = (current_close - past_close) / past_close
+        factor_returns.append((factors, fwd_return))
+
+    if len(factor_returns) < 5:
+        return
+
+    # 计算各因子的Rank IC
+    factor_keys = [("N_新事物", "N"), ("S_供需", "S"), ("L_龙头", "L"),
+                   ("CAI_基本面", "CAI"), ("P_前瞻", "P")]
+    
+    returns = [fr[1] for fr in factor_returns]
+    today_str = datetime.date.today().isoformat()
+
+    # 读取现有ic_history
+    ic_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'data', 'ic_history.json')
+    ic_data = {}
+    if os.path.exists(ic_path):
+        try:
+            with open(ic_path, 'r', encoding='utf-8') as f:
+                ic_data = json.load(f)
+        except Exception:
+            ic_data = {}
+
+    for display_name, key in factor_keys:
+        factor_values = [fr[0].get(display_name, 0) for fr in factor_returns]
+        # 计算Rank IC (Spearman相关)
+        if stats:
+            ic, _ = stats.spearmanr(factor_values, returns)
+        else:
+            # 简化版: Pearson相关
+            n = len(factor_values)
+            mean_f = sum(factor_values) / n
+            mean_r = sum(returns) / n
+            cov = sum((f - mean_f) * (r - mean_r) for f, r in zip(factor_values, returns)) / n
+            std_f = (sum((f - mean_f) ** 2 for f in factor_values) / n) ** 0.5
+            std_r = (sum((r - mean_r) ** 2 for r in returns) / n) ** 0.5
+            ic = cov / (std_f * std_r) if std_f > 0 and std_r > 0 else 0
+
+        if ic != ic:  # NaN check
+            ic = 0.0
+
+        # 追加到ic_history
+        if key not in ic_data:
+            ic_data[key] = []
+        # 避免同一天重复记录
+        existing_dates = [r.get("date") for r in ic_data[key] if isinstance(r, dict)]
+        if today_str not in existing_dates:
+            ic_data[key].append({"date": today_str, "ic": round(float(ic), 6)})
+            # 保留最近60条
+            if len(ic_data[key]) > 60:
+                ic_data[key] = ic_data[key][-60:]
+
+    # 写回
+    try:
+        with open(ic_path, 'w', encoding='utf-8') as f:
+            json.dump(ic_data, f, ensure_ascii=False, indent=1)
+        logger.info(f"[IC记录] CANSLIM五因子IC已记录 ({today_str})")
+    except Exception as e:
+        logger.error(f"[IC记录] 写入失败: {e}")
+
+
+# ============================================================
+# 北向资金/主力资金流加分（V3.2新增）
+# ============================================================
+_FLOW_BONUS_CACHE = None
+_FLOW_BONUS_CACHE_TIME = 0
+
+def _get_capital_flow_bonus(code: str) -> int:
+    """V3.2: 获取资金流加分（北向+主力）
+    
+    规则:
+    - 北向资金5日净流入>50亿 + 个股主力连续3日净流入 → +3
+    - 北向资金5日净流入>20亿 → +2
+    - 北向资金5日净流出>30亿 → -2
+    - 个股主力连续3日净流出 → -1
+    
+    缓存: 每小时刷新一次
+    """
+    global _FLOW_BONUS_CACHE, _FLOW_BONUS_CACHE_TIME
+    import time
+    now = time.time()
+    
+    # 加载北向资金大环境（缓存）
+    if _FLOW_BONUS_CACHE is None or (now - _FLOW_BONUS_CACHE_TIME) > 3600:
+        try:
+            from strategy.capital_flow import CapitalFlowAnalyzer
+            analyzer = CapitalFlowAnalyzer()
+            nb = analyzer.get_northbound_flow()
+            _FLOW_BONUS_CACHE = nb
+            _FLOW_BONUS_CACHE_TIME = now
+        except Exception:
+            _FLOW_BONUS_CACHE = {}
+            _FLOW_BONUS_CACHE_TIME = now
+    
+    nb_data = _FLOW_BONUS_CACHE or {}
+    bonus = 0
+    
+    # 北向资金大环境
+    nb_5d = nb_data.get("5d_net_inflow", 0)  # 单位: 亿
+    if nb_5d > 50:
+        bonus += 2
+    elif nb_5d > 20:
+        bonus += 1
+    elif nb_5d < -30:
+        bonus -= 2
+    
+    # 个股主力资金流（从缓存读取）
+    try:
+        from data.data_loader import load_capital_flow_cache
+        flow_cache = load_capital_flow_cache()
+        stock_flow = flow_cache.get(code, {})
+        consec_in = stock_flow.get("consecutive_inflow_days", 0)
+        consec_out = stock_flow.get("consecutive_outflow_days", 0)
+        if consec_in >= 3:
+            bonus += 1
+        elif consec_out >= 3:
+            bonus -= 1
+    except Exception:
+        pass
+    
+    return max(min(bonus, 3), -2)  # 范围[-2, +3]
+
+
+# ============================================================
+# 行业轮动加分（V3.2新增）
+# ============================================================
+_SECTOR_ROT_CACHE = None
+_SECTOR_ROT_CACHE_TIME = 0
+
+def _get_sector_rotation_adj(code: str) -> int:
+    """V3.2: 获取行业轮动加分/减分
+    
+    规则:
+    - 强势赛道(score>=60) → +3
+    - 较强赛道(score>=50) → +1
+    - 弱势赛道(score<35) → -3
+    - 较弱赛道(score<45) → -1
+    
+    缓存: 每小时刷新
+    """
+    global _SECTOR_ROT_CACHE, _SECTOR_ROT_CACHE_TIME
+    import time
+    now = time.time()
+    
+    if _SECTOR_ROT_CACHE is None or (now - _SECTOR_ROT_CACHE_TIME) > 3600:
+        try:
+            from strategy.sector_rotation import analyze_sector_rotation
+            # 用当前已有的data_dict缓存（如果有的话）
+            # 简化版：直接从filter_strong_sectors的结果读取
+            rot_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    'data', 'sector_rotation_cache.json')
+            if os.path.exists(rot_path):
+                with open(rot_path, 'r', encoding='utf-8') as f:
+                    rot_data = json.load(f)
+                _SECTOR_ROT_CACHE = rot_data.get("sector_scores", {})
+            else:
+                _SECTOR_ROT_CACHE = {}
+        except Exception:
+            _SECTOR_ROT_CACHE = {}
+        _SECTOR_ROT_CACHE_TIME = now
+    
+    if not _SECTOR_ROT_CACHE:
+        return 0
+    
+    # 查找股票所属赛道
+    sector = _get_stock_sector(code)
+    if not sector or sector == "其他":
+        return 0
+    
+    score = _SECTOR_ROT_CACHE.get(sector, 50)  # 默认中性50
+    if score >= 60:
+        return 3
+    elif score >= 50:
+        return 1
+    elif score < 35:
+        return -3
+    elif score < 45:
+        return -1
+    return 0
 
 
 def _canslim_reason(factors: dict, signals: list) -> str:
@@ -911,7 +1357,7 @@ def predict_forward(df: pd.DataFrame, code: str) -> dict:
     latest = df.iloc[-1]
     current_price = latest["close"]
     
-    # ---- 1. 动量延续性（6分）----
+    # ---- 1. 动量延续性（V3.2: 从6分降至3分，回测显示追涨信号在熊市反向）----
     # 近5日每日涨跌幅
     if len(df) >= 6:
         recent_5d_changes = []
@@ -919,20 +1365,18 @@ def predict_forward(df: pd.DataFrame, code: str) -> dict:
             chg = (df["close"].iloc[i] / df["close"].iloc[i-1] - 1) * 100
             recent_5d_changes.append(chg)
         
-        # 连续上涨天数
         up_days = sum(1 for c in recent_5d_changes if c > 0)
-        # 动量加速度：近3日平均涨幅 vs 前2日平均涨幅
         avg_recent_3 = np.mean(recent_5d_changes[-3:])
         avg_early_2 = np.mean(recent_5d_changes[:2])
         
         if up_days >= 4 and avg_recent_3 > avg_early_2 > 0:
-            score += 6  # 连续上涨且加速，明日延续概率高
+            score += 3  # V3.2: 从6降至3（连续上涨且加速，但追涨风险高）
             signals.append("动量加速↑")
         elif up_days >= 3 and avg_recent_3 > 0:
-            score += 4  # 多数天上涨，趋势延续
+            score += 2  # V3.2: 从4降至2
             signals.append("动量延续")
         elif up_days >= 3 and avg_recent_3 < avg_early_2:
-            score += 2  # 上涨但减速，注意
+            score += 1  # V3.2: 从2降至1
     
     # ---- 2. 板块轮动预判（5分）----
     # 判断板块是否处于启动初期（近5日涨幅 > 近20日涨幅的均值）
@@ -1096,7 +1540,8 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
 
     # ---- 止损价 ----
     # 1. 10%固定止损（底线）
-    fixed_stop = round(current_price * 0.90, 2)
+    # FIX P2: 止损基准从current_price改为moderate_buy（与文档"买入价×90%"一致）
+    fixed_stop = round(moderate_buy * 0.90, 2)
 
     # 2. ATR自适应止损
     atr_multiplier = 2.0 if stock_type == "龙头" else 2.5
@@ -1116,7 +1561,7 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     final_stop = max(candidates_stop) if candidates_stop else fixed_stop
     # FIX: 止损上限统一使用config.INITIAL_STOP_LOSS_PCT（10%），与generate_holdings_report一致
     _max_stop_pct = getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10)
-    final_stop = min(final_stop, round(current_price * (1 - _max_stop_pct), 2))  # 最多10%以内
+    final_stop = min(final_stop, round(moderate_buy * (1 - _max_stop_pct), 2))  # 最多10%以内
     # 止损价保护：确保止损价 < 现价（参考report_email.py保护逻辑）
     if final_stop >= current_price:
         final_stop = round(current_price * 0.92, 2)
@@ -1214,6 +1659,34 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
 # 五、行业配额动态分配
 # ============================================================
 
+def _build_coarse_sector_map() -> dict:
+    """
+    从 SECTOR_CANDIDATES 自动推导 细粒度赛道(细分) -> 粗粒度候选key 的映射。
+
+    背景: filter_strong_sectors() 按 get_stock_info 的"赛道"(即细分字段)分组，
+    输出细粒度赛道名（调味品/AI视觉/保险/军工航空...）；而 SECTOR_CANDIDATES 用
+    粗粒度key（大消费/AI数字经济/大金融/军工航天...）。两者粒度不一致会导致
+    子串模糊匹配失效（如"大消费"无法匹配"调味品"），使强势配额加分静默失效。
+    本映射直接从配置推导，无需硬编码、与配置自动同步。
+    """
+    mapping = {}
+    for sector_name, sector_info in getattr(config, 'SECTOR_CANDIDATES', {}).items():
+        mapping[sector_name] = sector_name  # 粗粒度key映射到自身
+        for _code, stock in sector_info.get("stocks", {}).items():
+            fine = stock.get("细分", sector_name)
+            mapping[fine] = sector_name
+    return mapping
+
+
+def _build_code_to_coarse_map() -> dict:
+    """股票代码 -> 粗粒度候选赛道key 映射（用于持仓集中度按统一赛道口径聚合）"""
+    mapping = {}
+    for sector_name, sector_info in getattr(config, 'SECTOR_CANDIDATES', {}).items():
+        for _code in sector_info.get("stocks", {}):
+            mapping[_code] = sector_name
+    return mapping
+
+
 def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
     """
     根据行业强弱动态分配选股名额
@@ -1234,8 +1707,11 @@ def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
     if not sector_candidates:
         return {}
     
-    strong_sectors = set(sector_result.get("strong", []))
-    weak_sectors = set(sector_result.get("weak", []))
+    # FIX P0/P1: 通过 细分->粗粒度 映射归一化强弱赛道，替代子串模糊匹配
+    # 使 大消费/大金融/军工航天/AI数字经济 能正确继承其子赛道（调味品/保险/军工航空/AI视觉）的强弱
+    coarse_map = _build_coarse_sector_map()
+    strong_candidates = {coarse_map.get(s, s) for s in sector_result.get("strong", [])}
+    weak_candidates = {coarse_map.get(s, s) for s in sector_result.get("weak", [])}
     
     quotas = {}
     for sector_name, sector_info in sector_candidates.items():
@@ -1243,14 +1719,10 @@ def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
         # 基础配额 = 总上限 × 权重
         base_quota = max(1, round(total_max * weight))
         
-        # 动态调整: 强势+1, 弱势-1
-        # 将行业名称与赛道评分中的赛道名匹配（模糊匹配）
-        is_strong = any(s in sector_name or sector_name in s for s in strong_sectors)
-        is_weak = any(s in sector_name or sector_name in s for s in weak_sectors)
-        
-        if is_strong:
+        # 动态调整: 强势+1, 弱势-1（强势优先，保持原 elif 优先级）
+        if sector_name in strong_candidates:
             base_quota += 1
-        elif is_weak:
+        elif sector_name in weak_candidates:
             base_quota = max(1, base_quota - 1)
         
         quotas[sector_name] = base_quota
@@ -1327,20 +1799,26 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     sector_quotas = allocate_sector_quotas(sector_result, max_stocks)
     # 根据持仓行业集中度降低已重仓行业配额
     if holdings:
+        # FIX P0: 按 代码->粗粒度赛道 权威映射聚合持仓市值，
+        # 替代 holdings sector 字符串模糊匹配（holdings.json用细粒度名如AI视觉/保险金融，
+        # 与 sector_quotas 粗粒度key无法匹配，导致集中度调整此前完全失效）
+        code_to_coarse = _build_code_to_coarse_map()
+        coarse_map = _build_coarse_sector_map()
         holdings_sector_amount = defaultdict(float)
         for code, pos in holdings.items():
-            sector = pos.get("sector", "")
+            # 优先用代码映射（权威），回退到sector字符串归一化
+            coarse = code_to_coarse.get(code) or coarse_map.get(pos.get("sector", ""), pos.get("sector", ""))
+            if not coarse:
+                continue
             shares = pos.get("shares", 0)
             price = pos.get("current_price", pos.get("buy_price", 0))
-            holdings_sector_amount[sector] += shares * price
+            holdings_sector_amount[coarse] += shares * price
         total_capital = config.TOTAL_CAPITAL
         for sector_name, amount in holdings_sector_amount.items():
             ratio = amount / total_capital if total_capital > 0 else 0
-            if ratio > 0.15:  # 单行业持仓超15%，降低配额
-                for q_sector in sector_quotas:
-                    if any(s in q_sector or q_sector in s for s in [sector_name]):
-                        sector_quotas[q_sector] = max(1, sector_quotas[q_sector] - 1)
-                        logger.info(f"  持仓集中调整: {q_sector}配额-1（已持仓{ratio:.1%}）")
+            if ratio > 0.15 and sector_name in sector_quotas:  # 单行业持仓超15%，降低配额
+                sector_quotas[sector_name] = max(1, sector_quotas[sector_name] - 1)
+                logger.info(f"  持仓集中调整: {sector_name}配额-1（已持仓{ratio:.1%}）")
     logger.info(f"  行业配额: {sector_quotas}")
 
     # 第二步：硬性筛选 + CANSLIM多因子打分
@@ -1601,6 +2079,193 @@ def _find_stock_info_from_candidates(code: str) -> dict:
 
 
 # ============================================================
+# V3.2: 短线动量筛选通道（与CANSLIM并行，不修改现有逻辑）
+# ============================================================
+
+def run_momentum_screener(market_df=None, zt_pool: list = None,
+                          holdings: dict = None) -> dict:
+    """
+    短线动量筛选通道 V3.2
+
+    与CANSLIM中线体系并行，专注于:
+      - 连板股/强势启动股的快速识别
+      - 跳过基本面(CAI)和“振幅>10%天数”等中线约束
+      - 仅用量价+连板+赛道热度评分
+
+    A股约束:
+      - 一字板(开盘即涨停)标记为"不可买入"
+      - 创业板/科创板20%涨跌停差异
+      - T+1: 标注"今日买入明日方可卖出"
+      - 100股整数倍仓位建议
+
+    参数:
+        market_df: 全市场实时行情DataFrame (akshare stock_zh_a_spot_em)
+        zt_pool: 当日涨停池列表 (zt_monitor.get_zt_pool())
+        holdings: 当前持仓
+
+    返回:
+        {"success": bool, "picks": [...], "summary": str}
+    """
+    result = {"success": False, "picks": [], "summary": ""}
+
+    if market_df is None or market_df.empty:
+        # 尝试获取全市场行情
+        try:
+            import akshare as ak
+            market_df = ak.stock_zh_a_spot_em()
+            if market_df is not None and not market_df.empty:
+                col_map = {
+                    "代码": "code", "名称": "name", "最新价": "price",
+                    "涨跌幅": "change_pct", "成交额": "amount",
+                    "换手率": "turnover", "量比": "vol_ratio",
+                    "今开": "open", "昨收": "prev_close",
+                }
+                market_df = market_df.rename(columns=col_map)
+                for col in ["price", "change_pct", "amount", "turnover", "vol_ratio", "open", "prev_close"]:
+                    if col in market_df.columns:
+                        market_df[col] = pd.to_numeric(market_df[col], errors="coerce")
+        except Exception as e:
+            logger.warning(f"[动量筛选] 行情获取失败: {e}")
+            result["summary"] = "行情获取失败"
+            return result
+
+    if market_df is None or market_df.empty:
+        result["summary"] = "无行情数据"
+        return result
+
+    # 构建涨停池代码集（用于连板加分）
+    zt_codes = set()
+    zt_consecutive = {}  # {code: 连板数}
+    if zt_pool:
+        for s in zt_pool:
+            code = s.get("code", "")
+            zt_codes.add(code)
+            zt_consecutive[code] = s.get("consecutive_days", 1)
+
+    # 筛选条件: 涨幅>5% + 量比>1.5 + 成交额>2亿 + 非ST
+    df = market_df.copy()
+    if "name" in df.columns:
+        df = df[~df["name"].str.contains("ST|退", na=False)]
+        df = df[~df["name"].str.startswith(("N", "C"), na=False)]
+    if "change_pct" in df.columns:
+        df = df[df["change_pct"] >= 5.0]
+    if "vol_ratio" in df.columns:
+        df = df[df["vol_ratio"] >= 1.5]
+    if "amount" in df.columns:
+        df = df[df["amount"] >= 2e8]
+    if "price" in df.columns:
+        df = df[(df["price"] >= 3) & (df["price"] <= 500)]
+
+    if df.empty:
+        result["success"] = True
+        result["summary"] = "无符合条件的强势股"
+        return result
+
+    # 动量评分(0-100)
+    picks = []
+    for _, row in df.head(30).iterrows():
+        code = str(row.get("code", "")).zfill(6)
+        if not code or len(code) != 6:
+            continue
+        # 排除创业板/科创板（用户无权限）
+        if code.startswith("300") or code.startswith("688"):
+            continue
+
+        name = str(row.get("name", ""))
+        price = float(row.get("price", 0))
+        change_pct = float(row.get("change_pct", 0))
+        vol_ratio = float(row.get("vol_ratio", 0))
+        turnover = float(row.get("turnover", 0))
+        amount = float(row.get("amount", 0))
+        open_price = float(row.get("open", 0))
+        prev_close = float(row.get("prev_close", 0))
+
+        # 一字板检测: 开盘价=涨停价
+        is_yizi = False
+        if prev_close > 0 and open_price > 0:
+            limit_pct = 0.20 if code.startswith(("300", "688")) else 0.10
+            limit_price = prev_close * (1 + limit_pct)
+            if open_price >= limit_price * 0.998:
+                is_yizi = True
+
+        # 动量评分
+        score = 0
+        # 涨幅因子(0-30)
+        score += min(int(change_pct / 10 * 30), 30)
+        # 量比因子(0-25)
+        if vol_ratio >= 4:
+            score += 25
+        elif vol_ratio >= 3:
+            score += 20
+        elif vol_ratio >= 2:
+            score += 15
+        else:
+            score += 8
+        # 换手率因子(0-20): 3-15%健康区间
+        if 3 <= turnover <= 15:
+            score += 20
+        elif 1 <= turnover < 3:
+            score += 10
+        elif turnover > 15:
+            score += 5
+        # 连板加分(0-15)
+        consec = zt_consecutive.get(code, 0)
+        if consec >= 3:
+            score += 15
+        elif consec >= 2:
+            score += 10
+        elif code in zt_codes:
+            score += 5
+        # 成交额加分(0-10)
+        if amount >= 10e8:
+            score += 10
+        elif amount >= 5e8:
+            score += 5
+
+        # 100股整数倍仓位建议
+        first_shares = 100
+        first_amount = first_shares * price
+
+        # 赛道分类
+        try:
+            from strategy.market_scanner import classify_stock_sector
+            sector = classify_stock_sector(name)
+        except Exception:
+            sector = "其他"
+
+        picks.append({
+            "code": code,
+            "name": name,
+            "price": round(price, 2),
+            "change_pct": round(change_pct, 2),
+            "vol_ratio": round(vol_ratio, 2),
+            "turnover": round(turnover, 2),
+            "amount_yi": round(amount / 1e8, 2),
+            "sector": sector,
+            "momentum_score": min(score, 100),
+            "consecutive_days": consec,
+            "is_yizi": is_yizi,
+            "buyable": not is_yizi,  # 一字板不可买
+            "first_shares": first_shares,
+            "first_amount": round(first_amount, 0),
+            "t1_note": "T+1: 今日买入明日方可卖出",
+            "alert_level": "high" if score >= 70 and not is_yizi else "medium",
+        })
+
+    # 按动量评分降序
+    picks.sort(key=lambda x: x["momentum_score"], reverse=True)
+    result["picks"] = picks[:10]
+    result["success"] = True
+
+    buyable_count = sum(1 for p in result["picks"] if p["buyable"])
+    result["summary"] = (f"短线动量筛选: {len(result['picks'])}只强势股"
+                         f"(可买{buyable_count}只/一字板{len(result['picks'])-buyable_count}只)")
+    logger.info(f"[动量筛选V3.2] {result['summary']}")
+
+    return result
+
+
+# ============================================================
 # 持仓诊断模块
 # ============================================================
 
@@ -1850,6 +2515,10 @@ def generate_screener_report_html(result: dict) -> str:
                     f'<span style="display:inline-block;width:30px;height:5px;background:#eee;border-radius:2px;vertical-align:middle">'
                     f'<span style="display:block;width:{pct:.0f}%;height:100%;background:{fc};border-radius:2px"></span>'
                     f'</span></span>')
+        # FIX P2: 资金异动bonus纳入因子展示（解决手动验算总分不一致问题）
+        ff_bonus = factors.get("资金异动", 0)
+        if ff_bonus > 0:
+            bar += f'<span style="display:inline-block;margin:1px 3px;font-size:10px"><b style="color:#F5222D">资金</b>=+{ff_bonus:.0f}</span>'
         return bar
 
     # === 板块A: 推荐买入 ===

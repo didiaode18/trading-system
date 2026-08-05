@@ -12,10 +12,11 @@
 - report.py: HTML可视化报告
 """
 
-from backtest.engine import BacktestEngineV2, run_backtest_v2
-from backtest.walk_forward import WalkForwardAnalyzer, run_walk_forward
-from backtest.report import generate_html_report
-from backtest.metrics import generate_performance_report
+# FIX: 使用相对导入，支持 backtest 与 trading_system.backtest 两种导入方式
+from .engine import BacktestEngineV2, run_backtest_v2
+from .walk_forward import WalkForwardAnalyzer, run_walk_forward
+from .report import generate_html_report
+from .metrics import generate_performance_report
 
 __all__ = [
     "BacktestEngineV2", "run_backtest_v2",

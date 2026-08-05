@@ -55,8 +55,18 @@ desktop.ini
 .env
 .env.local
 
+# 本地私有配置（含邮箱授权码等敏感信息，仅模板随仓库迁移）
+trading_system/config_local.py
+config_local.py
+
 # Holdings data (contains sensitive info)
 holdings.json
+holdings_backup_*.json
+
+# 调试与临时诊断产物
+output/debug_*
+trading_system/output/diagnosis*.json
+trading_system/output/recovery_progress.json
 
 # Temporary files
 *.tmp

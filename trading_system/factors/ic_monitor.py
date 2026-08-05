@@ -161,6 +161,24 @@ class ICMonitor:
             for r in recent
         )
 
+    def is_negative(self, factor_name: str, threshold: float = -0.02) -> bool:
+        """判断因子是否IC持续为负（V3.2新增: 因子反向，应禁用）
+        
+        回测诊断: S因子IC=-0.28%, P因子IC=-0.42%, 连续为负意味因子已完全失效
+        """
+        records = self.ic_records.get(factor_name, [])
+        if len(records) < self.decay_days:
+            return False
+        recent = records[-self.decay_days:]
+        return all(
+            (r['ic'] if isinstance(r, dict) else r) < threshold
+            for r in recent
+        )
+
+    def get_negative_factors(self) -> list:
+        """获取所有IC持续为负的因子（V3.2新增）"""
+        return [name for name in self.ic_records if self.is_negative(name)]
+
     def is_strong(self, factor_name: str, threshold: float = 0.05) -> bool:
         """判断因子是否IC强劲（连续N天|IC|>阈值）"""
         records = self.ic_records.get(factor_name, [])

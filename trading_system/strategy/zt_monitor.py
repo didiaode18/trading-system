@@ -40,9 +40,14 @@ except ImportError:
 class ZTMonitor:
     """涨停/炸板股票监控、连板天梯分析和涨停主题归因"""
 
+    # V9.1: 盘中TTL缓存过期时间(秒)，解决按日期缓存导致盘中不刷新的问题
+    _CACHE_TTL_SECONDS = 60
+
     def __init__(self):
         self._zt_cache = {}   # {date_str: list}
         self._zb_cache = {}   # {date_str: list}
+        self._zb_cache_time = {}  # V9.1: {date_str: datetime} 炸板池缓存写入时间
+        self._zb_seen_codes = set()  # V9.1: 已识别的炸板代码（增量对比用）
 
     # ------------------------------------------------------------------
     # 辅助
@@ -126,15 +131,27 @@ class ZTMonitor:
     # ------------------------------------------------------------------
     # 2. 炸板股票池
     # ------------------------------------------------------------------
-    def get_zb_pool(self, date: str = None) -> list:
+    def get_zb_pool(self, date: str = None, force_refresh: bool = False) -> list:
         """
         获取炸板股票列表
 
+        V9.1: 盘中TTL机制 — 缓存超过60秒自动刷新，解决原日期缓存盘中不更新问题
+        参数:
+            date: 日期(YYYYMMDD)，默认当天
+            force_refresh: 强制刷新（忽略TTL）
         返回: [{code, name, zt_time, zb_time, current_price, ...}, ...]
         """
         date_str = self._default_date(date)
-        if date_str in self._zb_cache:
-            return self._zb_cache[date_str]
+        # V9.1: TTL缓存 — 盘中60秒过期后重新拉取
+        if date_str in self._zb_cache and not force_refresh:
+            cache_time = self._zb_cache_time.get(date_str)
+            if cache_time is not None:
+                elapsed = (datetime.datetime.now() - cache_time).total_seconds()
+                if elapsed < self._CACHE_TTL_SECONDS:
+                    return self._zb_cache[date_str]
+            else:
+                # 兼容旧逻辑：无时间戳的缓存（盘后场景）直接返回
+                return self._zb_cache[date_str]
 
         if not HAS_AKSHARE:
             logger.warning("涨停监控: akshare不可用，跳过炸板池获取")
@@ -166,7 +183,33 @@ class ZTMonitor:
             logger.error(f"涨停监控: {date_str} 炸板池获取失败: {e}")
 
         self._zb_cache[date_str] = result
+        self._zb_cache_time[date_str] = datetime.datetime.now()  # V9.1: 记录缓存时间
         return result
+
+    # ------------------------------------------------------------------
+    # 2.1 炸板池增量扫描（V9.1新增，供scheduler盘中统一预警调用）
+    # ------------------------------------------------------------------
+    def get_zb_pool_incremental(self) -> list:
+        """
+        V9.1: 获取本轮新增炸板标的（增量识别）
+
+        对比 _zb_seen_codes，仅返回首次出现的炸板股。
+        每次调用后自动更新 _zb_seen_codes。
+        适用于 scheduler.run_unified_intraday_alert() 源4。
+
+        返回: [新增炸板标的列表]，格式同 get_zb_pool()
+        """
+        all_zb = self.get_zb_pool()  # 自动TTL刷新
+        new_items = []
+        for item in all_zb:
+            code = item.get("code", "")
+            if code and code not in self._zb_seen_codes:
+                new_items.append(item)
+                self._zb_seen_codes.add(code)
+        if new_items:
+            logger.info(f"[炸板增量] 新增{len(new_items)}只: "
+                        + ", ".join(f"{i.get('name','')}({i.get('code','')})" for i in new_items[:5]))
+        return new_items
 
     # ------------------------------------------------------------------
     # 3. 连板天梯分析
@@ -224,6 +267,26 @@ class ZTMonitor:
             f"封板率{zt_rate:.0%}, 最高连板{max_consecutive}板"
         )
 
+        # V3.2: 连板效应风险预警（知识库1.5规则: 7板以上=妖股，风险极高）
+        high_board_risks = []
+        for s in zt_pool:
+            days = s.get("consecutive_days", 1)
+            if days >= 7:
+                high_board_risks.append({
+                    "code": s["code"], "name": s["name"],
+                    "consecutive_days": days,
+                    "risk_level": "极端",
+                    "warning": f"{days}板妖股! 随时可能天地板，禁止追高",
+                })
+                logger.warning(f"⚠️ 妖股预警: {s['name']}({s['code']}) {days}连板，风险极高!")
+            elif days >= 5:
+                high_board_risks.append({
+                    "code": s["code"], "name": s["name"],
+                    "consecutive_days": days,
+                    "risk_level": "高",
+                    "warning": f"{days}连板强势股，游资接力末端，追高风险大",
+                })
+
         return {
             "ladder": ladder,
             "total_zt": total_zt,
@@ -231,6 +294,7 @@ class ZTMonitor:
             "zt_rate": zt_rate,
             "max_consecutive": max_consecutive,
             "top_stocks": top_stocks,
+            "high_board_risks": high_board_risks,  # V3.2新增
         }
 
     # ------------------------------------------------------------------

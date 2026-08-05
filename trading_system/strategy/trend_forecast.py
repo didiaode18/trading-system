@@ -125,6 +125,29 @@ class TrendForecaster:
             "advice": advice,
         }
 
+    def analyze_and_persist(self, code: str, df: pd.DataFrame, holding: dict = None) -> dict:
+        """V3.2: 分析并持久化预测结果（供验证闭环使用）"""
+        result = self.analyze_stock(code, df, holding)
+        if result.get("valid"):
+            try:
+                from monitor.prediction_tracker import PredictionTracker
+                tracker = PredictionTracker()
+                composite = result.get("composite", {})
+                direction = composite.get("direction", "中性")
+                confidence = composite.get("confidence", 50)
+                total_score = composite.get("total_score", 50)
+                tracker.record_forecast(
+                    code=code,
+                    direction=direction,
+                    confidence=confidence,
+                    composite_score=total_score,
+                    source="trend_forecast",
+                    extra={"name": result.get("name", code)},
+                )
+            except Exception:
+                pass  # 持久化失败不影响主流程
+        return result
+
     # ============================================================
     # 二、趋势方向分析
     # ============================================================

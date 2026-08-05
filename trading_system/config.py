@@ -15,11 +15,39 @@ V3.0新增:
 
 import os
 
+
+# ============================================================
+# 零、本地 .env 加载（无需python-dotenv，仅解析 KEY=VALUE 行）
+# 优先级: 系统环境变量 > .env文件（setdefault不覆盖已有环境变量）
+# ============================================================
+def _load_dotenv():
+    for _base in (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                  os.path.dirname(os.path.abspath(__file__))):
+        _env_file = os.path.join(_base, ".env")
+        if os.path.exists(_env_file):
+            try:
+                with open(_env_file, encoding="utf-8") as _f:
+                    for _line in _f:
+                        _line = _line.strip()
+                        if not _line or _line.startswith("#") or "=" not in _line:
+                            continue
+                        _k, _, _v = _line.partition("=")
+                        _k = _k.strip()
+                        _v = _v.strip().strip('"').strip("'")
+                        if _k:
+                            os.environ.setdefault(_k, _v)
+            except Exception:
+                pass
+            break
+
+
+_load_dotenv()
+
 # ============================================================
 # 一、资金与账户配置
 # ============================================================
-TOTAL_CAPITAL = 731_455.43     # 总资金（根据实际账户总资产）
-AVAILABLE_CASH = 297.43          # 当前可用资金（用于选股仓位计算）
+TOTAL_CAPITAL = 667_607.83     # 总资金（根据实际账户总资产，2026-08-04券商同步）
+AVAILABLE_CASH = 132.93          # 当前可用资金（用于选股仓位计算）
 CASH_RESERVE_RATIO = 0.10        # 最低现金保留比例（10%安全垫）
 
 # ============================================================
@@ -63,8 +91,10 @@ NEAR_FULL_POSITION = 0.80        # 仓位>=80%时只允许减仓不允许新开�
 # 个股硬性筛选标准
 MIN_DAILY_AMOUNT = 5e8           # 日均成交额下限（5亿元，V2.3降低避免中小盘龙头被误杀）
 MAX_HIGH_AMPLITUDE_DAYS = 3      # 近30日振幅>10%的天数上限
+MAX_HIGH_AMPLITUDE_DAYS_20CM = 5 # FIX P2: 20%涨跌幅板(科创/创业)高波动板块放宽上限，避免半导体等被系统性误杀
 CRASH_THRESHOLD = -0.08          # 单日暴跌阈值（-8%）
 CRASH_VOLUME_RATIO = 2.0         # 暴跌放量倍数（量>均量2倍）
+DYNAMIC_SCAN_MAX_PRICE = 1500    # FIX P2: 动态扫描股价上限（原500元误杀寒武纪等高价龙头）
 
 # 赛道分级（第一梯队权重加成）
 SECTOR_TIER1 = ["半导体", "AI数字经济"]  # 第一梯队：AI/半导体
@@ -98,6 +128,13 @@ SECTOR_CANDIDATES = {
             "002185": {"名称": "华天科技", "细分": "半导体封测", "类型": "弹性"},
             "002049": {"名称": "紫光国微", "细分": "芯片设计", "类型": "龙头"},
             "603986": {"名称": "兆易创新", "细分": "存储芯片", "类型": "龙头"},
+            # FIX P2: 补充池外半导体龙头（中芯国际/寒武纪等原仅靠动态扫描纳入，扫描失效时完全遗漏）
+            "688981": {"名称": "中芯国际", "细分": "晶圆代工", "类型": "龙头"},
+            "688256": {"名称": "寒武纪",   "细分": "AI芯片",   "类型": "弹性"},
+            "688041": {"名称": "海光信息", "细分": "CPU芯片",  "类型": "龙头"},
+            "688008": {"名称": "澜起科技", "细分": "内存接口芯片", "类型": "龙头"},
+            "688012": {"名称": "中微公司", "细分": "半导体设备", "类型": "龙头"},
+            "300604": {"名称": "长川科技", "细分": "半导体测试", "类型": "弹性"},
         }
     },
     # --- 军工航天（配额15%）---
@@ -223,6 +260,12 @@ ZT_GENE_ENABLED = True               # 是否启用涨停基因跟踪
 ZT_GENE_MIN_OPEN_PCT = 3.0           # 连板候选最低高开幅度(%)
 ZT_GENE_MIN_VOL_RATIO = 2.0          # 连板候选最低量比
 ZT_GENE_TRACK_DAYS = 3               # 跟踪最近N天涨停股
+
+# V3.0: 隔夜外盘联动配置
+OVERNIGHT_LINKAGE_ENABLED = True          # 总开关
+OVERNIGHT_SIGNIFICANT_THRESHOLD = 2.0     # 显著异动阈值(%)，触发条件单提示
+OVERNIGHT_MAX_BONUS = 3                   # CANSLIM外盘加分上限
+OVERNIGHT_CACHE_HOURS = 12                # 数据缓存有效期（避免重复请求）
 
 
 # ============================================================
@@ -414,9 +457,10 @@ RISK_UNIFIED_CONFIG = {
     "weekly_loss_limit": 0.08,        # 单周亏损>=8%: 强制降到30%以下
     "weekly_loss_pause_days": 3,      # 周熔断后暂停开仓天数
 
-    # --- 连续亏损熔断 ---
-    "consecutive_loss_pause": 3,      # 连续亏损3笔 → 暂停3天
-    "consecutive_loss_today": 2,      # 连续亏损2笔 → 当日禁止开仓
+    # --- 连续亏损熔断（V3.2回测优化: 连亏后继续交易avg=-1.33% vs 正常+1.76%）---
+    "consecutive_loss_pause": 5,      # V3.2: 连续亏损3笔 → 暂停5天（原3天）
+    "consecutive_loss_today": 2,      # 连续亏损2笔 → 暂停2天（V3.2: 原"当日禁止"升级）
+    "consecutive_loss_2_pause": 2,    # V3.2新增: 连亏2笔暂停天数
     "cool_down_days": 2,              # 卖出后冷却天数
 
     # --- 满仓防护 ---
@@ -430,13 +474,18 @@ RISK_UNIFIED_CONFIG = {
 
     # --- 单笔风险 ---
     "max_single_loss_ratio": 0.02,    # 单笔最大亏损2%
-    "initial_stop_loss_pct": 0.10,    # 初始止损幅度10%（固定百分比兜底）
+    "initial_stop_loss_pct": 0.10,    # 初始止损幅度10%（固定百分比兆底）
+    
+    # --- 组合层面风控（V3.2新增）---
+    "portfolio_drawdown_limit": -0.10, # 组合浮亏>10%禁止新开仓
+    "sector_concentration_limit": 0.50, # 同赛道持仓占比上限50%
 
-    # --- ATR自适应止损（V8.3新增）---
-    "atr_stop_multiplier": 2.0,       # ATR倍数，止损距离 = ATR * 此倍数
-    "min_stop_loss_pct": 0.05,        # 最小止损比例5%（兜底，防止止损太远）
+    # --- ATR自适应止损（V8.3新增，V3.2回测优化）---
+    "atr_stop_multiplier": 2.5,       # V3.2: ATR倍数从2.0升至2.5（回测显示2.0止损误杀率26.1%）
+    "min_stop_loss_pct": 0.05,        # 最小止损比例5%（兆底，防止止损太远）
     "max_stop_loss_pct": 0.15,        # 最大止损比例15%（防止止损太近）
     "trailing_atr_multiplier": 1.5,   # 移动止损ATR倍数
+    "stop_loss_close_confirm": True,  # V3.2新增: 止损需收盘确认（避免盘中假突破误杀）
 }
 
 # ============================================================
@@ -532,12 +581,18 @@ WECHAT_WORK_WEBHOOK = ""         # 企业微信机器人Webhook URL
 # ============================================================
 # 十二、邮件通知配置（QQ邮箱SMTP）
 # ============================================================
-EMAIL_SMTP_HOST = "smtp.qq.com"  # QQ邮箱SMTP服务器
-EMAIL_SMTP_PORT = 465            # SMTP端口（SSL）
-EMAIL_SENDER = "563646039@qq.com"                # 发件人QQ邮箱
-# FIX: 修复邮箱授权码明文硬编码，改为环境变量读取
-EMAIL_AUTH_CODE = "yxagunjowxedbdai"             # QQ邮箱授权码
-EMAIL_RECEIVER = "563646039@qq.com"  # 收件人邮箱
+# 敏感信息外部化: 授权码优先级 = config_local.py(文件末尾加载，最高) > 系统环境变量/.env > 空
+# 迁移到新机器时: 设置环境变量 EMAIL_AUTH_CODE 或填写 config_local.py
+EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.qq.com")  # QQ邮箱SMTP服务器
+EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", 465))       # SMTP端口（SSL）
+EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "563646039@qq.com")   # 发件人QQ邮箱
+# FIX: 修复邮箱授权码明文硬编码，改为环境变量/config_local.py读取
+EMAIL_AUTH_CODE = os.environ.get("EMAIL_AUTH_CODE", "")             # QQ邮箱授权码（勿提交到仓库）
+EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", "563646039@qq.com")  # 收件人邮箱
+
+# 钉钉/企业微信Webhook也支持环境变量覆盖
+DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", DINGTALK_WEBHOOK)
+WECHAT_WORK_WEBHOOK = os.environ.get("WECHAT_WORK_WEBHOOK", WECHAT_WORK_WEBHOOK)
 
 # ============================================================
 # 十一、基准指数（用于判定行情强弱）
@@ -948,3 +1003,58 @@ GAP_CONFIG = {
     "exhaustion_consecutive_gaps": 3,   # 连续N个同向缺口 → 衰竭
     "exhaustion_vol_spike": 2.5,        # 衰竭缺口: 量异常放大>2.5倍
 }
+
+
+# ============================================================
+# V3.2: 参数版本管理+变更追踪
+# ============================================================
+_CONFIG_VERSION = "3.2.0"  # 当前配置版本号
+_CONFIG_CHANGELOG = [
+    # (version, date, description)
+    ("3.2.0", "2026-07-28", "组合回撤拦截/Kelly仓位/黑天鹅检测/赛道集中度/IC降权"),
+    ("3.1.0", "2026-07-20", "连亏熔断升级/ATR止损2.5/移动止盈放宽/盘中通道收紧"),
+    ("3.0.0", "2026-07-01", "统一风控参数/组合风险管理/多策略引擎"),
+]
+
+def get_config_version() -> str:
+    """获取当前配置版本号"""
+    return _CONFIG_VERSION
+
+def get_config_changelog(n: int = 5) -> list:
+    """获取最近N条配置变更记录"""
+    return _CONFIG_CHANGELOG[:n]
+
+def log_config_change(description: str):
+    """V3.2: 记录配置变更到日志文件（供手动调用）
+    
+    用法: 修改config.py后调用 log_config_change("调整ATR倍数2.0→2.5")
+    """
+    import datetime as _dt
+    log_file = _os.path.join(LOG_DIR, "config_changes.log")
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{_dt.datetime.now().isoformat()} | v{_CONFIG_VERSION} | {description}\n")
+    except Exception:
+        pass
+
+
+# ============================================================
+# 报告增强: 回本计划/板块轮动/选股扩面（任务#1新增，仅追加）
+# ============================================================
+RECOVERY_TARGET_AMOUNT = 400_000          # 回本目标缺口金额（元）
+RECOVERY_PLAN_MONTHS = (3, 6, 12)         # 回本期限档位（月）
+RECOVERY_PLAN_FILE = _os.path.join(OUTPUT_DIR, "recovery_progress.json")  # 回本进度快照文件
+REPORT_CANDIDATE_MAX = 20                 # 综合报告选股候选上限（三源合并后截断）
+
+
+# ============================================================
+# 本地私有配置覆盖（config_local.py 已加入.gitignore，不随仓库迁移）
+# 模板见 config_local.example.py，支持覆盖本文件任意变量
+# ============================================================
+try:
+    from .config_local import *  # noqa: F401,F403  (作为包导入时)
+except ImportError:
+    try:
+        from config_local import *  # noqa: F401,F403  (作为顶层config导入时)
+    except ImportError:
+        pass

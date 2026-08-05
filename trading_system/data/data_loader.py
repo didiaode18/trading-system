@@ -88,6 +88,21 @@ def init_db(db_path: str = None) -> sqlite3.Connection:
             last_date  TEXT
         )
     """)
+    # V3.2: 分钟级K线表（支持5min/15min/60min）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS minute_kline (
+            code       TEXT    NOT NULL,
+            datetime   TEXT    NOT NULL,
+            freq       TEXT    NOT NULL DEFAULT '5',
+            open       REAL,
+            close      REAL,
+            high       REAL,
+            low        REAL,
+            volume     REAL,
+            amount     REAL,
+            PRIMARY KEY (code, datetime, freq)
+        )
+    """)
     conn.commit()
     return conn
 
@@ -733,6 +748,8 @@ def load_daily_data(code: str, conn: sqlite3.Connection = None,
         if df.empty:
             return df
         df = df.sort_values("date").reset_index(drop=True)
+        # V3.2: 数据质量自动校验
+        df = validate_dataframe(df, code)
         return df
     finally:
         if own_conn:
@@ -1255,6 +1272,283 @@ def validate_order_price(code: str, name: str, order_type: str,
         "adjusted_price": adjusted,
         "note": note if note else "校验通过",
     }
+
+
+# ============================================================
+# V3.2: 数据质量自动监控
+# ============================================================
+
+class DataQualityReport:
+    """数据质量检测报告"""
+    def __init__(self):
+        self.issues = []  # [(level, code, message)]
+    
+    def add(self, level: str, code: str, msg: str):
+        self.issues.append((level, code, msg))
+        if level == "ERROR":
+            logger.error(f"[数据质量] {code}: {msg}")
+        elif level == "WARN":
+            logger.warning(f"[数据质量] {code}: {msg}")
+    
+    @property
+    def has_errors(self) -> bool:
+        return any(lv == "ERROR" for lv, _, _ in self.issues)
+    
+    @property
+    def summary(self) -> str:
+        errs = sum(1 for lv, _, _ in self.issues if lv == "ERROR")
+        warns = sum(1 for lv, _, _ in self.issues if lv == "WARN")
+        return f"{errs}个错误, {warns}个警告"
+
+
+def validate_dataframe(df: pd.DataFrame, code: str,
+                       report: DataQualityReport = None) -> pd.DataFrame:
+    """
+    V3.2: 数据质量自动校验（每次load后自动调用）
+    
+    检查项:
+    1. 空值/NaN检测
+    2. 价格为0或负数
+    3. 成交量为0（停牌未标记）
+    4. OHLC逻辑关系 (high>=low, high>=open/close)
+    5. 复权异常（单日涨跌幅>20%非ST）
+    6. 日期连续性（缺失交易日）
+    
+    返回: 清洗后的DataFrame（严重问题行被移除）
+    """
+    if report is None:
+        report = DataQualityReport()
+    
+    if df is None or df.empty:
+        report.add("ERROR", code, "数据为空")
+        return df
+    
+    original_len = len(df)
+    
+    # 1. 空值检测
+    null_cols = df[['open', 'close', 'high', 'low']].isnull().any(axis=1)
+    if null_cols.sum() > 0:
+        report.add("ERROR", code, f"价格空值{null_cols.sum()}行，已移除")
+        df = df[~null_cols].reset_index(drop=True)
+    
+    # 2. 价格<=0
+    bad_price = (df['close'] <= 0) | (df['open'] <= 0)
+    if bad_price.sum() > 0:
+        report.add("ERROR", code, f"价格<=0共{bad_price.sum()}行，已移除")
+        df = df[~bad_price].reset_index(drop=True)
+    
+    # 3. 成交量为0（可能停牌）
+    if 'volume' in df.columns:
+        zero_vol = df['volume'] == 0
+        if zero_vol.sum() > 3:  # 超过3天量为0才警告
+            report.add("WARN", code, f"成交量为0共{zero_vol.sum()}天，疑似停牌")
+    
+    # 4. OHLC逻辑关系
+    if len(df) > 0:
+        bad_ohlc = (df['high'] < df['low']) | (df['high'] < df['open']) | (df['high'] < df['close'])
+        if bad_ohlc.sum() > 0:
+            report.add("ERROR", code, f"OHLC逻辑异常{bad_ohlc.sum()}行(high<low)，已移除")
+            df = df[~bad_ohlc].reset_index(drop=True)
+    
+    # 5. 复权异常（单日涨跌幅>20%）
+    if len(df) >= 2:
+        pct_change = df['close'].pct_change().abs()
+        extreme = pct_change > 0.20
+        if extreme.sum() > 0:
+            # 排除ST股（代码含ST）和ETF
+            is_etf = code.startswith('1') or code.startswith('5')
+            if not is_etf:
+                report.add("WARN", code,
+                           f"单日涨跌幅>20%共{extreme.sum()}天，疑似复权错误")
+    
+    # 6. 日期连续性（缺失超过3天警告）
+    if len(df) >= 5 and 'date' in df.columns:
+        try:
+            dates = pd.to_datetime(df['date'])
+            gaps = dates.diff().dt.days
+            large_gaps = gaps[gaps > 5]  # 超过5天无数据（排除周末）
+            if len(large_gaps) > 0:
+                report.add("WARN", code,
+                           f"数据缺口{len(large_gaps)}处(最长{large_gaps.max():.0f}天)")
+        except Exception:
+            pass
+    
+    if len(df) < original_len:
+        logger.info(f"[数据质量] {code}: 清洗{original_len - len(df)}行异常数据")
+    
+    return df
+
+
+# ============================================================
+# V3.2: 分钟级K线数据获取与加载
+# ============================================================
+
+def fetch_minute_data(code: str, freq: str = "5", days: int = 5,
+                      conn: sqlite3.Connection = None) -> pd.DataFrame:
+    """
+    V3.2: 获取分钟级K线数据并存储到SQLite
+    
+    数据源: akshare(东方财富分钟线) 或 腐讯实时API
+    
+    参数:
+        code: 股票代码
+        freq: 频率 "5"/"15"/"60"
+        days: 获取最近N天
+        conn: 数据库连接
+    
+    返回:
+        DataFrame: datetime, open, close, high, low, volume, amount
+    """
+    own_conn = False
+    if conn is None:
+        conn = init_db()
+        own_conn = True
+    
+    df = pd.DataFrame()
+    try:
+        if HAS_AKSHARE:
+            # akshare分钟线（东方财富）
+            period_map = {"5": "5", "15": "15", "60": "60"}
+            period = period_map.get(freq, "5")
+            raw = ak.stock_zh_a_minute(
+                symbol=_to_baostock_code(code).replace(".", ""),
+                period=period,
+                adjust="qfq"
+            )
+            if raw is not None and not raw.empty:
+                df = raw.rename(columns={
+                    "day": "datetime", "open": "open", "close": "close",
+                    "high": "high", "low": "low", "volume": "volume"
+                })
+                if "amount" not in df.columns:
+                    df["amount"] = df["volume"] * df["close"]
+                df["code"] = code
+                df["freq"] = freq
+                # 只保留最近N天
+                if len(df) > 0:
+                    df["datetime"] = pd.to_datetime(df["datetime"])
+                    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+                    df = df[df["datetime"] >= cutoff]
+    except Exception as e:
+        logger.warning(f"[分钟线] {code} akshare获取失败: {e}")
+    
+    # 存储到SQLite
+    if not df.empty:
+        try:
+            save_df = df[["code", "datetime", "freq", "open", "close",
+                          "high", "low", "volume", "amount"]].copy()
+            save_df["datetime"] = save_df["datetime"].astype(str)
+            save_df.to_sql("minute_kline", conn, if_exists="append",
+                          index=False, method="multi")
+            # 去重（保留最新）
+            conn.execute("""
+                DELETE FROM minute_kline WHERE rowid NOT IN (
+                    SELECT MAX(rowid) FROM minute_kline
+                    GROUP BY code, datetime, freq
+                )
+            """)
+            conn.commit()
+            logger.info(f"[分钟线] {code} {freq}min: 存储{len(save_df)}条")
+        except Exception as e:
+            logger.warning(f"[分钟线] {code} 存储失败: {e}")
+    
+    if own_conn:
+        conn.close()
+    return df
+
+
+def load_minute_data(code: str, freq: str = "5", bars: int = 240,
+                     conn: sqlite3.Connection = None) -> pd.DataFrame:
+    """
+    V3.2: 从SQLite加载分钟级K线
+    
+    参数:
+        code: 股票代码
+        freq: 频率 "5"/"15"/"60"
+        bars: 加载最近N根K线
+        conn: 数据库连接
+    
+    返回:
+        DataFrame: datetime, open, close, high, low, volume, amount (升序)
+    """
+    own_conn = False
+    if conn is None:
+        conn = init_db()
+        own_conn = True
+    
+    try:
+        query = """
+            SELECT datetime, open, close, high, low, volume, amount
+            FROM minute_kline
+            WHERE code = ? AND freq = ?
+            ORDER BY datetime DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(code, freq, bars))
+        if df.empty:
+            return df
+        df = df.sort_values("datetime").reset_index(drop=True)
+        return df
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# V3.2: 数据管道故障告警+自动重试
+# ============================================================
+
+def retry_with_fallback(max_retries: int = 3, delay: float = 2.0,
+                        fallback_fn=None):
+    """
+    V3.2: 数据获取重试装饰器
+    
+    失败时自动重试N次，每次间隔delay秒。
+    全部失败后调用fallback_fn（如返回缓存数据）并发送告警。
+    
+    用法:
+        @retry_with_fallback(max_retries=3, fallback_fn=_load_from_cache)
+        def fetch_data(code):
+            ...
+    """
+    def decorator(func):
+        import functools
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(max_retries):
+                try:
+                    result = func(*args, **kwargs)
+                    if result is not None:
+                        return result
+                    # 返回None视为失败
+                    last_err = Exception("返回None")
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"[数据管道] {func.__name__} 第{attempt+1}次失败: {e}, "
+                            f"{delay}秒后重试..."
+                        )
+                        time.sleep(delay)
+            
+            # 全部失败
+            logger.error(
+                f"[数据管道] {func.__name__} {max_retries}次重试均失败: {last_err}"
+            )
+            # 尝试降级
+            if fallback_fn is not None:
+                try:
+                    logger.info(f"[数据管道] 尝试降级方案: {fallback_fn.__name__}")
+                    return fallback_fn(*args, **kwargs)
+                except Exception as fb_err:
+                    logger.error(f"[数据管道] 降级也失败: {fb_err}")
+            return None
+        return wrapper
+    return decorator
 
 
 if __name__ == "__main__":

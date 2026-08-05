@@ -26,9 +26,15 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-from backtest.broker import SimBroker, Order, CostConfig
-from backtest.data_feed import DataFeed
-from backtest.metrics import generate_performance_report, format_report_text
+# FIX: 双模式导入，支持 backtest 与 trading_system.backtest 两种包路径
+try:
+    from .broker import SimBroker, Order, CostConfig
+    from .data_feed import DataFeed
+    from .metrics import generate_performance_report, format_report_text
+except ImportError:
+    from backtest.broker import SimBroker, Order, CostConfig
+    from backtest.data_feed import DataFeed
+    from backtest.metrics import generate_performance_report, format_report_text
 from attribution.trade_log import TradeLog
 
 logger = logging.getLogger(__name__)

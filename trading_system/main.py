@@ -64,14 +64,22 @@ from strategy.consensus import batch_consensus
 os.makedirs(config.LOG_DIR, exist_ok=True)
 log_file = os.path.join(config.LOG_DIR,
                         f"trading_{datetime.date.today().strftime('%Y%m%d')}.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# FIX: 被调度器拉起时root logger已有handler，logging.basicConfig会被静默忽略，
+# 导致trading_*.log长期为0字节。此时显式挂载专用FileHandler保证该日志正常写入。
+if logging.root.handlers:
+    _trading_fh = logging.FileHandler(log_file, encoding="utf-8")
+    _trading_fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.root.addHandler(_trading_fh)
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 logger = logging.getLogger("main")
 
 

@@ -304,9 +304,13 @@ class ZTGeneTracker:
             logger.warning(f"[涨停基因] akshare行情获取失败: {e}")
 
         # 方法2: 腾讯行情API（备用）
+        # FIX: 修复错误引用不存在的fetch_realtime_quotes，改用data.realtime.fetch_realtime_tencent
         try:
-            from data.data_loader import fetch_realtime_quotes
-            quotes = fetch_realtime_quotes(codes)
+            try:
+                from data.realtime import fetch_realtime_tencent
+            except ImportError:
+                from trading_system.data.realtime import fetch_realtime_tencent
+            quotes = fetch_realtime_tencent(codes)
             if quotes:
                 for code, q in quotes.items():
                     prev_close = q.get("prev_close", 0)

@@ -24,8 +24,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-from backtest.engine import BacktestEngineV2
-from backtest.data_feed import DataFeed
+# FIX: 双模式导入，支持 backtest 与 trading_system.backtest 两种包路径
+try:
+    from .engine import BacktestEngineV2
+    from .data_feed import DataFeed
+except ImportError:
+    from backtest.engine import BacktestEngineV2
+    from backtest.data_feed import DataFeed
 
 logger = logging.getLogger(__name__)
 

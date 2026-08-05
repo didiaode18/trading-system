@@ -477,9 +477,10 @@ def run_morning():
         html += '</table>'
 
     # ④ 次日调仓计划（基于综合评分再平衡）
-    REBALANCE_SCORE_GAP = 20
-    REBALANCE_SELL_THRESHOLD = 40
-    REBALANCE_BUY_THRESHOLD = 65
+    # V3.2回测诊断: 调仓增益-0.85%，收紧阈值
+    REBALANCE_SCORE_GAP = 25   # V3.2: 20→25
+    REBALANCE_SELL_THRESHOLD = 30  # V3.2: 40→30
+    REBALANCE_BUY_THRESHOLD = 70   # V3.2: 65→70
     REBALANCE_MAX_POSITION_RATIO = 0.15
     REBALANCE_TRADE_COST_RATE = 0.0015
 
@@ -1256,14 +1257,45 @@ def run_canslim():
     # 获取候选股票池数据
     holdings_list = load_holdings()
     holdings = {h["code"]: h for h in holdings_list}
+
+    # V3.2: 三层候选池架构（与caopan_report.run_screener对齐）
+    # 第1层: SECTOR_CANDIDATES 静态配置池
     sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
     all_codes = set()
     for sector_name, sector_info in sector_candidates.items():
         stocks = sector_info.get("stocks", {})
         all_codes.update(stocks.keys())
-    all_codes.add("000300")  # 沉深300指数
+    static_count = len(all_codes)
 
-    print(f"[选股] 候选股票池: {len(all_codes)}只")
+    # 第2层: PoolManager 观察池（动态维护）
+    pool_new = 0
+    try:
+        from strategy.pool_manager import PoolManager
+        _pm = PoolManager()
+        for code in _pm.get_watch_codes():
+            if code not in all_codes:
+                all_codes.add(code)
+                pool_new += 1
+    except Exception:
+        pass
+
+    # 第3层: scan_market_hot_stocks 全市场动态扫描
+    scan_new = 0
+    try:
+        from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
+        scan_result = scan_market_hot_stocks(total_max=15)
+        if scan_result.get("success"):
+            new_codes = merge_scan_results_to_pool(scan_result, all_codes)
+            for code in new_codes[:15]:
+                all_codes.add(code)
+                scan_new += 1
+    except Exception:
+        pass
+
+    all_codes.add("000300")  # 沪深300指数
+
+    print(f"[选股] 候选股票池: {len(all_codes)}只 "
+          f"(静态{static_count} + 观察池{pool_new} + 动态{scan_new} + 指数1)")
 
     # 批量拉取数据
     start = (datetime.date.today() - datetime.timedelta(days=300)).strftime("%Y-%m-%d")

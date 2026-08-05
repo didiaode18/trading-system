@@ -283,21 +283,21 @@ def calc_trailing_stop(current_price: float, highest_since_buy: float,
         lock_pct = 0.0
 
     elif profit_pct < 0.15:
-        # 浮盈 3%-15%：止损 = highest * (1 - ATR * trailing_mult / price)
+        # 浮盈 3%-15%：V3.2: 止损距离从ATR*1.5放宽至ATR*2.0（让利润奔跑，避免过早止盈）
         atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * trailing_mult)
+        trailing_stop = highest_since_buy * (1 - atr_ratio * 2.0)  # V3.2: 1.5→2.0
         lock_pct = max(0, (trailing_stop / cost_price - 1))
 
     elif profit_pct < 0.30:
-        # 浮盈 15%-30%：止损 = highest * (1 - ATR * 1.0 / price)（更紧）
+        # 浮盈 15%-30%：V3.2: 从ATR*1.0放宽至ATR*1.3（回测显示过早收紧导致平均盈利偏小）
         atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * 1.0)
+        trailing_stop = highest_since_buy * (1 - atr_ratio * 1.3)  # V3.2: 1.0→1.3
         lock_pct = max(0, (trailing_stop / cost_price - 1))
 
     else:
-        # 浮盈 > 30%：止损 = highest * (1 - ATR * 0.7 / price)（最紧）
+        # 浮盈 > 30%：止损 = highest * (1 - ATR * 0.8 / price)（V3.2: 0.7→0.8，略微放宽）
         atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * 0.7)
+        trailing_stop = highest_since_buy * (1 - atr_ratio * 0.8)  # V3.2: 0.7→0.8
         lock_pct = max(0, (trailing_stop / cost_price - 1))
 
     # 终极兜底：固定百分比止损（防止ATR异常时止损太远）

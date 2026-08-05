@@ -464,6 +464,248 @@ class MarketRegimeDetector:
 
 
 # ============================================================
+# V3.2: HMM市场状态识别 + 策略自动切换
+# ============================================================
+
+class HMMRegimeDetector:
+    """HMM市场状态识别器（升级版）
+    
+    使用sklearn GaussianHMM对多维特征进行无监督聚类，
+    识别牛市/震荡/熊市三态，并自动推荐策略组合。
+    
+    与MarketRegimeDetector的区别:
+    - MarketRegimeDetector: 规则式（固定阈值），简单可靠
+    - HMMRegimeDetector: 统计式（自适应阈值），更精确但需足够数据
+    
+    建议使用: 两者融合，HMM作为确认信号
+    """
+
+    # 策略映射: 市场状态 → 推荐策略组合
+    STRATEGY_MAP = {
+        "BULL": {
+            "primary": "CANSLIM_V3.2",
+            "secondary": ["板块轮动", "操盘密码DK"],
+            "weights": {"CANSLIM_V3.2": 0.5, "板块轮动": 0.3, "操盘密码DK": 0.2},
+            "position_range": (0.60, 0.90),
+        },
+        "RANGE": {
+            "primary": "均值回归",
+            "secondary": ["操盘密码DK", "事件驱动"],
+            "weights": {"均值回归": 0.4, "操盘密码DK": 0.3, "事件驱动": 0.3},
+            "position_range": (0.30, 0.60),
+        },
+        "BEAR": {
+            "primary": "均值回归",
+            "secondary": ["事件驱动"],
+            "weights": {"均值回归": 0.6, "事件驱动": 0.4},
+            "position_range": (0.00, 0.30),
+        },
+    }
+
+    def __init__(self, n_states: int = 3, lookback: int = 120):
+        self.n_states = n_states
+        self.lookback = lookback
+        self.model = None
+        self.state_labels = {}  # HMM state -> "BULL"/"RANGE"/"BEAR"
+
+    def fit_and_detect(self, benchmark_df: pd.DataFrame) -> dict:
+        """
+        训练HMM并检测当前状态
+        
+        参数:
+            benchmark_df: 基准指数日线数据(至少120天)
+        
+        返回:
+            {"state": str, "confidence": float, "strategy_config": dict, ...}
+        """
+        if benchmark_df is None or len(benchmark_df) < self.lookback:
+            # 数据不足，回退到规则式检测
+            fallback = MarketRegimeDetector()
+            result = fallback.detect(benchmark_df)
+            result["method"] = "rule_fallback"
+            result["strategy_config"] = self.STRATEGY_MAP.get(result["state"], {})
+            return result
+
+        try:
+            from sklearn.mixture import GaussianMixture
+
+            # 构建特征矩阵
+            features = self._build_features(benchmark_df)
+            if features is None or len(features) < 60:
+                raise ValueError("特征不足")
+
+            # 用GMM代替HMM（更稳定，小样本表现更好）
+            gmm = GaussianMixture(
+                n_components=self.n_states,
+                covariance_type='full',
+                random_state=42,
+                n_init=3,
+            )
+            gmm.fit(features)
+
+            # 预测当前状态
+            current_features = features[-1:].copy()
+            state_idx = gmm.predict(current_features)[0]
+            probs = gmm.predict_proba(current_features)[0]
+            confidence = float(probs[state_idx])
+
+            # 将GMM state映射到BULL/RANGE/BEAR
+            self._map_states(gmm, features, benchmark_df)
+            state_label = self.state_labels.get(state_idx, "RANGE")
+
+            # 获取策略配置
+            strategy_config = self.STRATEGY_MAP.get(state_label, self.STRATEGY_MAP["RANGE"])
+
+            result = {
+                "state": state_label,
+                "state_cn": {"BULL": "牛市/强势", "RANGE": "震荡/平衡", "BEAR": "熊市/弱势"}[state_label],
+                "confidence": round(confidence, 3),
+                "method": "gmm",
+                "state_probs": {
+                    self.state_labels.get(i, f"state_{i}"): round(float(p), 3)
+                    for i, p in enumerate(probs)
+                },
+                "strategy_config": strategy_config,
+                "position_range": strategy_config["position_range"],
+                "recommended_strategies": strategy_config["weights"],
+                "detect_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+
+            logger.info(f"[HMM状态] {state_label}(置信{confidence:.0%}) "
+                       f"推荐策略: {strategy_config['primary']}")
+            return result
+
+        except ImportError:
+            logger.warning("[HMM状态] sklearn未安装，回退规则式")
+            fallback = MarketRegimeDetector()
+            result = fallback.detect(benchmark_df)
+            result["method"] = "rule_fallback"
+            result["strategy_config"] = self.STRATEGY_MAP.get(result["state"], {})
+            return result
+        except Exception as e:
+            logger.warning(f"[HMM状态] 异常: {e}，回退规则式")
+            fallback = MarketRegimeDetector()
+            result = fallback.detect(benchmark_df)
+            result["method"] = "rule_fallback"
+            result["strategy_config"] = self.STRATEGY_MAP.get(result["state"], {})
+            return result
+
+    def _build_features(self, df: pd.DataFrame) -> np.ndarray:
+        """构建多维特征矩阵"""
+        close = df["close"].values
+        volume = df["volume"].values if "volume" in df.columns else np.ones_like(close)
+        n = len(close)
+        if n < 60:
+            return None
+
+        features = []
+        for i in range(60, n):
+            window = close[i-60:i+1]
+            vol_window = volume[i-20:i+1]
+
+            # 特1: 20日收益率
+            ret_20 = (close[i] / close[i-20] - 1) if close[i-20] > 0 else 0
+            # 特2: 60日收益率
+            ret_60 = (close[i] / close[i-60] - 1) if close[i-60] > 0 else 0
+            # 特3: 20日波动率
+            returns = np.diff(window[-21:]) / (window[-21:-1] + 1e-10)
+            vol_20 = np.std(returns) * np.sqrt(252) if len(returns) > 5 else 0
+            # 特4: 量能变化(近5日/前20日)
+            vol_ratio = np.mean(vol_window[-5:]) / (np.mean(vol_window[:15]) + 1e-10)
+            # 特5: MA20斜率
+            ma20_now = np.mean(window[-20:])
+            ma20_prev = np.mean(window[-25:-5]) if len(window) >= 25 else ma20_now
+            ma20_slope = (ma20_now - ma20_prev) / (ma20_prev + 1e-10)
+            # 特6: 价格位置(0-1，在60日高低点之间)
+            high_60 = np.max(window)
+            low_60 = np.min(window)
+            price_pos = (close[i] - low_60) / (high_60 - low_60 + 1e-10)
+
+            features.append([ret_20, ret_60, vol_20, vol_ratio, ma20_slope, price_pos])
+
+        return np.array(features)
+
+    def _map_states(self, gmm, features: np.ndarray, df: pd.DataFrame):
+        """将GMM聚类结果映射到BULL/RANGE/BEAR
+        
+        规则: 用每个cluster的平均收益率排序
+        - 最高收益 → BULL
+        - 最低收益 → BEAR
+        - 中间 → RANGE
+        """
+        labels = gmm.predict(features)
+        cluster_returns = {}
+        for i in range(self.n_states):
+            mask = labels == i
+            if mask.sum() > 0:
+                # 用特1(20日收益率)的均值排序
+                cluster_returns[i] = features[mask, 0].mean()
+            else:
+                cluster_returns[i] = 0
+
+        sorted_clusters = sorted(cluster_returns.items(), key=lambda x: x[1], reverse=True)
+        if len(sorted_clusters) >= 3:
+            self.state_labels[sorted_clusters[0][0]] = "BULL"
+            self.state_labels[sorted_clusters[1][0]] = "RANGE"
+            self.state_labels[sorted_clusters[2][0]] = "BEAR"
+        elif len(sorted_clusters) == 2:
+            self.state_labels[sorted_clusters[0][0]] = "BULL"
+            self.state_labels[sorted_clusters[1][0]] = "BEAR"
+        else:
+            self.state_labels[0] = "RANGE"
+
+    def get_strategy_for_state(self, state: str) -> dict:
+        """根据市场状态获取推荐策略配置"""
+        return self.STRATEGY_MAP.get(state, self.STRATEGY_MAP["RANGE"])
+
+
+def detect_with_ensemble(benchmark_df: pd.DataFrame) -> dict:
+    """V3.2: 融合检测（规则式 + HMM）
+    
+    两者一致 → 高置信度
+    两者不一致 → 以规则式为主，降低置信度
+    """
+    # 规则式检测
+    rule_detector = MarketRegimeDetector()
+    rule_result = rule_detector.detect(benchmark_df)
+
+    # HMM检测
+    hmm_detector = HMMRegimeDetector()
+    hmm_result = hmm_detector.fit_and_detect(benchmark_df)
+
+    rule_state = rule_result["state"]
+    hmm_state = hmm_result["state"]
+
+    # 融合决策
+    if rule_state == hmm_state:
+        final_state = rule_state
+        confidence = min(0.95, (rule_result["confidence"] + hmm_result["confidence"]) / 2 + 0.1)
+        agreement = True
+    else:
+        # 不一致时以规则式为主（更稳定）
+        final_state = rule_state
+        confidence = rule_result["confidence"] * 0.7  # 降低置信度
+        agreement = False
+
+    strategy_config = HMMRegimeDetector.STRATEGY_MAP.get(final_state, {})
+
+    return {
+        "state": final_state,
+        "state_cn": {"BULL": "牛市/强势", "RANGE": "震荡/平衡", "BEAR": "熊市/弱势"}[final_state],
+        "confidence": round(confidence, 3),
+        "agreement": agreement,
+        "rule_state": rule_state,
+        "hmm_state": hmm_state,
+        "strategy_config": strategy_config,
+        "recommended_strategies": strategy_config.get("weights", {}),
+        "position_range": strategy_config.get("position_range", (0.3, 0.6)),
+        "detail": (f"融合检测: {'agree' if agreement else 'disagree'} | "
+                  f"rule={rule_state} hmm={hmm_state} → final={final_state}"),
+        "detect_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+# ============================================================
 # 独立测试
 # ============================================================
 

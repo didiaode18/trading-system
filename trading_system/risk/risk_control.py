@@ -62,9 +62,10 @@ RISK_CONFIG = {
     "daily_loss_block": 0.03,       # 单日亏损≥3% → 当日禁止新开仓
     "weekly_loss_force": 0.08,      # 单周亏损≥8% → 强制降到30%以下
     "weekly_loss_pause_days": 3,    # 周熔断后暂停开仓天数
-    "consecutive_loss_today": 2,    # 连续亏损2笔 → 当日禁止开仓
-    "consecutive_loss_block": 3,    # 连续亏损3笔 → 暂停3天
-    "consecutive_loss_pause": 3,    # 暂停天数
+    "consecutive_loss_today": 2,    # 连续亏损2笔 → 暂停2天（V3.2回测优化: 原"当日禁止"升级为暂停2天）
+    "consecutive_loss_block": 3,    # 连续亏损3笔 → 暂停5天+仓位×0.5恢复
+    "consecutive_loss_pause": 5,    # 暂停天数（V3.2: 从3天升级为5天）
+    "consecutive_loss_2_pause": 2,  # V3.2新增: 连亏2笔暂停天数
 
     # --- 浮亏加仓拦截 ---
     "block_add_on_loss": True,      # 浮亏>0时绝对禁止加仓
@@ -276,6 +277,8 @@ class StrategyFailureDetector:
     PAUSE_WIN_RATE = 30       # 胜率<30% → 暂停买入
     BREAKER_EXPECTANCY = 0    # 期望<0% → 全面熔断
     RECOVERY_TRADES = 5       # 恢复后前5笔仓位减半（试探性恢复）
+    AUTO_RECOVERY_DAYS = 5    # V3.2: 暂停/熔断超过5天自动降级为degrade
+    CONSEC_LOSS_BREAKER = 5   # V3.2: 连续5笔亏损直接熔断
     
     def __init__(self):
         self.state = self._load_state()
@@ -334,7 +337,17 @@ class StrategyFailureDetector:
         """根据滚动窗口统计更新策略状态"""
         history = self.state["trade_history"]
         if len(history) < self.WINDOW_SIZE:
-            return  # 样本不足，不判定
+            # V3.2: 即使样本不足，连续5笔亏损也直接熔断
+            if len(history) >= self.CONSEC_LOSS_BREAKER:
+                recent = [t["pnl_pct"] for t in history[-self.CONSEC_LOSS_BREAKER:]]
+                if all(p < 0 for p in recent):
+                    if self.state["current_level"] != "breaker":
+                        self.state["current_level"] = "breaker"
+                        self.state["last_level_change"] = datetime.date.today().isoformat()
+                        logger.warning(
+                            f"[策略失效检测] 连续{self.CONSEC_LOSS_BREAKER}笔亏损，直接熔断"
+                        )
+            return
         
         pnls = [t["pnl_pct"] for t in history]
         wins = sum(1 for p in pnls if p > 0)
@@ -343,8 +356,12 @@ class StrategyFailureDetector:
         
         old_level = self.state["current_level"]
         
+        # V3.2: 连续5笔亏损加速熔断
+        recent_5 = pnls[-self.CONSEC_LOSS_BREAKER:]
+        all_loss_5 = all(p < 0 for p in recent_5)
+        
         # 三级判定（从严到宽）
-        if expectancy < self.BREAKER_EXPECTANCY:
+        if expectancy < self.BREAKER_EXPECTANCY or all_loss_5:
             new_level = "breaker"
         elif win_rate < self.PAUSE_WIN_RATE:
             new_level = "pause"
@@ -419,12 +436,40 @@ class StrategyFailureDetector:
         """
         检查是否允许买入（供UnifiedRiskEngine调用）
         
+        V3.2增强: 暂停/熔断超过5天自动降级为degrade（允许半仓试探）
+        
         返回: (allowed: bool, reason: str, position_scale: float)
         """
+        # V3.2: 时间自动恢复 - 暂停/熔断超过5天降级为degrade
+        self._try_auto_recovery()
+        
         status = self.get_status()
         if not status["allow_buy"]:
             return False, f"[策略失效] {status['message']}", 0.0
         return True, "", status["position_scale"]
+
+    def _try_auto_recovery(self):
+        """V3.2: 暂停/熔断超过N天自动降级为degrade（避免永久锁死）"""
+        level = self.state.get("current_level", "normal")
+        if level not in ("pause", "breaker"):
+            return
+        last_change = self.state.get("last_level_change", "")
+        if not last_change:
+            return
+        try:
+            change_date = datetime.date.fromisoformat(last_change)
+            days_elapsed = (datetime.date.today() - change_date).days
+            if days_elapsed >= self.AUTO_RECOVERY_DAYS:
+                self.state["current_level"] = "degrade"
+                self.state["trades_since_recovery"] = 0
+                self.state["last_level_change"] = datetime.date.today().isoformat()
+                self._save_state()
+                logger.info(
+                    f"[策略失效检测] 自动恢复: {level}→degrade "
+                    f"(已暂停{days_elapsed}天，允许半仓试探)"
+                )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -629,10 +674,10 @@ class RiskGate:
                 f"达到上限{self.cfg['max_daily_opens']}笔，禁止再开"
             )
 
-        # ===== 第4关：连续亏损熔断 =====
+        # ===== 第4关：连续亏损熔断（V3.2回测优化: 连亏后继续交易avg=-1.33% vs 正常+1.76%）=====
         consec = self.state_mgr.state["consecutive_losses"]
         if consec >= self.cfg["consecutive_loss_block"]:
-            # 连续3笔 → 暂停3天
+            # 连续3笔 → 暂停5天+仓位×0.5恢复
             pause_days = self.cfg["consecutive_loss_pause"]
             until = (datetime.date.today() + datetime.timedelta(days=pause_days)).isoformat()
             self.state_mgr.state["pause_until"] = until
@@ -641,9 +686,13 @@ class RiskGate:
                 f"连续亏损{consec}笔触发熔断，暂停开仓{pause_days}天（至{until}）"
             )
         elif consec >= self.cfg.get("consecutive_loss_today", 2):
-            # 连续2笔 → 当日禁止开仓
+            # V3.2: 连续2笔 → 暂停2天（原"当日禁止"升级为暂停2天）
+            pause_days_2 = self.cfg.get("consecutive_loss_2_pause", 2)
+            until = (datetime.date.today() + datetime.timedelta(days=pause_days_2)).isoformat()
+            self.state_mgr.state["pause_until"] = until
+            self.state_mgr.save()
             return self._block(
-                f"连续亏损{consec}笔，当日禁止开仓（强制冷静）"
+                f"连续亏损{consec}笔，暂停开仓{pause_days_2}天（至{until}，强制冷静）"
             )
 
         # ===== 第5关：日度亏损熔断 =====
@@ -1034,6 +1083,14 @@ class UnifiedRiskEngine:
 
         # 同步 RiskState 数据到状态管理器
         self._sync_risk_state(risk_state)
+
+        # ===== 关卡-2: 黑天鹅/极端行情检测（V3.2新增，最高优先级）=====
+        # 指数单日跌>3% / 千股跌停 / 连续暴跌 → 全面禁止开仓
+        # FIX P0: market_info未定义导致每次买入校验抛NameError
+        market_info = trade_plan.get("market_info") or {}
+        black_swan = self._check_black_swan(market_info)
+        if black_swan:
+            return black_swan
 
         # ===== 关卡-1: 盘中风险标记检查（最高优先级）=====
         self._expire_intraday_flags()  # 每次检查前先清理过期标记
@@ -1439,8 +1496,13 @@ class UnifiedRiskEngine:
                 f"连续亏损{consec}笔触发熔断，暂停开仓{pause_days}天（至{until}）"
             )
         elif consec >= consec_today:
+            # V3.2: 连续2笔 → 暂停2天（原"当日禁止"升级）
+            pause_days_2 = cfg.get("consecutive_loss_2_pause", 2)
+            until = (datetime.date.today() + datetime.timedelta(days=pause_days_2)).isoformat()
+            self.state_mgr.state["pause_until"] = until
+            self.state_mgr.save()
             return self._block(
-                f"连续亏损{consec}笔，当日禁止开仓（强制冷静）"
+                f"连续亏损{consec}笔，暂停开仓{pause_days_2}天（至{until}，强制冷静）"
             )
 
         # 第5关：日度亏损熔断
@@ -1461,16 +1523,32 @@ class UnifiedRiskEngine:
                 f"强制降仓+暂停{cfg.get('weekly_loss_pause_days', 3)}天"
             )
 
-        # 第6.5关：月度回撤硬限制（5%）
+        # 第6.5关：月度回撤硬限制（V3.2: 从5%收紧至4%）
         # FIX P0: 从110万亏到73万(-33.6%)过程中无任何月度熔断，新增此关卡
+        # V3.2回测诊断: 2026年-50.4%亏损证明5%仍过松，收紧至4%
         monthly_start = self.state_mgr.state.get("monthly_start_capital", self.total_capital)
         if monthly_start > 0:
             monthly_dd = (monthly_start - self.total_capital) / monthly_start
-            monthly_dd_limit = cfg.get("monthly_drawdown_limit", 0.05)
+            monthly_dd_limit = cfg.get("monthly_drawdown_limit", 0.04)  # V3.2: 0.05→0.04
             if monthly_dd >= monthly_dd_limit:
                 return self._block(
                     f"月度回撤{monthly_dd*100:.1f}%≥{monthly_dd_limit*100:.0f}%，"
                     f"本月禁止新开仓（防守优先）"
+                )
+
+        # 第6.6关：年度回撤硬限制（V3.2新增）
+        # 回测诊断: 2026年最大回撤58.4%，无任何年度熔断触发，新增15%硬限制
+        annual_start = self.state_mgr.state.get("annual_start_capital", self.total_capital)
+        if annual_start > 0:
+            annual_dd = (annual_start - self.total_capital) / annual_start
+            annual_dd_limit = cfg.get("annual_drawdown_limit", 0.15)
+            if annual_dd >= annual_dd_limit:
+                # 年度回撤≥15%: 全面暂停，需手动重置
+                self.state_mgr.state["annual_halt"] = True
+                self.state_mgr.save()
+                return self._block(
+                    f"⚠️年度回撤{annual_dd*100:.1f}%≥{annual_dd_limit*100:.0f}%，"
+                    f"全面暂停交易（需手动重置annual_halt后方可恢复）"
                 )
 
         # 第7关：浮亏加仓绝对拦截
@@ -1561,10 +1639,38 @@ class UnifiedRiskEngine:
                 f"最低保留{min_cash:.0f}元({min_cash_ratio:.0%})"
             )
 
+        # 第10.5关：Kelly动态仓位调整（V3.2新增）
+        # 基于该标的历史胜率/盈亏比动态缩减仓位（只减不增）
+        kelly_shares = self._kelly_adjust_shares(code, shares, price, signal)
+        if kelly_shares < shares:
+            logger.info(
+                f"[Kelly仓位] {code}: {shares}→{kelly_shares}股 "
+                f"(基于历史胜率动态缩减)"
+            )
+            shares = kelly_shares
+            amount = shares * price
+
         # ATR自适应止损计算（V8.3新增）
         adaptive_result = self._try_adaptive_stop_loss(
             code, price, signal.get("volatility_regime", "normal")
         )
+
+        # 第11关：组合层面浮亏强制减仓（V3.2新增）
+        # 回测诊断: 2026年-50.4%亏损主因是组合集中度过高+无组合级止损
+        portfolio_pnl_pct = self._calc_portfolio_pnl(holdings)
+        portfolio_dd_limit = cfg.get("portfolio_drawdown_limit", -0.10)
+        if portfolio_pnl_pct < portfolio_dd_limit:
+            return self._block(
+                f"组合浮亏{portfolio_pnl_pct:.1%}超过{portfolio_dd_limit:.0%}，"
+                f"禁止新开仓（应先减仓最弱标的）"
+            )
+
+        # 第12关：持仓相关性检查（V3.2新增）
+        # 避免7只持仓全部集中在同一赛道，系统性风险无法通过个股止损解决
+        if code not in holdings and len(holdings) >= 3:
+            corr_warning = self._check_correlation(code, holdings)
+            if corr_warning:
+                return self._block(corr_warning)
 
         # 全部通过
         pass_result = {
@@ -1719,6 +1825,139 @@ class UnifiedRiskEngine:
     # --------------------------------------------------------
     # ATR自适应止损辅助方法
     # --------------------------------------------------------
+    def _calc_portfolio_pnl(self, holdings: dict) -> float:
+        """V3.2: 计算组合整体浮盈/浮亏百分比"""
+        total_cost = 0
+        total_value = 0
+        for code, pos in holdings.items():
+            shares = pos.get("shares", 0)
+            cost = pos.get("cost", pos.get("buy_price", 0))
+            price = pos.get("price", cost)
+            if shares > 0 and cost > 0:
+                total_cost += shares * cost
+                total_value += shares * price
+        if total_cost <= 0:
+            return 0.0
+        return (total_value - total_cost) / total_cost
+
+    def _check_black_swan(self, market_info: dict) -> Optional[dict]:
+        """V3.2: 黑天鹅/极端行情检测（关卡-2，最高优先级）
+        
+        触发条件（满足任一即全面禁止开仓）:
+        1. 指数单日跌幅 > 3%
+        2. 指数连续3日累计跌幅 > 5%
+        3. 市场状态为'crash'或'panic'
+        
+        设计原理:
+        回测诊断2026年-50.4%亏损主因是系统性暴跌时未及时降仓。
+        年度回撤15%硬限制是滞后的，黑天鹅检测是前瞻的。
+        """
+        if not market_info:
+            return None
+        
+        # 条件1: 指数单日跌幅>3%
+        index_change = market_info.get("index_change_pct",
+                     market_info.get("change_pct", 0))
+        if isinstance(index_change, (int, float)) and index_change < -3.0:
+            return self._block(
+                f"⚠️黑天鹅拦截: 指数单日暴跌{index_change:.1f}%，"
+                f"全面禁止开仓（等待市场企稳）"
+            )
+        
+        # 条件2: 连续3日累计跌幅>5%
+        index_3d_change = market_info.get("index_3d_change_pct", 0)
+        if isinstance(index_3d_change, (int, float)) and index_3d_change < -5.0:
+            return self._block(
+                f"⚠️黑天鹅拦截: 指数连续3日累计跌{index_3d_change:.1f}%，"
+                f"全面禁止开仓（系统性风险）"
+            )
+        
+        # 条件3: 市场状态为极端
+        regime = market_info.get("regime", market_info.get("market_state", ""))
+        if regime in ("crash", "panic", "extreme_fear"):
+            return self._block(
+                f"⚠️黑天鹅拦截: 市场状态={regime}，"
+                f"全面禁止开仓（极端恐慌）"
+            )
+        
+        return None
+
+    def _check_correlation(self, new_code: str, holdings: dict) -> str:
+        """V3.2: 检查新标的与现有持仓的相关性
+        
+        简化实现: 基于赛道/行业判断（无需实时数据）
+        如果新标的与已有持仓同赛道占比>50%，拒绝买入
+        """
+        try:
+            new_sector = self._get_code_sector(new_code)
+            if not new_sector:
+                return ""  # 无法判断赛道，放行
+            
+            same_sector_count = 0
+            total_count = len(holdings)
+            for code in holdings:
+                if self._get_code_sector(code) == new_sector:
+                    same_sector_count += 1
+            
+            # 同赛道占比>50% → 拒绝（避免过度集中）
+            if total_count > 0 and (same_sector_count + 1) / (total_count + 1) > 0.5:
+                return (
+                    f"赛道集中度拦截: {new_code}与{same_sector_count}只持仓同属"
+                    f"[{new_sector}]赛道，买入后占比"
+                    f"{(same_sector_count+1)/(total_count+1):.0%}>50%"
+                )
+        except Exception:
+            pass
+        return ""
+
+    def _get_code_sector(self, code: str) -> str:
+        """获取标的所属赛道（从SECTOR_CANDIDATES查找）"""
+        sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+        for sector_name, sector_info in sector_candidates.items():
+            stocks = sector_info.get("stocks", {}) if isinstance(sector_info, dict) else {}
+            if code in stocks:
+                return sector_name
+        return ""
+
+    def _kelly_adjust_shares(self, code: str, shares: int, price: float,
+                             signal: dict) -> int:
+        """V3.2: Kelly公式动态仓位调整（只减不增）
+        
+        逻辑:
+        - 从策略失效检测器获取滚动胜率/盈亏比
+        - 半Kelly仓位 vs 当前请求仓位，取较小值
+        - 最低不低于100股（1手）
+        """
+        try:
+            from position.kelly import half_kelly_position
+            
+            # 从策略失效检测器获取滚动统计
+            history = self.failure_detector.state.get("trade_history", [])
+            if len(history) < 5:
+                return shares  # 样本不足，不调整
+            
+            pnls = [t["pnl_pct"] for t in history]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            
+            if not wins or not losses:
+                return shares
+            
+            win_rate = len(wins) / len(pnls)
+            avg_win = sum(wins) / len(wins)
+            avg_loss = abs(sum(losses) / len(losses))
+            profit_factor = avg_win / avg_loss if avg_loss > 0 else 1.0
+            
+            # 半Kelly仓位比例
+            kelly_ratio = half_kelly_position(win_rate, profit_factor)
+            kelly_amount = self.total_capital * kelly_ratio
+            kelly_shares = int(kelly_amount / price / 100) * 100
+            
+            # 只减不增，最低100股
+            return max(min(shares, kelly_shares), 100)
+        except Exception:
+            return shares
+
     def _try_adaptive_stop_loss(self, code: str, price: float,
                                 volatility_regime: str = "normal") -> Optional[dict]:
         """

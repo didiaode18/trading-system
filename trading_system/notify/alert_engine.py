@@ -4,7 +4,7 @@
 ================================
 对标同花顺/通达信条件预警，盘中实时监控关键信号
 
-触发条件(11大规则):
+触发条件(18大规则):
   R1. DK信号触发（金叉/死叉）
   R2. 价格突破控盘生命线
   R3. 乖离率进入超买/超卖区
@@ -16,6 +16,13 @@
   R9. 均线死叉 EMA13下穿EMA34
   R10. 日内跌幅阶梯预警(-3%警告/-5%严重/-7%紧急) [V2.1新增]
   R11. 推荐失效预警(买入后3日内跌破MA5+放量) [V2.1新增]
+  R12. 换手率异常预警(>15%主力出货风险) [V3.2新增]
+  R13. MACD顶背离(价格新高+主力流出) [V3.2新增]
+  R14. MACD底背离(价格新低+主力流入) [V3.2新增]
+  R15. KDJ J值超买(>100)/超卖(<0) [V3.2新增]
+  R16. 资金流模式识别(出货/洗盘/吸筹) [V3.2新增]
+  R17. 阶梯止盈提醒(浮盈≥10%/≥20%分批止盈) [V3.3新增]
+  R18. 加仓机会提醒(浮盈>5%+趋势加速+缩量回踩) [V3.3新增]
 
 推送渠道:
   - 邮件推送（QQ邮箱SMTP）
@@ -62,6 +69,37 @@ ALERT_CONFIG = {
 }
 
 # ============================================================
+# P2-FIX: 状态持久化工具（止损缓冲时间戳 / R17档位记忆）
+# ============================================================
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+_STOP_BUFFER_FILE = os.path.join(_DATA_DIR, "alert_stop_buffer.json")
+_R17_TIER_FILE = os.path.join(_DATA_DIR, "r17_tier_memory.json")
+
+
+def _load_json_state(path: str) -> dict:
+    """加载持久化状态JSON（失败返回空字典，降级不抛异常）"""
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_json_state(path: str, data: dict):
+    """保存持久化状态JSON（失败仅记日志，不中断主流程）"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.debug(f"状态持久化失败({path}): {e}")
+
+
+# ============================================================
 # 预警紧急度评分体系 (0-100分，分数越高越紧急)
 # ============================================================
 # 评分维度:
@@ -84,6 +122,9 @@ ALERT_CONFIG = {
 #   R1-DK金叉买入  = 35分 | 买入机会(非紧急)
 #   R3-乖离率超卖   = 30分 | 反弹机会(非紧急)
 #   R2-站上生命线   = 25分 | 反转观察
+#   R17-止盈≥10%   = 50分 | 第一止盈位，建议减仓1/3
+#   R17-止盈≥20%   = 65分 | 第二止盈位，建议再减1/3
+#   R18-加仓机会   = 20分 | 趋势加速+缩量回踩，可小幅加仓
 # ============================================================
 
 
@@ -96,6 +137,17 @@ class AlertEngine:
         self._alert_history = {}  # {code: last_alert_time}
         self._today_alerts = []   # 今日所有预警
         self._stop_touch_time = {}  # V3.1: {code: datetime} 止损首次触及时间（缓冲确认）
+        # FIX P2-13: 从持久化文件加载首次触及时间戳，进程重启不重置缓冲计时
+        try:
+            for _c, _t in _load_json_state(_STOP_BUFFER_FILE).items():
+                try:
+                    self._stop_touch_time[_c] = datetime.datetime.fromisoformat(_t)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # FIX P2-14: R17每日档位记忆 {"code:tier": "YYYY-MM-DD"}
+        self._r17_tier_mem = _load_json_state(_R17_TIER_FILE)
         self._load_history()
 
     def check_alerts(self, results: List[dict]) -> List[dict]:
@@ -329,6 +381,9 @@ class AlertEngine:
                         })
                 else:
                     # 洗盘概率低: 直接触发critical止损
+                    # FIX P1-4: 补齐可执行要素（卖出股数/建议挂单价/执行时间窗口）
+                    shares_r5 = info.get("shares", 0)
+                    order_px_r5 = effective_close * 0.998  # 现价下方0.2%附近挂单确保成交
                     alerts.append({
                         "type": "stop_loss",
                         "rule_name": "R5-触及止损线",
@@ -337,7 +392,8 @@ class AlertEngine:
                         "level": "critical",
                         "icon": "🚨",
                         "msg": f"{name} 触及止损线! 亏损{pnl_pct*100:.1f}% "
-                               f"(成本{buy_price:.3f} 现价{effective_close:.3f})",
+                               f"(成本{buy_price:.3f} 现价{effective_close:.3f}) | "
+                               f"卖出全部{shares_r5}股，挂单价{order_px_r5:.2f}(现价附近)，建议30分钟内执行",
                         "urgency_score": 90,
                     })
             # V2.1: 接近自定义止损位（距离<2%）
@@ -524,6 +580,255 @@ class AlertEngine:
             except (ValueError, TypeError):
                 pass
 
+        # R12. 换手率异常预警（V3.2新增 - 知识库规则落地）
+        turnover = r.get("turnover", 0)
+        if turnover and turnover >= 15.0:
+            alerts.append({
+                "type": "high_turnover",
+                "rule_name": "R12-换手率异常(>15%)",
+                "rule_detail": f"换手率{turnover:.1f}%远超健康区间(3-10%)，主力出货或对倒风险",
+                "level": "warning",
+                "icon": "🔄",
+                "msg": f"{name} 换手率{turnover:.1f}%异常! 远超健康区间(3-10%)，注意主力出货风险",
+                "urgency_score": 50,
+            })
+
+        # R13. MACD顶背离（V3.2新增 - 知识库2.2规则落地）
+        if r.get("top_divergence"):
+            alerts.append({
+                "type": "macd_top_divergence",
+                "rule_name": "R13-MACD顶背离",
+                "rule_detail": "价格创新高但主力连续净流出，动量衰竭信号",
+                "level": "high",
+                "icon": "📉",
+                "msg": f"{name} MACD顶背离! 价格新高+主力净流出，上涨动量衰竭，建议减仓",
+                "urgency_score": 70,
+            })
+
+        # R14. MACD底背离（V3.2新增）
+        if r.get("bottom_divergence"):
+            alerts.append({
+                "type": "macd_bottom_divergence",
+                "rule_name": "R14-MACD底背离",
+                "rule_detail": "价格创新低但主力连续净流入，底部信号",
+                "level": "info",
+                "icon": "📈",
+                "msg": f"{name} MACD底背离! 价格新低+主力净流入，可能接近底部",
+                "urgency_score": 30,
+            })
+
+        # R15. KDJ J值超买/超卖（V3.2新增 - 知识库2.4规则落地）
+        try:
+            df = r.get("df_analyzed")
+            if df is not None and len(df) >= 9:
+                j_val = self._calc_kdj_j(df)
+                if j_val is not None:
+                    if j_val > 100:
+                        alerts.append({
+                            "type": "kdj_overbought",
+                            "rule_name": "R15-KDJ J值超买(>100)",
+                            "rule_detail": f"J值={j_val:.1f}>100，短线超买极值",
+                            "level": "warning",
+                            "icon": "🔥",
+                            "msg": f"{name} KDJ J值={j_val:.0f}超买! 短线过热，注意回调风险",
+                            "urgency_score": 45,
+                        })
+                    elif j_val < 0:
+                        alerts.append({
+                            "type": "kdj_oversold",
+                            "rule_name": "R15-KDJ J值超卖(<0)",
+                            "rule_detail": f"J值={j_val:.1f}<0，短线超卖极值",
+                            "level": "info",
+                            "icon": "❄️",
+                            "msg": f"{name} KDJ J值={j_val:.0f}超卖! 短线超跌，关注反弹机会",
+                            "urgency_score": 25,
+                        })
+        except Exception:
+            pass
+
+        # R16. 资金流模式识别预警（V3.2新增 - 知识库3.2规则落地）
+        fund_pattern = r.get("fund_pattern", "normal")
+        if fund_pattern == "distribution":
+            alerts.append({
+                "type": "fund_distribution",
+                "rule_name": "R16-主力出货模式",
+                "rule_detail": "主力连续3天+净卖出但股价不跌，典型出货手法",
+                "level": "critical",
+                "icon": "🚨",
+                "msg": f"{name} 检测到主力出货模式! 连续净卖出+股价托盘，建议立即减仓",
+                "urgency_score": 75,
+            })
+        elif fund_pattern == "washout":
+            alerts.append({
+                "type": "fund_washout",
+                "rule_name": "R16-主力洗盘模式",
+                "rule_detail": "超大单买入+大单卖出(对倒)，清洗浮筹后可能拉升",
+                "level": "info",
+                "icon": "🌀",
+                "msg": f"{name} 检测到洗盘模式! 对倒交易清洗浮筹，不必恐慌",
+                "urgency_score": 20,
+            })
+        elif fund_pattern == "accumulation":
+            alerts.append({
+                "type": "fund_accumulation",
+                "rule_name": "R16-主力吸筹模式",
+                "rule_detail": "主力连续3天+净买入但股价不涨，低位收集筹码",
+                "level": "info",
+                "icon": "💰",
+                "msg": f"{name} 检测到主力吸筹! 连续净买入+股价平稳，后市可能拉升",
+                "urgency_score": 20,
+            })
+
+        # ============================================================
+        # R17. 阶梯止盈提醒（V3.3新增）
+        # ============================================================
+        # 基于config.LADDER_SELL_LEVELS: 浮盈10%→减1/3, 浮盈20%→再减1/3
+        # 同时检测回落止盈：从最高点回落超过阈值触发
+        info = self.holdings.get(code, {})
+        buy_price_r17 = info.get("buy_price", 0) or info.get("cost", 0)
+        if buy_price_r17 > 0 and close > 0:
+            profit_pct = (close - buy_price_r17) / buy_price_r17
+            highest = info.get("highest", buy_price_r17)  # 持仓最高价
+            drawdown_from_high = (close - highest) / highest if highest > 0 else 0
+
+            # 第一止盈位: 浮盈≥10%
+            # FIX P2-14: 同一交易日同一档位已提醒过则不再重复（语义去重）
+            if profit_pct >= 0.10 and not self._r17_tier_sent(code, "tier1"):
+                shares = info.get("shares", 0)
+                # FIX P1-3: 小仓位兜底100股（原取整会输出0股）；shares<100时输出全部
+                sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
+                alerts.append({
+                    "type": "profit_target_1",
+                    "rule_name": "R17-第一止盈位(浮盈≥10%)",
+                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第一止盈位(10%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
+                    "level": "info",
+                    "icon": "🎯",
+                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第一止盈位! 建议卖出{sell_1_3}股(1/3)锁定利润",
+                    "urgency_score": 50,
+                })
+
+            # 第二止盈位: 浮盈≥20%
+            if profit_pct >= 0.20 and not self._r17_tier_sent(code, "tier2"):
+                shares = info.get("shares", 0)
+                # FIX P1-3: 小仓位兜底100股；shares<100时输出全部
+                sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
+                alerts.append({
+                    "type": "profit_target_2",
+                    "rule_name": "R17-第二止盈位(浮盈≥20%)",
+                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第二止盈位(20%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
+                    "level": "warning",
+                    "icon": "",
+                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第二止盈位! 建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
+                    "urgency_score": 65,
+                })
+
+            # 回落止盈: 从最高点回落超过阈值（按股票类型区分）
+            from config import DRAWDOWN_STOP
+            stock_type = info.get("stock_type", "龙头稳健")
+            drawdown_threshold = DRAWDOWN_STOP.get(stock_type, DRAWDOWN_STOP.get("龙头稳健", 0.07))
+            if (profit_pct >= 0.05 and drawdown_from_high <= -drawdown_threshold
+                    and not self._r17_tier_sent(code, "drawdown")):
+                shares = info.get("shares", 0)
+                # FIX P1-3: 小仓位兜底100股；shares<100时输出全部
+                sell_half = min(shares, max(100, int(shares * 0.5 / 100) * 100)) if shares >= 100 else shares
+                alerts.append({
+                    "type": "drawdown_stop_profit",
+                    "rule_name": "R17-回落止盈(高点回落>阈值)",
+                    "rule_detail": f"浮盈{profit_pct*100:.1f}%，从最高{highest:.3f}回落{drawdown_from_high*100:.1f}%(>{drawdown_threshold*100:.0f}%触发)",
+                    "level": "warning",
+                    "icon": "📉",
+                    "msg": f"{name} 利润回落! 浮盈{profit_pct*100:.1f}%但从高点回落{drawdown_from_high*100:.1f}%，建议卖出{sell_half}股(50%)保住利润",
+                    "urgency_score": 60,
+                })
+
+        # ============================================================
+        # R18. 加仓机会提醒（V3.3新增）
+        # ============================================================
+        # 触发条件（全部满足）:
+        #   1. 浮盈>5%（已有安全垫）
+        #   2. 趋势加速：MA5>MA10>MA20（多头排列）
+        #   3. 缩量回踩：当日量比<0.8（缩量）且价格回踩MA5/MA10附近
+        #   4. 仓位<30%（集中度允许加仓）
+        #   5. 非涨停状态（涨停无法买入）
+        info_r18 = self.holdings.get(code, {})
+        buy_price_r18 = info_r18.get("buy_price", 0) or info_r18.get("cost", 0)
+        if buy_price_r18 > 0 and close > 0:
+            profit_pct_r18 = (close - buy_price_r18) / buy_price_r18
+            shares_r18 = info_r18.get("shares", 0)
+            total_mv = sum(v.get("shares", 0) * v.get("current_price", v.get("buy_price", 0))
+                          for v in self.holdings.values())
+            stock_mv = shares_r18 * close
+            weight = stock_mv / total_mv if total_mv > 0 else 0
+
+            # 条件1: 浮盈>5%
+            has_profit_cushion = profit_pct_r18 >= 0.05
+            # 条件2: 多头排列
+            df_r18 = r.get("df_analyzed")
+            ma_bullish = False
+            if df_r18 is not None and len(df_r18) >= 20:
+                ma5 = df_r18["close"].iloc[-5:].mean()
+                ma10 = df_r18["close"].iloc[-10:].mean()
+                ma20 = df_r18["close"].iloc[-20:].mean()
+                ma_bullish = ma5 > ma10 > ma20
+            # 条件3: 缩量回踩（量比<0.8）
+            turnover_r18 = r.get("turnover", 0)
+            volume_ratio_r18 = r.get("volume_ratio", 0)
+            is_shrinking = volume_ratio_r18 > 0 and volume_ratio_r18 < 0.8
+            # FIX P1-2: 换手率降级检查 — 换手率>15%时追高/出货风险大，不提醒加仓
+            turnover_ok = not (turnover_r18 and turnover_r18 > 15.0)
+            # FIX P2-11: 防追高过滤 — 近5日涨幅>15%不提醒加仓（无df时跳过过滤不阻断）
+            chg5_ok = True
+            try:
+                if df_r18 is not None and len(df_r18) >= 6:
+                    base_close_r18 = df_r18["close"].iloc[-6]
+                    if base_close_r18 > 0 and close > 0 and (close / base_close_r18 - 1) > 0.15:
+                        chg5_ok = False
+            except Exception:
+                pass
+            # 条件4: 仓位<30%
+            weight_ok = weight < 0.30
+            # 条件5: 非涨停
+            not_limit_up = True
+            if df_r18 is not None and len(df_r18) >= 2:
+                prev_close_r18 = df_r18["close"].iloc[-2] if not pd.isna(df_r18["close"].iloc[-2]) else 0
+                if prev_close_r18 > 0:
+                    chg = (close - prev_close_r18) / prev_close_r18 * 100
+                    not_limit_up = chg < 9.8
+
+            if (has_profit_cushion and ma_bullish and is_shrinking and weight_ok
+                    and not_limit_up and turnover_ok and chg5_ok):
+                add_shares = int(shares_r18 * 0.2 / 100) * 100  # 加仓不超过现有20%
+                add_shares = max(add_shares, 100)
+                new_stop = close * 0.95
+                # FIX P2-12: 加仓建议过风控预检，不通过则不输出（异常时降级放行不阻断）
+                risk_ok_r18 = True
+                try:
+                    from risk.risk_control import quick_risk_check
+                    _rc_r18 = quick_risk_check({
+                        "code": code, "name": name, "price": close, "shares": add_shares,
+                        "sector": info_r18.get("sector", ""), "type": "stock",
+                        "stop_loss": new_stop, "risk_reward": 0,
+                    }, self.holdings)
+                    if not _rc_r18.get("pass", True):
+                        risk_ok_r18 = False
+                        logger.info(f"[R18] {name}({code}) 加仓提醒被风控预检拦截: "
+                                    f"{_rc_r18.get('reason', '')}")
+                except Exception:
+                    pass
+                if not risk_ok_r18:
+                    return alerts
+                alerts.append({
+                    "type": "add_position_opportunity",
+                    "rule_name": "R18-加仓机会(浮盈+趋势+缩量)",
+                    "rule_detail": (f"浮盈{profit_pct_r18*100:.1f}%+多头排列+缩量(量比{volume_ratio_r18:.2f})" +
+                                   f"+仓位{weight*100:.0f}%<30%"),
+                    "level": "info",
+                    "icon": "✅",
+                    "msg": (f"{name} 加仓机会! 浮盈{profit_pct_r18*100:.1f}%+趋势加速+缩量回踩，"
+                            f"建议加{add_shares}股，加仓后止损上移至{new_stop:.2f}"),
+                    "urgency_score": 20,  # 非紧急，机会型提醒
+                })
+
         return alerts
 
     def _in_cooldown(self, code: str) -> bool:
@@ -533,6 +838,26 @@ class AlertEngine:
             return False
         elapsed = (datetime.datetime.now() - last_time).total_seconds() / 60
         return elapsed < self.cfg["alert_cooldown_min"]
+
+    @staticmethod
+    def _calc_kdj_j(df, n: int = 9) -> float:
+        """计算KDJ J值（知识库2.4规则）
+        
+        J = 3K - 2D, J>100超买, J<0超卖
+        """
+        if len(df) < n:
+            return None
+        try:
+            low_n = df["low"].rolling(n).min()
+            high_n = df["high"].rolling(n).max()
+            rsv = (df["close"] - low_n) / (high_n - low_n).replace(0, 1) * 100
+            # 简化计算: 用最近3天的RSV平滑
+            k = rsv.ewm(alpha=1/3, adjust=False).mean()
+            d = k.ewm(alpha=1/3, adjust=False).mean()
+            j = 3 * k - 2 * d
+            return float(j.iloc[-1])
+        except Exception:
+            return None
 
     def _check_wash_before_stop(self, code: str, r: dict,
                                  stop_loss_price: float, effective_close: float) -> dict:
@@ -578,11 +903,13 @@ class AlertEngine:
         # 价格已收回止损上方 → 重置缓冲，取消止损
         if current_price > stop_loss:
             self._stop_touch_time.pop(code, None)
+            self._persist_stop_buffer()  # FIX P2-13: 持久化重置
             return {"confirmed": False, "elapsed_min": 0, "remaining_min": 0}
 
         # 首次触及: 记录时间
         if code not in self._stop_touch_time:
             self._stop_touch_time[code] = now
+            self._persist_stop_buffer()  # FIX P2-13: 持久化首次触及时间戳
             return {"confirmed": False, "elapsed_min": 0, "remaining_min": buffer_minutes}
 
         # 计算已经过时间
@@ -595,6 +922,27 @@ class AlertEngine:
         else:
             return {"confirmed": False, "elapsed_min": elapsed_min,
                     "remaining_min": buffer_minutes - elapsed_min}
+
+    def _persist_stop_buffer(self):
+        """FIX P2-13: 止损缓冲首次触及时间戳持久化（进程重启不重置计时）"""
+        try:
+            _save_json_state(_STOP_BUFFER_FILE,
+                             {c: t.isoformat() for c, t in self._stop_touch_time.items()})
+        except Exception:
+            pass
+
+    def _r17_tier_sent(self, code: str, tier: str) -> bool:
+        """FIX P2-14: R17档位每日记忆 — 当日已提醒返回True，否则记录并返回False"""
+        try:
+            today = datetime.date.today().isoformat()
+            key = f"{code}:{tier}"
+            if self._r17_tier_mem.get(key) == today:
+                return True
+            self._r17_tier_mem[key] = today
+            _save_json_state(_R17_TIER_FILE, self._r17_tier_mem)
+            return False
+        except Exception:
+            return False
 
     def _push_alerts(self, alerts: List[dict]):
         """推送预警"""
@@ -701,10 +1049,14 @@ def send_alert_email(alerts: List[dict]):
     today = datetime.date.today().strftime("%Y-%m-%d")
 
     # V3.0: 仅对活跃持仓标的(shares>0)发送预警邮件
+    # V9.1: 放宽——critical级预警不受shares>0限制（解决股票池/候选池炸板被过滤问题）
     important = [a for a in alerts
-                 if (a.get("level") in ("critical", "high")
-                     or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50))
-                 and a.get("holdings_info", {}).get("shares", 0) > 0]
+                 if (a.get("level") == "critical"
+                     or ((a.get("level") == "high")
+                         and (a.get("holdings_info", {}).get("shares", 0) > 0
+                              or a.get("type") == "zb_alert"))
+                     or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50
+                         and a.get("holdings_info", {}).get("shares", 0) > 0))]
     if not important:
         return
 
@@ -733,6 +1085,10 @@ def send_alert_email(alerts: List[dict]):
             extra_items = " | ".join([f"{er.get('icon','')} {er.get('rule_name','')}" for er in extra_rules[:3]])
             extra_html = f'<div style="font-size:11px;color:#666;margin-top:4px">附加触发: {extra_items}</div>'
 
+        # V9.1: 赛道展示（从 alert 或 holdings_info 中获取）
+        sector_display = a.get("sector", "") or hi.get("sector", "")
+        sector_html = f' | 赛道:<b>{sector_display}</b>' if sector_display else ''
+
         items += f"""
         <div style="border:1px solid #ffccc7;border-left:4px solid {score_color};border-radius:8px;padding:14px 16px;margin:12px 0;background:#fff1f0">
             <div style="display:flex;justify-content:space-between;align-items:center">
@@ -740,7 +1096,7 @@ def send_alert_email(alerts: List[dict]):
                 <span style="background:{score_color};color:white;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:bold">紧急度 {score}</span>
             </div>
             <div style="margin-top:10px;font-size:13px;line-height:1.8">
-                <div>⏰ <b>触发时间:</b> {today} {a.get('time', now)}</div>
+                <div>⏰ <b>触发时间:</b> {today} {a.get('time', now)}{sector_html}</div>
                 <div>📌 <b>触发原因:</b> {a.get('rule_name','')} — {a.get('rule_detail', a.get('msg',''))}</div>
                 {extra_html}
                 <div>🎯 <b>操作建议:</b> <span style="color:#cf1322;font-weight:700">{action}</span></div>
@@ -780,13 +1136,25 @@ def _generate_action(alert: dict, holdings_info: dict) -> str:
     atype = alert.get("type", "")
     shares = holdings_info.get("shares", 0)
     cur_price = holdings_info.get("current_price", 0)
-    sell_50 = int(shares * 0.5 / 100) * 100 if shares > 0 else 0
-    sell_30 = int(shares * 0.3 / 100) * 100 if shares > 0 else 0
+    # V9.1: 修复100股持仓取整为0的问题（如德明利100股×50%=50→取整为0）
+    sell_50 = max(100, int(shares * 0.5 / 100) * 100) if shares >= 100 else shares
+    sell_30 = max(100, int(shares * 0.3 / 100) * 100) if shares >= 100 else shares
+    # 不能超过实际持仓
+    sell_50 = min(sell_50, shares)
+    sell_30 = min(sell_30, shares)
     # 挂单价区间（现价下方0.5%-1%）
     price_low = cur_price * 0.99 if cur_price > 0 else 0
     price_high = cur_price * 0.995 if cur_price > 0 else 0
 
-    if atype == "stop_loss_wash":
+    # V9.1: 炸板/涨停开板类预警操作建议
+    if atype == "zb_alert":
+        if shares > 0:
+            return (f"炸板确认! 建议立即减仓{sell_50}股(50%), "
+                    f"挂单价{price_low:.1f}-{price_high:.1f} | "
+                    f"若已跌破止损则全部清仓 | 禁止加仓")
+        else:
+            return "炸板确认(股票池/候选池标的) | 禁止买入 | 已持有者评估止损 | 关注封板资金撤退情况"
+    elif atype == "stop_loss_wash":
         return "疑似洗盘已拦截，暂不执行止损，观望15分钟，若未收回止损则手动执行"
     elif atype == "stop_loss_pending":
         return f"缓冲确认中，若10分钟内收回止损上方则取消，否则执行卖出{sell_50}股(50%)"
@@ -926,6 +1294,18 @@ def _fetch_and_analyze(holdings: dict = None) -> list:
             name = holdings[code].get("name", code) if isinstance(holdings[code], dict) else code
             result = engine.analyze(df, code=code, name=name)
             if "error" not in result:
+                # FIX P1-2: 注入turnover/volume_ratio（CaopanEngine.analyze结果不含这两字段，
+                # 导致R12换手率预警与R18量比条件静默失效）
+                try:
+                    _q = quotes.get(code, {})
+                    if _q.get("turnover", 0) > 0:
+                        result["turnover"] = _q.get("turnover", 0)
+                    if result.get("volume_ratio", 0) <= 0 and len(df) >= 6:
+                        _prev_vol = df["volume"].iloc[-6:-1].mean()
+                        if _prev_vol and _prev_vol > 0:
+                            result["volume_ratio"] = float(df["volume"].iloc[-1] / _prev_vol)
+                except Exception:
+                    pass  # 取不到则跳过注入，不阻断分析
                 results.append(result)
         except Exception as e:
             logger.debug(f"分析{code}失败: {e}")

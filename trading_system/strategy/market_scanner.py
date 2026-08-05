@@ -15,6 +15,7 @@
 """
 
 import logging
+import os
 import time
 import datetime
 import json
@@ -26,6 +27,14 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 try:
+    import config as _config
+except ImportError:
+    try:
+        from trading_system import config as _config
+    except ImportError:
+        _config = None
+
+try:
     import akshare as ak
     HAS_AKSHARE = True
 except ImportError:
@@ -33,6 +42,14 @@ except ImportError:
 
 # V2.4: 扫描结果缓存（网络失败时降级使用）
 _SCAN_CACHE = {"data": None, "time": None}  # 有效期24小时
+
+# V3.0-FIX P0: 缓存持久化落盘路径（内存缓存进程重启即失，且从未成功过则永远无兑底）
+_SCAN_CACHE_FILE = None
+if _config is not None:
+    try:
+        _SCAN_CACHE_FILE = os.path.join(getattr(_config, "DATA_DIR", ""), "scan_cache.json")
+    except Exception:
+        _SCAN_CACHE_FILE = None
 
 
 # ============================================================
@@ -52,48 +69,72 @@ def _fetch_spot_em_direct(page_size: int = 5000) -> pd.DataFrame:
     V2.9: 直接HTTP请求东方财富全市场行情（绕过akshare封装）
     
     返回与 ak.stock_zh_a_spot_em() 兼容的 DataFrame
+    
+    FIX P1: 服务端单页实际只返回约100行，原实现未翻页导致备用通道仅能覆盖100只；
+    现改为按涨幅降序翻页拉取（最多_MAX_PAGES页），满足强势股扫描需求。
     """
-    params = (
-        f"?pn=1&pz={page_size}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-        f"&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-        f"&fields=f2,f3,f5,f6,f8,f10,f12,f14,f15,f16,f17"
-    )
-    url = _EM_SPOT_URL + params
-    req = urllib.request.Request(url, headers=_EM_HEADERS)
-    
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = resp.read().decode("utf-8")
-    
-    data = json.loads(raw)
-    if not data or data.get("data") is None:
+    _MAX_PAGES = 30  # 约3000只，覆盖涨幅榜前列（扫描仅取强势股，无需全市场）
+    all_rows = []
+    seen = set()
+    for page in range(1, _MAX_PAGES + 1):
+        params = (
+            f"?pn={page}&pz={page_size}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            f"&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+            f"&fields=f2,f3,f5,f6,f8,f10,f12,f14,f15,f16,f17"
+        )
+        url = _EM_SPOT_URL + params
+        req = urllib.request.Request(url, headers=_EM_HEADERS)
+
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+
+        data = json.loads(raw)
+        if not data or data.get("data") is None:
+            break
+
+        items = data["data"].get("diff", [])
+        if not items:
+            break
+
+        # 映射东方财富字段 -> 标准列名
+        for item in items:
+            code = str(item.get("f12", "")).zfill(6)
+            if code in seen:
+                continue
+            seen.add(code)
+            all_rows.append({
+                "代码": code,
+                "名称": item.get("f14", ""),
+                "最新价": item.get("f2"),       # 价格(分->元已处理)
+                "涨跌幅": item.get("f3"),       # %
+                "成交额": item.get("f6"),       # 元
+                "换手率": item.get("f8"),       # %
+                "量比": item.get("f10"),
+                "最高": item.get("f15"),
+                "最低": item.get("f16"),
+                "今开": item.get("f17"),
+            })
+
+        # 返回不足一页 → 已到末尾；涨幅榜跌破扫描关注线(-2%)也可提前终止
+        if len(items) < 100:
+            break
+        try:
+            last_chg = float(items[-1].get("f3", 0))
+            if last_chg < -2:
+                break
+        except (TypeError, ValueError):
+            pass
+
+    if not all_rows:
         return pd.DataFrame()
-    
-    items = data["data"].get("diff", [])
-    if not items:
-        return pd.DataFrame()
-    
-    # 映射东方财富字段 -> 标准列名
-    rows = []
-    for item in items:
-        rows.append({
-            "代码": str(item.get("f12", "")).zfill(6),
-            "名称": item.get("f14", ""),
-            "最新价": item.get("f2"),       # 价格(分->元已处理)
-            "涨跌幅": item.get("f3"),       # %
-            "成交额": item.get("f6"),       # 元
-            "换手率": item.get("f8"),       # %
-            "量比": item.get("f10"),
-            "最高": item.get("f15"),
-            "最低": item.get("f16"),
-            "今开": item.get("f17"),
-        })
-    
-    df = pd.DataFrame(rows)
+
+    df = pd.DataFrame(all_rows)
     # 东方财富返回 "-" 表示无效值
     for col in ["最新价", "涨跌幅", "成交额", "换手率", "量比"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    
+
+    logger.info(f"[市场扫描] 东财直接HTTP翻页完成: {len(df)}只 ({page}页)")
     return df
 
 
@@ -213,8 +254,10 @@ def scan_market_hot_stocks(max_per_sector: int = 3, total_max: int = 20,
             df = df[df["amount"] > min_amount]
         
         # 4. 股价合理（排除低价股和超高价股）
+        # FIX P2: 上限500元会误杀寒武纪等高价龙头，改用config.DYNAMIC_SCAN_MAX_PRICE(1500)
+        _max_price = getattr(_config, "DYNAMIC_SCAN_MAX_PRICE", 1500) if _config else 1500
         if "price" in df.columns:
-            df = df[(df["price"] >= 5) & (df["price"] <= 500)]
+            df = df[(df["price"] >= 5) & (df["price"] <= _max_price)]
         
         # 5. 当日涨跌幅 > -2%（排除暴跌股）
         if "change_pct" in df.columns:
@@ -295,24 +338,53 @@ def scan_market_hot_stocks(max_per_sector: int = 3, total_max: int = 20,
 
 
 def _get_scan_cache() -> dict:
-    """V2.4: 获取缓存的扫描结果（有效期24小时）"""
+    """V2.4: 获取缓存的扫描结果（有效期24小时）
+    
+    FIX P0: 新增磁盘缓存层——内存缓存进程重启即失，且首次成功前永远无兑底；
+    现优先读内存，内存无则读磁盘文件（跨进程/跨重启有效）。
+    """
     global _SCAN_CACHE
-    if _SCAN_CACHE["data"] is None or _SCAN_CACHE["time"] is None:
-        return None
-    elapsed = (datetime.datetime.now() - _SCAN_CACHE["time"]).total_seconds()
-    if elapsed > 86400:  # 24小时过期
+    if _SCAN_CACHE["data"] is not None and _SCAN_CACHE["time"] is not None:
+        elapsed = (datetime.datetime.now() - _SCAN_CACHE["time"]).total_seconds()
+        if elapsed <= 86400:  # 24小时内有效
+            import copy
+            return copy.deepcopy(_SCAN_CACHE["data"])
         _SCAN_CACHE = {"data": None, "time": None}
-        return None
-    import copy
-    return copy.deepcopy(_SCAN_CACHE["data"])
+
+    # 磁盘缓存降级
+    if _SCAN_CACHE_FILE and os.path.exists(_SCAN_CACHE_FILE):
+        try:
+            with open(_SCAN_CACHE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            saved_at = datetime.datetime.strptime(payload.get("saved_at", ""), "%Y-%m-%d %H:%M:%S")
+            if (datetime.datetime.now() - saved_at).total_seconds() <= 86400:
+                data = payload.get("data") or {}
+                if data.get("codes"):
+                    # 回填内存缓存
+                    _SCAN_CACHE = {"data": data, "time": saved_at}
+                    logger.info(f"[市场扫描] 磁盘缓存命中 ({payload.get('saved_at')}, {len(data['codes'])}只)")
+                    return data
+        except Exception as e:
+            logger.warning(f"[市场扫描] 磁盘缓存读取失败: {e}")
+    return None
 
 
 def _set_scan_cache(result: dict):
-    """V2.4: 缓存成功的扫描结果"""
+    """V2.4: 缓存成功的扫描结果（FIX P0: 同步落盘，跨进程可用）"""
     global _SCAN_CACHE
     import copy
+    now = datetime.datetime.now()
     _SCAN_CACHE["data"] = copy.deepcopy(result)
-    _SCAN_CACHE["time"] = datetime.datetime.now()
+    _SCAN_CACHE["time"] = now
+    # 落盘持久化
+    if _SCAN_CACHE_FILE:
+        try:
+            os.makedirs(os.path.dirname(_SCAN_CACHE_FILE), exist_ok=True)
+            with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"saved_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                           "data": result}, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"[市场扫描] 磁盘缓存写入失败: {e}")
 
 
 def merge_scan_results_to_pool(scan_result: dict, existing_codes: set) -> list:

@@ -28,6 +28,9 @@ class CostConfig:
     min_commission: float = 5.0       # 最低佣金 5元
     stamp_tax_rate: float = 0.001     # 印花税 千1（仅卖出）
     transfer_fee_rate: float = 0.00001  # 过户费 十万分之一
+    # V3.2: 市场冲击成本（基于订单量/日成交量比例）
+    impact_cost_enabled: bool = True   # 是否启用冲击成本
+    impact_cost_coeff: float = 0.1    # 冲击系数: impact = coeff * sqrt(order_value / daily_volume)
 
 
 DEFAULT_COST = CostConfig()
@@ -126,12 +129,31 @@ class SimBroker:
     # ----------------------------------------------------------
     # 价格计算
     # ----------------------------------------------------------
-    def _apply_slippage(self, price: float, direction: str) -> float:
-        """应用滑点"""
+    def _apply_slippage(self, price: float, direction: str,
+                        order_value: float = 0, daily_volume: float = 0) -> float:
+        """应用滑点 + V3.2市场冲击成本
+        
+        冲击成本模型: impact = coeff * sqrt(order_value / daily_volume)
+        73万资金买入日成交3亿的股票: impact ≈ 0.1*sqrt(100000/300000000) ≈ 0.006%
+        73万资金买入日成交3000万的股票: impact ≈ 0.1*sqrt(100000/30000000) ≈ 0.018%
+        """
         if direction == "buy":
-            return price * (1 + self.cost_config.buy_slippage)
+            slip = self.cost_config.buy_slippage
         else:
-            return price * (1 - self.cost_config.sell_slippage)
+            slip = self.cost_config.sell_slippage
+        
+        # V3.2: 市场冲击成本
+        impact = 0.0
+        if (self.cost_config.impact_cost_enabled and order_value > 0
+                and daily_volume > 0):
+            participation = order_value / daily_volume
+            impact = self.cost_config.impact_cost_coeff * (participation ** 0.5)
+            impact = min(impact, 0.005)  # 上限0.5%
+        
+        if direction == "buy":
+            return price * (1 + slip + impact)
+        else:
+            return price * (1 - slip - impact)
 
     def _calc_commission(self, amount: float) -> float:
         """计算佣金"""
@@ -182,8 +204,13 @@ class SimBroker:
             logger.debug(f"{order.code} 涨停，无法买入")
             return None
 
-        # 计算实际成交价（含滑点）
-        exec_price = self._apply_slippage(order.price, "buy")
+        # 计算实际成交价（含滑点 + V3.2冲击成本）
+        _daily_vol = (market_data or {}).get("amount",
+                     (market_data or {}).get("volume", 0) * order.price)
+        _order_val = order.price * order.target_shares
+        exec_price = self._apply_slippage(order.price, "buy",
+                                          order_value=_order_val,
+                                          daily_volume=_daily_vol)
 
         # 计算可买股数（100股整数倍）
         max_shares = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate)))
@@ -282,8 +309,13 @@ class SimBroker:
         if sell_shares <= 0:
             sell_shares = available  # 全部卖出
 
-        # 计算实际成交价（含滑点）
-        exec_price = self._apply_slippage(order.price, "sell")
+        # 计算实际成交价（含滑点 + V3.2冲击成本）
+        _daily_vol_sell = (market_data or {}).get("amount",
+                          (market_data or {}).get("volume", 0) * order.price)
+        _order_val_sell = order.price * sell_shares
+        exec_price = self._apply_slippage(order.price, "sell",
+                                          order_value=_order_val_sell,
+                                          daily_volume=_daily_vol_sell)
 
         # 计算费用
         amount = exec_price * sell_shares

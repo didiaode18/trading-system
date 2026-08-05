@@ -150,6 +150,8 @@ def get_ma5_trend(codes: list) -> dict:
                 "ma5_direction": "up" if ma5 > ma5_prev else "down",
                 "close_yesterday": closes[-1],
                 "above_ma5": closes[-1] > ma5,
+                # FIX P2-11: 近5日涨幅（防追高过滤用，取不到时为0）
+                "chg_5d": (closes[-1] / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] > 0 else 0,
             }
         except Exception as e:
             logger.debug(f"[盘中决策] {code} MA5获取失败: {e}")
@@ -322,6 +324,14 @@ def score_stock(code: str, info: dict, quote: dict, market_pct: float,
     if add_locked and decision == "可以加仓":
         decision, icon = "禁止加仓", "🔒"
 
+    # FIX P2-11: 加仓防追高过滤 — 近5日涨幅>15%时加仓建议降级为持有观察（无数据时不阻断）
+    try:
+        if decision == "可以加仓" and ma5_info and ma5_info.get("chg_5d", 0) > 15.0:
+            decision, icon = "持有观察", "👀"
+            reasons.append(f"近5日涨幅{ma5_info.get('chg_5d', 0):.1f}%>15%，追高风险，加仓建议已降级")
+    except Exception:
+        pass
+
     # ---- 生成可执行建议 ----
     advice = _generate_action_advice(
         decision, price, shares, buy_price, stop_loss, weight,
@@ -486,6 +496,27 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
 
     # 按紧急程度排序
     decisions.sort(key=lambda x: (_URGENCY_ORDER.get(x["decision"], 5), x["score"]))
+
+    # FIX P2-12: 加仓建议过风控预检（不通过时在建议文案追加说明，异常降级不阻断）
+    try:
+        from risk.risk_control import quick_risk_check
+        for d in decisions:
+            if d.get("decision") != "可以加仓":
+                continue
+            try:
+                _add_shares = max(int(d.get("shares", 0) * 0.2 / 100) * 100, 100)
+                _rc = quick_risk_check({
+                    "code": d["code"], "name": d["name"], "price": d["price"],
+                    "shares": _add_shares, "sector": d.get("sector", ""),
+                    "type": "stock", "stop_loss": d["price"] * 0.95, "risk_reward": 0,
+                }, holdings)
+                if not _rc.get("pass", True):
+                    d["advice"] = (d.get("advice", "") +
+                                   f"（风控预检未通过：{_rc.get('reason', '未知')}，加仓建议作废）")
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"[盘中决策] 风控预检异常(不影响报告): {e}")
 
     # 7. 生成报告
     report_text = _build_console_report(decisions, market_pct, market_300_pct,

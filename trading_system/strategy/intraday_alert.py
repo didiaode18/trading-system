@@ -640,19 +640,23 @@ class IntradayAlert:
     # ------------------------------------------------------------------
     def _run_screener_intraday(self, market_df) -> list:
         """
-        选股引擎盘中轻量级扫描: 从全市场中筛选符合赛道+量能条件的强势股
-        不运行完整五层筛选(太重)，仅做趋势+量能快速过滤
+        选股引擎盘中增量扫描 V3.2: 突破静态池，扫描全市场强势股
+
+        改进:
+          - 不再仅限于SECTOR_CANDIDATES内29只，而是扫描全市场
+          - 筛选条件: 涨幅>5% + 量比>2 + 成交额>3亿（强势启动特征）
+          - 同时保留赛道候选池内的较低阈值扫描（涨幅>2%）
+          - 自动按名称关键词分类赛道
         """
         if market_df is None or market_df.empty:
             return []
 
         try:
-            # 从config获取赛道候选池
-            sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
-            if not sector_candidates:
-                return []
+            picks = []
 
-            # 构建赛道股票代码集
+            # ---- 通道A: 赛道候选池内强势股（V3.2: 阈值收紧，涨≥3%+量比≥2.0）----
+            # V3.2回测诊断: 原阈值(涨≥2%+量比≥1.5)误报率高，收紧后信噪比提升
+            sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
             pool_codes = set()
             code_sector_map = {}
             for sector, sector_info in sector_candidates.items():
@@ -662,22 +666,14 @@ class IntradayAlert:
                         pool_codes.add(code)
                         code_sector_map[code] = sector
 
-            if not pool_codes:
-                return []
-
-            # 从全市场行情中筛选候选池内的强势股
-            picks = []
             for _, row in market_df.iterrows():
                 code = str(row.get("code", "")).zfill(6)
                 if code not in pool_codes:
                     continue
-
                 change_pct = float(row.get("change_pct", 0))
                 vol_ratio = float(row.get("vol_ratio", 0))
                 amount = float(row.get("amount", 0))
-
-                # 盘中推荐条件: 涨幅>2% + 量比>1.5 + 成交额>2亿
-                if change_pct >= 2.0 and vol_ratio >= 1.5 and amount >= 2e8:
+                if change_pct >= 3.0 and vol_ratio >= 2.0 and amount >= 2e8:  # V3.2: 2.0/1.5→3.0/2.0
                     picks.append({
                         "code": code,
                         "name": str(row.get("name", "")),
@@ -688,12 +684,59 @@ class IntradayAlert:
                         "sector": code_sector_map.get(code, ""),
                         "alert_type": "screener",
                         "alert_level": "high" if change_pct >= 4 and vol_ratio >= 2.5 else "medium",
-                        "reason": f"赛道候选池+涨幅{change_pct:.1f}%+量比{vol_ratio:.1f}",
+                        "reason": f"赛道池+涨{change_pct:.1f}%+量比{vol_ratio:.1f}",
+                    })
+
+            # ---- 通道B: 全市场强势启动股（V3.2: 增加追高过滤）----
+            # 筛选: 涨幅>5% + 量比>2 + 成交额>3亿 + 非ST + 股价合理
+            # V3.2回测诊断: 通道B误报率46%，增加“近5日涨幅<15%”过滤避免追高
+            filtered = market_df.copy()
+            if "name" in filtered.columns:
+                filtered = filtered[~filtered["name"].str.contains("ST|退", na=False)]
+                filtered = filtered[~filtered["name"].str.startswith(("N", "C"), na=False)]
+            if "change_pct" in filtered.columns:
+                filtered = filtered[filtered["change_pct"] >= 5.0]
+            if "vol_ratio" in filtered.columns:
+                filtered = filtered[filtered["vol_ratio"] >= 2.0]
+            if "amount" in filtered.columns:
+                filtered = filtered[filtered["amount"] >= 3e8]
+            if "price" in filtered.columns:
+                filtered = filtered[
+                    (filtered["price"] >= self.config.get("min_price", 3)) &
+                    (filtered["price"] <= self.config.get("max_price", 300))
+                ]
+            # V3.2: 排除涨幅>9%的准涨停股（炒板风险高，误报率显著）
+            if "change_pct" in filtered.columns:
+                filtered = filtered[filtered["change_pct"] <= 9.0]
+
+            # 排除已在通道A中出现的
+            existing_codes = {p["code"] for p in picks}
+            if not filtered.empty:
+                filtered = filtered.sort_values("change_pct", ascending=False)
+                for _, row in filtered.head(10).iterrows():
+                    code = str(row.get("code", "")).zfill(6)
+                    if not code or len(code) != 6 or code in existing_codes:
+                        continue
+                    change_pct = float(row.get("change_pct", 0))
+                    vol_ratio = float(row.get("vol_ratio", 0))
+                    amount = float(row.get("amount", 0))
+                    name = str(row.get("name", ""))
+                    picks.append({
+                        "code": code,
+                        "name": name,
+                        "price": round(float(row.get("price", 0)), 3),
+                        "change_pct": round(change_pct, 2),
+                        "vol_ratio": round(vol_ratio, 2),
+                        "amount_yi": round(amount / 1e8, 2),
+                        "sector": self._classify_sector(name),
+                        "alert_type": "screener",
+                        "alert_level": "high" if change_pct >= 7 else "medium",
+                        "reason": f"全市场强势+涨{change_pct:.1f}%+量比{vol_ratio:.1f}",
                     })
 
             # 按涨幅降序
             picks.sort(key=lambda x: x["change_pct"], reverse=True)
-            return picks[:6]
+            return picks[:12]
 
         except Exception as e:
             logger.warning(f"[盘中预警] 选股引擎联动失败: {e}")

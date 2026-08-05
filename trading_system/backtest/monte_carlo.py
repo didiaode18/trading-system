@@ -243,3 +243,120 @@ class MonteCarloStressTest:
         }
 
         return scenarios
+
+
+# ============================================================
+# V3.2: 历史情景压力测试
+# ============================================================
+
+# A股历史极端行情情景库
+HISTORICAL_SCENARIOS = {
+    "2015股灾": {
+        "period": ("2015-06-15", "2015-08-26"),
+        "index_drop": -0.45,  # 沪深300跌幅
+        "duration_days": 50,
+        "description": "杠杆牛崩盘，千股跌停连续出现，流动性枟竭",
+        "daily_vol": 0.04,  # 日均波动率
+    },
+    "2018贸易战": {
+        "period": ("2018-01-29", "2018-12-28"),
+        "index_drop": -0.32,
+        "duration_days": 230,
+        "description": "全年单边下跌，去杠杆+贸易战双杀",
+        "daily_vol": 0.015,
+    },
+    "2020疫情": {
+        "period": ("2020-01-20", "2020-03-23"),
+        "index_drop": -0.16,
+        "duration_days": 42,
+        "description": "疫情黑天鹅，2月3日单日跌-7.9%",
+        "daily_vol": 0.025,
+    },
+    "2022暴跌": {
+        "period": ("2022-01-01", "2022-04-27"),
+        "index_drop": -0.28,
+        "duration_days": 80,
+        "description": "俄乌+疫情封控+美联储加息三重打击",
+        "daily_vol": 0.02,
+    },
+    "2024微盘股崩": {
+        "period": ("2024-01-02", "2024-02-08"),
+        "index_drop": -0.20,
+        "duration_days": 28,
+        "description": "微盘股流动性危机，小票连续跌停",
+        "daily_vol": 0.03,
+    },
+}
+
+
+def historical_stress_test(trades: list, initial_capital: float = None,
+                           scenarios: dict = None) -> dict:
+    """
+    V3.2: 历史情景压力测试
+    
+    原理: 用历史极端行情的统计特征（日均跌幅/波动率/持续天数）
+    模拟如果策略在该环境下运行，结果会如何。
+    
+    参数:
+        trades: 历史交易记录 [{"pnl_pct": 0.05}, ...]
+        initial_capital: 初始资金
+        scenarios: 自定义情景（默认用HISTORICAL_SCENARIOS）
+    
+    返回:
+        {scenario_name: {"final_equity", "max_drawdown", "survival", "detail"}}
+    """
+    if initial_capital is None:
+        initial_capital = getattr(config, 'TOTAL_CAPITAL', 730000)
+    if scenarios is None:
+        scenarios = HISTORICAL_SCENARIOS
+    
+    if not trades:
+        return {"error": "无交易记录"}
+    
+    returns = np.array([t.get("pnl_pct", 0) for t in trades])
+    avg_win = returns[returns > 0].mean() if (returns > 0).any() else 0.02
+    avg_loss = returns[returns < 0].mean() if (returns < 0).any() else -0.05
+    win_rate = (returns > 0).sum() / len(returns)
+    
+    results = {}
+    rng = np.random.default_rng(42)
+    
+    for name, scenario in scenarios.items():
+        index_drop = scenario["index_drop"]
+        duration = scenario["duration_days"]
+        daily_vol = scenario["daily_vol"]
+        
+        # 模拟该情景下的交易表现
+        # 假设: 熊市中胜率下降20%，亏损放大30%
+        stress_win_rate = max(win_rate * 0.8, 0.15)
+        stress_avg_loss = avg_loss * 1.3
+        stress_avg_win = avg_win * 0.7  # 牛市中盈利也缩减
+        
+        # 模拟duration/5笔交易（平均5天一笔）
+        n_trades = max(duration // 5, 5)
+        equity = initial_capital
+        peak = initial_capital
+        max_dd = 0
+        
+        for _ in range(n_trades):
+            if rng.random() < stress_win_rate:
+                pnl = abs(rng.normal(stress_avg_win, daily_vol))
+            else:
+                pnl = -abs(rng.normal(abs(stress_avg_loss), daily_vol))
+            equity *= (1 + pnl)
+            peak = max(peak, equity)
+            dd = (peak - equity) / peak
+            max_dd = max(max_dd, dd)
+        
+        survival = equity > initial_capital * 0.5  # 资金腰斩视为未存活
+        
+        results[name] = {
+            "final_equity": round(equity, 0),
+            "total_return": round((equity - initial_capital) / initial_capital, 4),
+            "max_drawdown": round(max_dd, 4),
+            "survival": survival,
+            "simulated_trades": n_trades,
+            "description": scenario["description"],
+        }
+    
+    return results

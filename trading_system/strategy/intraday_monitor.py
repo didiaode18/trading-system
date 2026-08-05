@@ -197,6 +197,8 @@ class IntradayMonitor:
             buy_price = holding.get("buy_price", current_price)
             stop_loss = holding.get("stop_loss", buy_price * (1 - config.INITIAL_STOP_LOSS_PCT))
             name = holding.get("name", self._get_stock_name(code))
+            # FIX P1-1: shares原仅在止损确认深分支赋值，止盈分支引用会NameError，循环顶部统一补齐
+            shares = holding.get("shares", 0)
 
             # 更新价格记录
             self.last_prices[code] = {
@@ -462,13 +464,17 @@ class IntradayMonitor:
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 
-            # ---- 检查3: 止盈位到达 ----
-            if self.PROFIT_TARGET_ALERT:
-                profit_pct = (current_price / buy_price - 1) if buy_price > 0 else 0
-                # 第一止盈位8%
-                if profit_pct >= 0.08:
-                    alert_key = f"{today}_{code}_profit_8"
+            # ---- 检查3: 止盈位到达（V3.3: 阶梯止盈+回落止盈）----
+            if self.PROFIT_TARGET_ALERT and buy_price > 0:
+                profit_pct = (current_price / buy_price - 1)
+                highest = holding.get("highest", buy_price)
+                drawdown_from_high = (current_price - highest) / highest if highest > 0 else 0
+
+                # 第一止盈位: 浮盈≥10%（V6.0: 8%→10%）
+                if profit_pct >= 0.10:
+                    alert_key = f"{today}_{code}_profit_10"
                     if alert_key not in self.alerts_sent:
+                        sell_1_3 = int(shares / 3 / 100) * 100 if shares > 0 else 0
                         alert = {
                             "level": "info",
                             "type": "止盈提醒",
@@ -476,13 +482,59 @@ class IntradayMonitor:
                             "name": name,
                             "current_price": current_price,
                             "profit_pct": round(profit_pct * 100, 2),
-                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第一止盈位！"
-                                      f"建议卖出1/3锁定利润",
+                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第一止盈位(10%)！"
+                                      f"建议卖出{sell_1_3}股(1/3)锁定利润",
                             "time": datetime.datetime.now().strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
+
+                # 第二止盈位: 浮盈≥20%
+                if profit_pct >= 0.20:
+                    alert_key = f"{today}_{code}_profit_20"
+                    if alert_key not in self.alerts_sent:
+                        sell_1_3 = int(shares / 3 / 100) * 100 if shares > 0 else 0
+                        alert = {
+                            "level": "warning",
+                            "type": "止盈提醒",
+                            "code": code,
+                            "name": name,
+                            "current_price": current_price,
+                            "profit_pct": round(profit_pct * 100, 2),
+                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第二止盈位(20%)！"
+                                      f"建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
+                            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                        }
+                        alerts.append(alert)
+                        self.alerts_sent.add(alert_key)
+                        self._send_alert(alert)
+
+                # 回落止盈: 浮盈>5%且从最高点回落超过阈值
+                if profit_pct >= 0.05:
+                    from config import DRAWDOWN_STOP
+                    stock_type = holding.get("stock_type", "龙头稳健")
+                    dd_threshold = DRAWDOWN_STOP.get(stock_type, DRAWDOWN_STOP.get("龙头稳健", 0.07))
+                    if drawdown_from_high <= -dd_threshold:
+                        alert_key = f"{today}_{code}_drawdown_profit"
+                        if alert_key not in self.alerts_sent:
+                            sell_half = int(shares * 0.5 / 100) * 100 if shares > 0 else 0
+                            alert = {
+                                "level": "warning",
+                                "type": "回落止盈",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "profit_pct": round(profit_pct * 100, 2),
+                                "drawdown_pct": round(drawdown_from_high * 100, 2),
+                                "message": f" {name}({code}) 利润回落! 浮盈{profit_pct*100:.1f}%"
+                                          f"但从最高{highest:.2f}回落{drawdown_from_high*100:.1f}%"
+                                          f"(>{dd_threshold*100:.0f}%)，建议卖出{sell_half}股(50%)保住利润",
+                                "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            self.alerts_sent.add(alert_key)
+                            self._send_alert(alert)
 
             # ---- 检查4: 振幅异常 ----
             amplitude = quote.get("amplitude", 0)
@@ -517,6 +569,10 @@ class IntradayMonitor:
             # ---- 检查8: V9.0 量比异动（P1-1）----
             vr_alerts = self._check_volume_ratio(code, name, current_price, quote, holding, today)
             alerts.extend(vr_alerts)
+
+            # ---- 检查8.5: V3.2 换手率异常+量价背离（知识库规则落地）----
+            to_alerts = self._check_turnover_divergence(code, name, current_price, quote, holding, today)
+            alerts.extend(to_alerts)
 
             # ---- V9.0: 记录分时价格序列（P2-3用）----
             if code not in self.price_history:
@@ -600,6 +656,7 @@ class IntradayMonitor:
                     # FIX: 修复放量急跌检测永远False的问题，添加缺失的volume字段
                     "volume": info.get("volume", 0),
                     "amount": info.get("amount", 0),
+                    "turnover": info.get("turnover", 0),  # V3.2: 换手率(%)
                     # V9.0: 看盘增强字段
                     "vwap": info.get("vwap", 0),
                     "outer_vol": info.get("outer_vol", 0),
@@ -1408,6 +1465,122 @@ class IntradayMonitor:
                 self._send_alert(alert)
 
         return alerts
+
+    # ============================================================
+    # V3.2: 换手率异常 + 量价背离检测（知识库规则落地）
+    # ============================================================
+
+    def _check_turnover_divergence(self, code: str, name: str, current_price: float,
+                                   quote: dict, holding: dict, today: str) -> list:
+        """检查换手率异常和量价背离
+        
+        知识库规则:
+          - 换手率>15%: 过度换手，可能是主力出货（给低分0.05）
+          - 换手率3-10%: 健康活跃区间
+          - 涨+缩量: 上涨乏力，警惕回调
+          - 跌+缩量: 卖压减小，可能见底
+        """
+        alerts = []
+        turnover = quote.get("turnover", 0)  # 换手率(%)
+        change_pct = quote.get("change_pct", 0)
+        volume = quote.get("volume", 0)
+        avg_volume = holding.get("avg_volume", 0)
+        buy_price = holding.get("buy_price", 0)
+        now = datetime.datetime.now()
+
+        # ---- 规则1: 换手率异常高（>15% = 主力出货风险）----
+        if turnover >= 15.0:
+            alert_key = f"{today}_{code}_high_turnover"
+            if alert_key not in self.alerts_sent:
+                profit_pct = ((current_price / buy_price - 1) * 100) if buy_price > 0 else 0
+                # 高位+高换手 = 出货概率极大
+                if profit_pct > 10:
+                    level = "critical"
+                    msg = (f"🚨 {name}({code}) 换手率{turnover:.1f}%异常偏高! "
+                           f"浮盈{profit_pct:.1f}%+过度换手 | "
+                           f"主力出货概率极大，建议立即减仓")
+                else:
+                    level = "warning"
+                    msg = (f"⚠️ {name}({code}) 换手率{turnover:.1f}%异常偏高! "
+                           f"涨跌{change_pct:+.1f}% | "
+                           f"筹码剧烈换手，注意主力动向")
+                alert = {
+                    "level": level,
+                    "type": "换手率异常",
+                    "code": code,
+                    "name": name,
+                    "turnover": turnover,
+                    "change_pct": change_pct,
+                    "message": msg,
+                    "time": now.strftime("%H:%M:%S"),
+                }
+                alerts.append(alert)
+                self.alerts_sent.add(alert_key)
+                self._send_alert(alert)
+
+        # ---- 规则2: 量价背离（涨+缩量 = 上涨乏力）----
+        if avg_volume > 0 and volume > 0:
+            # 计算当前量比（简化版）
+            elapsed_min = self._calc_elapsed_minutes(now)
+            if elapsed_min > 30:  # 开盘30分钟后才检测
+                current_per_min = volume / elapsed_min
+                hist_per_min = avg_volume / 240.0
+                vol_ratio = current_per_min / hist_per_min if hist_per_min > 0 else 1.0
+
+                # 涨>3% 但量比<0.7 = 缩量上涨（背离）
+                if change_pct > 3.0 and vol_ratio < 0.7:
+                    alert_key = f"{today}_{code}_vol_diverge_up"
+                    if alert_key not in self.alerts_sent:
+                        alert = {
+                            "level": "warning",
+                            "type": "量价背离(缩量涨)",
+                            "code": code,
+                            "name": name,
+                            "change_pct": change_pct,
+                            "vol_ratio": round(vol_ratio, 2),
+                            "message": f"⚠️ {name}({code}) 缩量上涨背离! "
+                                      f"涨{change_pct:.1f}%但量比仅{vol_ratio:.2f} | "
+                                      f"上涨乏力，警惕回调",
+                            "time": now.strftime("%H:%M:%S"),
+                        }
+                        alerts.append(alert)
+                        self.alerts_sent.add(alert_key)
+                        self._send_alert(alert)
+
+                # 跌>3% 但量比<0.5 = 缩量下跌（卖压衰竭，可能见底）
+                elif change_pct < -3.0 and vol_ratio < 0.5:
+                    alert_key = f"{today}_{code}_vol_diverge_down"
+                    if alert_key not in self.alerts_sent:
+                        alert = {
+                            "level": "info",
+                            "type": "缩量下跌(见底信号)",
+                            "code": code,
+                            "name": name,
+                            "change_pct": change_pct,
+                            "vol_ratio": round(vol_ratio, 2),
+                            "message": f"💡 {name}({code}) 缩量下跌! "
+                                      f"跌{change_pct:.1f}%但量比仅{vol_ratio:.2f} | "
+                                      f"卖压衰竭，可能接近底部",
+                            "time": now.strftime("%H:%M:%S"),
+                        }
+                        alerts.append(alert)
+                        self.alerts_sent.add(alert_key)
+                        self._send_alert(alert)
+
+        return alerts
+
+    @staticmethod
+    def _calc_elapsed_minutes(now: datetime.datetime) -> float:
+        """计算已经过的交易分钟数"""
+        market_open = now.replace(hour=9, minute=30, second=0)
+        mid_close = now.replace(hour=11, minute=30, second=0)
+        mid_open = now.replace(hour=13, minute=0, second=0)
+        if now <= mid_close:
+            return max((now - market_open).total_seconds() / 60, 1)
+        elif now < mid_open:
+            return 120.0
+        else:
+            return 120 + max((now - mid_open).total_seconds() / 60, 1)
 
     # ============================================================
     # 十二、V9.0 开盘30分钟定性（P0-4）

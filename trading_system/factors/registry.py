@@ -134,12 +134,21 @@ class FactorRegistry:
                         r['ic'] if isinstance(r, dict) else r for r in records
                     ]
 
-        result = {"decaying": [], "strong": [], "normal": []}
+        result = {"decaying": [], "strong": [], "negative": [], "normal": []}
         for meta in self.factors.values():
             if len(meta.ic_history) >= 5:
                 recent_ic = np.mean(meta.ic_history[-5:])
                 old_weight = meta.weight
-                if abs(recent_ic) < 0.02:
+                # V3.2: IC持续为负 → 因子已反向，权重置0（回测诊断: S/P因子IC为负）
+                if recent_ic < -0.02:
+                    meta.weight = 0.0
+                    meta.enabled = False  # 直接禁用
+                    result["negative"].append({
+                        "name": meta.name, "old_weight": old_weight,
+                        "new_weight": 0.0, "avg_ic": round(recent_ic, 4),
+                        "action": "禁用(IC持续为负)"
+                    })
+                elif abs(recent_ic) < 0.02:
                     meta.weight = round(old_weight * 0.5, 2)  # 衰减: 降权50%
                     result["decaying"].append({
                         "name": meta.name, "old_weight": old_weight,
@@ -147,7 +156,7 @@ class FactorRegistry:
                         "days_low": sum(1 for ic in meta.ic_history[-5:] if abs(ic) < 0.02)
                     })
                 elif abs(recent_ic) > 0.05:
-                    meta.weight = round(old_weight * 1.2, 2)  # 强劲: 加权20%
+                    meta.weight = round(min(old_weight * 1.2, 2.0), 2)  # 强劲: 加权20%(上限2.0)
                     result["strong"].append({
                         "name": meta.name, "old_weight": old_weight,
                         "new_weight": meta.weight, "avg_ic": round(recent_ic, 4)

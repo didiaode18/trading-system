@@ -867,6 +867,32 @@ def run_screener():
         except Exception as e:
             logger.warning(f"  涨停基因异常(不影响选股): {e}")
 
+    # V3.2: 短线动量筛选通道（与CANSLIM并行，增量输出）
+    try:
+        from trading_system.strategy.stock_screener import run_momentum_screener
+        # 复用涨停池数据（如已获取）
+        _zt_pool_for_momentum = None
+        if zt_report and zt_report.get("ladder", {}).get("stocks"):
+            _zt_pool_for_momentum = zt_report["ladder"]["stocks"]
+        momentum_result = run_momentum_screener(
+            market_df=None,  # 自动获取全市场实时行情
+            zt_pool=_zt_pool_for_momentum,
+            # FIX: holdings已是{code: info}字典，无需再转换（原误当列表迭代导致string indices异常）
+            holdings=holdings if holdings else None,
+        )
+        if momentum_result.get("success") and momentum_result.get("picks"):
+            result["momentum_picks"] = momentum_result["picks"]
+            print(f"\n  ⚡ 短线动量筛选: {momentum_result['summary']}")
+            for i, p in enumerate(momentum_result["picks"][:5], 1):
+                yizi_tag = " [一字板-不可买]" if p.get("is_yizi") else ""
+                print(f"     {i}. {p['code']} {p['name']} | 涨{p['change_pct']:+.1f}% | "
+                      f"量比{p['vol_ratio']:.1f} | 动量{p['momentum_score']}分 | "
+                      f"{p['sector']}{yizi_tag}")
+        else:
+            print(f"  短线动量: {momentum_result.get('summary', '无结果')}")
+    except Exception as e:
+        logger.warning(f"  短线动量筛选异常(不影响CANSLIM): {e}")
+
     # 发送选股报告邮件
     success = send_screener_email(result)
     if success:

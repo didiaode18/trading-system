@@ -1,5 +1,7 @@
-# 高胜率A股交易操作系统 V7.0 - 依赖
+# 操盘密码 A股交易操作系统 V9.0 - 依赖清单
+# Python版本: 3.9 ~ 3.11（当前开发环境 3.10.8，已验证）
 # 安装: pip install -r requirements.txt
+# 可选依赖（xgboost/lightgbm/win10toast/streamlit）见下方注释区块，按需单独安装
 
 # === 数据源 ===
 baostock>=0.8.8       # 主数据源：证券宝（免费A股日线/基本面）
@@ -8,19 +10,28 @@ akshare>=1.10.0       # 备用数据源：东方财富（实时行情/资金流�
 # === 数据处理 ===
 pandas>=1.5.0         # 数据处理
 numpy>=1.21.0         # 数值计算
-scipy>=1.9.0          # 科学计算（统计检验/相关性）
+scipy>=1.9.0          # 科学计算（统计检验/相关性，缺失时部分模块自动降级）
 
 # === 输出与通知 ===
 openpyxl>=3.0.0       # Excel条件单生成
 schedule>=1.2.0       # 定时任务调度
 
 # === 机器学习 ===
-scikit-learn>=1.1.0   # HMM/聚类（市场状态检测）
-xgboost>=1.6.0        # XGBoost模型（ML预测/特征重要性）
+scikit-learn>=1.1.0   # HMM/聚类（市场状态检测），附带joblib
+joblib>=1.2.0         # 模型持久化（ml/trainer.py）
 
 # === 可视化 ===
 matplotlib>=3.5.0     # 图表绘制（回测曲线/因子分析）
-pyecharts>=1.9.0      # 交互式图表（操盘密码K线图）
+pyecharts>=1.9.0      # 交互式图表（缺失时相关图表功能自动跳过）
+
+# ============================================================
+# 可选依赖（缺失时系统自动降级，不影响核心运行）
+# ============================================================
+# xgboost>=1.6.0      # ML预测增强（ml/trainer.py，缺失时回退sklearn）
+# lightgbm>=4.0.0     # ML预测增强（ml/trainer.py，可选）
+# win10toast>=0.9     # Windows桌面弹窗通知（仅Windows，缺失时跳过）
+# streamlit>=1.28.0   # 可视化仪表盘（trading_system/dashboard/app.py，可选）
+# pytest>=7.0.0       # 开发测试用
 
 # === 自动交易（可选，开通QMT后安装） ===
-# xtquant             # miniQMT交易接口（从QMT安装目录复制）
+# xtquant             # miniQMT交易接口（从QMT安装目录复制，非pip安装）

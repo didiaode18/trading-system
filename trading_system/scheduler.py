@@ -230,6 +230,18 @@ def run_daily_task():
         except Exception as e:
             logger.error(f"[{today}] IC监控异常(不影响主流程): {e}")
 
+        # ---- V3.2: 预测验证闭环（不影响主流程）----
+        try:
+            _run_prediction_verification()
+        except Exception as e:
+            logger.error(f"[{today}] 预测验证异常(不影响主流程): {e}")
+
+        # ---- V3.2: CANSLIM五因子IC记录（不影响主流程）----
+        try:
+            _run_canslim_ic_recording(signals)
+        except Exception as e:
+            logger.error(f"[{today}] CANSLIM IC记录异常(不影响主流程): {e}")
+
     except Exception as e:
         logger.error(f"[{today}] 任务执行失败: {e}", exc_info=True)
 
@@ -342,6 +354,23 @@ def _cache_market_regime_state():
             return
 
         result = detector.detect(benchmark_df)
+
+        # FIX: detector返回的dict中可能含numpy类型(bool_/int64/float64)，
+        # 标准json.dump无法序列化导致"Object of type bool_ is not JSON serializable"，
+        # 递归转换为原生Python类型。
+        def _to_native(obj):
+            if isinstance(obj, dict):
+                return {k: _to_native(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_native(v) for v in obj]
+            if hasattr(obj, "item"):  # numpy标量(bool_/int64/float64等)
+                try:
+                    return obj.item()
+                except (ValueError, AttributeError):
+                    return str(obj)
+            return obj
+
+        result = _to_native(result)
 
         # 写入缓存文件
         output_dir = os.path.join(PROJECT_ROOT, "output")
@@ -653,6 +682,28 @@ def run_morning_screener():
         logger.error(f"[{today}] 竞价选股失败: {e}", exc_info=True)
 
 
+def run_intraday_scan_task():
+    """盘中动态扫描缓存预热（09:45/10:30运行）—— 刷新全市场强势股扫描并落盘缓存
+
+    V3.0-FIX P1: 选股报告09:25盘前运行时无当日盘中涨幅数据，且动态扫描网络失败时
+    仅能用静态池；盘中预热两次扫描后，后续选股/手动触发可用盘中真实数据降级兑底。
+    仅更新缓存，不发送邮件。
+    """
+    today = datetime.date.today()
+    if not is_trading_day(today):
+        logger.info(f"[{today}] 非交易日，跳过盘中扫描")
+        return
+    try:
+        from strategy.market_scanner import scan_market_hot_stocks
+        result = scan_market_hot_stocks(total_max=15)
+        if result.get("success"):
+            logger.info(f"[{today}] 盘中扫描缓存已更新: {len(result['codes'])}只强势股")
+        else:
+            logger.warning(f"[{today}] 盘中扫描未成功（沿用现有缓存）")
+    except Exception as e:
+        logger.error(f"[{today}] 盘中扫描异常: {e}", exc_info=True)
+
+
 def run_morning_reminder():
     """盘前条件单提醒（19:00运行）—— 发送完整条件单邮件（持仓止损+选股买入）"""
     today = datetime.date.today()
@@ -808,9 +859,14 @@ def run_morning_reminder():
                 logger.warning(f"  新闻扫描异常(不影响主流程): {e}")
 
         # 发送条件单邮件（附带新闻预警）
-        send_eastmoney_orders_email(signals, holdings, data_dict, news_risk=news_risk)
-        logger.info(f"[{today}] 盘前条件单提醒发送成功"
-                   f"（持仓{len(holdings)}只 + 买入推荐，共{len(signals)}条信号）")
+        # FIX: 校验发送返回值。原逻辑无论邮件是否发送成功（如19:00 DNS解析失败
+        # getaddrinfo failed导致3次重试全失败）都记录"发送成功"，造成通知失败不可见。
+        _email_ok = send_eastmoney_orders_email(signals, holdings, data_dict, news_risk=news_risk)
+        if _email_ok:
+            logger.info(f"[{today}] 盘前条件单提醒发送成功"
+                        f"（持仓{len(holdings)}只 + 买入推荐，共{len(signals)}条信号）")
+        else:
+            logger.error(f"[{today}] 盘前条件单提醒邮件发送失败（订单文件已生成，请手动补发）")
 
         # FIX: 同步生成QMT执行JSON，消除定时条件单与QMT执行器的断链
         try:
@@ -1402,6 +1458,67 @@ def _get_ic_report(monitor=None, weight_result=None, computed_count=0) -> dict:
 
 
 # ============================================================
+# V3.2: 预测验证闭环 + CANSLIM IC记录
+# ============================================================
+
+def _run_prediction_verification():
+    """[每日盘后] V3.2: 验证到期的预测记录，统计准确率"""
+    today = datetime.date.today()
+    logger.info(f"[{today}] 🔮 预测验证闭环...")
+    try:
+        from monitor.prediction_tracker import PredictionTracker
+        tracker = PredictionTracker()
+        tracker.verify_all()  # 自动验证到期预测
+        summary = tracker.get_summary_text()
+        logger.info(f"[{today}] {summary}")
+    except Exception as e:
+        logger.error(f"预测验证失败: {e}")
+
+
+def _run_canslim_ic_recording(signals=None):
+    """[每日盘后] V3.2: 记录CANSLIM五因子IC（供IC降权机制使用）"""
+    today = datetime.date.today()
+    logger.info(f"[{today}] 📝 CANSLIM五因子IC记录...")
+    try:
+        from strategy.stock_screener import record_canslim_ic, canslim_score
+        from data.data_loader import init_db, load_daily_data, get_all_candidate_codes
+        from strategy.trend_strategy import compute_indicators
+
+        conn = init_db()
+        all_codes = get_all_candidate_codes()
+        stock_codes = [c for c in all_codes if not c.startswith("300") and not c.startswith("688")]
+
+        # 加载数据并计算评分
+        data_dict = {}
+        all_scores = []
+        for code in stock_codes[:30]:  # 取前30只
+            try:
+                df = load_daily_data(code, conn, days=120)
+                if df is not None and not df.empty and len(df) >= 60:
+                    df = compute_indicators(df)
+                    data_dict[code] = df
+                    result = canslim_score(df, code)
+                    if result.get("total_score", 0) > 0:
+                        all_scores.append({
+                            "code": code,
+                            "factors": result.get("factors", {}),
+                            "total_score": result.get("total_score", 0),
+                        })
+            except Exception:
+                pass
+        conn.close()
+
+        if len(all_scores) >= 5:
+            record_canslim_ic(all_scores, data_dict)
+            logger.info(f"[{today}] CANSLIM IC记录完成 ({len(all_scores)}只样本)")
+        else:
+            logger.info(f"[{today}] 样本不足({len(all_scores)}只)，跳过IC记录")
+
+    except Exception as e:
+        logger.error(f"CANSLIM IC记录失败: {e}")
+
+
+# ============================================================
 # 二-4、月度Walk-Forward验证
 # ============================================================
 
@@ -1622,8 +1739,67 @@ _monitor_thread = None
 _monitor_instance = None
 
 # V4.0: 统一盘中预警冷却记录 {stock_code: last_send_time}
-_alert_cooldown = {}
 _ALERT_COOLDOWN_MINUTES = 30  # 同一股票30分钟内不重复发送
+
+# FIX P2-7: 冷却字典JSON持久化（启动加载/写入即保存/自动清理过期键，重启不重复推送）
+_ALERT_COOLDOWN_FILE = os.path.join(PROJECT_ROOT, "data", "alert_cooldown.json")
+
+
+def _load_alert_cooldown() -> dict:
+    """FIX P2-7: 加载冷却记录（自动清理过期键，失败降级为空字典）"""
+    data = {}
+    try:
+        if os.path.exists(_ALERT_COOLDOWN_FILE):
+            import json as _json
+            with open(_ALERT_COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                raw = _json.load(f)
+            now = datetime.datetime.now()
+            for code, ts in raw.items():
+                try:
+                    t = datetime.datetime.fromisoformat(ts)
+                    if (now - t).total_seconds() < _ALERT_COOLDOWN_MINUTES * 60:
+                        data[code] = t
+                except Exception:
+                    continue
+    except Exception:
+        data = {}
+    return data
+
+
+def _save_alert_cooldown():
+    """FIX P2-7: 冷却记录落盘（先清理过期键，失败不阻断主流程）"""
+    try:
+        import json as _json
+        now = datetime.datetime.now()
+        live = {c: t.isoformat() for c, t in _alert_cooldown.items()
+                if (now - t).total_seconds() < _ALERT_COOLDOWN_MINUTES * 60}
+        os.makedirs(os.path.dirname(_ALERT_COOLDOWN_FILE), exist_ok=True)
+        with open(_ALERT_COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            _json.dump(live, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"冷却持久化失败: {e}")
+
+
+_alert_cooldown = _load_alert_cooldown()
+
+
+# FIX P2-8: AlertEngine模块级单例复用（原每轮新建实例导致引擎15分钟冷却失效）
+_alert_engine_singleton = None
+
+
+def _get_alert_engine(holdings_data: dict):
+    """FIX P2-8: 懒加载全局单例，每轮仅刷新holdings引用"""
+    global _alert_engine_singleton
+    try:
+        from notify.alert_engine import AlertEngine
+        if _alert_engine_singleton is None:
+            _alert_engine_singleton = AlertEngine(holdings=holdings_data)
+        else:
+            _alert_engine_singleton.holdings = holdings_data
+        return _alert_engine_singleton
+    except Exception as e:
+        logger.warning(f"AlertEngine单例初始化失败: {e}")
+        return None
 
 
 def _generate_intraday_stop_orders(alerts: list, holdings_data: dict):
@@ -1807,13 +1983,16 @@ def run_unified_intraday_alert():
             pass
 
         if holdings_data:
-            engine = AlertEngine(holdings=holdings_data)
-            results = _fetch_and_analyze(holdings_data)
-            if results:
+            engine = _get_alert_engine(holdings_data)  # FIX P2-8: 单例复用
+            results = _fetch_and_analyze(holdings_data) if engine else None
+            if engine and results:
                 triggered = engine.check_alerts(results)
                 if triggered:
-                    critical = [a for a in triggered if a.get("level") in ("critical", "high")]
-                    logger.info(f"  [深度预警] 触发{len(triggered)}条(critical/high: {len(critical)}条)")
+                    # FIX P2-5: warning级且评分>=50的预警（如R17止盈）也纳入邮件链路
+                    critical = [a for a in triggered
+                                if a.get("level") in ("critical", "high")
+                                or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50)]
+                    logger.info(f"  [深度预警] 触发{len(triggered)}条(入邮件链路: {len(critical)}条)")
                     urgent_alerts.extend(critical)
     except Exception as e:
         logger.warning(f"  [深度预警] 异常: {e}")
@@ -1836,6 +2015,16 @@ def run_unified_intraday_alert():
                     "code": stock.get("code", ""), "urgency_score": 75,
                     "msg": f"准涨停: {stock.get('reason', '')}",
                     "rule_name": "盘中异动-准涨停", "icon": "🚀",
+                })
+            # FIX P2-6: 板块联动达阈值时构造warning级预警入urgent_alerts（原仅记日志）
+            for cas in result.get('sector_cascade', []):
+                urgent_alerts.append({
+                    "level": "warning", "name": cas.get("name", ""),
+                    "code": cas.get("code", ""), "urgency_score": 50,
+                    "msg": (f"板块联动: {cas.get('sector', '')}已有{cas.get('sector_zt_count', 0)}只涨停, "
+                            f"跟涨候选{cas.get('name', '')} +{cas.get('change_pct', 0):.1f}% "
+                            f"(量比{cas.get('vol_ratio', 0):.1f})"),
+                    "rule_name": "盘中异动-板块联动", "icon": "🔗",
                 })
     except Exception as e:
         logger.warning(f"  [异动预警] 异常: {e}")
@@ -1861,6 +2050,93 @@ def run_unified_intraday_alert():
                     })
     except Exception as e:
         logger.warning(f"  [决策报告] 异常: {e}")
+
+    # ---- 源4: 炸板池增量扫描（V9.1新增，P0资金安全）----
+    # 解决缺口: 原系统无实时炸板检测，持仓股从涨停回落无法及时通知
+    # 覆盖范围: 全市场炸板池（东财接口），持仓股critical/候选池high/其他warning
+    try:
+        from strategy.zt_monitor import ZTMonitor
+        _zb_monitor = ZTMonitor()
+        new_zb_stocks = _zb_monitor.get_zb_pool_incremental()
+        if new_zb_stocks:
+            # 构建持仓代码集 + 候选池代码集（用于分级）
+            holdings_codes = set(holdings_data.keys()) if holdings_data else set()
+            candidate_codes = set()
+            sector_candidates = getattr(config, 'SECTOR_CANDIDATES', {})
+            code_sector_map = {}  # code -> 粗粒度赛道
+            for sector_name, sector_info in sector_candidates.items():
+                for stk_code in sector_info.get("stocks", {}).keys():
+                    candidate_codes.add(stk_code)
+                    code_sector_map[stk_code] = sector_name
+
+            for zb in new_zb_stocks:
+                code = zb.get("code", "")
+                name = zb.get("name", "")
+                change_pct = zb.get("change_pct", 0)
+                zt_time = zb.get("zt_time", "")
+                zb_time = zb.get("zb_time", "")
+                cur_price = zb.get("current_price", 0)
+                sector_raw = zb.get("sector", "")
+
+                # 赛道归一化: 优先用config粗粒度口径，其次用东财行业
+                sector_display = code_sector_map.get(code, sector_raw or "其他")
+
+                # 分级: 持仓股critical(95) > 候选池high(80) > 全市场warning(65)
+                if code in holdings_codes:
+                    level, score = "critical", 95
+                elif code in candidate_codes:
+                    level, score = "high", 80
+                else:
+                    level, score = "warning", 65
+
+                # 仅warning且非持仓/候选的不进入邮件（降噪）
+                if level == "warning" and score < 70:
+                    logger.info(f"  [炸板池] 全市场炸板(非持仓/候选): {name}({code}) 涨幅{change_pct:.1f}%")
+                    continue
+
+                msg = (f"炸板回落: 曾{zt_time}封板→{zb_time}开板 | "
+                       f"当前涨幅{change_pct:+.1f}% | 赛道:{sector_display}")
+
+                urgent_alerts.append({
+                    "level": level,
+                    "name": name,
+                    "code": code,
+                    "urgency_score": score,
+                    "msg": msg,
+                    "rule_name": "炸板池增量-涨停开板",
+                    "rule_detail": f"封板{zt_time}→开板{zb_time}, 现价{cur_price}, 涨幅{change_pct:+.1f}%",
+                    "icon": "💥",
+                    "type": "zb_alert",
+                    "sector": sector_display,
+                    "time": now.strftime("%H:%M"),
+                })
+
+            n_zb_alerts = sum(1 for a in urgent_alerts if a.get("type") == "zb_alert")
+            if n_zb_alerts > 0:
+                logger.info(f"  [炸板池] 🚨 新增炸板预警{n_zb_alerts}条")
+    except Exception as e:
+        logger.warning(f"  [炸板池] 异常: {e}")
+
+    # ---- FIX P2-10: 系统性风险标记接通（大盘跌>2.5%→风控systemic_risk标记，恢复时清除）----
+    try:
+        from data.realtime import fetch_index_realtime
+        _idx_sh = fetch_index_realtime("000001")
+        _mkt_chg = _idx_sh.get("change_pct", 0)
+        if _mkt_chg:
+            _esc_cfg = getattr(config, 'INTRADAY_ESCALATION_CONFIG', {})
+            _emerg_drop = _esc_cfg.get("emergency_triggers", {}).get("market_drop_pct", -2.5)
+            from risk.risk_control import UnifiedRiskEngine
+            _risk_eng = UnifiedRiskEngine()
+            if _mkt_chg <= _emerg_drop:
+                _risk_eng.set_intraday_risk_flag("systemic_risk", {
+                    "source": "run_unified_intraday_alert",
+                    "market_change_pct": _mkt_chg,
+                })
+            elif _mkt_chg > _emerg_drop + 0.5:
+                # 恢复口径: 回升到跌2%以内清除标记（滞回0.5%防抖动）
+                _risk_eng.clear_intraday_risk_flag("systemic_risk")
+    except Exception as e:
+        logger.warning(f"  [系统性风险联动] 异常: {e}")
 
     # ---- 去重 + 冷却过滤 ----
     if not urgent_alerts:
@@ -1912,6 +2188,7 @@ def run_unified_intraday_alert():
         # 更新冷却记录
         for a in filtered:
             _alert_cooldown[a.get("code", "")] = now
+        _save_alert_cooldown()  # FIX P2-7: 冷却记录落盘，重启不重复推送
         logger.info(f"  [统一预警] 📧 邮件已发送({len(filtered)}条)")
     except Exception as e:
         logger.warning(f"  [统一预警] 邮件发送失败: {e}")
@@ -2053,6 +2330,10 @@ def start_scheduler():
     # V3.1: 每个交易日 09:25 竞价后选股报告（修复: 原来只在CLI模式可用，未注册到调度器）
     schedule.every().day.at("09:25").do(run_morning_screener)
 
+    # V3.0-FIX P1: 盘中动态扫描缓存预热（09:45/10:30各一次，仅刷缓存不发邮件）
+    schedule.every().day.at("09:45").do(run_intraday_scan_task)
+    schedule.every().day.at("10:30").do(run_intraday_scan_task)
+
     # V9.0 P2-1: 每个交易日 09:15 竞价轨迹采集（后台线程，09:15-09:25多点采样）
     schedule.every().day.at("09:15").do(run_auction_tracking_task)
 
@@ -2114,6 +2395,16 @@ def start_scheduler():
 
     logger.info(f"  统一盘中预警: 每个交易日 09:35-14:55 分级变频(正常10min/预警3min/紧急1min)")
 
+    # FIX P2-9: 盘中启动补跑 — 若调度器在盘中时段启动，立即启动盘中监控（不等待次日09:30）
+    try:
+        _now_startup = datetime.datetime.now()
+        _startup_hm = (_now_startup.hour, _now_startup.minute)
+        if is_trading_day(datetime.date.today()) and (9, 30) <= _startup_hm and _now_startup.hour < 15:
+            logger.info("[盘中监控] 检测到盘中时段启动，立即补跑启动盘中监控")
+            start_intraday_monitor()
+    except Exception as e:
+        logger.warning(f"[盘中监控] 补跑启动失败(不影响主循环): {e}")
+
     # P0: 启动时立即写入心跳
     _write_heartbeat()
 
@@ -2139,6 +2430,77 @@ def start_scheduler():
 
 
 # ============================================================
+# P0 自愈: 心跳失联告警 + 自动拉起主循环
+# ============================================================
+
+SELF_HEAL_STALE_SECONDS = 900  # 心跳超过15分钟未更新视为失联
+
+
+def run_self_heal():
+    """P0 调度器自愈: 心跳失联 → 发失联告警邮件 + 拉起主调度循环
+
+    由Windows任务 TradingSystem_SelfHeal(09:31) 触发。
+    主循环拉起后盘中监控/统一盘中预警等盘中任务一并恢复（主循环是唯一载体）。
+    start_scheduler内部_acquire_lock单实例锁防止重复拉起。
+    """
+    try:
+        if not is_trading_day(datetime.date.today()):
+            logger.info("[自愈] 非交易日，跳过")
+            return
+
+        # 第1步: 心跳检测
+        last_beat = None
+        alive = False
+        try:
+            if os.path.exists(HEARTBEAT_FILE):
+                with open(HEARTBEAT_FILE, "r") as f:
+                    ts_str = f.read().strip().split("|")[0]
+                last_beat = datetime.datetime.fromisoformat(ts_str)
+                alive = (datetime.datetime.now() - last_beat).total_seconds() <= SELF_HEAL_STALE_SECONDS
+        except Exception:
+            alive = False
+
+        if alive:
+            logger.info("[自愈] 心跳正常，无需处理")
+            return
+
+        last_str = last_beat.strftime("%Y-%m-%d %H:%M:%S") if last_beat else "无心跳记录"
+        logger.warning(f"[自愈] 检测到心跳失联(最后: {last_str})，启动告警与拉起")
+
+        # 第2步: 失联告警邮件
+        try:
+            from notify.email_notify import send_email
+            html = (
+                "<html><body style='font-family:Microsoft YaHei,sans-serif;padding:20px'>"
+                "<h2 style='color:#cf1322'>⚠️ 调度器失联告警</h2>"
+                f"<p>最后心跳时间: <b>{last_str}</b></p>"
+                f"<p>检测时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"（失联阈值{SELF_HEAL_STALE_SECONDS // 60}分钟）</p>"
+                "<p>主调度循环可能已停止，盘中预警/定时报告将不会触发。</p>"
+                "<p>系统正在尝试自动拉起调度器主循环，若反复收到本邮件请人工检查。</p>"
+                "</body></html>"
+            )
+            send_email(f"[操盘密码] ⚠️调度器失联告警 {datetime.date.today()} | 最后心跳{last_str}", html)
+        except Exception as e:
+            logger.warning(f"[自愈] 失联告警邮件发送失败: {e}")
+
+        # 第3步: 拉起主调度循环（python scheduler.py无参数→start_scheduler，内部单实例锁防重复）
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__)],
+                cwd=PROJECT_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+            logger.info("[自愈] 已发起拉起: python scheduler.py (主循环)")
+        except Exception as e:
+            logger.warning(f"[自愈] 拉起主循环失败: {e}")
+    except Exception as e:
+        logger.warning(f"[自愈] 异常(不影响其他任务): {e}")
+
+
+# ============================================================
 # 四、Windows任务计划程序（每个报告独立任务）
 # ============================================================
 
@@ -2154,6 +2516,7 @@ SCHEDULED_TASKS = [
     ("TradingSystem_Weekly",          "10:00", "--run-weekly",           "周六周策略报告"),
     ("TradingSystem_MLTraining",      "11:00", "--run-ml-training",      "周六ML模型训练"),
     ("TradingSystem_WalkForward",     "09:00", "--run-walk-forward",     "月度Walk-Forward验证(每月1日)"),
+    ("TradingSystem_SelfHeal",        "09:31", "--self-heal",            "P0调度器自愈(心跳检测+自动拉起)"),
 ]
 
 
@@ -2244,6 +2607,12 @@ def main():
                         help="运行涨停基因跟踪")
     parser.add_argument("--run-holdings-report", action="store_true",
                         help="运行综合分析报告(技术面+条件单)")
+    parser.add_argument("--run-auction-track", action="store_true",
+                        help="运行V9.0竞价轨迹采集")
+    parser.add_argument("--run-auction-analysis", action="store_true",
+                        help="运行V9.0集合竞价分析")
+    parser.add_argument("--self-heal", action="store_true",
+                        help="P0调度器自愈: 心跳失联检测+告警邮件+拉起主循环")
     args = parser.parse_args()
 
     # 配置日志
@@ -2264,6 +2633,11 @@ def main():
     elif args.uninstall:
         uninstall_windows_task()
     else:
+        # P0: 调度器自愈任务（自身检测心跳，不走心跳去重逻辑）
+        if getattr(args, 'self_heal', False):
+            run_self_heal()
+            return
+
         # P1: CLI一次性任务执行前检查主循环是否存活，避免双重执行
         _ONE_SHOT_TASKS = {
             'run_once': run_daily_task,
@@ -2277,6 +2651,8 @@ def main():
             'run_intraday_decision': run_intraday_decision_task,
             'run_zt_gene': run_zt_gene_task,
             'run_holdings_report': run_holdings_report_task,
+            'run_auction_track': run_auction_tracking_task,
+            'run_auction_analysis': run_auction_analysis,
         }
         dispatched = False
         for arg_name, func in _ONE_SHOT_TASKS.items():
@@ -2291,13 +2667,15 @@ def main():
                 break
 
         if not dispatched:
-            # Walk-Forward特殊处理（手动触发忽略日期限制）
+            # FIX: Walk-Forward CLI入口改为走带日期校验的入口。
+            # 原逻辑调用_force_walk_forward()强制绕过today.day==1检查，
+            # 而Windows任务TradingSystem_WalkForward每日09:00触发，
+            # 导致非1号交易日也执行月度资金重置(monthly_start_capital)，月度收益统计失真。
             if args.run_walk_forward:
                 if is_scheduler_alive():
                     logger.info("[P1去重] 调度器主循环存活，跳过CLI任务: --run-walk-forward")
                 else:
-                    _run_monthly_walk_forward.__wrapped__ = True
-                    _force_walk_forward()
+                    _run_monthly_walk_forward()
             else:
                 start_scheduler()
 
