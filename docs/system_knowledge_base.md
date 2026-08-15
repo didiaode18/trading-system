@@ -1,6 +1,6 @@
 # 操盘密码 V9.0 系统设计知识库
 
-> 版本: V3.2 | 最后同步日期: 2026-07-28 | 对应代码版本: 操盘密码 V9.0 | 基于代码实际实现编写
+> 版本: V9.0 | 最后同步日期: 2026-08-16 | 对应代码版本: 操盘密码 V9.0 | 基于代码实际实现编写
 
 ---
 
@@ -40,11 +40,13 @@
 | 6 | position/ | 仓位管理 | kelly.py, risk_parity.py, vol_target.py | risk, factors | execution |
 | 7 | quant/ | 量化引擎与组合优化 | engine.py, portfolio.py | factors, position | backtest |
 | 8 | ml/ | 机器学习信号增强(LightGBM) | trainer.py, predictor.py, features.py | factors, data | strategy |
-| 9 | execution/ | 交易执行 | twap.py, slippage_tracker.py | risk, position | broker(QMT) |
+| 9 | execution/ | 交易执行与执行归因 | execution_closure.py, slippage_tracker.py, order_attribution.py | risk, position | broker(QMT), 报告 |
 | 10 | monitor/ | 盘中实时监控 | intraday_monitor.py | data(realtime) | notify |
 | 11 | attribution/ | 绩效归因 | alpha_beta.py, barra.py | backtest | 报告 |
-| 12 | notify/ | 通知推送 | email_notify.py, wechat_notify.py | 所有模块 | 用户 |
-| 13 | paper_trading/ | 模拟交易验证 | simulator.py | strategy, risk | attribution |
+| 12 | notify/ | 通知推送 | email_notify.py, wechat_notify.py, alert_ledger.py | 所有模块 | 用户 |
+| 13 | output/ | 报告区块与组合监控 | weekly_review.py, portfolio_monitor.py, live_divergence.py | attribution, factors, data | 邮件报告 |
+
+> [NOTE] 早期规划中的 paper_trading/（模拟交易）层尚未建目录落地，当前实际落地为 12 个模块层 + output/ 报告层；模拟验证能力由回测层（backtest/）承担。
 
 ### 1.3 数据流向
 
@@ -247,6 +249,27 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 ```
 
 **候选池总容量**: 最大 29 + 10 + 15 + 1(指数) = **55只**
+
+### 3.8 选股质量增强 G1-G12（V4.0新增，2026-08完成）
+
+针对CANSLIM选股与顶级系统的差距，实施G1-G12共12项改进（全部已完成，测试89/89通过）：
+
+| 编号 | 改进项 | 实现位置 | 状态 |
+|------|--------|----------|------|
+| G1 | 报告输出前数据质量校验（止损/买点异常自动降级为观察） | `validate_screener_result()` @ stock_screener.py | ✅ 已生效（send_screener_email入口自动调用） |
+| G2 | 历史推荐表现T+20真实前瞻结算（cohort胜率反馈） | ic_monitor.load_cohort_performance_stats + scheduler结算任务 | ✅ 已接入报告（已结算期数>0才渲染，当前结算期数仍在积累） |
+| G3 | 选股覆盖面统计（_universe_info/coverage_pct） | run_screener返回结构 | ⏳ 底层已产出，报告HTML展示区块待接入 |
+| G4 | 被风控拦截的条件单不进入QMT JSON | daily_orders.py（blocked过滤） | ✅ 已生效 |
+| G5 | 因子IC权重状态标注（近5期Spearman IC+降权建议） | 选股报告HTML"因子IC权重状态"区块 | ✅ 标注已展示；IC_DEWEIGHT_ENABLED=False观察模式，降权仅标注不实际施加 |
+| G6 | 再平衡建议转条件单（from_rebalance标记） | daily_orders.py + calc_rebalance_plan | ✅ 已生效 |
+| G7 | 预警效果台账（预警后T+5收益回填） | alert_ledger.py | ✅ 台账积累中（样本足够后在报告展示，见M3） |
+| G8 | 调度器/盘中监控双心跳落盘 | scheduler心跳 + system_health_section消费 | ✅ 已接入综合分析报告健康度区块 |
+| G9 | 因子行业/市值中性化 | factors/neutralize.py | ✅ 模块完成可独立测试，接入因子管线待后续 |
+| G10 | 滑点历史积累与校准建议（只展示不自动写回） | slippage_tracker + slippage_section | ✅ 已接入报告（见P3） |
+| G11 | 周报执行归因（信号→委托→成交链路） | caopan_report.py周报执行归因节 | ✅ 已接入 |
+| G12 | 数据源降级原因汇总警示区 | 选股报告"数据质量警示区" | ✅ 已生效 |
+
+> ⚠️ 风控纪律：G5的IC降权在积累≥20个真实结算cohort前保持观察模式，不实际改变因子权重；校准类能力（如滑点回写）一律只展示建议，需人工确认后手动启用。
 
 ---
 
@@ -665,6 +688,45 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 
 ---
 
+## 10. 综合分析报告增强 V4.1（M/P/E 十项，2026-08完成）
+
+对照顶级量化系统的综合分析报告能力，完成10项差距修复（全部为可独立测试模块+报告脚本薄接入，try/except静默降级，config零新增参数）：
+
+### 10.1 完全缺失项补齐（M类）
+
+| 编号 | 能力 | 模块 | 接入点与降级逻辑 |
+|------|------|------|----------------|
+| M1 | 实盘偏差监控（回测胜率 vs G2 cohort实盘结算，偏差>50%红色告警提示降仓防守而非改参数） | output/live_divergence.py | 综合分析报告；样本不足时显示"积累中" |
+| M2 | 条件单执行归因（委托vs成交双源匹配：trades_today.json + trade_journal.db） | execution/order_attribution.py | 综合分析报告（近3日）+ 周报（近7日）；无订单数据时隐藏 |
+| M3 | 预警闭环统计（台账回填率/按规则后验收益/预警后5日下跌占比） | notify/alert_stats_section.py | 综合分析报告；台账样本<3时隐藏 |
+| M4 | 组合净值曲线 vs 沪深300基准（base64图表内嵌邮件） | output/portfolio_monitor.py | 综合分析报告 + 周度回顾 |
+
+### 10.2 部分具备项完善（P类）
+
+| 编号 | 能力 | 说明 |
+|------|------|------|
+| P1 | 周报基准收益修复 | 修复 weekly_review `benchmark_return: 0 # TODO`，改从本地DB取沪深300近5日；取不到时显示"暂无"而非误导性0 |
+| P2 | CAPM/择时归因 | 实盘净值 vs 沪深300对齐后调用 attribution/alpha_beta（含T-M择时）；样本<20时标注"样本偏少结论仅供参考" |
+| P3 | 滑点归因区块 | execution/slippage_section.py；校准建议只展示"待人工确认"，绝不调用apply_backtest_adjustment自动写回 |
+| P4 | Deflated Sharpe进月度Walk-Forward邮件 | DSR>0.95才认为夏普显著（多重检验校正） |
+| P5 | CANSLIM五因子IC趋势 | 周报归因节；只汇总N/S/L/CAI/P主因子（不含57个技术因子） |
+
+### 10.3 需要增强项（E类）
+
+| 编号 | 能力 | 说明 |
+|------|------|------|
+| E1 | strategy_analysis_report定时化 | scheduler每日10:00检查，仅每月1日执行；开关 `STRATEGY_ANALYSIS_MONTHLY_ENABLED` **默认关**（config未设置视为False，全量回测耗时长，需人工确认资源占用后启用） |
+| E2 | overfit_guard过拟合守卫审计 | 月度Walk-Forward邮件附审计摘要（参数预算/魔数阈值热点文件）；CLI：`python scripts/overfit_guard.py` |
+| E3 | 系统健康度区块 | output/system_health_section.py：调度器心跳（>320秒异常）+ 盘中监控心跳（盘后显示"已收盘"不判异常）+ G2结算链路新鲜度 |
+
+### 10.4 已知限制与风险提示
+
+- **M2成交率口径**：trade_journal.db的trades表当前为空，成交仅记录在trades_today.json（单日），条件单未触发属正常现象，成交率偏低不代表异常；建议后续将每日成交回填交易日志使归因口径更完整。
+- **数据积累依赖**：M1/CAPM归因/G2结算目前样本少（净值序列仅十几天、cohort 0期结算），需积累1-2周后复核展示效果。
+- **测试结论**（2026-08-08）：pytest 89/89通过；选股/条件单/报告/周报四链路冒烟全部通过；14个近期修改文件py_compile全部通过；全程未触发真实邮件。
+
+---
+
 > [NOTE] 本知识库基于代码实际实现编写，参数值来源于 trading_system/config.py 和 trading_system/risk/risk_control.py。
 > 如有代码更新，请同步更新本文档对应章节。
 >
@@ -673,3 +735,8 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 > - 新增 3.6 双通道盘中扫描（intraday_alert.py）
 > - 新增 3.7 三层候选池在report_dispatcher中的实现
 > - caopan_report.py CLI流程集成run_momentum_screener()
+>
+> V4.1更新记录（2026-08-08）：
+> - 模块架构表修正：execution/核心文件改为实际存在的execution_closure/slippage_tracker/order_attribution；paper_trading尚未落地，新增output/报告层行
+> - 新增 3.8 选股质量增强G1-G12（含各项状态标注）
+> - 新增 10. 综合分析报告增强V4.1（M1-M4/P1-P5/E1-E3十项，含已知限制与测试结论）

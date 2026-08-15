@@ -519,12 +519,18 @@ def run_canslim_backtest(data_dict):
 
         bp_stats["total"] += 1
         # 检查5日内是否触发
+        # FIX: aggressive 改为每个信号独立判断（原条件 bp_stats["aggressive"] == bp_stats["total"] - 1 导致漏计），触及计一次并 break 防重复计数
+        for d in range(1, min(6, len(df) - idx)):
+            low = df["low"].iloc[idx + d]
+            if low <= aggressive_buy:
+                bp_stats["aggressive"] += 1
+                # 用触及当日 low 计算前瞻收益（保持原语义）
+                fwd_10 = (df["close"].iloc[min(idx+d+10, len(df)-1)] - low) / low * 100 if idx+d+10 < len(df) else 0
+                bp_profits["aggressive"].append(fwd_10)
+                break
         for d in range(1, min(6, len(df) - idx)):
             low = df["low"].iloc[idx + d]
             fwd_10 = (df["close"].iloc[min(idx+d+10, len(df)-1)] - low) / low * 100 if idx+d+10 < len(df) else 0
-            if low <= aggressive_buy and bp_stats["aggressive"] == bp_stats["total"] - 1:
-                bp_stats["aggressive"] += 1
-                bp_profits["aggressive"].append(fwd_10)
             if low <= moderate_buy:
                 bp_stats["moderate"] += 1
                 bp_profits["moderate"].append(fwd_10)
@@ -627,10 +633,12 @@ def run_composite_backtest(data_dict, precomputed):
                     f"WR={stat['win_rate']:.1f}%")
 
     # B2: 调仓逻辑验证
-    logger.info("\n  --- B2: 调仓逻辑验证(SELL<40, BUY>65, GAP>=20) ---")
-    SELL_THRESHOLD = 40
-    BUY_THRESHOLD = 65
-    SCORE_GAP = 20
+    # FIX: 阈值改从 config.REBALANCE_CONFIG 单一来源读取，与实盘口径对齐（原硬编码 40/65/20 为错误旧值）
+    _rb_cfg = getattr(config, "REBALANCE_CONFIG", {"score_gap": 25, "sell_threshold": 30, "buy_threshold": 70})
+    SELL_THRESHOLD = _rb_cfg["sell_threshold"]   # 30
+    BUY_THRESHOLD = _rb_cfg["buy_threshold"]     # 70
+    SCORE_GAP = _rb_cfg["score_gap"]             # 25
+    logger.info(f"\n  --- B2: 调仓逻辑验证(SELL<{SELL_THRESHOLD}, BUY>{BUY_THRESHOLD}, GAP>={SCORE_GAP}) ---")
 
     rebalance_events = []
     # 每个扫描日检查是否有调仓机会
@@ -675,7 +683,8 @@ def run_composite_backtest(data_dict, precomputed):
             "benefit": benefit
         }
     else:
-        logger.info("    [WARN] 无调仓事件触发(SCORE_GAP=20可能过大)")
+        # FIX: 文案与实际阈值同步（SCORE_GAP 取自 config.REBALANCE_CONFIG）
+        logger.info(f"    [WARN] 无调仓事件触发(SCORE_GAP={SCORE_GAP}可能过大)")
         # 测试不同GAP
         for gap_test in [10, 15, 20, 25, 30]:
             cnt = 0
@@ -923,6 +932,8 @@ def run_portfolio_backtest(data_dict, precomputed):
     win_rate = win_trades / total_trades * 100 if total_trades > 0 else 0
     avg_win = np.mean([t["pnl_pct"] for t in sell_trades if t["pnl_pct"] > 0]) if win_trades > 0 else 0
     avg_loss = abs(np.mean([t["pnl_pct"] for t in sell_trades if t["pnl_pct"] <= 0])) if (total_trades - win_trades) > 0 else 1
+    # FIX: 注释澄清：此变量名为 profit_factor，但计算实为盈亏比(payoff ratio = 平均盈利/平均亏损)，
+    # 而非 profit factor(总盈利/总亏损)；不重命名以避免下游连锁改动
     profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
 
     # 夏普
@@ -1057,6 +1068,15 @@ def run():
     print("  CANSLIM + 综合分析报告 历史回测验证")
     print(f"  区间: {START_DATE} ~ {END_DATE} | 资金: {INITIAL_CAPITAL:,.0f}")
     print("=" * 60)
+
+    # FIX: 回测口径固定声明（与实盘差异提示，避免误读回测结论）
+    logger.info(
+        "回测口径声明：本回测按信号日收盘价(+滑点)买入（实盘为 T+1 买点价执行）；"
+        "三档买点按当日最低价判定触及（乐观假设）；"
+        "CAI 因子固定 8 分（实盘为动量代理/中性分）；"
+        "股票池为 stock_db.db 现存标的（存在幸存者偏差）；"
+        "结论与实盘绩效不可直接比较。"
+    )
 
     # 1. 加载数据
     data_dict = load_data()

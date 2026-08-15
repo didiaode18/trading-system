@@ -58,12 +58,12 @@ class WalkForwardAnalyzer:
         result = wf.run(data_dict, stock_codes)
     """
 
-    def __init__(self, train_days: int = 120, test_days: int = 40,
+    def __init__(self, train_days: int = 150, test_days: int = 40,
                  param_grid: dict = None, initial_capital: float = None,
                  max_windows: int = None):
         """
         参数:
-            train_days: 训练窗口天数（V2.0: 60→120，覆盖完整牛熊周期）
+            train_days: 训练窗口天数（V2.1: 120→150，覆盖更长周期减少过拟合）
             test_days: 验证窗口天数（V2.0: 20→40，增加统计显著性）
             param_grid: 参数网格 {"参数名": [值1, 值2, ...]}
             initial_capital: 初始资金
@@ -72,11 +72,11 @@ class WalkForwardAnalyzer:
         self.train_days = train_days
         self.test_days = test_days
         self.max_windows = max_windows
-        # V2.0: 精简参数网格，仅优化核心参数（降低过拟合维度）
+        # P1-6: 精简参数网格，仅2个核心参数×2-3值=6组合（原27组合过拟合维度太高）
+        # min_signal_quality对齐P0-2新门槛62，取60/65/70
         self.param_grid = param_grid or {
-            "initial_stop_loss": [0.06, 0.07, 0.08],
-            "min_signal_quality": [55, 60, 65],
-            "drawdown_leader": [0.05, 0.06, 0.07],
+            "initial_stop_loss": [0.06, 0.08],
+            "min_signal_quality": [60, 65, 70],
         }
         self.initial_capital = initial_capital or config.TOTAL_CAPITAL
 
@@ -288,15 +288,6 @@ class WalkForwardAnalyzer:
             "total_return": round(sum(returns), 2),
             "max_drawdown": round(min(returns) if returns else 0, 2),
         }
-
-    # 保留旧接口向后兼容
-    def _optimize_on_train(self, data_dict, stock_codes, start_date, end_date):
-        """[已废弃] 使用事件驱动引擎的旧接口，保留兼容"""
-        return self._optimize_on_train_v5(data_dict, stock_codes, start_date, end_date)
-
-    def _evaluate_on_test(self, data_dict, stock_codes, start_date, end_date, params):
-        """[已废弃] 使用事件驱动引擎的旧接口，保留兼容"""
-        return self._evaluate_on_test_v5(data_dict, stock_codes, start_date, end_date, params)
 
     def _summarize(self, results: list) -> dict:
         """汇总所有窗口结果"""

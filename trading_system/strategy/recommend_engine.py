@@ -15,8 +15,7 @@
 """
 
 import logging
-import datetime
-import numpy as np
+# FIX: 清理死代码无用 import（datetime/numpy 均 grep 确认本文件零使用）
 import pandas as pd
 
 import sys, os
@@ -36,7 +35,8 @@ MIN_RISK_REWARD = getattr(config, 'MIN_RISK_REWARD_RATIO', getattr(config, 'MIN_
 MIN_AVG_AMOUNT = 3e8         # 日均成交额最低3亿
 MIN_MARKET_CAP = 100e8       # 最低总市值100亿（近似用成交额替代）
 MAX_SECTOR_RATIO = 0.25      # 单赛道最大仓位25%
-MAX_SINGLE_RATIO = 0.15      # 单只最大仓位15%
+# FIX P1(2026-08-07): 单只仓位上限收口config（原硬编码15%与scheduler/报告/kelly口径不一）
+MAX_SINGLE_RATIO = getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15)
 
 
 # ============================================================
@@ -526,13 +526,16 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
 
     # ---- 止损价 ----
     # P2优化: 止损与config统一，不再硬编码5%上限
+    # FIX P0(2026-08-07): 原实现将fixed_stop放进max()，止损距离恒≤10%，
+    # "给ATR止损留余量(至12%)"从未生效且距离限制行为死代码。
+    # 改为双向钳制: ATR/支撑止损取较高者作技术止损，
+    # 距离上限=STOP_LOSS_PCT+2%(不无限远)，距离下限=STOP_LOSS_PCT(不过度收紧防频繁止损)
     atr_stop = price - 2 * atr
-    fixed_stop = price * (1 - STOP_LOSS_PCT)
     support_stop = first_support * 0.98  # 支撑位下方2%
-    stop_loss = max(atr_stop, fixed_stop, support_stop)
-    # 止损不超过STOP_LOSS_PCT+2%（给ATR止损留余量，但不无限远）
-    max_stop_distance = price * (1 - STOP_LOSS_PCT - 0.02)
-    stop_loss = round(max(stop_loss, max_stop_distance), 2)
+    technical_stop = max(atr_stop, support_stop)
+    stop_floor = price * (1 - STOP_LOSS_PCT - 0.02)   # 距离上限12% → 止损价下限
+    stop_ceiling = price * (1 - STOP_LOSS_PCT)        # 距离下限10% → 止损价上限
+    stop_loss = round(min(max(technical_stop, stop_floor), stop_ceiling), 2)
 
     # ---- 目标价 ----
     target_1 = round(first_resistance, 2)
@@ -563,7 +566,7 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     else:
         max_shares_by_risk = 0
 
-    # 单只仓位上限15%
+    # 单只仓位上限（config.MAX_SINGLE_STOCK_RATIO统一配置）
     max_amount_by_position = TOTAL_CAPITAL * MAX_SINGLE_RATIO
     max_shares_by_position = int(max_amount_by_position / price / 100) * 100
 

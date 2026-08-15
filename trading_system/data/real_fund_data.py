@@ -50,6 +50,11 @@ class RealFundData:
     _cache_lock = threading.Lock()
     _COOLDOWN_SECONDS = 300  # 5分钟冷却期
 
+    # V5修复: ETF/基金非北向持股与两融标的，对其发起真实数据请求必失败
+    # 且刷屏警告(如"北向资金: 588000 获取失败")，识别后直接走量价估算路径
+    _ETF_FUND_PREFIXES = ("159", "510", "511", "512", "513", "515",
+                          "516", "518", "560", "562", "588")
+
     def __init__(self, config: dict = None):
         self.cfg = {**FUND_CONFIG, **(config or {})}
         self._cache = {}
@@ -83,9 +88,10 @@ class RealFundData:
             "signal": "数据不可用",
         }
 
-        # 尝试获取真实数据
-        north_data = self._fetch_north_fund(code)
-        margin_data = self._fetch_margin_data(code)
+        # 尝试获取真实数据（ETF/基金非北向与两融标的，跳过真实源直接估算）
+        _is_etf = str(code).startswith(self._ETF_FUND_PREFIXES)
+        north_data = None if _is_etf else self._fetch_north_fund(code)
+        margin_data = None if _is_etf else self._fetch_margin_data(code)
 
         if north_data or margin_data:
             result["data_source"] = "real"

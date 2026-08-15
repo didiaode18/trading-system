@@ -50,6 +50,13 @@ try:
 except ImportError:
     HAS_AKSHARE = False
 
+# FIX: 修复盘中监控实例状态全内存、进程重启导致重复邮件/重复条件单/缓冲计时重置的问题
+# 状态持久化文件（按交易日key，跨日自动重置，参照alert_cooldown.json模式）
+_INTRADAY_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "intraday_state.json"
+)
+
 
 class IntradayMonitor:
     """盘中实时监控器（V8.0: 梯度减仓+智能缓冲+变频监控增强版）"""
@@ -92,6 +99,11 @@ class IntradayMonitor:
         self.gradient_cfg = getattr(config, 'GRADIENT_REDUCE_CONFIG', {})
         self.gradient_triggered = {}  # {code: set()} 已触发的梯度级别
 
+        # 批2-S3: ATR自适应档位观察缓存（日线14日ATR，每日每标的最多算一次，严禁轮询内拉数据）
+        self._atr_cache = {"date": None, "values": {}}  # {"date": "YYYY-MM-DD", "values": {code: atr|None}}
+        self._atr_obs_logged = set()        # {f"{date}_{code}_{level}"} ATR档位观察日志去重，避免刷屏
+        self._sector_switch_logged = False  # 板块涨跌幅开关状态日志标记（仅记录一次，勿刷屏）
+
         # V8.0: 智能缓冲配置
         self.smart_buffer_cfg = getattr(config, 'SMART_BUFFER_CONFIG', {})
 
@@ -118,6 +130,61 @@ class IntradayMonitor:
         self.closing_alerts_sent = set() # 尾盘预警已发送
         self.day_phase_label = {}        # {code: str} 当日定性标签
         self.price_history = {}          # {code: [(time, price)]} 分时价格序列(P2-3用)
+
+        # FIX: 从持久化文件加载当日状态（盘中重启不重复报警/不重置缓冲计时）
+        self._load_state()
+
+    # ============================================================
+    # 状态持久化（FIX: 参照alert_cooldown.json模式，失败仅debug不阻断）
+    # ============================================================
+
+    def _load_state(self):
+        """FIX: 加载当日盘中监控状态（跨日自动重置为空状态，失败降级不阻断）"""
+        try:
+            if not os.path.exists(_INTRADAY_STATE_FILE):
+                return
+            with open(_INTRADAY_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") != datetime.date.today().isoformat():
+                return  # 跨日自动清理：非当日状态不加载，下次保存时覆盖
+            self.alerts_sent = set(data.get("alerts_sent", []))
+            self.gradient_triggered = {
+                c: set(v) for c, v in data.get("gradient_triggered", {}).items()
+            }
+            self.alert_level = data.get("alert_level", "normal")
+            self._clear_count = int(data.get("clear_count", 0))
+            for c, t in data.get("stop_loss_first_touch", {}).items():
+                try:
+                    self.stop_loss_first_touch[c] = datetime.datetime.fromisoformat(t)
+                except (TypeError, ValueError):
+                    continue
+            self.opening_phase_done = bool(data.get("opening_phase_done", False))
+            self.closing_alerts_sent = set(data.get("closing_alerts_sent", []))
+            logger.info(f"[盘中监控] 已恢复当日状态: 已发预警{len(self.alerts_sent)}条, "
+                        f"缓冲计时{len(self.stop_loss_first_touch)}只")
+        except Exception as e:
+            logger.debug(f"[盘中监控] 状态加载失败，使用空状态: {e}")
+
+    def _save_state(self):
+        """FIX: 当日状态落盘（按交易日key，失败仅debug不阻断监控）"""
+        try:
+            data = {
+                "date": datetime.date.today().isoformat(),
+                "alerts_sent": list(self.alerts_sent),
+                "gradient_triggered": {c: list(v) for c, v in self.gradient_triggered.items()},
+                "alert_level": self.alert_level,
+                "clear_count": self._clear_count,
+                "stop_loss_first_touch": {
+                    c: t.isoformat() for c, t in self.stop_loss_first_touch.items()
+                },
+                "opening_phase_done": self.opening_phase_done,
+                "closing_alerts_sent": list(self.closing_alerts_sent),
+            }
+            os.makedirs(os.path.dirname(_INTRADAY_STATE_FILE), exist_ok=True)
+            with open(_INTRADAY_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.debug(f"[盘中监控] 状态持久化失败: {e}")
 
     # ============================================================
     # 一、启动监控
@@ -146,6 +213,8 @@ class IntradayMonitor:
 
             # 只在交易时段运行
             if not self._is_trading_time(now):
+                # V4.0(G8): 非交易时段也写心跳（状态idle），供watchdog区分"线程存活但非盘中"与"线程已死"
+                self._write_heartbeat("idle")
                 # 非交易时间等待
                 time.sleep(300)
                 continue
@@ -155,7 +224,20 @@ class IntradayMonitor:
             except Exception as e:
                 logger.error(f"[盘中监控] 检查异常: {e}")
 
+            # V4.0(G8): 每轮扫描后写心跳文件，watchdog据此检测监控静默失效
+            self._write_heartbeat("active")
+
             time.sleep(self.poll_interval)
+
+    def _write_heartbeat(self, status: str):
+        """V4.0(G8): 写入监控心跳文件（时间戳|PID|状态），失败不影响主流程"""
+        try:
+            hb_path = os.path.join(config.PROJECT_ROOT, "output", ".monitor_heartbeat")
+            os.makedirs(os.path.dirname(hb_path), exist_ok=True)
+            with open(hb_path, "w") as f:
+                f.write(f"{datetime.datetime.now().isoformat()}|{os.getpid()}|{status}")
+        except Exception:
+            pass
 
     def stop(self):
         """停止监控"""
@@ -380,6 +462,9 @@ class IntradayMonitor:
                                 "current_price": current_price,
                                 "stop_loss": stop_loss,
                                 "buy_price": buy_price,
+                                # 批2-S3: 结构化标记（纯增量字段，供下游执行层识别止损类信号）
+                                "is_stop_signal": True,
+                                "stop_price": stop_loss,
                                 "loss_pct": round((current_price / buy_price - 1) * 100, 2),
                                 "buffer_minutes": round(elapsed_minutes, 1),
                                 "message": f"🚨 {name}({code}) 止损确认！"
@@ -474,7 +559,8 @@ class IntradayMonitor:
                 if profit_pct >= 0.10:
                     alert_key = f"{today}_{code}_profit_10"
                     if alert_key not in self.alerts_sent:
-                        sell_1_3 = int(shares / 3 / 100) * 100 if shares > 0 else 0
+                        # FIX: 修复100股持仓减1/3取整为0的问题（建议卖出量不超持有股数）
+                        sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
                         alert = {
                             "level": "info",
                             "type": "止盈提醒",
@@ -494,7 +580,8 @@ class IntradayMonitor:
                 if profit_pct >= 0.20:
                     alert_key = f"{today}_{code}_profit_20"
                     if alert_key not in self.alerts_sent:
-                        sell_1_3 = int(shares / 3 / 100) * 100 if shares > 0 else 0
+                        # FIX: 修复100股持仓减1/3取整为0的问题（建议卖出量不超持有股数）
+                        sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
                         alert = {
                             "level": "warning",
                             "type": "止盈提醒",
@@ -518,7 +605,8 @@ class IntradayMonitor:
                     if drawdown_from_high <= -dd_threshold:
                         alert_key = f"{today}_{code}_drawdown_profit"
                         if alert_key not in self.alerts_sent:
-                            sell_half = int(shares * 0.5 / 100) * 100 if shares > 0 else 0
+                            # FIX: 修复100股持仓减半取整为0的问题（建议卖出量不超持有股数）
+                            sell_half = min(shares, max(100, int(shares * 0.5 / 100) * 100)) if shares >= 100 else shares
                             alert = {
                                 "level": "warning",
                                 "type": "回落止盈",
@@ -627,6 +715,9 @@ class IntradayMonitor:
 
         # ---- V8.0: 更新监控级别（供scheduler变频使用）----
         self._update_alert_level(quotes, market_quote)
+
+        # FIX: 每轮检查后状态落盘（盘中重启不重复报警/不重置缓冲计时）
+        self._save_state()
 
         return alerts
 
@@ -882,6 +973,46 @@ class IntradayMonitor:
         if code not in self.gradient_triggered:
             self.gradient_triggered[code] = set()
 
+        # FIX(2026-08-12): 深亏模式 —— 浮亏远超清仓预警线(默认-30%)时成本已无止损纪律意义，
+        # 三档齐发会每天重复"清仓建议+3张超量条件单"轰炸；合并为每日1条汇总提醒且不生成条件单，
+        # 可在holdings.json对该标的设 "ack_deep_loss": true 完全豁免提醒
+        change_pct = quote.get("change_pct", 0) or 0
+        deep_cfg = self.gradient_cfg.get("deep_loss", {})
+        if (deep_cfg.get("enabled", True) and loss_pct <= deep_cfg.get("threshold", -0.30)
+                and not holding.get("ack_deep_loss")):
+            dl_key = f"{today}_{code}_deep_loss_digest"
+            if dl_key not in self.alerts_sent:
+                self.alerts_sent.add(dl_key)
+                # 标记全部档位已触发，防止降级开关变动后当日再走正常三档路径
+                self.gradient_triggered[code].update(
+                    lv["level"] for lv in self.gradient_cfg.get("levels", []))
+                alert = {
+                    "level": "warning",
+                    "type": "深亏标的每日提醒",
+                    "code": code,
+                    "name": name,
+                    "current_price": current_price,
+                    "buy_price": buy_price,
+                    "loss_pct": round(loss_pct * 100, 2),
+                    "message": f"🕳️ {name}({code}) 深亏{loss_pct*100:.1f}% "
+                              f"(成本{buy_price:.2f} 现价{current_price:.2f}) | "
+                              f"今日{change_pct:+.1f}% | "
+                              f"深亏模式: 已远超清仓预警线，不再重复发清仓建议/条件单，"
+                              f"每日仅提醒1次，请结合当日走势自主决策处置",
+                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                }
+                alerts.append(alert)
+                self._send_alert(alert)
+            return alerts
+
+        # 批2-S3: ATR自适应档位观察模式（每日每标的仅从本地日线算一次ATR，查缓存为主）
+        atr_log_only = getattr(config, "ATR_ADAPTIVE_STOP_LOG_ONLY", True)
+        atr_val = self._get_atr_cached(code)
+
+        # FIX(2026-08-12): 累计减仓股数 —— 同日多档齐发时各档均按全仓计算，
+        # 三张条件单合计会超持仓量（如6000股生成11000股卖单），需累计封顶
+        cum_reduce = 0
+
         # 梯度级别检查
         for level_cfg in self.gradient_cfg.get("levels", []):
             threshold = level_cfg["loss_pct"]
@@ -889,11 +1020,42 @@ class IntradayMonitor:
             reduce_ratio = level_cfg["reduce_ratio"]
             label = level_cfg["label"]
 
+            # ATR档位建议值（小数形式，如 0.05=5%；算不到ATR时保持固定档不变）
+            atr_suggest = None
+            if atr_val is not None:
+                try:
+                    from risk.risk_control import suggest_atr_threshold
+                    atr_suggest = suggest_atr_threshold(current_price, atr_val, abs(threshold))
+                except Exception as e:
+                    logger.debug(f"[ATR档位] {code} 建议值计算失败: {e}")
+
+            if atr_log_only:
+                # 观察模式（默认）: 判断逻辑完全不变，仅记录固定档与ATR建议的对比；
+                # 只在ATR建议值与固定档不同且当日未记录过时输出一行，避免刷屏
+                if (atr_suggest is not None and
+                        abs(atr_suggest - abs(threshold)) > 1e-9):
+                    obs_key = f"{today}_{code}_{level_name}"
+                    if obs_key not in self._atr_obs_logged:
+                        self._atr_obs_logged.add(obs_key)
+                        logger.info(
+                            f"ATR档位观察: {code} 固定档{threshold*100:.1f}% "
+                            f"vs ATR建议-{atr_suggest*100:.1f}%（观察模式，判断逻辑不变）"
+                        )
+            else:
+                # 观察期结束后启用: 档位生效值取更宽者（保持负号语义），本次默认行为不变
+                if atr_suggest is not None:
+                    threshold = min(threshold, -atr_suggest)
+
             if loss_pct <= threshold and level_name not in self.gradient_triggered[code]:
                 self.gradient_triggered[code].add(level_name)
                 reduce_shares = int(shares * reduce_ratio / 100) * 100  # 整百股
                 if reduce_shares < 100:
                     reduce_shares = min(shares, 100)
+                # FIX(2026-08-12): 按剩余可减股数封顶，保证同日多档条件单合计不超持仓
+                reduce_shares = min(reduce_shares, shares - cum_reduce)
+                if reduce_shares <= 0:
+                    continue
+                cum_reduce += reduce_shares
 
                 alert = {
                     "level": level_name,
@@ -905,9 +1067,12 @@ class IntradayMonitor:
                     "loss_pct": round(loss_pct * 100, 2),
                     "reduce_shares": reduce_shares,
                     "reduce_ratio": round(reduce_ratio * 100),
+                    # 批2-S3: 结构化标记；预警上下文无现成止损价，取现价×0.97作为参考价
+                    "is_stop_signal": True,
+                    "stop_price": round(current_price * 0.97, 2),
                     "message": f"🚨 {name}({code}) {label}！"
                               f"现价{current_price:.2f} 成本{buy_price:.2f} "
-                              f"浮亏{loss_pct*100:.1f}% | "
+                              f"浮亏{loss_pct*100:.1f}% | 今日{change_pct:+.1f}% | "
                               f"建议卖出{reduce_shares}股({reduce_ratio*100:.0f}%仓位) | "
                               f"请立即在东方财富APP挂单执行",
                     "time": datetime.datetime.now().strftime("%H:%M:%S"),
@@ -944,6 +1109,9 @@ class IntradayMonitor:
                 "current_price": current_price,
                 "change_pct": change_pct,
                 "reduce_shares": reduce_shares,
+                # 批2-S3: 结构化标记；预警上下文无现成止损价，取现价×0.97作为参考价
+                "is_stop_signal": True,
+                "stop_price": round(current_price * 0.97, 2),
                 "message": f"⚡ {name}({code}) 盘中放量暴跌{change_pct:.1f}%！"
                           f"量比{volume/avg_volume:.1f}倍 | "
                           f"不等收盘，建议立即减仓{reduce_shares}股(50%)",
@@ -958,6 +1126,41 @@ class IntradayMonitor:
                 )
 
         return alerts
+
+    def _get_atr_cached(self, code: str):
+        """
+        批2-S3: 获取标的日线14日ATR（实例级缓存，每日每标的最多从本地SQLite算一次）
+
+        缓存结构: {"date": "YYYY-MM-DD", "values": {code: atr|None}}
+        跨日自动失效；算不到（数据不足/异常）记 None 且当日不再重试；绝不抛异常。
+        """
+        try:
+            today = datetime.date.today().isoformat()
+            if self._atr_cache.get("date") != today:
+                self._atr_cache = {"date": today, "values": {}}
+            values = self._atr_cache["values"]
+            if code in values:
+                return values[code]
+            atr = None
+            try:
+                from data.data_loader import load_daily_data  # 本地SQLite读，无网络请求
+                df = load_daily_data(code, days=30)
+                # shift(1)+rolling(14) 至少需要15根日线
+                if df is not None and len(df) >= 15:
+                    high_low = df["high"] - df["low"]
+                    high_close = (df["high"] - df["close"].shift(1)).abs()
+                    low_close = (df["low"] - df["close"].shift(1)).abs()
+                    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                    last = tr.rolling(14).mean().iloc[-1]
+                    if pd.notna(last) and last > 0:
+                        atr = float(last)
+            except Exception as e:
+                logger.debug(f"[ATR缓存] {code} 日线ATR计算失败: {e}")
+                atr = None
+            values[code] = atr
+            return atr
+        except Exception:
+            return None
 
     def _generate_reduce_condition_order(self, code: str, name: str,
                                           price: float, shares: int, reason: str):
@@ -1039,9 +1242,14 @@ class IntradayMonitor:
             mkt_chg = market_quote.get("change_pct", 0)
             if mkt_chg < -0.5:
                 true_score += 1
-        # 4. 板块联动（简化: 用大盘代替，后续可扩展）
-        # 如果大盘跌>1%，大概率板块联动
-        if market_quote and market_quote.get("change_pct", 0) < -1.0:
+        # 4. 板块联动（批2-S3: 开关开启时用东财板块真实涨跌幅模糊匹配赛道，
+        #    未命中/失败/开关关闭一律回退大盘近似）
+        sector_chg = self._get_sector_change_pct(code, holding)
+        if sector_chg is not None:
+            if sector_chg < -1.0:
+                true_score += 1
+        elif market_quote and market_quote.get("change_pct", 0) < -1.0:
+            # 回退: 大盘跌>1%，大概率板块联动
             true_score += 1
         # 5. 连续多日下跌（用浮亏深度近似）
         if buy_price > 0 and current_price > 0:
@@ -1096,6 +1304,50 @@ class IntradayMonitor:
             return "wash_trading"
 
         return "unknown"
+
+    def _get_sector_change_pct(self, code: str, holding: dict):
+        """
+        批2-S3: 获取标的所属板块当日涨跌幅（SECTOR_CHANGE_PCT_ENABLED 开关控制）
+
+        返回:
+            float: 板块涨跌幅百分比（东财真实值）
+            None:  开关关闭/未命中/失败，调用方回退大盘近似
+        绝不抛异常。
+        """
+        try:
+            enabled = getattr(config, "SECTOR_CHANGE_PCT_ENABLED", False)
+            if not enabled:
+                # 默认关闭: 完全维持现状，仅首次记录一次开关状态（勿刷屏）
+                if not self._sector_switch_logged:
+                    self._sector_switch_logged = True
+                    logger.debug("[板块联动] SECTOR_CHANGE_PCT_ENABLED=关闭，维持大盘近似判定")
+                return None
+
+            # 赛道名: 优先持仓自带sector，其次STOCK_POOL的赛道字段
+            sector_name = holding.get("sector", "") or ""
+            if not sector_name:
+                sector_name = getattr(config, "STOCK_POOL", {}).get(code, {}).get("赛道", "")
+            if not sector_name:
+                return None
+
+            from data.realtime import fetch_sector_changes_cached  # O(1)模块级缓存
+            board_map = fetch_sector_changes_cached()
+            if not board_map:
+                return None
+
+            # 模糊匹配: 赛道名与东财板块名互相包含即命中
+            for board_name, pct in board_map.items():
+                if not board_name or pct is None:
+                    continue
+                if board_name in sector_name or sector_name in board_name:
+                    try:
+                        return float(pct)
+                    except (TypeError, ValueError):
+                        continue
+            return None
+        except Exception as e:
+            logger.debug(f"[板块联动] {code} 板块涨跌幅获取失败，回退大盘近似: {e}")
+            return None
 
     def _get_dynamic_buffer_minutes(self, code: str, quote: dict,
                                      holding: dict, market_quote: dict) -> float:
@@ -1210,8 +1462,11 @@ class IntradayMonitor:
         if was_above and not is_above and self.vwap_cfg.get("vwap_break_alert", True):
             alert_key = f"{today}_{code}_vwap_break"
             if alert_key not in self.alerts_sent:
+                # FIX(2026-08-12): ETF无主力多空博弈，VWAP失守的"空头控盘"语义弱，
+                # 降级为info避免与个股告警混淆（沪市51/56/58，深市15/16/18开头）
+                is_etf = code.startswith(("15", "16", "18", "51", "56", "58"))
                 alert = {
-                    "level": "warning",
+                    "level": "info" if is_etf else "warning",
                     "type": "VWAP失守",
                     "code": code,
                     "name": name,
@@ -1389,7 +1644,7 @@ class IntradayMonitor:
             return alerts
 
         volume = quote.get("volume", 0)  # 当日累计成交量(手)
-        avg_volume = holding.get("avg_volume", 0)  # 5日日均量
+        avg_volume = holding.get("avg_volume", 0)  # FIX: 更正注释口径: 近20日日均量(手)，由update_holdings.py写入
         change_pct = quote.get("change_pct", 0)
         buy_price = holding.get("buy_price", 0)
 

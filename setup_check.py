@@ -159,9 +159,17 @@ def check_holdings(config):
         if os.path.exists(hf):
             with open(hf, "r", encoding="utf-8") as f:
                 h = json.load(f)
-            record(isinstance(h, dict), "holdings.json格式正确", f"{len(h)}只持仓: {hf}")
+            record(isinstance(h, dict), "holdings.json格式正确", f"{hf}")
+            if isinstance(h, dict) and len(h) == 0:
+                record(True, "持仓内容检测",
+                       "持仓为空 {}，请参考 holdings.example.json 填写持仓",
+                       warn_only=True)
+            else:
+                record(True, "持仓内容检测", f"{len(h)}只持仓")
         else:
-            record(True, "holdings.json", "不存在（空仓模式，首次运行时创建）", warn_only=True)
+            record(True, "holdings.json",
+                   "不存在（请参考 holdings.example.json 创建并填写持仓）",
+                   warn_only=True)
     except Exception as e:
         record(False, "holdings.json", str(e))
 

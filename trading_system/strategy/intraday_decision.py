@@ -87,7 +87,7 @@ DECISION_CONFIG = {
 _MA5_CACHE = {"date": None, "data": {}}
 
 # 决策优先级排序权重
-_URGENCY_ORDER = {"紧急卖出": 0, "禁止加仓": 1, "建议减仓": 2, "持有观察": 3, "可以加仓": 4}
+_URGENCY_ORDER = {"紧急卖出": 0, "禁止加仓": 1, "建议减仓": 2, "回调加仓": 3, "持有观察": 4, "可以加仓": 5}
 
 
 # ============================================================
@@ -95,13 +95,8 @@ _URGENCY_ORDER = {"紧急卖出": 0, "禁止加仓": 1, "建议减仓": 2, "持�
 # ============================================================
 
 def load_holdings() -> dict:
-    """加载持仓文件（只取有仓位的标的）"""
-    holdings_file = getattr(config, 'HOLDINGS_FILE', None)
-    if not holdings_file or not os.path.exists(holdings_file):
-        holdings_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "holdings.json"
-        )
+    """加载持仓文件（只取有仓位的标的，路径统一委托 config）"""
+    holdings_file = config.get_holdings_file()
     if not os.path.exists(holdings_file):
         logger.warning("[盘中决策] 持仓文件不存在")
         return {}
@@ -333,9 +328,11 @@ def score_stock(code: str, info: dict, quote: dict, market_pct: float,
         pass
 
     # ---- 生成可执行建议 ----
+    # "可以加仓"时先调统一仓位引擎算加仓方案，供建议文案与风控预检共用
+    add_plan = _calc_add_plan(code, price, shares) if decision == "可以加仓" else None
     advice = _generate_action_advice(
         decision, price, shares, buy_price, stop_loss, weight,
-        pnl_pct, change_pct, market_value, total_market_value, cfg
+        pnl_pct, change_pct, market_value, total_market_value, cfg, add_plan
     )
 
     # ---- 下一步观察条件 ----
@@ -363,14 +360,35 @@ def score_stock(code: str, info: dict, quote: dict, market_pct: float,
         "range_position": range_position,
         "turnover": turnover,
         "advice": advice,
+        "add_plan": add_plan,
         "next_watch": next_watch,
         "stop_triggered": stop_triggered,
         "trend_broken": trend_broken,
     }
 
 
+def _calc_add_plan(code, price, shares) -> dict:
+    """调用统一仓位引擎计算加仓股数与新止损（异常时安全返回0股）
+
+    - ATR: 本函数上下文无日线df(不做新增网络调用)，取0走止损回退口径
+    - capital取值链: TOTAL_CAPITAL → INITIAL_CAPITAL → 兜底估算
+      兜底假设: 该股当前持仓约占总资金1/5，以 持仓市值×5 近似总资金
+    """
+    atr = 0.0
+    capital = getattr(config, "TOTAL_CAPITAL", 0) \
+        or getattr(config, "INITIAL_CAPITAL", 0) \
+        or shares * price * 5
+    try:
+        from risk.position_sizing import calc_add_position
+        return calc_add_position(code, price, shares, capital, atr=atr)
+    except Exception as e:
+        logger.warning(f"[盘中决策] {code} 仓位引擎加仓计算异常，维持不加仓: {e}")
+        return {"add_shares": 0, "new_stop": 0.0, "method": "仓位引擎异常"}
+
+
 def _generate_action_advice(decision, price, shares, buy_price, stop_loss,
-                            weight, pnl_pct, change_pct, mv, total_mv, cfg) -> str:
+                            weight, pnl_pct, change_pct, mv, total_mv, cfg,
+                            add_plan=None) -> str:
     """根据决策类型生成具体可执行建议"""
     if decision == "紧急卖出":
         sell_pct = cfg["emergency_sell_pct"]
@@ -410,14 +428,18 @@ def _generate_action_advice(decision, price, shares, buy_price, stop_loss,
                 f"站稳{price*1.02:.2f}以上且放量则可继续持有")
 
     elif decision == "可以加仓":
-        # 加仓条件: 仓位<30%才允许
+        # 加仓条件: 仓位<30%才允许追加，具体数量改由统一仓位引擎计算
         if weight > cfg["warn_single_weight"] * 100:
             return f"虽趋势偏强但仓位已{weight:.0f}%，不建议追加，持有即可"
-        add_shares = int(shares * 0.2 / 100) * 100  # 加仓不超过现有20%
-        add_shares = max(add_shares, 100)
-        new_stop = price * 0.95
+        add_plan = add_plan or _calc_add_plan(None, price, shares)
+        if add_plan["add_shares"] <= 0:
+            return (f"允许小幅加仓: 前提①回踩{price*0.99:.2f}不破②量能不萎缩。"
+                    f"仓位引擎不建议加仓(不足100股)，本轮不加仓，仅持有观察"
+                    f"(依据: {add_plan.get('method', '未知')})")
+        new_stop = add_plan["new_stop"]
         return (f"允许小幅加仓: 前提①回踩{price*0.99:.2f}不破②量能不萎缩。"
-                f"建议加{add_shares}股，加仓后止损上移至{new_stop:.2f}")
+                f"建议加{add_plan['add_shares']}股，加仓后止损上移至{new_stop:.2f}"
+                f"(依据: {add_plan.get('method', '仓位引擎')})")
 
     return "持有观察"
 
@@ -497,26 +519,108 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
     # 按紧急程度排序
     decisions.sort(key=lambda x: (_URGENCY_ORDER.get(x["decision"], 5), x["score"]))
 
-    # FIX P2-12: 加仓建议过风控预检（不通过时在建议文案追加说明，异常降级不阻断）
+    # FIX P2-12: 加仓建议过风控预检（不通过时降级决策并留痕，异常降级不阻断）
     try:
         from risk.risk_control import quick_risk_check
         for d in decisions:
             if d.get("decision") != "可以加仓":
                 continue
             try:
-                _add_shares = max(int(d.get("shares", 0) * 0.2 / 100) * 100, 100)
+                # V4.0(G7): 加仓股数/止损完全以统一仓位引擎为准，缺失时重算，
+                # 彻底移除原"持仓×20%"硬编码兑底（兑底会绕过风险预算/Kelly口径）
+                _ap = d.get("add_plan") or _calc_add_plan(d["code"], d["price"], d.get("shares", 0))
+                _add_shares = _ap.get("add_shares", 0)
+                if _add_shares <= 0:
+                    # 仓位引擎不建议加仓(不足100股) → 降级为持有观察，不再进入风控预检
+                    d["decision"] = "持有观察"
+                    d["decision_icon"] = "👀"
+                    d["advice"] = (d.get("advice", "") +
+                                   f"（仓位引擎不建议加仓: {_ap.get('method', '不足100股')}，加仓建议作废）")
+                    logger.info(f"[盘中决策] {d['code']} 仓位引擎输出0股，" 
+                                "决策由'可以加仓'降级为'持有观察'")
+                    continue
                 _rc = quick_risk_check({
                     "code": d["code"], "name": d["name"], "price": d["price"],
                     "shares": _add_shares, "sector": d.get("sector", ""),
-                    "type": "stock", "stop_loss": d["price"] * 0.95, "risk_reward": 0,
+                    "type": "stock",
+                    "stop_loss": _ap.get("new_stop") or d["price"] * 0.95,
+                    "risk_reward": 0,
                 }, holdings)
                 if not _rc.get("pass", True):
+                    _veto_reason = _rc.get('reason', '未知')
                     d["advice"] = (d.get("advice", "") +
-                                   f"（风控预检未通过：{_rc.get('reason', '未知')}，加仓建议作废）")
+                                   f"（风控预检未通过：{_veto_reason}，加仓建议作废）")
+                    # 预检不通过 → "可以加仓"降级为"持有观察"并留痕
+                    d["decision"] = "持有观察"
+                    d["decision_icon"] = "👀"
+                    d["risk_veto"] = {
+                        "reason": _veto_reason,
+                        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "original_decision": "可以加仓",
+                    }
+                    logger.warning(f"[盘中决策] {d['code']} 风控预检未通过({_veto_reason})，"
+                                   f"决策由'可以加仓'降级为'持有观察'")
             except Exception:
                 continue
     except Exception as e:
         logger.warning(f"[盘中决策] 风控预检异常(不影响报告): {e}")
+
+    # FIX V1.0: 逆势加仓（回调加仓）检测 —— 对"持有观察"/"禁止加仓"的持仓股检查回调企稳信号
+    try:
+        import config
+        pb_cfg = getattr(config, 'PULLBACK_ADD_CONFIG', {})
+        if pb_cfg.get("enabled", True):
+            from risk.risk_control import check_pullback_add_risk
+            # 大盘状态评估
+            _market_state = "up" if market_pct > 0.5 else ("neutral" if market_pct > -0.5 else "weak")
+            for d in decisions:
+                if d["decision"] not in ("持有观察", "禁止加仓"):
+                    continue  # 仅对非紧急标的检查回调加仓
+                code = d["code"]
+                try:
+                    # 获取日K线数据
+                    from data.data_loader import fetch_stock_daily
+                    _start = (datetime.date.today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+                    df = fetch_stock_daily(code, start_date=_start)
+                    if df is None or len(df) < 25:
+                        continue
+                    # 计算所需指标
+                    from strategy.trend_strategy import compute_indicators
+                    df = compute_indicators(df)
+                    # 调用回调加仓风控检查
+                    pb_result = check_pullback_add_risk(
+                        code, holdings, df,
+                        market_state=_market_state,
+                        market_drop_pct=market_pct / 100
+                    )
+                    if pb_result.get("pass"):
+                        # 覆盖决策为"回调加仓"
+                        d["decision"] = "回调加仓"
+                        d["decision_icon"] = "📉"
+                        d["pullback_add"] = pb_result
+                        d["reasons"].append(f"📉回调加仓信号: {pb_result['reason']}")
+                        # 生成回调加仓专属建议
+                        add_shares = pb_result["add_shares"]
+                        stop_loss = pb_result["stop_loss"]
+                        signal_type = pb_result.get("signal_type", "pullback_ma20")
+                        d["advice"] = (
+                            f"允许逆势加仓{add_shares}股(回调{pb_result['pullback_pct']:.1%}企稳)。"
+                            f"信号类型: {'超跌反弹' if signal_type == 'oversold_rebound' else '回踩支撑'}。"
+                            f"加仓后止损设{stop_loss:.2f}(跌破即止损新加部分)。"
+                            f"挂单价: {d['price']*0.999:.2f}(略低现价确保成交)"
+                        )
+                        d["next_watch"] = (
+                            f"加仓后15分钟观察: 跌破{d['price']*0.98:.2f}立即止损新加部分；"
+                            f"站稳{d['price']*1.02:.2f}则持有等待反弹"
+                        )
+                        logger.info(f"[盘中决策] {code} 触发回调加仓: {pb_result['reason']}")
+                except Exception as e:
+                    logger.debug(f"[盘中决策] {code} 回调加仓检测异常: {e}")
+                    continue
+            # 重新排序（回调加仓的优先级在持有观察之前）
+            decisions.sort(key=lambda x: (_URGENCY_ORDER.get(x["decision"], 5), x.get("score", 0)))
+    except Exception as e:
+        logger.warning(f"[盘中决策] 回调加仓检测异常(不影响报告): {e}")
 
     # 7. 生成报告
     report_text = _build_console_report(decisions, market_pct, market_300_pct,

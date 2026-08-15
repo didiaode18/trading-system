@@ -78,14 +78,20 @@ def _section_performance(data: dict) -> str:
     cls = "text-red" if weekly_return > 0 else "text-green" if weekly_return < 0 else ""
     html += f'<div class="metric-card"><div class="label">周收益率</div><div class="value {cls}">{weekly_return:+.2f}%</div></div>'
 
-    # 基准收益
-    benchmark = perf.get("benchmark_return", 0)
-    html += f'<div class="metric-card"><div class="label">基准(沪深300)</div><div class="value">{benchmark:+.2f}%</div></div>'
+    # 基准收益（V4.1(P1): 修复恒为0的TODO，None=基准数据缺失）
+    benchmark = perf.get("benchmark_return")
+    if isinstance(benchmark, (int, float)):
+        html += f'<div class="metric-card"><div class="label">基准(沪深300)</div><div class="value">{benchmark:+.2f}%</div></div>'
+    else:
+        html += '<div class="metric-card"><div class="label">基准(沪深300)</div><div class="value">暂无</div></div>'
 
-    # 超额收益
-    excess = weekly_return - benchmark
-    cls = "text-red" if excess > 0 else "text-green"
-    html += f'<div class="metric-card"><div class="label">超额收益</div><div class="value {cls}">{excess:+.2f}%</div></div>'
+    # 超额收益（仅在基准可用时计算，避免用误导性的0基准）
+    if isinstance(benchmark, (int, float)):
+        excess = weekly_return - benchmark
+        cls = "text-red" if excess > 0 else "text-green"
+        html += f'<div class="metric-card"><div class="label">超额收益</div><div class="value {cls}">{excess:+.2f}%</div></div>'
+    else:
+        html += '<div class="metric-card"><div class="label">超额收益</div><div class="value">暂无</div></div>'
 
     # 最大回撤
     max_dd = perf.get("max_drawdown", 0)
@@ -99,7 +105,14 @@ def _section_performance(data: dict) -> str:
     trades = perf.get("trade_count", 0)
     html += f'<div class="metric-card"><div class="label">交易笔数</div><div class="value">{trades}</div></div>'
 
-    html += '</div></div>'
+    html += '</div>'
+
+    # V4.1(M4): 净值曲线 vs 基准（数据不足时为空字符串）
+    nav_html = data.get("nav_section_html", "")
+    if nav_html:
+        html += nav_html
+
+    html += '</div>'
     return html
 
 
@@ -162,6 +175,37 @@ def _section_attribution(data: dict) -> str:
     if alpha_p is not None:
         sig_text = "显著" if alpha_p < 0.05 else "不显著"
         html += f'<p style="font-size:12px">个股Alpha: p={alpha_p:.3f} ({sig_text})</p>'
+
+    # V4.1(P2): CAPM/择时归因（实盘净值 vs 沪深300）
+    ab = attribution.get("alpha_beta")
+    if ab:
+        timing_txt = ("有择时能力(T-M b2>0)" if ab.get("has_timing") else "未检测到显著择时能力")
+        html += ('<div class="metric-grid" style="margin-top:10px">'
+                 f'<div class="metric-card"><div class="label">年化Alpha</div>'
+                 f'<div class="value">{ab.get("alpha", 0)*100:+.1f}%</div></div>'
+                 f'<div class="metric-card"><div class="label">Beta</div>'
+                 f'<div class="value">{ab.get("beta", 0):.2f}</div></div>'
+                 f'<div class="metric-card"><div class="label">拟合度R²</div>'
+                 f'<div class="value">{ab.get("r_squared", 0):.2f}</div></div>'
+                 f'<div class="metric-card"><div class="label">择时能力</div>'
+                 f'<div class="value" style="font-size:13px">{timing_txt}</div></div></div>'
+                 f'<p style="font-size:12px;color:#888">归因口径: 实盘净值日收益 vs 沪深300，'
+                 f'样本{ab.get("samples", 0)}个交易日'
+                 + ('，样本偏少结论仅供参考' if ab.get('samples', 0) < 20 else '')
+                 + '；Alpha为正说明收益含选股贡献，'
+                 f'高Beta说明收益主要来自市场暴露（仓位择时更重要）。</p>')
+
+    # V4.1(P5): 选股因子IC趋势汇总
+    ic_trend = attribution.get("ic_trend", {})
+    if ic_trend:
+        parts = []
+        for fname, item in ic_trend.items():
+            avg_ic = item.get("recent_avg_ic", 0)
+            cls = "text-red" if avg_ic > 0.02 else "text-green" if avg_ic < -0.02 else ""
+            parts.append(f'<span class="{cls}">{fname}: {avg_ic:+.3f}({item.get("samples", 0)}期)</span>')
+        html += ('<p style="font-size:12px;margin-top:8px"><b>选股因子IC趋势(近5期均值):</b> '
+                 + ' | '.join(parts)
+                 + ' <span style="color:#888">（|IC|<0.02视为无效；观察口径，与G5降权建议联动）</span></p>')
 
     html += '</div>'
     return html
@@ -377,25 +421,51 @@ def prepare_weekly_data(holdings: dict, data_dict: dict) -> dict:
         from strategy.trade_journal import TradeJournal
         journal = TradeJournal()
         perf = journal.performance_report(days=5)
+        # V4.1(P1): 基准收益从本地DB的沪深300日线计算，失败为None(展示"暂无")
+        _bench_ret = None
+        try:
+            from output.portfolio_monitor import fetch_benchmark_return
+            _bench_ret = fetch_benchmark_return(days=5)
+        except Exception as _be:
+            logger.debug(f"  基准收益获取失败: {_be}")
         weekly_data["performance"] = {
             "weekly_return": perf.get("total_return_pct", 0),
-            "benchmark_return": 0,  # TODO: 从指数数据计算
+            "benchmark_return": _bench_ret,
             "max_drawdown": perf.get("max_drawdown_pct", 0),
             "win_rate": perf.get("win_rate_pct", 0),
             "trade_count": perf.get("total_trades", 0),
         }
+        # V4.1(M4): 净值曲线 vs 基准图区块（异常/数据不足时为空）
+        try:
+            from output.portfolio_monitor import render_nav_section_html
+            weekly_data["nav_section_html"] = render_nav_section_html(days=90)
+        except Exception as _ne:
+            logger.debug(f"  净值区块生成失败: {_ne}")
+            weekly_data["nav_section_html"] = ""
     except Exception as e:
         logger.debug(f"  绩效数据获取失败: {e}")
         weekly_data["performance"] = {"weekly_return": 0, "trade_count": 0}
+        weekly_data["nav_section_html"] = ""
 
-    # 2. 盈亏归因（Barra）
+    # 2. 盈亏归因（V4.1(P2): CAPM/择时归因接入 + P5 IC趋势；Barra需收益序列暂留）
+    attribution = {}
     try:
         from attribution.barra import BarraAttribution
         barra = BarraAttribution()
         # 需要收益率序列，暂用简化版
-        weekly_data["attribution"] = {}
     except Exception:
-        weekly_data["attribution"] = {}
+        pass
+    try:
+        from output.portfolio_monitor import calc_alpha_beta_from_nav, get_ic_trend_summary
+        _ab = calc_alpha_beta_from_nav(days=60)
+        if _ab:
+            attribution["alpha_beta"] = _ab
+        _ic = get_ic_trend_summary(recent_n=5)
+        if _ic:
+            attribution["ic_trend"] = _ic
+    except Exception as _ae:
+        logger.debug(f"  CAPM/IC趋势归因获取失败: {_ae}")
+    weekly_data["attribution"] = attribution
 
     # 3. 信号质量
     try:

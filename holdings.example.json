@@ -1,0 +1,30 @@
+{
+  "600519": {
+    "name": "贵州茅台",
+    "shares": 100,
+    "buy_price": 1680.000,
+    "current_price": 1700.000,
+    "sector": "白酒消费",
+    "stock_type": "龙头",
+    "stop_loss": 1512.000,
+    "trailing_stop": 1512.000,
+    "buy_date": "2026-08-01",
+    "market_value": 170000.00,
+    "pnl": 2000.00,
+    "pnl_pct": 1.19
+  },
+  "000858": {
+    "name": "五粮液",
+    "shares": 500,
+    "buy_price": 148.000,
+    "current_price": 152.000,
+    "sector": "白酒消费",
+    "stock_type": "龙头",
+    "stop_loss": 133.200,
+    "trailing_stop": 133.200,
+    "buy_date": "2026-08-05",
+    "market_value": 76000.00,
+    "pnl": 2000.00,
+    "pnl_pct": 2.70
+  }
+}

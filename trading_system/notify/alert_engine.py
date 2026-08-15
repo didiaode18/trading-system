@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-智能预警系统 (Alert Engine) V2.1
+智能预警系统 (Alert Engine) V3.4
 ================================
 对标同花顺/通达信条件预警，盘中实时监控关键信号
 
@@ -23,6 +23,7 @@
   R16. 资金流模式识别(出货/洗盘/吸筹) [V3.2新增]
   R17. 阶梯止盈提醒(浮盈≥10%/≥20%分批止盈) [V3.3新增]
   R18. 加仓机会提醒(浮盈>5%+趋势加速+缩量回踩) [V3.3新增]
+  V3.4: R18加仓机会提醒纳入邮件链路(开关控制+每日每标的去重)
 
 推送渠道:
   - 邮件推送（QQ邮箱SMTP）
@@ -46,7 +47,8 @@ import json
 import logging
 import datetime
 import time
-from typing import Dict, List, Optional
+# FIX: 清理死代码无用 import（Dict/Optional grep 确认本文件零使用）
+from typing import List
 
 import pandas as pd
 
@@ -63,10 +65,20 @@ ALERT_CONFIG = {
     "deviation_oversold": -8.0,    # 超卖乖离率阈值(%)
     "profit_ratio_drop": 0.10,     # 获利盘骤降阈值(10%)
     "stop_loss_pct": -0.10,        # 止损线(-10%) FIX: 统一使用config.INITIAL_STOP_LOSS_PCT(10%)，原-8%与主系统不一致
-    "alert_cooldown_min": 15,      # 同一标的预警冷却时间(分钟) V2.0: 30→15
+    "alert_cooldown_min": 30,      # 同一标的预警冷却时间(分钟) FIX(2026-08-12): 15→30，与scheduler统一冷却口径一致
     "alert_log_file": "alerts.json",  # 预警记录文件
     "trend_drop_alert": True,      # 趋势降级预警开关
+    # V3.4: R18加仓机会提醒纳入邮件链路（默认开启）
+    "opportunity_alert_email": True,
 }
+
+# V3.4: 机会型预警类型集合（避免魔法字符串散落）
+OPPORTUNITY_ALERT_TYPES = {"add_position_opportunity"}
+
+
+def is_opportunity_alert(a: dict) -> bool:
+    """V3.4: 判断单条预警是否为机会型提醒"""
+    return a.get("type", "") in OPPORTUNITY_ALERT_TYPES
 
 # ============================================================
 # P2-FIX: 状态持久化工具（止损缓冲时间戳 / R17档位记忆）
@@ -74,6 +86,11 @@ ALERT_CONFIG = {
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 _STOP_BUFFER_FILE = os.path.join(_DATA_DIR, "alert_stop_buffer.json")
 _R17_TIER_FILE = os.path.join(_DATA_DIR, "r17_tier_memory.json")
+# V3.4: R18每日去重记忆 {"YYYY-MM-DD": [codes]}
+_R18_DAILY_FILE = os.path.join(_DATA_DIR, "r18_daily_memory.json")
+# FIX(2026-08-12): 深亏模式 —— 浮亏≤-30%时止损类告警永久触发，改为每日仅提醒1次
+DEEP_LOSS_PNL_PCT = -0.30
+_DEEP_LOSS_DAILY_FILE = os.path.join(_DATA_DIR, "deep_loss_daily_memory.json")
 
 
 def _load_json_state(path: str) -> dict:
@@ -148,6 +165,21 @@ class AlertEngine:
             pass
         # FIX P2-14: R17每日档位记忆 {"code:tier": "YYYY-MM-DD"}
         self._r17_tier_mem = _load_json_state(_R17_TIER_FILE)
+        # V3.4: R18每日去重记忆（加载时仅保留当日条目，过期日期自动清理）
+        try:
+            self._r18_daily_mem = _load_json_state(_R18_DAILY_FILE)
+            _today_key = datetime.date.today().isoformat()
+            self._r18_daily_mem = {d: v for d, v in self._r18_daily_mem.items()
+                                   if d == _today_key and isinstance(v, list)}
+        except Exception:
+            self._r18_daily_mem = {}
+        # FIX(2026-08-12): 深亏每日提醒去重记忆（仅保留当日条目，跨日自动清理）
+        try:
+            _dl_today_key = datetime.date.today().isoformat()
+            self._deep_loss_daily = {d: v for d, v in _load_json_state(_DEEP_LOSS_DAILY_FILE).items()
+                                     if d == _dl_today_key and isinstance(v, list)}
+        except Exception:
+            self._deep_loss_daily = {}
         self._load_history()
 
     def check_alerts(self, results: List[dict]) -> List[dict]:
@@ -165,6 +197,10 @@ class AlertEngine:
         for r in results:
             code = r.get("code", "")
             name = r.get("name", code)
+            # FIX(2026-08-12): 观察池标的（零仓位并入监控）加前缀，避免误判为持仓告警
+            if isinstance(self.holdings.get(code), dict) and \
+                    self.holdings[code].get("watch_pool"):
+                name = "[观察池]" + name
 
             # 冷却检查
             if self._in_cooldown(code):
@@ -178,7 +214,9 @@ class AlertEngine:
                 triggered.append(alert)
 
             if alerts:
-                self._alert_history[code] = datetime.datetime.now()
+                # V3.4: 纯机会型预警(R18)不占用引擎15分钟冷却，避免压制同标的后续风险预警
+                if not all(is_opportunity_alert(a) for a in alerts):
+                    self._alert_history[code] = datetime.datetime.now()
 
         # V3.0: 同标的合并 — 每只标的只保留1条预警（最高urgency为主，其余为附加原因）
         from collections import defaultdict
@@ -332,7 +370,27 @@ class AlertEngine:
                 wash_prob = wash_result.get("wash_probability", 0)
                 should_block = wash_result.get("should_block_stop", False)
 
-                if should_block:
+                # FIX(2026-08-12): 深亏模式 —— 浮亏≤-30%时成本已无止损纪律意义，R5会永久触发，
+                # 每30分钟冷却到期就重发critical止损邮件；改为每日仅提醒1次并降级为warning
+                if pnl_pct <= DEEP_LOSS_PNL_PCT:
+                    _dl_today = datetime.date.today().isoformat()
+                    _dl_codes = self._deep_loss_daily.get(_dl_today, [])
+                    if code not in _dl_codes:
+                        _dl_codes.append(code)
+                        self._deep_loss_daily[_dl_today] = _dl_codes
+                        _save_json_state(_DEEP_LOSS_DAILY_FILE, self._deep_loss_daily)
+                        alerts.append({
+                            "type": "deep_loss_digest",
+                            "rule_name": "R5-深亏每日提醒",
+                            "rule_detail": f"浮亏{pnl_pct*100:.1f}%远超止损线"
+                                           f"{self.cfg['stop_loss_pct']*100:.0f}%，深亏模式每日仅提醒1次",
+                            "level": "warning",
+                            "icon": "🕳️",
+                            "msg": f"{name} 深亏{pnl_pct*100:.1f}% (成本{buy_price:.3f}→现价{effective_close:.3f}) | "
+                                   f"深亏模式: 不再重复发止损建议，每日仅提醒1次，请自主决策处置",
+                            "urgency_score": 50,
+                        })
+                elif should_block:
                     # 高概率洗盘: 降级为warning，不触发critical止损
                     alerts.append({
                         "type": "stop_loss_wash",
@@ -362,6 +420,9 @@ class AlertEngine:
                             "msg": f"{name} 止损确认! 亏损{pnl_pct*100:.1f}% "
                                    f"(缓冲{buffer_result['elapsed_min']:.0f}分钟未收回) 建议执行止损",
                             "urgency_score": 90,
+                            # 确认型止损: 打结构化标记供下游执行链路识别
+                            "is_stop_signal": True,
+                            "stop_price": stop_loss_price,
                         })
                     else:
                         # 缓冲期中: 发出待确认预警
@@ -378,6 +439,9 @@ class AlertEngine:
                                    f"若收回止损上方则自动取消",
                             "urgency_score": 70,  # 中等紧急
                             "wash_info": wash_result,
+                            # 待确认止损(缓冲确认中): 打结构化标记供下游执行链路识别
+                            "is_stop_signal": True,
+                            "stop_price": stop_loss_price,
                         })
                 else:
                     # 洗盘概率低: 直接触发critical止损
@@ -395,13 +459,17 @@ class AlertEngine:
                                f"(成本{buy_price:.3f} 现价{effective_close:.3f}) | "
                                f"卖出全部{shares_r5}股，挂单价{order_px_r5:.2f}(现价附近)，建议30分钟内执行",
                         "urgency_score": 90,
+                        # 确认型止损: 打结构化标记供下游执行链路识别
+                        "is_stop_signal": True,
+                        "stop_price": stop_loss_price,
                     })
             # V2.1: 接近自定义止损位（距离<2%）
             elif stop_loss_price > 0 and effective_close > 0:
                 stop_distance = (effective_close - stop_loss_price) / effective_close
                 if stop_distance <= 0.02 and effective_close > stop_loss_price:
                     shares = info.get("shares", 0)
-                    sell_qty = int(shares * 0.5 / 100) * 100 if shares > 0 else 0
+                    # FIX: 修复100股持仓减半取整为0的问题（建议卖出量不超持有股数）
+                    sell_qty = min(shares, max(100, int(shares * 0.5 / 100) * 100)) if shares >= 100 else shares
                     alerts.append({
                         "type": "near_stop_loss",
                         "rule_name": "R5-接近止损位(距离<2%)",
@@ -693,7 +761,7 @@ class AlertEngine:
 
             # 第一止盈位: 浮盈≥10%
             # FIX P2-14: 同一交易日同一档位已提醒过则不再重复（语义去重）
-            if profit_pct >= 0.10 and not self._r17_tier_sent(code, "tier1"):
+            if profit_pct >= 0.10 and not self._r17_tier_seen(code, "tier1"):
                 shares = info.get("shares", 0)
                 # FIX P1-3: 小仓位兜底100股（原取整会输出0股）；shares<100时输出全部
                 sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
@@ -705,10 +773,11 @@ class AlertEngine:
                     "icon": "🎯",
                     "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第一止盈位! 建议卖出{sell_1_3}股(1/3)锁定利润",
                     "urgency_score": 50,
+                    "r17_tier": "tier1",  # FIX: 供发送成功后登记档位记忆
                 })
 
             # 第二止盈位: 浮盈≥20%
-            if profit_pct >= 0.20 and not self._r17_tier_sent(code, "tier2"):
+            if profit_pct >= 0.20 and not self._r17_tier_seen(code, "tier2"):
                 shares = info.get("shares", 0)
                 # FIX P1-3: 小仓位兜底100股；shares<100时输出全部
                 sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
@@ -720,6 +789,7 @@ class AlertEngine:
                     "icon": "",
                     "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第二止盈位! 建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
                     "urgency_score": 65,
+                    "r17_tier": "tier2",  # FIX: 供发送成功后登记档位记忆
                 })
 
             # 回落止盈: 从最高点回落超过阈值（按股票类型区分）
@@ -727,7 +797,7 @@ class AlertEngine:
             stock_type = info.get("stock_type", "龙头稳健")
             drawdown_threshold = DRAWDOWN_STOP.get(stock_type, DRAWDOWN_STOP.get("龙头稳健", 0.07))
             if (profit_pct >= 0.05 and drawdown_from_high <= -drawdown_threshold
-                    and not self._r17_tier_sent(code, "drawdown")):
+                    and not self._r17_tier_seen(code, "drawdown")):
                 shares = info.get("shares", 0)
                 # FIX P1-3: 小仓位兜底100股；shares<100时输出全部
                 sell_half = min(shares, max(100, int(shares * 0.5 / 100) * 100)) if shares >= 100 else shares
@@ -739,6 +809,7 @@ class AlertEngine:
                     "icon": "📉",
                     "msg": f"{name} 利润回落! 浮盈{profit_pct*100:.1f}%但从高点回落{drawdown_from_high*100:.1f}%，建议卖出{sell_half}股(50%)保住利润",
                     "urgency_score": 60,
+                    "r17_tier": "drawdown",  # FIX: 供发送成功后登记档位记忆
                 })
 
         # ============================================================
@@ -797,9 +868,31 @@ class AlertEngine:
 
             if (has_profit_cushion and ma_bullish and is_shrinking and weight_ok
                     and not_limit_up and turnover_ok and chg5_ok):
-                add_shares = int(shares_r18 * 0.2 / 100) * 100  # 加仓不超过现有20%
-                add_shares = max(add_shares, 100)
-                new_stop = close * 0.95
+                # V3.5: 加仓数量与新止损改调统一仓位引擎 calc_add_position（替换原20%硬编码）
+                # ATR近似: 用R18上下文已有日线 df_r18 的 (high-low) 最近14日均值，不新增任何网络调用
+                atr_r18 = 0.0
+                try:
+                    if (df_r18 is not None and "high" in df_r18.columns
+                            and "low" in df_r18.columns and len(df_r18) >= 14):
+                        atr_r18 = float((df_r18["high"] - df_r18["low"]).iloc[-14:].mean())
+                except Exception:
+                    atr_r18 = 0.0
+                # capital取值链（按序尝试）:
+                #   1) config.TOTAL_CAPITAL（账户总资金，config.py实际存在的常量）
+                #   2) config.INITIAL_CAPITAL（兼容旧配置名）
+                #   3) 兜底: 当前持仓市值*5（即假设当前持仓占总资金20%）
+                import config as _cfg_r18
+                capital_r18 = (getattr(_cfg_r18, "TOTAL_CAPITAL", 0)
+                               or getattr(_cfg_r18, "INITIAL_CAPITAL", 0)
+                               or shares_r18 * close * 5)
+                try:
+                    from risk.position_sizing import calc_add_position
+                    _sizing_r18 = calc_add_position(code, close, shares_r18, capital_r18, atr=atr_r18)
+                    add_shares = int(_sizing_r18.get("add_shares", 0) or 0)
+                    new_stop = float(_sizing_r18.get("new_stop", 0) or close * 0.95)
+                    sizing_method_r18 = _sizing_r18.get("method", "")
+                except Exception:
+                    add_shares, new_stop, sizing_method_r18 = 0, close * 0.95, "引擎异常降级"
                 # FIX P2-12: 加仓建议过风控预检，不通过则不输出（异常时降级放行不阻断）
                 risk_ok_r18 = True
                 try:
@@ -817,6 +910,10 @@ class AlertEngine:
                     pass
                 if not risk_ok_r18:
                     return alerts
+                # V3.4: R18每日每标的去重（防邮件轰炸，仅查询不写入，发送成功后登记）
+                if self._r18_daily_seen(code):
+                    logger.info(f"[R18] {name}({code}) 当日已提醒过，跳过重复推送")
+                    return alerts
                 alerts.append({
                     "type": "add_position_opportunity",
                     "rule_name": "R18-加仓机会(浮盈+趋势+缩量)",
@@ -824,8 +921,13 @@ class AlertEngine:
                                    f"+仓位{weight*100:.0f}%<30%"),
                     "level": "info",
                     "icon": "✅",
-                    "msg": (f"{name} 加仓机会! 浮盈{profit_pct_r18*100:.1f}%+趋势加速+缩量回踩，"
-                            f"建议加{add_shares}股，加仓后止损上移至{new_stop:.2f}"),
+                    "msg": (
+                        (f"{name} 加仓机会! 浮盈{profit_pct_r18*100:.1f}%+趋势加速+缩量回踩，"
+                         f"建议加{add_shares}股，加仓后止损上移至{new_stop:.2f}({sizing_method_r18})")
+                        if add_shares > 0 else
+                        (f"{name} 加仓机会! 浮盈{profit_pct_r18*100:.1f}%+趋势加速+缩量回踩，"
+                         f"仓位引擎不建议加仓(数量不足100股)，止损参考{new_stop:.2f}({sizing_method_r18})")
+                    ),
                     "urgency_score": 20,  # 非紧急，机会型提醒
                 })
 
@@ -931,18 +1033,44 @@ class AlertEngine:
         except Exception:
             pass
 
-    def _r17_tier_sent(self, code: str, tier: str) -> bool:
-        """FIX P2-14: R17档位每日记忆 — 当日已提醒返回True，否则记录并返回False"""
+    def _r17_tier_seen(self, code: str, tier: str) -> bool:
+        """FIX: 修复R17档位记忆检查时即写入导致邮件发送失败当日不再重发的问题
+        （拆为查询/登记两个动作，检查时只读不写，当日已提醒返回True）"""
         try:
             today = datetime.date.today().isoformat()
-            key = f"{code}:{tier}"
-            if self._r17_tier_mem.get(key) == today:
-                return True
-            self._r17_tier_mem[key] = today
-            _save_json_state(_R17_TIER_FILE, self._r17_tier_mem)
-            return False
+            return self._r17_tier_mem.get(f"{code}:{tier}") == today
         except Exception:
             return False
+
+    def register_r17_tier(self, code: str, tier: str):
+        """FIX: R17档位登记（仅由调用方在预警发送成功后调用，失败仅降级）"""
+        try:
+            today = datetime.date.today().isoformat()
+            self._r17_tier_mem[f"{code}:{tier}"] = today
+            _save_json_state(_R17_TIER_FILE, self._r17_tier_mem)
+        except Exception:
+            pass
+
+    def _r18_daily_seen(self, code: str) -> bool:
+        """V3.4: R18当日该标的是否已提醒过（只读不写，参考R17查询/登记拆分模式）"""
+        try:
+            today = datetime.date.today().isoformat()
+            return code in self._r18_daily_mem.get(today, [])
+        except Exception:
+            return False
+
+    def register_r18_daily(self, code: str):
+        """V3.4: R18当日提醒登记（仅由调用方在预警发送成功后调用，失败仅降级）
+        写入前清理过期日期条目，避免文件无限增长"""
+        try:
+            today = datetime.date.today().isoformat()
+            self._r18_daily_mem = {d: v for d, v in self._r18_daily_mem.items() if d == today}
+            codes = self._r18_daily_mem.setdefault(today, [])
+            if code and code not in codes:
+                codes.append(code)
+            _save_json_state(_R18_DAILY_FILE, self._r18_daily_mem)
+        except Exception:
+            pass
 
     def _push_alerts(self, alerts: List[dict]):
         """推送预警"""
@@ -1050,12 +1178,17 @@ def send_alert_email(alerts: List[dict]):
 
     # V3.0: 仅对活跃持仓标的(shares>0)发送预警邮件
     # V9.1: 放宽——critical级预警不受shares>0限制（解决股票池/候选池炸板被过滤问题）
+    # V3.4: 开关开启时机会型提醒(R18加仓)也纳入可推送列表
+    _opp_enabled = ALERT_CONFIG.get("opportunity_alert_email", True)
     important = [a for a in alerts
                  if (a.get("level") == "critical"
                      or ((a.get("level") == "high")
                          and (a.get("holdings_info", {}).get("shares", 0) > 0
                               or a.get("type") == "zb_alert"))
                      or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50
+                         and a.get("holdings_info", {}).get("shares", 0) > 0)
+                     # V3.4: R18加仓机会提醒视为可推送（仍要求持仓标的）
+                     or (_opp_enabled and is_opportunity_alert(a)
                          and a.get("holdings_info", {}).get("shares", 0) > 0))]
     if not important:
         return
@@ -1109,13 +1242,25 @@ def send_alert_email(alerts: List[dict]):
     # 最紧急标的名称
     top_name = important[0].get("name", "") if important else ""
     n_stocks = len(important)
+    # V3.4: 区分风险预警与机会型提醒数量，避免纯机会型邮件标题误导
+    n_opp = sum(1 for a in important if is_opportunity_alert(a))
+    n_risk = n_stocks - n_opp
+    if n_risk == 0:
+        header_title = f"💰 盘中加仓机会 ({n_opp}个加仓机会)"
+        header_bg = "linear-gradient(135deg,#389e0d,#73d13d)"  # 机会型用绿色头栏
+    elif n_opp > 0:
+        header_title = f"⚠️ 盘中预警 ({n_risk}个风险 | {n_opp}个加仓机会)"
+        header_bg = "linear-gradient(135deg,#cf1322,#ff4d4f)"
+    else:
+        header_title = f"⚠️ 盘中预警 ({n_stocks}只标的异常)"
+        header_bg = "linear-gradient(135deg,#cf1322,#ff4d4f)"
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:15px;background:#f0f2f5;font-family:'Microsoft YaHei',Arial,sans-serif">
 <div style="max-width:700px;margin:0 auto">
-    <div style="background:linear-gradient(135deg,#cf1322,#ff4d4f);color:white;padding:18px 25px;border-radius:12px 12px 0 0">
-        <h1 style="margin:0;font-size:20px">⚠️ 盘中预警 ({n_stocks}只标的异常)</h1>
+    <div style="background:{header_bg};color:white;padding:18px 25px;border-radius:12px 12px 0 0">
+        <h1 style="margin:0;font-size:20px">{header_title}</h1>
         <div style="font-size:12px;opacity:0.8;margin-top:5px">{today} {now} | 操盘密码V9.0 | 同标的合并去重 | 仅活跃持仓</div>
     </div>
     <div style="background:white;padding:20px 25px;border-radius:0 0 12px 12px;box-shadow:0 4px 15px rgba(0,0,0,0.08)">
@@ -1127,8 +1272,77 @@ def send_alert_email(alerts: List[dict]):
 </div>
 </body></html>"""
 
-    subject = f"[操盘密码] ⚠️盘中预警 {now} | {n_stocks}只标的异常 | 最紧急: {top_name}"
-    send_email(subject, html)
+    # V3.4: 标题按风险/机会构成区分，纯机会型不误导为风险预警
+    if n_risk == 0:
+        subject = f"[操盘密码] 💰盘中加仓机会 {now} | {n_opp}个加仓机会"
+    elif n_opp > 0:
+        subject = f"[操盘密码] ⚠️盘中预警 {now} | {n_risk}个风险 | {n_opp}个加仓机会 | 最紧急: {top_name}"
+    else:
+        subject = f"[操盘密码] ⚠️盘中预警 {now} | {n_stocks}只标的异常 | 最紧急: {top_name}"
+    # V4.4: 预警邮件异步发送（后台工作线程含重试，防SMTP阻塞盘中主循环）；
+    # 调用方对发送结果无依赖（冷却/台账/禁加仓在scheduler侧另登记）；
+    # ALERT_EMAIL_ASYNC=False回退同步语义
+    try:
+        import config as _cfg_async
+        _async = getattr(_cfg_async, "ALERT_EMAIL_ASYNC", True)
+    except Exception:
+        _async = False
+    if _async:
+        from notify.email_notify import send_email_async
+        send_email_async(subject, html)
+    else:
+        send_email(subject, html)
+
+    # V5.0: 钉钉分级路由 —— 按ALERT_DINGTALK_MIN_LEVEL过滤，低级别预警不发钉钉
+    # critical→仅钉钉(秒级响应)  high→钉钉+邮件双发  warning/opportunity→仅邮件
+    # webhook未配置时send_notification内部直接返回全False，无副作用
+    try:
+        import config as _cfg_dt
+        _min_level = getattr(_cfg_dt, "ALERT_DINGTALK_MIN_LEVEL", "high")
+    except Exception:
+        _min_level = "high"
+    _level_rank = {"critical": 3, "high": 2, "warning": 1, "info": 0}
+    _min_rank = _level_rank.get(_min_level, 2)
+    # 筛选达到钉钉门槛的预警（排除机会型，机会型始终走邮件）
+    _dt_alerts = [a for a in important
+                  if _level_rank.get(a.get("level", "info"), 0) >= _min_rank
+                  and not is_opportunity_alert(a)]
+    if _dt_alerts:
+        try:
+            from notify.wechat_notify import send_notification
+            _cards = []
+            for a in _dt_alerts[:3]:
+                hi = a.get("holdings_info", {})
+                _buy_p = hi.get("buy_price", 0)
+                _cur_p = hi.get("current_price", 0)
+                _stop_p = hi.get("stop_loss", 0)
+                _shares = hi.get("shares", 0)
+                _pnl = hi.get("pnl_pct", 0)
+                _score = a.get("urgency_score", 0)
+                _action = _generate_action(a, hi)
+                # 附加规则
+                _extra = a.get("extra_rules", [])
+                _extra_str = " | ".join([er.get("rule_name", "") for er in _extra[:2]]) if _extra else ""
+                _card = (
+                    f"{a.get('icon', '🚨')} **{a.get('name', '')}({a.get('code', '')})** "
+                    f"紧急度{_score}\n\n"
+                    f"📌 {a.get('rule_name', '')} — {a.get('rule_detail', a.get('msg', ''))}\n\n"
+                    + (f"➕ 附加: {_extra_str}\n\n" if _extra_str else "")
+                    + f"🎯 **{_action}**\n\n"
+                    f"📊 成本{_buy_p:.2f} | 现价{_cur_p:.2f} | 止损{_stop_p:.2f} | "
+                    f"浮盈亏{_pnl:+.1f}% | 持仓{_shares}股"
+                )
+                _cards.append(_card)
+            _n_dt = len(_dt_alerts)
+            _md = (f"### {header_title}\n\n---\n\n"
+                   + "\n\n---\n\n".join(_cards)
+                   + (f"\n\n---\n\n...其余{_n_dt - 3}条见预警邮件" if _n_dt > 3 else "")
+                   + f"\n\n> {today} {now} | 紧急度90+=立即操作 / 70-89=尽快处理")
+            send_notification(subject, _md)
+        except Exception as _e:
+            logger.debug(f"预警钉钉推送异常(不阻断): {_e}")
+    else:
+        logger.debug(f"预警钉钉跳过: 无达到{_min_level}级别的预警(共{len(important)}条)")
 
 
 def _generate_action(alert: dict, holdings_info: dict) -> str:
@@ -1172,6 +1386,9 @@ def _generate_action(alert: dict, holdings_info: dict) -> str:
         return f"推荐失效，建议止损离场{sell_50}股(50%)"
     elif atype == "fund_outflow":
         return "资金大幅流出，禁止加仓，观察主力动向"
+    # V3.4: R18加仓机会属机会型，操作建议不能输出"禁止加仓"误导文案
+    elif atype in OPPORTUNITY_ALERT_TYPES:
+        return "可小幅加仓(不超现持20%)，加仓后同步上移止损，具体股数见触发说明"
     else:
         return "密切关注，禁止加仓，等待企稳信号"
 
@@ -1213,14 +1430,32 @@ def run_alert_loop(holdings: dict = None, interval_min: int = None):
             if results:
                 triggered = engine.check_alerts(results)
                 if triggered:
+                    # V3.4: 开关开启时R18加仓机会提醒也计入需推送列表
+                    _opp_on = ALERT_CONFIG.get("opportunity_alert_email", True)
                     important = [a for a in triggered if a.get("level") in ("critical", "high")
-                                 or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50)]
+                                 or (a.get("level") == "warning" and a.get("urgency_score", 0) >= 50)
+                                 or (_opp_on and is_opportunity_alert(a))]
                     print(f"  🔔 触发 {len(triggered)} 条预警 (需推送: {len(important)}条)")
                     for a in triggered:
                         print(f"     {a.get('icon','')} [{a.get('rule_name','')}] {a.get('msg','')}")
                     # 即时发送邮件
                     if important:
                         send_alert_email(triggered)
+                        # FIX: 修复R17档位记忆检查时即写入导致发送失败当日不再重发的问题
+                        # （仅在本轮发送成功后登记R17档位）
+                        try:
+                            for _a in triggered:
+                                if _a.get("r17_tier"):
+                                    engine.register_r17_tier(_a.get("code", ""), _a["r17_tier"])
+                        except Exception:
+                            pass
+                        # V3.4: 发送成功后登记R18当日去重（失败仅降级，不阻断）
+                        try:
+                            for _a in triggered:
+                                if is_opportunity_alert(_a):
+                                    engine.register_r18_daily(_a.get("code", ""))
+                        except Exception:
+                            pass
                         print(f"  📧 预警邮件已发送")
                 else:
                     print(f"  ✅ 无预警触发")
@@ -1228,6 +1463,29 @@ def run_alert_loop(holdings: dict = None, interval_min: int = None):
             logger.error(f"预警检查异常: {e}")
 
         time.sleep(interval * 60)
+
+
+def _calc_elapsed_trade_ratio(now: datetime.datetime = None) -> float:
+    """FIX: 已过交易分钟占全日240分钟比例（供实时量比折算）
+
+    交易时段: 09:30-11:30 / 13:00-15:00（集合竞价忽略不计）
+    盘后(>=15:00)返回1.0，自然退化为全日口径；盘前返回0.0
+    """
+    now = now or datetime.datetime.now()
+    hm = now.hour * 60 + now.minute
+    am_open, am_close = 9 * 60 + 30, 11 * 60 + 30
+    pm_open, pm_close = 13 * 60, 15 * 60
+    if hm >= pm_close:
+        return 1.0
+    if hm <= am_open:
+        return 0.0
+    if hm <= am_close:
+        elapsed = hm - am_open
+    elif hm < pm_open:
+        elapsed = 120
+    else:
+        elapsed = 120 + (hm - pm_open)
+    return min(elapsed / 240.0, 1.0)
 
 
 def _fetch_and_analyze(holdings: dict = None) -> list:
@@ -1247,12 +1505,28 @@ def _fetch_and_analyze(holdings: dict = None) -> list:
     if not holdings:
         return []
 
+    # FIX(2026-08-12): 过滤已清仓标的(shares=0)，避免对历史标的回检/误发告警
+    holdings = {c: v for c, v in holdings.items()
+                if isinstance(v, dict) and v.get("shares", 0) > 0}
+    if not holdings:
+        return []
+
     codes = list(holdings.keys())
     engine = CaopanEngine()
     results = []
 
     # 获取实时行情
     quotes = fetch_realtime_batch(codes)
+
+    # FIX: 修复反洗盘评估读 market_change_pct 恒为0（CaopanEngine.analyze不产出该字段），
+    # 导致"大盘暴跌加分"(wash_score+0.20)永不触发的问题。循环外取一次上证指数实时涨跌幅
+    market_change_pct = 0.0
+    try:
+        from data.realtime import fetch_index_realtime
+        _idx_quote = fetch_index_realtime("000001")  # 上证指数
+        market_change_pct = float(_idx_quote.get("change_pct", 0.0) or 0.0)
+    except Exception:
+        market_change_pct = 0.0  # 取不到则降级为0，不阻断分析
 
     # FIX: 修复循环内每只股票重复baostock login/logout的性能问题，改为循环外一次login、循环后一次logout
     import baostock as bs
@@ -1301,11 +1575,55 @@ def _fetch_and_analyze(holdings: dict = None) -> list:
                     if _q.get("turnover", 0) > 0:
                         result["turnover"] = _q.get("turnover", 0)
                     if result.get("volume_ratio", 0) <= 0 and len(df) >= 6:
-                        _prev_vol = df["volume"].iloc[-6:-1].mean()
+                        _prev_vol = df["volume"].iloc[-6:-1].mean()  # 前5日日均量(股, baostock口径)
                         if _prev_vol and _prev_vol > 0:
-                            result["volume_ratio"] = float(df["volume"].iloc[-1] / _prev_vol)
+                            # FIX: 修复盘中量比用baostock日线最后一根(昨日)数据、
+                            # R18缩量判断实为"昨日量比"的问题。改用实时当日累计量
+                            # (quote.volume, 单位手)按已过交易时间占比折算全日预估量:
+                            #   预估全日量 = 实时量*100 / max(elapsed_ratio, 0.05)
+                            # 再除以前5日均量；15:00后elapsed_ratio=1退化为全日口径。
+                            # 折算假设: 全天成交按已过时段线性外推(开盘初期波动大,下限0.05防除零放大)
+                            _rt_vol = float(_q.get("volume", 0) or 0)
+                            _ratio = _calc_elapsed_trade_ratio()
+                            if _rt_vol > 0 and _ratio > 0:
+                                _est_full = (_rt_vol * 100) / max(_ratio, 0.05)  # 手→股
+                                result["volume_ratio"] = float(_est_full / _prev_vol)
+                            else:
+                                # 实时量缺失/盘前: 降级为旧算法(日线最后一根, 盘中实为昨日口径)
+                                result["volume_ratio"] = float(df["volume"].iloc[-1] / _prev_vol)
                 except Exception:
                     pass  # 取不到则跳过注入，不阻断分析
+                # FIX: 注入 market_change_pct，供 _check_wash_before_stop 反洗盘"大盘暴跌加分"使用；
+                # V3.5: sector_change_pct 改按 SECTOR_CHANGE_PCT_ENABLED 开关注入东财板块实时涨跌幅
+                try:
+                    result["market_change_pct"] = market_change_pct
+                    _injected = False
+                    try:
+                        import config as _cfg_sec
+                        if getattr(_cfg_sec, "SECTOR_CHANGE_PCT_ENABLED", False):
+                            # 开关开启: 拉取板块涨跌幅(O(1)内存缓存, 当日只请求一次, 失败返回None)
+                            from data.realtime import fetch_sector_changes_cached
+                            _sec_map = fetch_sector_changes_cached()
+                            if _sec_map:
+                                # 标的所属板块: config.get_stock_info 的"赛道"字段
+                                # (SECTOR_CANDIDATES 命中时=细分名, 兜底"其他")
+                                _track = _cfg_sec.get_stock_info(code).get("赛道", "")
+                                if _track and _track != "其他":
+                                    for _bk_name, _bk_pct in _sec_map.items():
+                                        # 东财板块名与系统赛道名可能不完全一致, 用互相包含模糊匹配
+                                        if _track in _bk_name or _bk_name in _track:
+                                            result["sector_change_pct"] = float(_bk_pct)
+                                            _injected = True
+                                            break
+                        else:
+                            # 开关关闭(默认): 双算对照仅记debug日志, 开关打开后将生效真实值
+                            logger.debug(f"[sector_change_pct] {code} 开关未开启, 维持0.0")
+                    except Exception:
+                        _injected = False  # 失败静默降级
+                    if not _injected:
+                        result.setdefault("sector_change_pct", 0.0)
+                except Exception:
+                    pass  # 注入失败不阻断分析
                 results.append(result)
         except Exception as e:
             logger.debug(f"分析{code}失败: {e}")
@@ -1348,6 +1666,20 @@ if __name__ == "__main__":
                 for a in triggered:
                     print(f"  {a.get('icon','')} [{a.get('rule_name','')}] {a.get('msg','')}")
                 send_alert_email(triggered)
+                # FIX: 发送成功后登记R17档位记忆（查询/登记拆分，失败当日可重发）
+                try:
+                    for _a in triggered:
+                        if _a.get("r17_tier"):
+                            engine.register_r17_tier(_a.get("code", ""), _a["r17_tier"])
+                except Exception:
+                    pass
+                # V3.4: 发送成功后登记R18当日去重
+                try:
+                    for _a in triggered:
+                        if is_opportunity_alert(_a):
+                            engine.register_r18_daily(_a.get("code", ""))
+                except Exception:
+                    pass
             else:
                 print("\n无预警触发")
     else:

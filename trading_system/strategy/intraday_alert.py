@@ -219,6 +219,29 @@ class IntradayAlert:
                 if attempt < max_retries:
                     time.sleep(2)
 
+        # V4.4: akshare全失败时东财直连HTTP兜底（与market_scanner同源备用通道，
+        # 避免源2异动预警因单一数据源故障整轮静默跳过）
+        if df is None:
+            try:
+                from strategy.market_scanner import _fetch_spot_em_direct
+                _fb = _fetch_spot_em_direct()
+                if _fb is not None and not _fb.empty:
+                    logger.info(f"[盘中预警] 东财直连HTTP兜底成功: {len(_fb)}只")
+                    df = _fb
+            except Exception as e:
+                logger.warning(f"[盘中预警] 东财直连兜底失败: {e}")
+
+        # V4.4 P4: 备用源3（新浪直连），akshare+东财全灭时的第三道兜底
+        if df is None:
+            try:
+                from strategy.market_scanner import _fetch_spot_sina_direct
+                _fb2 = _fetch_spot_sina_direct()
+                if _fb2 is not None and not _fb2.empty:
+                    logger.info(f"[盘中预警] 新浪直连HTTP兜底成功: {len(_fb2)}只")
+                    df = _fb2
+            except Exception as e:
+                logger.warning(f"[盘中预警] 新浪直连兜底失败: {e}")
+
         if df is not None and not df.empty:
             # 标准化列名
             col_map = {
@@ -231,6 +254,11 @@ class IntradayAlert:
             for col in ["price", "change_pct", "amount", "turnover", "vol_ratio", "circ_mv"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
+            # V4.4: 东财直连快照缺少流通市值/行业列，补空列防下游KeyError
+            if "circ_mv" not in df.columns:
+                df["circ_mv"] = float("nan")
+            if "sector" not in df.columns:
+                df["sector"] = ""
             # 更新缓存
             _ALERT_CACHE["data"] = df
             _ALERT_CACHE["time"] = datetime.datetime.now()

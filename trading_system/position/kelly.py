@@ -3,15 +3,22 @@ Kelly公式仓位计算
 ================
 Kelly仓位 = (胜率 * 盈亏比 - 败率) / 盈亏比
 实际仓位 = Kelly * 0.5（半Kelly，降低波动）
-约束: 单只最大15%
+约束: 单只最大仓位由config.MAX_SINGLE_STOCK_RATIO统一管理（默认15%）
 """
+
+import os
+import sys
 
 import numpy as np
 import logging
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
+
 logger = logging.getLogger(__name__)
 
-MAX_SINGLE_POSITION = 0.15  # 单只最大15%
+# FIX P1(2026-08-07): 单只仓位上限收口config（原硬编码15%与scheduler/报告/recommend_engine口径不一）
+MAX_SINGLE_POSITION = getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15)
 
 
 def kelly_position(win_rate: float, profit_factor: float,

@@ -45,11 +45,8 @@ PNL_DB_PATH = os.path.join(DATA_DIR, "pnl_history.db")
 
 
 def load_holdings() -> dict:
-    """加载持仓数据"""
-    if os.path.exists(HOLDINGS_PATH):
-        with open(HOLDINGS_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+    """加载持仓数据（统一委托 config.load_holdings）"""
+    return config.load_holdings(validated=False)
 
 
 def load_lifecycle() -> dict:

@@ -30,6 +30,7 @@
 
 import os
 import sys
+import json
 import logging
 import datetime
 
@@ -703,6 +704,196 @@ def detect_with_ensemble(benchmark_df: pd.DataFrame) -> dict:
                   f"rule={rule_state} hmm={hmm_state} → final={final_state}"),
         "detect_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+
+
+# ============================================================
+# 门面函数（2026-08-07 P0修复：综合分析报告逐股调用入口）
+# ============================================================
+_REGIME_FACADE_CACHE = {"date": None, "result": None}
+
+
+def detect_market_regime(benchmark_df: pd.DataFrame = None) -> dict:
+    """大盘状态检测门面函数（当日进程级缓存）
+
+    2026-08-07修复: 综合分析报告composite评分逐股调用本函数，但此前从未定义，
+    ImportError被静默吞掉导致熊市高分警告/低分反弹提示成为死代码。
+    - 不传benchmark_df时自动从本地DB加载000300日线
+    - 结果按日缓存: 同一进程内当日重复调用直接返回缓存，避免逐股重复拉库
+    - 任何失败均降级返回 regime="range"，不阻断主流程
+
+    返回:
+        {"regime": "bull"/"range"/"bear", "state": "BULL"/...,
+         "confidence": float, "detail": str}
+    """
+    today = datetime.date.today().isoformat()
+    if benchmark_df is None and _REGIME_FACADE_CACHE["date"] == today:
+        return _REGIME_FACADE_CACHE["result"]
+
+    if benchmark_df is None or len(benchmark_df) < 60:
+        try:
+            from data.data_loader import load_daily_data
+            benchmark_df = load_daily_data("000300", None, days=250)
+        except Exception as e:
+            logger.warning(f"[大盘状态] 000300基准数据加载失败，降级为range: {e}")
+            benchmark_df = None
+
+    fallback = {"regime": "range", "state": "RANGE", "confidence": 0.3,
+                "detail": "基准数据不足，默认震荡"}
+    if benchmark_df is None or len(benchmark_df) < 60:
+        result = fallback
+    else:
+        try:
+            detect_result = MarketRegimeDetector().detect(benchmark_df)
+            result = {
+                "regime": detect_result["state"].lower(),
+                "state": detect_result["state"],
+                "confidence": detect_result.get("confidence", 0.5),
+                "detail": detect_result.get("detail", ""),
+            }
+        except Exception as e:
+            logger.warning(f"[大盘状态] 检测失败，降级为range: {e}")
+            result = fallback
+
+    # 仅无参调用（自动拉库）写入缓存，显式传df的调用不影响缓存
+    if _REGIME_FACADE_CACHE["date"] != today and result is not fallback:
+        _REGIME_FACADE_CACHE["date"] = today
+        _REGIME_FACADE_CACHE["result"] = result
+    return result
+
+
+# ============================================================
+# V4.2(P2-8): 市场阶段估计（初期/中期/末期，观察模式）
+# ============================================================
+# 设计纪律（评审定案，禁止随意修改阈值）:
+#   1. 只用规则不用模型 —— A股完整牛熊周期样本极少，任何调参都会过拟合
+#   2. 硬前提: market_regime_history.json 积累≥60条才输出阶段，否则自降级为"数据积累中"
+#   3. 观察模式: 本函数结果仅供报告展示，严禁接入 target_pct 等仓位计算（如需接入须人工评审）
+#   4. 三态切换<5天显示"阶段确认中"，避免拐点附近误导
+REGIME_HISTORY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "output", "market_regime_history.json")
+PHASE_MIN_HISTORY = 60      # 阶段判断最少历史条数
+PHASE_CONFIRM_DAYS = 5      # 切换后确认期天数
+
+
+def _load_regime_history(history_path: str = None) -> list:
+    """加载regime历史序列（损坏/不存在返回空表）"""
+    path = history_path or REGIME_HISTORY_FILE
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"[阶段估计] 历史序列读取失败: {e}")
+    return []
+
+
+def estimate_market_phase(regime_result: dict = None,
+                          history_path: str = None) -> dict:
+    """市场阶段估计（观察模式，仅展示不参与仓位）
+
+    参数:
+        regime_result: MarketRegimeDetector.detect() 的返回（None时自动检测）
+        history_path: 历史序列路径（None=默认，测试可传临时路径）
+
+    返回:
+        {"available": bool,         # False=数据不足，报告应显示积累进度
+         "accumulated_days": int,   # 已积累条数
+         "required_days": int,      # 门槛(60)
+         "days": int,               # 当前三态持续天数(含今日)
+         "phase": str,              # 如"牛市中期"/"震荡第N天"
+         "note": str,               # 依据/风险提示(一句话)
+         "transition": bool}        # 切换未满确认期
+    """
+    fallback = {"available": False, "accumulated_days": 0,
+                "required_days": PHASE_MIN_HISTORY, "days": 0,
+                "phase": "", "note": "", "transition": False}
+    try:
+        history = _load_regime_history(history_path)
+        # 今日状态: 优先用传入结果；历史末条为今日时也认可
+        today_iso = datetime.date.today().isoformat()
+        state = None
+        if isinstance(regime_result, dict) and regime_result.get("state"):
+            state = regime_result["state"]
+        elif history and history[-1].get("date") == today_iso:
+            state = history[-1].get("state")
+        if not state:
+            fallback["accumulated_days"] = len(history)
+            fallback["note"] = "今日状态不可用，仅显示积累进度"
+            return fallback
+
+        # 当前三态持续天数（含今日；历史末条若已是今日则不重复计）
+        today_iso = datetime.date.today().isoformat()
+        _tail_is_today = bool(history and history[-1].get("date") == today_iso)
+        days = 1
+        tail = history[:-1] if _tail_is_today else history
+        for entry in reversed(tail):
+            if entry.get("state") == state:
+                days += 1
+            else:
+                break
+
+        result = {"available": len(history) >= PHASE_MIN_HISTORY,
+                  "accumulated_days": len(history) if _tail_is_today else len(history) + 1,
+                  "required_days": PHASE_MIN_HISTORY,
+                  "days": days, "phase": "", "note": "", "transition": False}
+
+        if not result["available"]:
+            result["note"] = "历史序列积累中，不参与阶段判断"
+            return result
+
+        # ---- 阶段规则（全部为评审定案的经验阈值，禁止回测调参）----
+        scores_hist = [e.get("scores", {}) for e in tail[-25:]]
+        if state == "BULL":
+            # 宽度背离检查: 指数创近期新高但近5日宽度得分转负(顶部特征)
+            closes = [e.get("close") for e in tail[-45:] if e.get("close")]
+            new_high = bool(closes and closes[-1] >= max(closes[:-5] or closes))
+            recent_breadth = [s.get("breadth", 0) for s in scores_hist[-5:]]
+            prior_breadth = [s.get("breadth", 0) for s in scores_hist[:-5][-20:]]
+            divergence = (new_high and recent_breadth and prior_breadth and
+                          sum(recent_breadth) / len(recent_breadth) <= -0.2 and
+                          sum(prior_breadth) / len(prior_breadth) > 0)
+            if divergence:
+                result["phase"] = "牛市末期"
+                result["note"] = "指数新高但市场宽度背离，顶部特征，锁盈优先"
+            elif days > 90:
+                result["phase"] = "牛市末期"
+                result["note"] = f"强势已持续{days}天(>90天)，防高位波动放大"
+            elif days >= 20:
+                result["phase"] = "牛市中期"
+                result["note"] = f"强势持续{days}天，持股+止损上移节奏"
+            else:
+                result["phase"] = "牛市初期"
+                result["note"] = f"强势仅{days}天，趋势待确认，不追高"
+        elif state == "BEAR":
+            # 蓄势检查: 近5日波动率得分转正且前期为负(波动收缩+抛压减轻)
+            recent_vol = [s.get("volatility", 0) for s in scores_hist[-5:]]
+            prior_vol = [s.get("volatility", 0) for s in scores_hist[:-5][-20:]]
+            contraction = (recent_vol and prior_vol and
+                           sum(recent_vol) / len(recent_vol) >= 0.2 and
+                           sum(prior_vol) / len(prior_vol) < 0)
+            if contraction and days >= 15:
+                result["phase"] = "熊市末期"
+                result["note"] = "波动收缩+抛压减轻，蓄势特征，但仍不抄底"
+            elif days < 15:
+                result["phase"] = "熊市初期"
+                result["note"] = f"弱势仅{days}天，降仓防守优先，不接飞刀"
+            else:
+                result["phase"] = "熊市中期"
+                result["note"] = f"弱势持续{days}天，轻仓等待企稳信号"
+        else:  # RANGE
+            result["phase"] = f"震荡第{days}天"
+            result["note"] = "震荡市不细分阶段，高抛低吸+单票仓位控制"
+
+        # 切换确认期: 未满5天不输出确定阶段，避免拐点附近误导
+        if days < PHASE_CONFIRM_DAYS:
+            result["transition"] = True
+            result["note"] += "；三态切换未满5天，阶段确认中(判断可能滞后)"
+        return result
+    except Exception as e:
+        logger.warning(f"[阶段估计] 异常降级: {e}")
+        return fallback
 
 
 # ============================================================

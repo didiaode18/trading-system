@@ -34,7 +34,8 @@ from data.realtime import fetch_realtime_batch
 from data.data_loader import fetch_stock_daily_baostock, _bs_logout
 from strategy.recommend_engine import run_recommendation, generate_trading_plan
 # FIX B4: 统一使用UnifiedRiskEngine替代已废弃的RiskGate
-from risk.risk_control import UnifiedRiskEngine, RISK_CONFIG
+# V4.0(G4): 新增 pre_trade_check_orders 条件单下单前硬校验
+from risk.risk_control import UnifiedRiskEngine, RISK_CONFIG, pre_trade_check_orders
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -89,7 +90,8 @@ REBOUND_FROM_LOW = 0.02    # 低点反弹2%触发
 # FIX: 修复TOTAL_CAPITAL硬编码424000与config不一致，改为从 config 引用
 TOTAL_CAPITAL = config.TOTAL_CAPITAL     # 总资金（与 config.py 保持一致）
 MAX_DAILY_TRADES = 3       # 每日最大交易笔数
-MAX_SINGLE_POSITION = 0.25 # 单只最大仓位25%
+# V4.0(G4): 原硬编码25%与config三级仓位硬限制(个股15%)不一致，统一从风控配置引用
+MAX_SINGLE_POSITION = RISK_CONFIG["stock_max_ratio"]
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -552,6 +554,78 @@ for h in holdings_list:
 # 6. 纪律锁
 discipline = generate_discipline_lock()
 
+# 5.5 V4.0(G6): 组合风控再平衡actions并入条件单闭环
+# （解决"组合风控只会算不会做"：卖出类动作转条件单进QMT，买入类仅建议不自动转单）
+rebalance_plan = None
+rebalance_converted = 0
+try:
+    from strategy.portfolio_risk import PortfolioRiskManager
+    _holdings_dict = {
+        h["code"]: {
+            "shares": h["数量"],
+            "buy_price": h["成本"],
+            "current_price": h["price"],
+            "sector": h["赛道"],
+        }
+        for h in holdings_with_price if h["数量"] > 0
+    }
+    if _holdings_dict:
+        prm = PortfolioRiskManager(all_data, _holdings_dict)
+        rebalance_plan = prm.calc_rebalance_plan()
+        _rb_actions = rebalance_plan.get("actions", []) if isinstance(rebalance_plan, dict) else []
+        _sell_actions = [a for a in _rb_actions if a.get("action") in ("减仓", "清仓")]
+        _buy_actions = [a for a in _rb_actions if a.get("action") == "加仓"]
+        # 已有卖出类条件单(止损/清仓优先)的标的不重复转单
+        _existing_sell_codes = {o["证券代码"] for o in all_orders if o["方向"] == "卖出"}
+        for a in _sell_actions:
+            code = a["code"]
+            if code in _existing_sell_codes:
+                continue
+            _h = next((h for h in holdings_with_price if h["code"] == code), None)
+            if not _h or _h["price"] <= 0:
+                continue
+            _shares = min(int(a.get("shares", 0)), _h["数量"])
+            if _shares < 100:
+                continue
+            _trigger = round(_h["price"] * 0.99, 3)  # 限价卖出：现价下方1%，避免滑点扩大
+            all_orders.append({
+                "类型": f"组合风控再平衡({a['action']})",
+                "优先级": "★★建议",
+                "证券代码": code,
+                "证券名称": a.get("name", code),
+                "方向": "卖出",
+                "触发价": _trigger,
+                "触发时间": "盘中实时",
+                "数量": _shares,
+                "有效期": "3个交易日",
+                "说明": f"组合风控再平衡: {a.get('reason', '')}，约回笼{a.get('amount', 0)/10000:.1f}万元",
+                "from_rebalance": True,
+            })
+            rebalance_converted += 1
+            print(f"  [再平衡→条件单] {a.get('name', code)} {a['action']}{_shares}股 @{_trigger:.3f}")
+        if rebalance_converted or _buy_actions:
+            _buy_note = f"，买入建议{len(_buy_actions)}条（不自动转单，避免绕过选股信号纪律）" if _buy_actions else ""
+            print(f"\n[组合风控] 再平衡动作: 卖出类已转条件单{rebalance_converted}条{_buy_note}")
+except Exception as e:
+    print(f"\n[组合风控] 再平衡动作并入异常(不影响基础条件单): {e}")
+
+# 6.5 V4.0(G4): 条件单下单前风控硬校验（三级仓位上限+现金底线）
+_positions_snapshot = {
+    h["code"]: {
+        "market_value": h["市值"],
+        "sector": h["赛道"],
+        "is_etf": ("ETF" in h["赛道"]) or h["code"][:2] in ("51", "58", "15"),
+    }
+    for h in holdings_with_price
+}
+blocked_orders = pre_trade_check_orders(all_orders, _positions_snapshot, TOTAL_CAPITAL)
+if blocked_orders:
+    print(f"\n[风控] ⛔ {len(blocked_orders)}条买入条件单被pre-trade校验拦截:")
+    for b in blocked_orders:
+        print(f"  {b['code']} {b['name']}: {b['reason']}")
+else:
+    print(f"\n[风控] ✅ pre-trade校验通过，无超限买入单")
+
 # ============================================================
 # 生成HTML报告
 # ============================================================
@@ -625,6 +699,35 @@ html += f'<div class="alert alert-info">总仓位: {total_mv/TOTAL_CAPITAL*100:.
 html += f'ETF上限{RISK_CONFIG["etf_max_ratio"]*100:.0f}% | 个股上限{RISK_CONFIG["stock_max_ratio"]*100:.0f}% | '
 html += f'赛道上限{RISK_CONFIG["sector_max_ratio"]*100:.0f}%</div>'
 
+# V4.0(G4): pre-trade拦截警示区
+if blocked_orders:
+    html += '<div class="alert alert-danger"><b>⛔ 下单前风控拦截（以下买入单禁止录入APP/QMT）:</b><br>'
+    for b in blocked_orders:
+        html += f'• {b["code"]} {b["name"]}: {b["reason"]}<br>'
+    html += '</div>'
+
+# V4.0(G6): 组合风控再平衡动作区块
+if isinstance(rebalance_plan, dict) and rebalance_plan.get("actions"):
+    html += '<h2>⚖️ 组合风控再平衡动作</h2>'
+    html += '<table><tr><th>方向</th><th>代码</th><th>名称</th><th>股数</th><th>金额</th><th>原因</th><th>执行状态</th></tr>'
+    _converted_codes = {o["证券代码"] for o in all_orders if o.get("from_rebalance")}
+    for a in rebalance_plan["actions"]:
+        _is_sell = a.get("action") in ("减仓", "清仓")
+        if _is_sell and a["code"] in _converted_codes:
+            _status = '<b style="color:#1976d2">已转条件单</b>'
+        elif _is_sell:
+            _status = '已有卖出单/不满足转单条件'
+        else:
+            _status = '仅建议（不自动转单）'
+        _color = "#e53935" if _is_sell else "#4caf50"
+        html += (f'<tr><td style="color:{_color}"><b>{a.get("action", "")}</b></td>'
+                 f'<td>{a.get("code", "")}</td><td>{a.get("name", "")}</td>'
+                 f'<td>{a.get("shares", 0):,}</td><td>{a.get("amount", 0):,.0f}</td>'
+                 f'<td style="font-size:11px">{a.get("reason", "")}</td><td>{_status}</td></tr>')
+    html += '</table>'
+    html += ('<div class="alert alert-info">卖出类再平衡动作已转为条件单并入下方清单与QMT执行文件；'
+             '买入类仅展示建议，由选股信号驱动，避免绕过入场纪律。</div>')
+
 # ---- 纪律锁 ----
 html += '<h2>🔒 操作纪律锁（铁律，不可违反）</h2>'
 html += '<div class="discipline"><ul>'
@@ -655,7 +758,11 @@ for idx, order in enumerate(all_orders, 1):
     html += f"""
 <div class="order-card {card_cls}">
 <b>#{idx}</b> <span class="tag {tag_cls}">{order['优先级']}</span>
-<b>{order['类型']}</b> | {order['证券代码']} {order['证券名称']} | <b>{order['方向']}</b>
+<b>{order['类型']}</b> | {order['证券代码']} {order['证券名称']} | <b>{order['方向']}</b>"""
+    # V4.0(G4): 被pre-trade拦截的订单卡片内红色警示
+    if order.get("blocked"):
+        html += f'<div class="alert alert-danger">⛔ 已被风控拦截: {order.get("block_reason", "")} —— 请勿录入此单</div>'
+    html += f"""
 <table>
 <tr><td style="width:80px"><b>触发价</b></td><td class="price-tag">{order['触发价']:.3f} 元</td></tr>
 <tr><td><b>触发时间</b></td><td>{trigger_time}</td></tr>
@@ -736,8 +843,14 @@ orders_json = {
     "orders": [],
 }
 for idx, order in enumerate(all_orders, 1):
+    # V4.0(G4): 被pre-trade拦截的买入单不进入QMT执行JSON，防止超限成交
+    if order.get("blocked"):
+        continue
     orders_json["orders"].append({
         "order_id": f"ORD_{date_str}_{idx:03d}",
+        # V4.2(P0-3): 生命周期初始态，盘后由 execution/order_lifecycle.reconcile_daily_orders
+        # 回写为 已成交/未触发，补齐G4/G6闭环最后一环
+        "status": "已生成",
         **order,
     })
 

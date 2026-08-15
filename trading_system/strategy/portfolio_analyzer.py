@@ -28,6 +28,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# 与 generate_holdings_report._ETF_PREFIXES 口径一致: ETF单票上限走 MAX_SINGLE_ETF_RATIO(20%)
+_ETF_PREFIXES = ("159", "510", "511", "512", "513", "515", "516", "518", "560", "562", "588")
+
 
 # ============================================================
 # 一、仓位分析
@@ -296,9 +299,12 @@ def generate_optimization(position_analysis: list, sector_allocation: list,
         })
         priority += 1
 
-    # 规则2: 单股仓位超15% → 减仓至12%
+    # 规则2: 单股仓位超限 → 减仓至上限内(股票12%/ETF20%, ETF不走龙头15%口径)
     overweight_positions = sorted(
-        [p for p in position_analysis if p["position_ratio"] > 15 and p["code"] not in [a["code"] for a in actions]],
+        [p for p in position_analysis
+         if not p["code"].startswith(_ETF_PREFIXES)
+         and p["position_ratio"] > 15
+         and p["code"] not in [a["code"] for a in actions]],
         key=lambda x: -x["position_ratio"]
     )
     for pos in overweight_positions:

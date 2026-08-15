@@ -119,3 +119,62 @@ trading_system/output/trade_logs/
 
 # AICoding workspace
 .aicoding-chat-workspace
+
+# === 临时调试与一次性脚本（根目录） ===
+_v50_*.py
+_v50_*.txt
+_v44_*.py
+analyze_*.py
+diag_*.py
+qa_pytest_out.txt
+review_diff_*.txt
+
+# 子目录临时脚本
+scripts/_*.py
+scripts/_*.ps1
+
+# QMT 运行日志
+qmt_*.log
+
+# === output/ 临时产物 ===
+output/*.py
+output/*.txt
+output/*.json
+output/*.ps1
+output/gradient_reduce_*.json
+output/holdings_snapshot_*.json
+output/market_regime_history.json
+output/universe_rescan_*.json
+output/ic_history_backup_*.json
+output/portfolio_structure.py
+output/live_divergence.py
+output/portfolio_monitor.py
+output/system_health_section.py
+
+# === trading_system/ 临时调试产物 ===
+trading_system/_*.py
+trading_system/_*.txt
+trading_system/validate_v8.py
+
+# === trading_system/data/ 运行时状态 ===
+trading_system/data/alert_*.json
+trading_system/data/buy_*.json
+trading_system/data/ic_pending.json
+trading_system/data/intraday_state.json
+trading_system/data/margin_monitor_cache*.json
+trading_system/data/r17_*.json
+trading_system/data/r18_*.json
+trading_system/data/holdings_snapshots/
+trading_system/data/fundamental_cache.json
+trading_system/data/capital_flow_cache.json
+trading_system/data/market_pulse_cache.json
+trading_system/data/scan_cache.json
+trading_system/data/sector_rotation_cache.json
+
+# === trading_system/output/ 运行时状态 ===
+trading_system/output/*.json
+trading_system/output/.monitor_heartbeat
+trading_system/output/*.py
+
+# === 根目录临时持仓备份 ===
+holdings_backup_*.json

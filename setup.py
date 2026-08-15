@@ -63,6 +63,80 @@ def install_dependencies():
         return False
 
 
+def check_config_local():
+    """检查config_local.py是否存在，不存在则从模板复制并引导填写"""
+    print("[3.5/7] 检查私有配置...")
+    local_cfg = os.path.join(TRADING_SYSTEM_DIR, "config_local.py")
+    example_cfg = os.path.join(TRADING_SYSTEM_DIR, "config_local.example.py")
+
+    if os.path.exists(local_cfg):
+        print("  ✓ config_local.py 已存在")
+        return True
+
+    if not os.path.exists(example_cfg):
+        print("  ✗ config_local.example.py 模板不存在，跳过")
+        return False
+
+    # 自动从模板复制
+    import shutil
+    shutil.copy2(example_cfg, local_cfg)
+    print(f"  ✓ 已从模板复制: config_local.example.py → config_local.py")
+    print()
+    print("  ┌─────────────────────────────────────────────────┐")
+    print("  │  首次配置向导                                    │")
+    print("  │  请按提示填写以下信息（直接回车跳过，稍后手动编辑）│")
+    print("  └─────────────────────────────────────────────────┘")
+    print()
+
+    lines = []
+    # 读取模板内容，替换占位符
+    with open(local_cfg, "r", encoding="utf-8") as f:
+        template = f.read()
+
+    # 交互式填写
+    try:
+        capital = input("  总资金（元，如 500000）: ").strip()
+        if capital and capital.isdigit():
+            template = template.replace(
+                "TOTAL_CAPITAL = 500000",
+                f"TOTAL_CAPITAL = {int(capital):_}"
+            )
+
+        cash = input("  可用资金（元，如 100000）: ").strip()
+        if cash and cash.isdigit():
+            template = template.replace(
+                "AVAILABLE_CASH = 100000",
+                f"AVAILABLE_CASH = {int(cash):_}"
+            )
+
+        auth_code = input("  QQ邮箱SMTP授权码（16位，回车跳过）: ").strip()
+        if auth_code:
+            template = template.replace(
+                'EMAIL_AUTH_CODE = "\u5728\u6b64\u586b\u519916\u4f4dQQ\u90ae\u7bb1\u6388\u6743\u7801"',
+                f'EMAIL_AUTH_CODE = "{auth_code}"'
+            )
+
+        email = input("  QQ邮箱地址（如 123456@qq.com，回车跳过）: ").strip()
+        if email:
+            template = template.replace(
+                'EMAIL_SENDER = "your_qq@qq.com"',
+                f'EMAIL_SENDER = "{email}"'
+            )
+            template = template.replace(
+                'EMAIL_RECEIVER = "your_qq@qq.com"',
+                f'EMAIL_RECEIVER = "{email}"'
+            )
+    except (EOFError, KeyboardInterrupt):
+        print("\n  （跳过交互式填写，请手动编辑 config_local.py）")
+
+    with open(local_cfg, "w", encoding="utf-8") as f:
+        f.write(template)
+
+    print()
+    print("  ✓ config_local.py 已生成，可随时编辑修改")
+    return True
+
+
 def create_directories():
     """创建必要目录"""
     print("[3/7] 创建目录结构...", end=" ")
@@ -265,6 +339,9 @@ def main():
 
     # Step 3: 创建目录
     create_directories()
+
+    # Step 3.5: 检查私有配置（P0-6 + P1-1 交互式向导）
+    check_config_local()
 
     # Step 4: 初始化数据库
     init_database(reset=args.reset)

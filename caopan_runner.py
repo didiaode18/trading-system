@@ -45,23 +45,8 @@ OUTPUT_DIR = os.path.join(TRADING_SYSTEM_DIR, "output", "caopan")
 
 
 def load_holdings() -> dict:
-    """加载持仓配置"""
-    # 名称映射表
-    NAME_MAP = {
-        "588000": "科创50", "002415": "海康威视", "603501": "豪威集团",
-        "002409": "雅克科技", "002185": "华天科技", "600036": "招商银行",
-        "159205": "创业东财", "600276": "恒瑞医药", "603993": "洛阳钼业",
-    }
-    holdings_path = os.path.join(BASE_DIR, "holdings.json")
-    if os.path.exists(holdings_path):
-        with open(holdings_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 补充name字段
-        for code, info in data.items():
-            if "name" not in info:
-                info["name"] = NAME_MAP.get(code, info.get("sector", code))
-        return data
-    return {}
+    """加载持仓（统一委托 config.load_holdings）"""
+    return config.load_holdings(validated=False)
 
 
 def fetch_stock_data(code: str, days: int = 500, _logged_in: bool = False) -> "pd.DataFrame":

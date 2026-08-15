@@ -301,7 +301,9 @@ def _generate_holding_orders(code: str, sig: dict, holding: dict, data_df=None) 
     shares = holding.get("shares", 0)
     buy_price = holding.get("buy_price", 0)
     current_price = holding.get("current_price", holding.get("buy_price", 0))
-    highest_price = holding.get("highest_price", current_price)
+    # FIX: 修复字段名错位：holdings.json 实际字段为 highest，原读 highest_price 永远fallback到当前价，
+    # 导致回落卖出触发价失真；保留 highest_price 兼容既有测试/mock数据
+    highest_price = holding.get("highest") or holding.get("highest_price", current_price)
 
     if shares <= 0 or buy_price <= 0:
         return orders
@@ -1034,6 +1036,30 @@ def _save_qmt_orders_json(signals: list, holdings: dict = None, data_dict: dict 
             "优先级": priority_map.get(order.get("priority", 2), "★★建议"),
             "说明": order.get("notes", ""),
         })
+
+    # V4.0(G4): 条件单下单前风控硬校验，超限买入单不进入QMT执行JSON
+    try:
+        from risk.risk_control import pre_trade_check_orders
+        _total_cap = getattr(config, 'TOTAL_CAPITAL', 1000000)
+        _positions = {}
+        for _c, _h in (holdings or {}).items():
+            if not isinstance(_h, dict):
+                continue
+            _shares = float(_h.get("shares", _h.get("数量", 0)) or 0)
+            _price = float(_h.get("price", _h.get("最新价", 0)) or _h.get("buy_price", _h.get("成本", 0)) or 0)
+            _sector = _h.get("sector", _h.get("赛道", "")) or ""
+            _positions[_c] = {
+                "market_value": _shares * _price,
+                "sector": _sector,
+                "is_etf": ("ETF" in _sector) or str(_c)[:2] in ("51", "58", "15"),
+            }
+        _blocked = pre_trade_check_orders(qmt_orders, _positions, _total_cap)
+        if _blocked:
+            for _b in _blocked:
+                logger.warning(f"[条件单] ⛔ pre-trade拦截: {_b['code']} {_b['name']} {_b['reason']}")
+            qmt_orders = [o for o in qmt_orders if not o.get("blocked")]
+    except Exception as _pte:
+        logger.warning(f"[条件单] pre-trade校验异常(不阻断生成): {_pte}")
 
     orders_json = {
         "date": today.strftime("%Y-%m-%d"),

@@ -137,16 +137,6 @@ def is_trading_day() -> bool:
     return True
 
 
-def run_after_close_tasks():
-    """DEPRECATED: 盘后任务已统一由 scheduler.py 负责，本函数保留仅为兼容"""
-    logger.warning("[DEPRECATED] 盘后任务已统一由 trading_system/scheduler.py 负责")
-    logger.warning("[DEPRECATED] 请改用: python trading_system/scheduler.py --run-once")
-    logger.info("=" * 60)
-    logger.info(f"  (DEPRECATED) 盘后自动任务 | {datetime.date.today()}")
-    logger.info("=" * 60)
-    logger.info("本功能已废弃，不再执行。")
-
-
 def run_scheduler_daemon():
     """常驻调度守护进程（V2.0: 仅QMT执行）"""
     logger.info("=" * 60)
@@ -245,7 +235,7 @@ def print_setup_guide():
 # ============================================================
 if __name__ == "__main__":
     if "--once" in sys.argv:
-        run_after_close_tasks()
+        logger.info("盘后任务已统一由 scheduler.py 负责，请使用: python trading_system/scheduler.py --run-once")
     elif "--setup" in sys.argv:
         print_setup_guide()
     else:

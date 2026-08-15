@@ -417,3 +417,130 @@ def position_summary(plan: dict) -> str:
             lines.append(f"    {icon} {rb['name']} {rb['action']} {rb['shares']}股 ({rb['amount']/10000:.1f}万) | {rb['reason']}")
 
     return "\n".join(lines)
+
+
+# =============================================================
+# 公共仓位计算辅助函数（模块级，供 calc_add_position 等复用）
+# 与 PositionSizer._calc_single_position 的风险预算/半凯利口径保持一致
+# =============================================================
+
+def _risk_budget_shares(capital: float, price: float, risk_per_share: float,
+                        risk_pct: float = None) -> int:
+    """
+    风险预算法股数（公共辅助函数）
+
+    口径与 PositionSizer._calc_single_position 一致:
+        股数 = 总资金 × 单笔风险预算比例 / 每股风险
+
+    参数:
+        capital: 总资金(元)
+        price: 现价(元)
+        risk_per_share: 每股风险(入场价-止损价, 元)
+        risk_pct: 单笔风险预算比例, 缺省沿用 SIZING_CONFIG["max_risk_per_trade"](2%)
+
+    返回:
+        风险预算股数(int), 输入非法时返回 0
+    """
+    if capital <= 0 or price <= 0 or risk_per_share <= 0:
+        return 0
+    if risk_pct is None:
+        risk_pct = SIZING_CONFIG["max_risk_per_trade"]
+    return int(capital * risk_pct / risk_per_share)
+
+
+def _kelly_shares(capital: float, price: float, win_rate: float,
+                  pay_off_ratio: float) -> tuple:
+    """
+    半凯利公式股数（公共辅助函数）
+
+    口径与 PositionSizer._calc_single_position 一致:
+        kelly = max(0, (b*p - q) / b) × kelly_fraction(半凯利)
+        股数 = 总资金 × kelly / 现价
+
+    参数:
+        capital: 总资金(元)
+        price: 现价(元)
+        win_rate: 胜率 p (0~1)
+        pay_off_ratio: 盈亏比 b
+
+    返回:
+        (凯利股数int, 半凯利比例float); 输入非法时返回 (0, 0.0)
+    """
+    if capital <= 0 or price <= 0:
+        return 0, 0.0
+    b = max(float(pay_off_ratio), 1.0)
+    p = float(win_rate)
+    q = 1 - p
+    kelly = (b * p - q) / b if b > 0 else 0
+    kelly = max(0, kelly * SIZING_CONFIG["kelly_fraction"])  # 半凯利
+    return int(capital * kelly / price), kelly
+
+
+def calc_add_position(code, price, current_shares, capital,
+                      atr=0.0, win_rate=None, pay_off_ratio=None):
+    """
+    计算已持仓标的的建议加仓股数与新止损价（纯计算, 无任何I/O与网络）
+
+    语义: 为"已持有 current_shares 股、现价 price 的标的"给出加仓建议。
+    计算链路:
+      1. 新止损价: atr>0 时取 price - 2*atr(不低于 price×0.90 防极端),
+         否则回退 price×0.95(与现状硬编码口径一致)
+      2. 风险预算股数: capital × 2%(沿用 SIZING_CONFIG) / (price - new_stop)
+      3. 若 win_rate/pay_off_ratio 可用, 套用半凯利逻辑并与风险预算取小
+      4. 加仓上限钳位: min(上述股数, 现持仓×0.5, 单票市值上限折算股数)
+      5. 100股整数向下取整, 不足100股返回 0(不加仓)
+
+    参数:
+        code: 股票代码(仅用于日志/标识)
+        price: 现价(元)
+        current_shares: 当前持有股数
+        capital: 总资金(元)
+        atr: 20日ATR绝对值(元), 0 表示不可用
+        win_rate: 胜率(0~1), None 表示不可用
+        pay_off_ratio: 盈亏比, None 表示不可用
+
+    返回:
+        {"add_shares": int, "new_stop": float, "method": str}
+        price<=0 或 capital<=0 时安全返回 add_shares=0
+    """
+    # 安全兜底: 非法输入不加仓
+    if price is None or capital is None or price <= 0 or capital <= 0:
+        return {"add_shares": 0, "new_stop": 0.0, "method": "无效输入"}
+
+    # 1. 新止损价
+    if atr and atr > 0:
+        new_stop = max(price - 2 * atr, price * 0.90)
+    else:
+        new_stop = price * 0.95  # 与现状硬编码5%止损口径一致
+    new_stop = round(new_stop, 2)
+
+    risk_per_share = price - new_stop
+    if risk_per_share <= 0:
+        return {"add_shares": 0, "new_stop": new_stop, "method": "止损距离无效"}
+
+    # 2. 风险预算股数(2%, 沿用 SIZING_CONFIG)
+    shares_by_risk = _risk_budget_shares(capital, price, risk_per_share)
+    method = f"风险预算{SIZING_CONFIG['max_risk_per_trade']*100:.0f}%@止损{new_stop:.2f}"
+
+    # 3. 凯利钳位(胜率/盈亏比可用时, 与风险预算取小)
+    add_shares = shares_by_risk
+    if win_rate is not None and pay_off_ratio is not None:
+        shares_by_kelly, kelly = _kelly_shares(capital, price, win_rate, pay_off_ratio)
+        if shares_by_kelly < add_shares:
+            add_shares = shares_by_kelly
+            method = f"半凯利钳位({kelly*100:.1f}%)@止损{new_stop:.2f}"
+
+    # 4. 加仓上限钳位
+    current_shares = current_shares or 0
+    add_cap_by_holding = int(current_shares * 0.5)  # 单次加仓不超过现持仓50%
+    max_position_pct = SIZING_CONFIG.get("max_position_pct", 0.25)  # 单票市值上限25%
+    add_cap_by_total = int(capital * max_position_pct / price)
+    add_shares = min(add_shares, add_cap_by_holding, add_cap_by_total)
+    add_shares = max(0, add_shares)
+
+    # 5. A股100股整数倍, 不足100股不加
+    add_shares = (add_shares // 100) * 100
+    if add_shares < 100:
+        add_shares = 0
+
+    return {"add_shares": add_shares, "new_stop": float(new_stop), "method": method}

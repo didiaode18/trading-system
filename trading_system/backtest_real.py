@@ -748,7 +748,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     sell_ratio = 1.0
 
             # ---- 移动止损 ----
-            # OPTIMIZE: 初始止损从8%收紧至7%（回测显示平均亏损-10.20%含滑点，与backtest_v6 INITIAL_STOP_LOSS=0.07一致）
+            # OPTIMIZE: 初始止损从8%收紧至7%（回测显示平均亏损-10.20%含滑点）
             # P0: 市场环境自适应 - BEAR时止损收紧至5%（快速止损），BULL时保持7%
             # P1: ATR自适应止损 - 根据买入时波动率动态调整止损距离
             #   公式: stop_pct = ATR_at_buy / buy_price * multiplier
@@ -1295,7 +1295,7 @@ def run():
         html = generate_report(stats_v5, stats_v6, trades_v6)
     else:
         html = generate_report(stats_v2, stats_v5, trades_v5)
-    report_path = os.path.join(config.PROJECT_ROOT, "output", f"backtest_v6_{datetime.date.today().strftime('%Y%m%d')}.html")
+    report_path = os.path.join(config.PROJECT_ROOT, "output", f"backtest_real_{datetime.date.today().strftime('%Y%m%d')}.html")
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)

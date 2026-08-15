@@ -4,6 +4,7 @@
 大单拆分、滑点追踪、执行质量分析
 """
 
-from execution.twap import ExecutionSplitter
+# FIX: 清理 twap.py 死代码（已整文件删除，grep 验证零调用；
+# slippage_tracker 使用方均为直接模块导入，无需包级导出）
 
-__all__ = ["ExecutionSplitter"]
+__all__ = []

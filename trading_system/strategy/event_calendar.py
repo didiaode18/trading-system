@@ -40,6 +40,12 @@ try:
 except ImportError:
     HAS_AKSHARE = False
 
+# V5修复: 解禁数据进程级缓存 —— 原实现每只持仓重复调用全市场接口(17次)且
+# 失败不缓存，接口不可用时刷出17条warning。汇总接口按日负缓存，
+# 个股解禁队列按(代码,日期)缓存(含空结果)。
+_RELEASE_SUMMARY_FAIL_CACHE = {"date": None}
+_RELEASE_QUEUE_CACHE = {}
+
 
 class EventCalendar:
     """事件日历管理器"""
@@ -313,17 +319,73 @@ class EventCalendar:
         today = datetime.date.today()
         end_date = today + datetime.timedelta(days=days_ahead)
 
+        # V5修复: 当日失败过则不再重试(负缓存)，避免逐持仓重复打接口刷日志
+        if _RELEASE_SUMMARY_FAIL_CACHE.get("date") == today.isoformat():
+            return empty_df
+
         # --- 方案1: akshare 限售解禁摘要接口 ---
+        # V5修复: akshare已将symbol枚举改为"全部股票"，旧值"全部"抛KeyError
         try:
-            df = ak.stock_restricted_release_summary_em(symbol="全部")
+            df = ak.stock_restricted_release_summary_em(
+                symbol="全部股票",
+                start_date=today.strftime("%Y%m%d"),
+                end_date=end_date.strftime("%Y%m%d"))
             if df is not None and not df.empty:
                 return self._parse_release_df(df, today, end_date, columns)
         except Exception as e:
             logger.warning(f"[解禁日历] stock_restricted_release_summary_em 失败: {e}")
 
         # --- 方案2: 尝试逐个获取（仅作为兜底，不遍历全市场） ---
-        logger.warning("[解禁日历] 所有数据源均不可用，返回空日历")
+        _RELEASE_SUMMARY_FAIL_CACHE["date"] = today.isoformat()
+        logger.warning("[解禁日历] 所有数据源均不可用，返回空日历(当日不再重试)")
         return empty_df
+
+    def _fetch_stock_release_queue(self, stock_code: str,
+                                   days_ahead: int = 90) -> list:
+        """V5修复: 个股解禁队列(东财 per-stock 接口)
+
+        全市场摘要接口无个股代码，check_stock_release_risk 此前恒为空转。
+        现改用 stock_restricted_release_queue_em(symbol=股票代码) 拉取该股
+        未来 days_ahead 天内的解禁事件，按(代码,日期)缓存含空结果。
+
+        返回: [{"release_date": "YYYY-MM-DD",
+                "release_market_value_ratio": float(百分比),
+                "release_type": str}, ...]
+        """
+        today = datetime.date.today()
+        ent = _RELEASE_QUEUE_CACHE.get(stock_code)
+        if ent and ent.get("date") == today.isoformat():
+            return ent["events"]
+
+        events = []
+        if HAS_AKSHARE:
+            try:
+                df = ak.stock_restricted_release_queue_em(symbol=stock_code)
+                if df is not None and not df.empty:
+                    end = today + datetime.timedelta(days=days_ahead)
+                    for _, row in df.iterrows():
+                        try:
+                            d = pd.to_datetime(row.get("解禁时间")).date()
+                        except Exception:
+                            continue
+                        if d < today or d > end:
+                            continue
+                        # 接口返回小数(0.1049=10.49%)，评级阈值为百分数口径
+                        try:
+                            ratio = float(row.get("占流通市值比例") or 0) * 100
+                        except (ValueError, TypeError):
+                            ratio = 0.0
+                        events.append({
+                            "release_date": d.isoformat(),
+                            "release_market_value_ratio": round(ratio, 2),
+                            "release_type": str(row.get("限售股类型", "")),
+                        })
+            except Exception as e:
+                logger.debug(f"[解禁日历] 个股解禁队列获取失败({stock_code}): {e}")
+
+        _RELEASE_QUEUE_CACHE[stock_code] = {
+            "date": today.isoformat(), "events": events}
+        return events
 
     def _parse_release_df(self, df: pd.DataFrame, start: datetime.date,
                           end: datetime.date, columns: list) -> pd.DataFrame:
@@ -442,6 +504,24 @@ class EventCalendar:
         max_impact = "none"
         block_buy = False
         impact_order = {"high": 3, "medium": 2, "low": 1, "none": 0}
+
+        # V5修复: 优先走个股解禁队列(全市场摘要无个股代码，原路径恒空转)
+        queue_events = self._fetch_stock_release_queue(stock_code, days_ahead=90)
+        if queue_events:
+            for release_data in queue_events:
+                result = self.assess_release_impact(stock_code, release_data)
+                events.append(result)
+                if impact_order.get(result["impact_level"], 0) > impact_order.get(max_impact, 0):
+                    max_impact = result["impact_level"]
+                if result["impact_level"] == "high" and result["days_until_release"] <= 30:
+                    block_buy = True
+            return {
+                "stock_code": stock_code,
+                "has_release": len(events) > 0,
+                "events": events,
+                "max_impact": max_impact,
+                "block_buy": block_buy,
+            }
 
         if not cal_df.empty and "stock_code" in cal_df.columns:
             stock_rows = cal_df[cal_df["stock_code"] == stock_code]

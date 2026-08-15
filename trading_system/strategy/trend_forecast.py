@@ -88,7 +88,9 @@ class TrendForecaster:
         if holding:
             buy_price = holding.get("buy_price", current_price)
             shares = holding.get("shares", 0)
-            highest = holding.get("highest_price", current_price)
+            # FIX: 修复字段名错位：holdings.json 实际字段为 highest，原读 highest_price 永远fallback到当前价，
+            # 导致回撤计算失真；保留 highest_price 兼容其他调用方，保留原 fallback
+            highest = holding.get("highest") or holding.get("highest_price") or current_price
             pnl_pct = (current_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
             drawdown_from_high = (current_price - highest) / highest * 100 if highest > 0 else 0
             market_value = shares * current_price

@@ -44,6 +44,12 @@ def send_dingtalk(title: str, content: str, webhook_url: str = None) -> bool:
         logger.warning("钉钉Webhook未配置，跳过发送")
         return False
 
+    # V4.4: 自定义关键词安全模式 —— 消息体不含关键词时自动给标题加前缀，
+    # 避免errcode 310000（关键词不匹配）静默丢推
+    _kw = getattr(config, "DINGTALK_KEYWORD", "")
+    if _kw and _kw not in title and _kw not in content:
+        title = f"[{_kw}] {title}"
+
     payload = {
         "msgtype": "markdown",
         "markdown": {

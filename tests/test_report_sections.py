@@ -23,6 +23,10 @@ from strategy.recovery_planner import build_recovery_plan, track_progress
 from strategy.sector_divergence import (
     load_sector_cache, detect_divergence, get_coarse_sector_map, merge_report_candidates,
 )
+from execution.trade_behavior import (
+    analyze_trade_behavior, estimate_commission, render_behavior_alert_html,
+)
+import update_holdings
 
 
 # ============================================================
@@ -166,11 +170,15 @@ class TestSectorDivergence:
         assert result["lagging_positions"] == []
 
     def test_coarse_sector_mapping(self):
-        """粗-细赛道映射: 银行→大金融, 半导体材料→半导体, 创新药→医药医疗"""
+        """粗-细赛道映射: 概念板块体系(2026-08-06)下细分自动归入对应概念，旧兜底映射保留"""
         cmap = get_coarse_sector_map()
+        # 新口径: 细分直接归入东方财富概念板块键名
+        assert cmap.get("AI视觉") == "人工智能"
+        assert cmap.get("半导体设备") == "半导体芯片"
+        assert cmap.get("创新药") == "创新药"
+        assert cmap.get("白酒") == "白酒"
+        # 旧兜底映射保留（配置中已不存在的细分仍走内置表）
         assert cmap.get("银行") == "大金融"
-        assert cmap.get("半导体材料") == "半导体"
-        assert cmap.get("创新药") == "医药医疗"
         assert cmap.get("调味品") == "大消费"
 
     def test_weak_sector_lagging_positions(self):
@@ -258,3 +266,179 @@ class TestMergeReportCandidates:
     def test_empty_sources(self):
         """空源不抛异常"""
         assert merge_report_candidates([], None, None) == []
+
+
+# ============================================================
+# 交易行为自诊断测试
+# ============================================================
+
+class TestTradeBehavior:
+    """analyze_trade_behavior 频繁操作诊断核心逻辑测试"""
+
+    def test_empty_trades(self):
+        """空成交返回ok不抛异常"""
+        r = analyze_trade_behavior([], 100000)
+        assert r["severity"] == "ok"
+        assert r["total_waste"] == 0
+
+    def test_chase_cost(self):
+        """追高成本: 更低买价出现后高价买入的额外支出"""
+        trades = [
+            {"time": "09:30:00", "code": "159243", "name": "A", "direction": "买入", "qty": 1000, "price": 1.20},
+            {"time": "10:00:00", "code": "159243", "name": "A", "direction": "买入", "qty": 2000, "price": 1.26},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        assert r["chase_cost"] == pytest.approx((1.26 - 1.20) * 2000, abs=0.01)
+
+    def test_no_chase_when_buying_lower(self):
+        """越买越便宜不算追高"""
+        trades = [
+            {"time": "09:30:00", "code": "159243", "name": "A", "direction": "买入", "qty": 1000, "price": 1.26},
+            {"time": "10:00:00", "code": "159243", "name": "A", "direction": "买入", "qty": 2000, "price": 1.20},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        assert r["chase_cost"] == 0
+
+    def test_panic_cost(self):
+        """杀低损失: 更高卖价出现后低价继续卖出"""
+        trades = [
+            {"time": "09:30:00", "code": "601318", "name": "B", "direction": "卖出", "qty": 400, "price": 53.36},
+            {"time": "11:00:00", "code": "601318", "name": "B", "direction": "卖出", "qty": 1500, "price": 53.18},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        assert r["panic_cost"] == pytest.approx((53.36 - 53.18) * 1500, abs=0.01)
+
+    def test_quick_flip_loss(self):
+        """闪电翻转: 买入后30分钟内卖出亏损计入回转亏损"""
+        trades = [
+            {"time": "09:52:55", "code": "600036", "name": "C", "direction": "买入", "qty": 1000, "price": 38.78},
+            {"time": "09:57:55", "code": "600036", "name": "C", "direction": "卖出", "qty": 1000, "price": 38.69},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        assert r["roundtrip_loss"] == pytest.approx(90.0, abs=0.01)
+        assert r["quick_flip"]["count"] == 1
+        assert r["quick_flip"]["loss"] == pytest.approx(90.0, abs=0.01)
+
+    def test_sell_then_buyback_premium(self):
+        """先卖后溢价买回计入回转亏损; 高卖低接为盈利抵减"""
+        trades = [
+            {"time": "09:30:00", "code": "588000", "name": "D", "direction": "卖出", "qty": 1000, "price": 1.745},
+            {"time": "10:16:00", "code": "588000", "name": "D", "direction": "买入", "qty": 1000, "price": 1.787},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        assert r["roundtrip_loss"] == pytest.approx((1.787 - 1.745) * 1000, abs=0.01)
+
+    def test_commission_etf_no_stamp(self):
+        """ETF卖出免印花税，股票卖出收印花税"""
+        fees_etf = estimate_commission([
+            {"code": "159599", "direction": "卖出", "qty": 10000, "price": 2.8, "amount": 28000}])
+        fees_stock = estimate_commission([
+            {"code": "601318", "direction": "卖出", "qty": 1000, "price": 28.0, "amount": 28000}])
+        assert fees_etf["stamp"] == 0
+        assert fees_stock["stamp"] == pytest.approx(28000 * 0.0005, abs=0.01)
+
+    def test_severe_severity(self):
+        """成交笔数≥20且换手率高 → severe，横幅含警示文案"""
+        trades = [
+            {"time": f"09:{30+i//10}{i%10}:00", "code": "159243", "name": "A",
+             "direction": "买入", "qty": 1000, "price": 1.2}
+            for i in range(25)
+        ]
+        r = analyze_trade_behavior(trades, 100000)
+        assert r["severity"] == "severe"
+        html = render_behavior_alert_html(r)
+        assert "频繁操作警示" in html and "纪律提醒" in html
+
+    def test_total_waste_components(self):
+        """total_waste = 费用 + 追高 + 杀低 + 回转净亏损"""
+        trades = [
+            {"time": "09:30:00", "code": "159243", "name": "A", "direction": "买入", "qty": 1000, "price": 1.20},
+            {"time": "10:00:00", "code": "159243", "name": "A", "direction": "买入", "qty": 1000, "price": 1.26},
+        ]
+        r = analyze_trade_behavior(trades, 1000000)
+        expected = r["fees"]["total"] + r["chase_cost"] + r["panic_cost"] + r["roundtrip_loss"]
+        assert r["total_waste"] == pytest.approx(expected, abs=0.01)
+
+
+# ============================================================
+# 持仓更新V2.0合并规则测试
+# ============================================================
+
+class TestHoldingsMerge:
+    """update_holdings.merge_holding: 首次字段锁定/止损Ratchet/审计字段"""
+
+    EXISTING = {
+        "name": "海天味业", "shares": 900, "buy_price": 40.895,
+        "current_price": 36.55, "stop_loss": 36.81, "highest": 40.895,
+        "buy_date": "2026-07-25", "reason": "消费食品龙头", "sector": "大消费",
+    }
+
+    def _parsed(self, **kw):
+        base = {"code": "603288", "name": "海天味业", "shares": 900,
+                "buy_price": 40.895, "current_price": 36.50, "stop_loss": 0}
+        base.update(kw)
+        return base
+
+    def test_new_position_initial_fields(self):
+        """新建仓: 首次字段全量写入，未提供止损时默认成本×90%"""
+        merged, warns = update_holdings.merge_holding(
+            {}, self._parsed(shares=500), source="单只更新")
+        assert merged["shares"] == 500
+        assert merged["initial_stop_loss"] == pytest.approx(40.895 * 0.9, abs=0.001)
+        assert merged["stop_loss"] == pytest.approx(40.895 * 0.9, abs=0.001)
+        assert merged["first_shares"] == 500
+        assert merged["revision_count"] == 0
+        assert merged["first_confirmed_at"] and merged["last_update_source"] == "单只更新"
+        assert not warns
+
+    def test_cost_change_rejected_when_shares_same(self):
+        """股数不变但输入新成本 → 拒绝覆盖原始成本"""
+        merged, warns = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(buy_price=38.0), source="文件")
+        assert merged["buy_price"] == 40.895
+        assert any("已忽略" in w for w in warns)
+
+    def test_cost_change_with_force(self):
+        """--force 显式确认 → 允许人工修正成本"""
+        merged, warns = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(buy_price=38.0), source="文件", force=True)
+        assert merged["buy_price"] == 38.0
+        assert any("--force" in w for w in warns)
+
+    def test_stop_loss_ratchet_never_down(self):
+        """输入止损低于现有 → 按Ratchet保留原值"""
+        merged, warns = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(stop_loss=33.63), source="交互式")
+        assert merged["stop_loss"] == 36.81
+        assert any("Ratchet" in w for w in warns)
+
+    def test_stop_loss_zero_keeps_existing(self):
+        """输入止损0视为未提供，保留现值绝不置0"""
+        merged, _ = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(stop_loss=0), source="文件")
+        assert merged["stop_loss"] == 36.81
+
+    def test_stop_loss_up_allowed(self):
+        """输入更高止损 → 允许上移（只升不降）"""
+        merged, _ = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(stop_loss=37.5), source="文件")
+        assert merged["stop_loss"] == 37.5
+
+    def test_shares_change_accepts_new_cost_keeps_buy_date(self):
+        """股数变化=真实交易: 接受新加权成本，但buy_date/initial_stop_loss不变"""
+        merged, warns = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(shares=1200, buy_price=41.5, stop_loss=37.2), source="文件")
+        assert merged["shares"] == 1200
+        assert merged["buy_price"] == 41.5
+        assert merged["buy_date"] == "2026-07-25"  # 首次建仓日期不变
+
+    def test_daily_fields_and_audit(self):
+        """每日字段更新 + revision_count 递增"""
+        merged, _ = update_holdings.merge_holding(
+            dict(self.EXISTING), self._parsed(current_price=36.20), source="交互式")
+        assert merged["current_price"] == 36.20
+        assert merged["highest"] == 40.895  # highest只升不降
+        assert merged["revision_count"] == 1
+        assert merged["last_update_source"] == "交互式"
+        assert merged["updated_at"]
+

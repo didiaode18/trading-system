@@ -298,7 +298,7 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
 
 def _validate_data_quality(conn: sqlite3.Connection, code: str, df: pd.DataFrame) -> pd.DataFrame:
     """
-    数据质量验证：过滤明显异常的数据行
+    数据质量验证：过滤明显异常的数据行（向量化实现）
     
     检测规则:
     1. 成交量异常低（< 历史均量的2%）且价格大幅变动（>5%）→ 疑似数据源错误
@@ -320,63 +320,53 @@ def _validate_data_quality(conn: sqlite3.Connection, code: str, df: pd.DataFrame
     hist_volumes = [row[0] for row in cursor.fetchall()]
     avg_volume = sum(hist_volumes) / len(hist_volumes) if hist_volumes else 0
     
-    valid_rows = []
+    original_len = len(df)
+    mask_valid = pd.Series(True, index=df.index)
     removed = []
     
-    for idx, row in df.iterrows():
-        vol = row.get("volume", 0) or 0
-        close = row.get("close", 0) or 0
-        open_price = row.get("open", 0) or 0
-        
-        # 规则0: 价格无效
-        if close <= 0 or open_price <= 0:
-            removed.append(f"{row['date']}: 价格无效(close={close})")
-            continue
-        
-        # 规则1: 成交量异常低 + 价格大幅变动
-        if avg_volume > 0 and vol > 0:
-            vol_ratio = vol / avg_volume
-            if vol_ratio < 0.02:  # 成交量不足均量2%
-                # 检查价格变动（与前一天收盘对比）
-                if valid_rows:
-                    prev_close = valid_rows[-1]["close"]
-                else:
-                    # 从数据库取前一天收盘价
-                    cursor.execute("""
-                        SELECT close FROM daily_kline 
-                        WHERE code=? ORDER BY date DESC LIMIT 1
-                    """, (code,))
-                    prev_row = cursor.fetchone()
-                    prev_close = prev_row[0] if prev_row else close
-                
-                if prev_close > 0:
-                    price_change = abs(close - prev_close) / prev_close
-                    if price_change > 0.05:  # 价格变动>5%
-                        removed.append(
-                            f"{row['date']}: 量价异常(vol={vol:.0f}, "
-                            f"均量比={vol_ratio:.3f}, 跌幅={price_change:.1%})")
-                        continue
-        
-        # 规则2: 单日跌幅超11%（非ST/非新股）
-        if valid_rows:
-            prev_close = valid_rows[-1]["close"]
-            if prev_close > 0:
-                daily_change = (close - prev_close) / prev_close
-                if daily_change < -0.11:
-                    removed.append(
-                        f"{row['date']}: 单日跌幅{daily_change:.1%}超限(可能前复权错误)")
-                    continue
-        
-        valid_rows.append(row)
+    # 规则0: 价格无效（向量化）
+    close = pd.to_numeric(df['close'], errors='coerce')
+    open_p = pd.to_numeric(df['open'], errors='coerce')
+    bad_price = (close <= 0) | (open_p <= 0) | close.isna() | open_p.isna()
+    if bad_price.any():
+        for idx in df.index[bad_price]:
+            removed.append(f"{df.loc[idx, 'date']}: 价格无效(close={df.loc[idx, 'close']})")
+        mask_valid &= ~bad_price
+    
+    # 规则2: 单日跌幅超11%（向量化，用pct_change）
+    if mask_valid.sum() >= 2:
+        pct = close.pct_change()
+        extreme_drop = pct < -0.11
+        extreme_drop &= mask_valid  # 只看当前仍有效的行
+        if extreme_drop.any():
+            for idx in df.index[extreme_drop]:
+                removed.append(
+                    f"{df.loc[idx, 'date']}: 单日跌幅{pct.loc[idx]:.1%}超限(可能前复权错误)")
+            mask_valid &= ~extreme_drop
+    
+    # 规则1: 成交量异常低 + 价格大幅变动（向量化）
+    if avg_volume > 0:
+        vol = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+        vol_ratio = vol / avg_volume
+        prev_close = close.shift(1)
+        price_change = ((close - prev_close) / prev_close).abs()
+        # 量<均量2% 且 价格变动>5%
+        vol_price_anomaly = (vol_ratio < 0.02) & (vol > 0) & (price_change > 0.05)
+        vol_price_anomaly &= mask_valid
+        if vol_price_anomaly.any():
+            for idx in df.index[vol_price_anomaly]:
+                removed.append(
+                    f"{df.loc[idx, 'date']}: 量价异常(vol={vol.loc[idx]:.0f}, "
+                    f"均量比={vol_ratio.loc[idx]:.3f}, 跌幅={price_change.loc[idx]:.1%})")
+            mask_valid &= ~vol_price_anomaly
     
     if removed:
         logger.warning(f"[{code}] 数据质量验证: 过滤{len(removed)}条异常数据")
         for r in removed:
             logger.warning(f"  {r}")
     
-    if not valid_rows:
-        return pd.DataFrame()
-    return pd.DataFrame(valid_rows)
+    result = df.loc[mask_valid].reset_index(drop=True)
+    return result
 
 
 def update_stock_to_db(conn: sqlite3.Connection, code: str) -> int:
@@ -724,18 +714,24 @@ def batch_update_all(conn: sqlite3.Connection = None, full_pool: bool = True,
     return results
 
 
-def load_daily_data(code: str, conn: sqlite3.Connection = None,
-                    days: int = 120) -> pd.DataFrame:
-    """
-    从数据库加载某只股票最近N天的日线数据
-    返回按日期升序排列的DataFrame
-    """
-    # FIX: 修复自建SQLite连接未关闭导致连接泄漏
-    own_conn = False
-    if conn is None:
-        conn = init_db()
-        own_conn = True
+# ============================================================
+# 内存缓存层（减少重复SQLite查询）
+# ============================================================
+import functools
 
+@functools.lru_cache(maxsize=256)
+def _load_daily_data_cached(code: str, days: int, _db_mtime: float) -> pd.DataFrame:
+    """
+    load_daily_data 的内存缓存层
+    
+    参数:
+        _db_mtime: 数据库文件修改时间戳，用于缓存失效触发
+        code: 股票代码
+        days: 加载天数
+    
+    返回: DataFrame (date升序)
+    """
+    conn = init_db()
     try:
         query = """
             SELECT date, open, close, high, low, volume
@@ -748,15 +744,52 @@ def load_daily_data(code: str, conn: sqlite3.Connection = None,
         if df.empty:
             return df
         df = df.sort_values("date").reset_index(drop=True)
-        # V3.2: 数据质量自动校验
         df = validate_dataframe(df, code)
         return df
     finally:
-        if own_conn:
-            try:
-                conn.close()
-            except Exception as e:
-                logger.debug(f"关闭自建SQLite连接失败: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _get_db_mtime() -> float:
+    """获取数据库文件修改时间（用于缓存失效）"""
+    try:
+        return os.path.getmtime(config.DB_PATH)
+    except OSError:
+        return 0
+
+
+def load_daily_data(code: str, conn: sqlite3.Connection = None,
+                    days: int = 120) -> pd.DataFrame:
+    """
+    从数据库加载某只股票最近N天的日线数据（带进程内缓存）
+    
+    缓存策略:
+      - 同一进程内对 (code, days) 的查询结果缓存
+      - 数据库文件被更新（mtime变化）时自动失效
+      - 传入自定义conn时绕过缓存（保证调用方控制的数据新鲜度）
+    
+    返回按日期升序排列的DataFrame
+    """
+    # 自定义conn时走原路径（调用方可能刚写入数据）
+    if conn is not None:
+        query = """
+            SELECT date, open, close, high, low, volume
+            FROM daily_kline
+            WHERE code = ?
+            ORDER BY date DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(code, days))
+        if df.empty:
+            return df
+        df = df.sort_values("date").reset_index(drop=True)
+        return validate_dataframe(df, code)
+    
+    # 默认路径：使用缓存
+    return _load_daily_data_cached(code, days, _get_db_mtime())
 
 
 # ============================================================
@@ -838,7 +871,7 @@ def fetch_capital_flow_akshare(code: str, days: int = 30) -> pd.DataFrame:
 
 def update_capital_flow(conn: sqlite3.Connection, code: str) -> int:
     """
-    更新单只股票的资金流向数据到数据库
+    更新单只股票的资金流向数据到数据库（executemany批量写入）
     返回新增记录数
     """
     init_capital_flow_table(conn)
@@ -848,23 +881,24 @@ def update_capital_flow(conn: sqlite3.Connection, code: str) -> int:
         return 0
 
     cursor = conn.cursor()
-    count = 0
-    for _, row in df.iterrows():
-        try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO capital_flow
-                (code, date, main_net, super_net, big_net, mid_net, small_net)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (code, row["date"],
-                  row.get("main_net", 0), row.get("super_net", 0),
-                  row.get("big_net", 0), row.get("mid_net", 0),
-                  row.get("small_net", 0)))
-            count += 1
-        except Exception as e:
-            logger.error(f"[{code}] 资金流向写入失败: {e}")
-
-    conn.commit()
-    return count
+    rows = [
+        (code, row["date"],
+         row.get("main_net", 0), row.get("super_net", 0),
+         row.get("big_net", 0), row.get("mid_net", 0),
+         row.get("small_net", 0))
+        for _, row in df.iterrows()
+    ]
+    try:
+        cursor.executemany("""
+            INSERT OR REPLACE INTO capital_flow
+            (code, date, main_net, super_net, big_net, mid_net, small_net)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
+        return len(rows)
+    except Exception as e:
+        logger.error(f"[{code}] 资金流向批量写入失败: {e}")
+        return 0
 
 
 def load_capital_flow(code: str, conn: sqlite3.Connection = None,

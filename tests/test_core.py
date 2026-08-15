@@ -199,22 +199,204 @@ class TestPnLTracker:
 class TestICMonitor:
     """因子IC监控测试"""
 
-    def test_is_negative(self):
+    def test_is_negative(self, tmp_path):
         """IC持续为负检测"""
         from trading_system.factors.ic_monitor import ICMonitor
-        monitor = ICMonitor(decay_days=5)
+        # 使用临时目录，避免污染真实 ic_history.json
+        monitor = ICMonitor(decay_days=5, history_path=str(tmp_path / "ic_history_test.json"))
         # 模拟连续负IC
         for i in range(6):
             monitor.update("test_factor", -0.03, date=f"2026-07-{20+i:02d}")
         assert monitor.is_negative("test_factor")
 
-    def test_is_decaying(self):
+    def test_is_decaying(self, tmp_path):
         """IC衰减检测"""
         from trading_system.factors.ic_monitor import ICMonitor
-        monitor = ICMonitor(decay_days=5, decay_threshold=0.02)
+        # 使用临时目录，避免污染真实 ic_history.json
+        monitor = ICMonitor(decay_days=5, decay_threshold=0.02, history_path=str(tmp_path / "ic_history_test.json"))
         for i in range(6):
             monitor.update("weak_factor", 0.01, date=f"2026-07-{20+i:02d}")
         assert monitor.is_decaying("weak_factor")
+
+
+# ============================================================
+# 选股引擎V3.5 深跌防护测试（2026-08-06诊断修复）
+# ============================================================
+
+class TestHardFilterV35:
+    """hard_filter 深跌防护与弱势模式标记测试"""
+
+    @staticmethod
+    def _mk_df(closes, ma20=None):
+        import pandas as pd
+        closes = np.array(closes, dtype=float)
+        n = len(closes)
+        vol = np.full(n, 5e7)
+        df = pd.DataFrame({
+            "close": closes,
+            "high": closes * 1.01,
+            "low": closes * 0.99,
+            "volume": vol,
+            "amount": vol * closes,
+        })
+        df["ma20"] = pd.Series(ma20, index=df.index) if ma20 is not None else df["close"].rolling(20).mean()
+        df["ma20_slope"] = df["ma20"].diff(3)
+        df["ma60"] = df["close"].rolling(60).mean()
+        return df
+
+    def test_deep_drawdown_rejected(self):
+        """距20日高点回撤>8%的企稳股（弱势模式）必须被拒绝（海天味业案例）"""
+        from trading_system.strategy.stock_screener import hard_filter
+        # 前50日10元横盘 → 拉升到12元 → 回落至10.5元横盘企稳（回撤-12.5%）
+        closes = [10.0] * 50 + [10.5, 11.0, 11.5, 12.0, 12.0, 11.8, 11.5, 11.0, 10.5] + [10.5] * 11
+        ma20 = [11.5] * len(closes)  # 横盘企稳，距MA20约-8.7% → weak_score可过25
+        df = self._mk_df(closes, ma20)
+        res = hard_filter(df, "603288", market_state="down")
+        assert res["pass"] is False
+        assert "回撤" in res["reason"]
+
+    def test_60d_decline_rejected(self):
+        """60日累计跌幅超20%的横盘股必须被拒绝（下降趋势防护）"""
+        from trading_system.strategy.stock_screener import hard_filter
+        # 前10日15元高位 → 40日阴跌到11.5元 → 后21日横盘企稳（20日回撤<8%但60日跌-23%）
+        closes = [15.0] * 10 + list(np.linspace(15.0, 11.5, 40)) + [11.5] * 21
+        ma20 = [11.6] * len(closes)
+        df = self._mk_df(closes, ma20)
+        res = hard_filter(df, "600000", market_state="down")
+        assert res["pass"] is False
+        assert "60日" in res["reason"]
+
+    def test_strong_uptrend_passes(self):
+        """强势上升趋势股（回撤≈0）正常通过硬性筛选"""
+        from trading_system.strategy.stock_screener import hard_filter
+        closes = list(np.linspace(10.0, 13.0, 70))
+        df = self._mk_df(closes)
+        res = hard_filter(df, "000001", market_state="up")
+        assert res["pass"] is True
+        assert res["details"].get("drawdown_from_high", 0) > -0.08
+
+    def test_weak_mode_below_ma20_flag(self):
+        """弱势模式通过但破MA20的企稳股必须标记 below_ma20（供输出层降级）"""
+        from trading_system.strategy.stock_screener import hard_filter
+        # V5.1: weak_score门槛从25提升至40，测试数据需产生≥40分
+        # 构造: 距MA20偏离<5%(+20) + 近5日企稳(+20) + 5日正收益(+20) = 60分 ≥40
+        closes = [11.0] * 49 + [11.05, 11.08, 11.1, 11.12, 11.15] + [11.1] * 11
+        ma20 = [11.2] * len(closes)  # MA20=11.2 > close=11.1
+        df = self._mk_df(closes, ma20)
+        res = hard_filter(df, "600001", market_state="down")
+        assert res["pass"] is True  # weak_score=20(偏离)+20(企稳)+20(5日正收益) = 60 ≥40
+        assert bool(res["details"]["below_ma20"]) is True  # numpy.bool_需bool()转换后比较
+
+
+# ============================================================
+# 逆势加仓（回调加仓）风控测试 V1.0（2026-08-07）
+# ============================================================
+
+class TestPullbackAddRisk:
+    """回调加仓风控检查 check_pullback_add_risk 测试"""
+
+    def _mk_df(self, closes, volumes=None, ma20=None, ma60=None, ma20_slope=None):
+        """构造测试用DataFrame"""
+        import pandas as pd
+        n = len(closes)
+        data = {
+            "close": closes,
+            "high": [c * 1.02 for c in closes],
+            "low": [c * 0.98 for c in closes],
+            "open": closes,
+            "volume": volumes or [5e7] * n,
+        }
+        df = pd.DataFrame(data)
+        if ma20:
+            df["ma20"] = ma20
+        else:
+            df["ma20"] = pd.Series(closes).rolling(20, min_periods=1).mean().tolist()
+        if ma60:
+            df["ma60"] = ma60
+        else:
+            df["ma60"] = pd.Series(closes).rolling(60, min_periods=1).mean().tolist()
+        if ma20_slope is not None:
+            df["ma20_slope"] = ma20_slope
+        else:
+            df["ma20_slope"] = pd.Series(df["ma20"]).diff(3).fillna(0).tolist()
+        # RSI/Bollinger（简化）
+        df["rsi"] = 50.0
+        df["boll_lower"] = [c * 0.95 for c in closes]
+        return df
+
+    def test_pullback_pass_basic(self):
+        """正常回调企稳应通过: 回调5%+缩量+触及MA20"""
+        from risk.risk_control import check_pullback_add_risk
+        # 构造: 先涨到12，再回调到11.4（回调约5%），缩量
+        closes = [10.0] * 10 + [11.0] * 5 + [12.0] * 10 + [11.6, 11.5, 11.4]
+        volumes = [5e7] * 20 + [5e7] * 5 + [2e7, 1.5e7, 1e7]  # 最后3日缩量
+        ma20 = [11.5] * len(closes)  # MA20恒定11.5
+        ma60 = [10.5] * len(closes)  # MA60在MA20下方
+        df = self._mk_df(closes, volumes, ma20=ma20, ma60=ma60, ma20_slope=[0.01]*len(closes))
+        holdings = {"600001": {"shares": 1000, "buy_price": 11.0, "current_price": 11.4, "weight": 0.15}}
+        result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
+        assert result["pass"] is True
+        assert result["add_shares"] > 0
+        assert "回调" in result["reason"]
+
+    def test_pullback_rejected_deep_loss(self):
+        """浮亏>8%应拒绝"""
+        from risk.risk_control import check_pullback_add_risk
+        closes = [10.0] * 25 + [9.0, 8.5, 8.0]  # 大跌，确保>=25行
+        df = self._mk_df(closes)
+        holdings = {"600001": {"shares": 1000, "buy_price": 10.0, "current_price": 8.0}}
+        result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
+        assert result["pass"] is False
+        assert "浮亏" in result["reason"]
+
+    def test_pullback_rejected_market_weak(self):
+        """大盘弱势应拒绝"""
+        from risk.risk_control import check_pullback_add_risk
+        closes = [10.0] * 20 + [9.5, 9.4, 9.3]
+        df = self._mk_df(closes)
+        holdings = {"600001": {"shares": 1000, "buy_price": 10.0}}
+        result = check_pullback_add_risk("600001", holdings, df, market_state="down")
+        assert result["pass"] is False
+        assert "大盘" in result["reason"]
+
+    def test_pullback_rejected_no_volume_shrink(self):
+        """未缩量应拒绝"""
+        from risk.risk_control import check_pullback_add_risk
+        closes = [10.0] * 10 + [11.0] * 5 + [12.0] * 10 + [11.6, 11.5, 11.4]
+        volumes = [5e7] * len(closes)  # 全程未缩量
+        ma20 = [11.5] * len(closes)
+        ma60 = [10.5] * len(closes)
+        # 传入正值ma20_slope，避免被步骤5(MA20斜率<=0)先拦截
+        df = self._mk_df(closes, volumes, ma20=ma20, ma60=ma60, ma20_slope=[0.01] * len(closes))
+        holdings = {"600001": {"shares": 1000, "buy_price": 11.0}}
+        result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
+        assert result["pass"] is False
+        assert "缩量" in result["reason"] or "未缩量" in result["reason"] or "量比" in result["reason"]
+
+    def test_pullback_rejected_too_deep(self):
+        """回调>12%应拒绝（趋势可能反转）"""
+        from risk.risk_control import check_pullback_add_risk
+        closes = [10.0] * 10 + [12.0] * 15 + [10.0, 9.5, 9.0]  # 从12回调到9=-25%
+        volumes = [5e7] * len(closes)  # 确保长度一致
+        ma20 = [11.5] * len(closes)
+        ma60 = [10.5] * len(closes)
+        # buy_price=9.2 → 浮亏=(9.0/9.2-1)=-2.2%<8%，通过步骤4
+        # 回调深度=(9.0/12.24-1)≈-26.5%>12%，命中步骤6
+        df = self._mk_df(closes, volumes, ma20=ma20, ma60=ma60, ma20_slope=[0.01] * len(closes))
+        holdings = {"600001": {"shares": 1000, "buy_price": 9.2}}
+        result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
+        assert result["pass"] is False
+        assert "过深" in result["reason"]
+
+    def test_pullback_rejected_not_holding(self):
+        """非持仓股应拒绝"""
+        from risk.risk_control import check_pullback_add_risk
+        closes = [10.0] * 20 + [9.5, 9.4, 9.3]
+        df = self._mk_df(closes)
+        holdings = {}  # 无持仓
+        result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
+        assert result["pass"] is False
+        assert "非持仓" in result["reason"]
 
 
 if __name__ == "__main__":

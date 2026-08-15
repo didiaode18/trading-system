@@ -78,6 +78,35 @@ COMMANDS = {
 }
 
 
+def check_config_ready():
+    """检查用户是否已完成必要配置，未就绪时输出友好引导而非报错堆栈"""
+    local_cfg = os.path.join(TRADING_SYSTEM_DIR, "config_local.py")
+    if not os.path.exists(local_cfg):
+        print("\n" + "=" * 55)
+        print("  ⚠ 检测到首次运行，尚未完成配置")
+        print("=" * 55)
+        print()
+        print("  请按以下 3 步完成配置：")
+        print()
+        print("  ① 复制配置模板")
+        print("     copy trading_system\\config_local.example.py trading_system\\config_local.py")
+        print()
+        print("  ② 编辑 config_local.py，填写：")
+        print("     - TOTAL_CAPITAL / AVAILABLE_CASH（账户资金）")
+        print("     - STOCK_POOL（股票池）")
+        print("     - EMAIL_AUTH_CODE（QQ邮箱授权码）")
+        print("     - EMAIL_SENDER / EMAIL_RECEIVER（邮箱地址）")
+        print()
+        print("  ③ 编辑持仓文件")
+        print("     copy holdings.example.json holdings.json")
+        print("     然后编辑 holdings.json 填写您的持仓")
+        print()
+        print("  完成后运行: python setup.py  初始化数据库")
+        print("=" * 55)
+        return False
+    return True
+
+
 def print_help():
     """打印帮助信息"""
     print("""
@@ -217,7 +246,10 @@ def main():
         print_help()
         return 0
 
+    # P1-3: 首次运行前置配置检查（setup命令本身跳过检查）
     cmd = args[0]
+    if cmd != "setup" and not check_config_ready():
+        return 1
     cmd_args = args[1:]
 
     # status命令直接处理

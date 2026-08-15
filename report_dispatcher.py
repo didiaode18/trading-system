@@ -54,9 +54,25 @@ from notify.email_notify import send_email
 from data.realtime import fetch_realtime_batch
 from data.data_loader import fetch_stock_daily_baostock, _bs_logout
 
-today = datetime.date.today().strftime("%Y-%m-%d")
-now = datetime.datetime.now().strftime("%H:%M:%S")
-weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.date.today().weekday()]
+# FIX: 模块级today/now/weekday_cn原在导入时固化，长驻进程跨天取值会过期，
+# 改为函数按需取当前值，各run_*入口处一次性取值，保证同一报告内取值一致
+def _today():
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+def _now():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def _weekday_cn():
+    return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.date.today().weekday()]
+
+
+# FIX: ETF前缀口径复用 capital_planner._ETF_PREFIXES，导入失败时兜底同值常量
+try:
+    from strategy.capital_planner import _ETF_PREFIXES
+except Exception:
+    _ETF_PREFIXES = ("159", "510", "511", "512", "513", "515", "516", "518", "560", "562", "588")
 
 
 # ============================================================
@@ -64,12 +80,15 @@ weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周�
 # ============================================================
 
 def load_holdings() -> list:
-    """加载持仓列表"""
-    hjson_path = os.path.join(BASE_DIR, 'holdings.json')
+    """加载持仓列表（路径统一委托 config）"""
+    hjson_path = config.get_holdings_file()
     if os.path.exists(hjson_path):
         with open(hjson_path, 'r', encoding='utf-8') as f:
             hjson = json.load(f)
-        return [{"code": k, **v} for k, v in hjson.items()]
+        # FIX: 仅保留shares>0的真实持仓（口径同generate_holdings_report.py的
+        # _load_holdings_from_json），已清仓标的不参与"已持仓排除"与报告
+        return [{"code": k, **v} for k, v in hjson.items()
+                if isinstance(v, dict) and int(v.get("shares", 0) or 0) > 0]
     # 降级：从config读取
     return [{"code": k, "名称": v.get("名称", k), "赛道": v.get("赛道", "")}
             for k, v in config.STOCK_POOL.items()]
@@ -344,6 +363,9 @@ def run_morning():
     print("  第一层：盘前快速决策报告")
     print("=" * 60)
 
+    # FIX: 时间变量改为入口处按需取值（原模块级变量在导入时固化）
+    today, now, weekday_cn = _today(), _now(), _weekday_cn()
+
     holdings_list = load_holdings()
     shared = fetch_shared_data(holdings_list)
 
@@ -478,9 +500,12 @@ def run_morning():
 
     # ④ 次日调仓计划（基于综合评分再平衡）
     # V3.2回测诊断: 调仓增益-0.85%，收紧阈值
-    REBALANCE_SCORE_GAP = 25   # V3.2: 20→25
-    REBALANCE_SELL_THRESHOLD = 30  # V3.2: 40→30
-    REBALANCE_BUY_THRESHOLD = 70   # V3.2: 65→70
+    # FIX: 调仓阈值改读config.REBALANCE_CONFIG（config.py未更新时getattr兜底原硬编码值）
+    _rb_cfg = getattr(config, "REBALANCE_CONFIG",
+                      {"score_gap": 25, "sell_threshold": 30, "buy_threshold": 70})
+    REBALANCE_SCORE_GAP = _rb_cfg.get("score_gap", 25)   # V3.2: 20→25
+    REBALANCE_SELL_THRESHOLD = _rb_cfg.get("sell_threshold", 30)  # V3.2: 40→30
+    REBALANCE_BUY_THRESHOLD = _rb_cfg.get("buy_threshold", 70)   # V3.2: 65→70
     REBALANCE_MAX_POSITION_RATIO = 0.15
     REBALANCE_TRADE_COST_RATE = 0.0015
 
@@ -675,9 +700,13 @@ def run_evening():
     print("  第二层：盘后深度复盘报告")
     print("=" * 60)
 
+    # FIX: 时间变量改为入口处按需取值（原模块级变量在导入时固化）
+    today, now, weekday_cn = _today(), _now(), _weekday_cn()
+
     holdings_list = load_holdings()
     shared = fetch_shared_data(holdings_list)
-    STOP_LOSS_PCT = 0.08
+    # FIX: 统一使用config.INITIAL_STOP_LOSS_PCT，与盘前报告口径一致（同盘前段②止损价计算）
+    STOP_LOSS_PCT = config.INITIAL_STOP_LOSS_PCT
 
     # === 扩展数据获取（龙虎榜/融资融券/解禁/四级资金流）===
     print("[扩展] 获取龙虎榜/融资融券/解禁/四级资金流...")
@@ -1028,9 +1057,13 @@ def run_evening():
             mv = v.get('shares', 0) * v.get('current_price', 0)
             stock_mvs[k] = {'name': v.get('name', k), 'mv': mv, 'pct': mv / total_mv * 100 if total_mv > 0 else 0}
         sorted_mvs = sorted(stock_mvs.items(), key=lambda x: x[1]['pct'], reverse=True)
+        # FIX: 单只上限按ETF/个股区分走config（pct为百分数单位，故×100后比较）
+        _limit_etf_pct = getattr(config, 'MAX_SINGLE_ETF_RATIO', 0.20) * 100
+        _limit_stock_pct = getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15) * 100
         for code_w, info_w in sorted_mvs:
-            if info_w['pct'] > 20:
-                html += f'<div class="alert alert-danger">🚨 <b>{info_w["name"]}仓位{info_w["pct"]:.1f}%</b>，超出单只上限20%！建议分批减仓。</div>'
+            _limit_pct = _limit_etf_pct if code_w.startswith(_ETF_PREFIXES) else _limit_stock_pct
+            if info_w['pct'] > _limit_pct:
+                html += f'<div class="alert alert-danger">🚨 <b>{info_w["name"]}仓位{info_w["pct"]:.1f}%</b>，超出单只上限{_limit_pct:.0f}%！建议分批减仓。</div>'
         if len(sorted_mvs) >= 2:
             top2_pct = sorted_mvs[0][1]['pct'] + sorted_mvs[1][1]['pct']
             if top2_pct > 60:
@@ -1081,6 +1114,9 @@ def run_weekly():
     print("\n" + "=" * 60)
     print("  第三层：周策略报告")
     print("=" * 60)
+
+    # FIX: 时间变量改为入口处按需取值（原模块级变量在导入时固化）
+    today, now, weekday_cn = _today(), _now(), _weekday_cn()
 
     holdings_list = load_holdings()
     shared = fetch_shared_data(holdings_list)
@@ -1252,6 +1288,9 @@ def run_canslim():
     print("  CANSLIM独立选股报告")
     print("=" * 60)
 
+    # FIX: 时间变量改为入口处按需取值（原模块级变量在导入时固化）
+    today, now, weekday_cn = _today(), _now(), _weekday_cn()
+
     from strategy.stock_screener import run_stock_screener, send_screener_email, check_market_direction
 
     # 获取候选股票池数据
@@ -1279,14 +1318,27 @@ def run_canslim():
     except Exception:
         pass
 
-    # 第3层: scan_market_hot_stocks 全市场动态扫描
+    # 第3层: 全市场动态扫描（V4.0 G3: 先构建可投资域，与热股扫描共享单次行情拉取）
+    # V1.1扩面: total_max 从 hardcoded 15 → config.SCREENER_SCAN_MAX(30)
+    _expand = getattr(config, 'CANDIDATE_POOL_EXPAND_ENABLED', True)
+    _screener_scan_max = getattr(config, 'SCREENER_SCAN_MAX', 30) if _expand else 15
     scan_new = 0
+    scan_ok = False  # V4.0(G12): 扫描失败时报告需标注数据降级
+    _universe_info = None
     try:
-        from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
-        scan_result = scan_market_hot_stocks(total_max=15)
+        from strategy.market_scanner import (scan_market_hot_stocks,
+                                             merge_scan_results_to_pool,
+                                             build_investable_universe)
+        _uni = build_investable_universe()
+        _spot_df = _uni.get("df") if _uni.get("success") else None
+        if _uni.get("success"):
+            _universe_info = {"size": _uni["size"], "total": _uni["total"],
+                              "filter_stats": _uni["filter_stats"]}
+        scan_result = scan_market_hot_stocks(total_max=_screener_scan_max, spot_df=_spot_df)
         if scan_result.get("success"):
+            scan_ok = True
             new_codes = merge_scan_results_to_pool(scan_result, all_codes)
-            for code in new_codes[:15]:
+            for code in new_codes[:_screener_scan_max]:
                 all_codes.add(code)
                 scan_new += 1
     except Exception:
@@ -1325,14 +1377,18 @@ def run_canslim():
     market_detail = market_info.get("detail", "")
 
     # 动态调整min_score
+    # FIX: 自适应min_score改读config.SCREENER_CONFIG（config.py未更新时get兜底原硬编码值）
+    _sc_cfg = getattr(config, "SCREENER_CONFIG", {})
+    _min_score_strong = _sc_cfg.get("min_buy_score_strong", 45)
+    _min_score_weak = _sc_cfg.get("min_buy_score_weak", 35)
     if market_state == "up":
-        adaptive_min_score = 45
-        mode_desc = "📈 上涨市 | 正常模式（min_score=45）"
+        adaptive_min_score = _min_score_strong
+        mode_desc = f"📈 上涨市 | 正常模式（min_score={_min_score_strong}）"
     elif market_state == "neutral":
-        adaptive_min_score = 35
-        mode_desc = "↔️ 震荡市 | 适度放宽（min_score=35）"
+        adaptive_min_score = _min_score_weak
+        mode_desc = f"↔️ 震荡市 | 适度放宽（min_score={_min_score_weak}）"
     else:  # down
-        adaptive_min_score = 45  # 保持高分门槛，但标记为观察模式
+        adaptive_min_score = _min_score_strong  # 保持高分门槛，但标记为观察模式
         mode_desc = "📉 下跌市 | 严格模式（仅观察，不建议买入）"
 
     print(f"[选股] 大盘状态: {mode_desc}")
@@ -1340,6 +1396,20 @@ def run_canslim():
 
     # 运行选股引擎
     result = run_stock_screener(data_dict, holdings, min_score=adaptive_min_score)
+
+    # V4.0(G12): 动态扫描失败时标注数据降级，随报告警示区展示
+    if not scan_ok:
+        result.setdefault("_data_degraded", []).append(
+            "全市场动态扫描未成功（网络异常/非盘中），本期仅使用静态+观察池候选，可能遗漏池外强势股")
+
+    # V4.0(G3): 可投资域覆盖率度量（选股域可观测性）
+    if _universe_info:
+        _cov = len(all_codes) / max(_universe_info["size"], 1) * 100
+        _universe_info["coverage_pct"] = round(_cov, 1)
+        result["_universe_info"] = _universe_info
+        print(f"[选股] 可投资域{_universe_info['size']}只 | "
+              f"当前候选池覆盖率{_cov:.1f}%（含静态+观察池+动态）")
+
     print(f"[选股] ✅ 完成: {result['qualified_count']}只入选 / {result['total_candidates']}只候选")
 
     if result["stock_pool"]:

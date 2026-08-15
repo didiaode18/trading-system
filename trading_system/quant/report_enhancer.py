@@ -18,6 +18,7 @@
     # panel_data 传给报告构建函数
 """
 
+import json
 import logging
 import numpy as np
 import pandas as pd
@@ -73,56 +74,42 @@ class QuantReportEnhancer:
     def _calc_factor_health(self, data_dict: dict, date: str) -> dict:
         """
         计算因子有效性指标
-        - 动量因子IC: 过去20日涨幅 vs 未来5日涨幅的相关性
-        - 趋势因子IC: 均线多头排列 vs 未来收益
-        - 综合判断: 因子是否失效
+
+        V4.2(P1-6)修复: 原实现用 df[date之后的未来数据]算前瞻收益，
+        实时运行时未来数据恒为空→forward_returns全为0→IC恒无意义。
+        现改为消费 factors/ic_monitor 链路的持久化产出 ic_history.json
+        （CANSLIM五因子延迟结算的真实前瞻收益IC）；文件不可用时
+        降级为"数据积累中"而非现场算出假IC。
         """
-        if not data_dict:
-            return {"status": "无数据", "momentum_ic": 0, "trend_ic": 0, "verdict": "未知"}
-
-        # 收集所有股票的因子值和前瞻收益
-        momentum_values = []
-        forward_returns = []
-        trend_values = []
-
-        for code, df in data_dict.items():
-            df_cut = df[df["date"] <= date]
-            if len(df_cut) < 30:
-                continue
-
-            close = df_cut["close"].values
-
-            # 动量因子: 20日收益率
-            if len(close) > 20:
-                momentum = (close[-1] - close[-21]) / close[-21]
-                momentum_values.append(momentum)
-
-            # 趋势因子: MA5>MA10>MA20 得分
-            if len(close) > 20:
-                ma5 = np.mean(close[-5:])
-                ma10 = np.mean(close[-10:])
-                ma20 = np.mean(close[-20:])
-                trend_score = int(ma5 > ma10) + int(ma10 > ma20) + int(close[-1] > ma20)
-                trend_values.append(trend_score)
-
-            # 前瞻收益: 未来5日（如果有数据）
-            df_future = df[df["date"] > date]
-            if len(df_future) >= 5:
-                future_ret = (df_future["close"].iloc[4] - close[-1]) / close[-1]
-                forward_returns.append(future_ret)
+        try:
+            import os as _os
+            _ic_path = _os.path.join(_os.path.dirname(_os.path.dirname(
+                _os.path.abspath(__file__))), "data", "ic_history.json")
+            if _os.path.exists(_ic_path):
+                with open(_ic_path, "r", encoding="utf-8") as _f:
+                    ic_records = json.load(_f)
             else:
-                forward_returns.append(0)
+                ic_records = {}
+        except Exception:
+            ic_records = {}
 
-        # 计算IC
-        n = min(len(momentum_values), len(forward_returns))
-        if n < 10:
-            return {"status": "样本不足", "momentum_ic": 0, "trend_ic": 0, "verdict": "数据不足"}
+        # 逐因子取最近20条IC的均值，因子数与样本数双门槛
+        factor_means = []
+        for _fname, _recs in (ic_records or {}).items():
+            _ics = [r["ic"] if isinstance(r, dict) else r
+                    for r in (_recs or [])[-20:]
+                    if (isinstance(r, dict) and isinstance(r.get("ic"), (int, float)))
+                    or isinstance(r, (int, float))]
+            if len(_ics) >= 5:
+                factor_means.append(float(np.mean(_ics)))
 
-        mom_ic = np.corrcoef(momentum_values[:n], forward_returns[:n])[0, 1] if n > 2 else 0
-        trend_ic = np.corrcoef(trend_values[:n], forward_returns[:n])[0, 1] if n > 2 else 0
+        if len(factor_means) < 2:
+            return {"status": "warning", "momentum_ic": 0, "trend_ic": 0,
+                    "avg_ic": 0,
+                    "verdict": "IC结算数据积累中(延迟结算需约3周)"}
 
-        # 判断
-        avg_ic = (abs(mom_ic) + abs(trend_ic)) / 2
+        # 兼容旧键: 前两个因子均值填入momentum_ic/trend_ic展示位
+        avg_ic = float(np.mean([abs(m) for m in factor_means]))
         if avg_ic > 0.1:
             verdict = "因子强势有效"
             status = "excellent"
@@ -136,13 +123,14 @@ class QuantReportEnhancer:
             verdict = "因子可能失效，谨慎操作"
             status = "danger"
 
-        self.ic_history.append({"date": date, "mom_ic": mom_ic, "trend_ic": trend_ic})
+        self.ic_history.append({"date": date, "avg_ic": avg_ic})
 
         return {
             "status": status,
-            "momentum_ic": round(mom_ic, 4),
-            "trend_ic": round(trend_ic, 4),
+            "momentum_ic": round(factor_means[0], 4) if factor_means else 0,
+            "trend_ic": round(factor_means[1], 4) if len(factor_means) > 1 else 0,
             "avg_ic": round(avg_ic, 4),
+            "factor_count": len(factor_means),
             "verdict": verdict,
         }
 
@@ -154,16 +142,15 @@ class QuantReportEnhancer:
         """
         牛熊震荡三态判断 + 市场情绪
 
-        判断逻辑:
-        - 取所有股票的中位数表现作为"大盘代理"
-        - MA20>MA60 且 价格>MA20 = 牛市
-        - MA20<MA60 且 价格<MA20 = 熊市
-        - 其他 = 震荡
+        V4.2(P1-7)口径统一: 三态判断改为以沪深300基准的
+        strategy.market_regime.detect_market_regime 门面为主(与综合分析报告/
+        风控引擎同源)，持仓池breadth仅作情绪辅助展示；
+        门面不可用时降级回原持仓池宽度逻辑。
         """
         if not data_dict:
             return {"regime": "unknown", "sentiment": 50, "position_limit": 0.7}
 
-        # 收集市场宽度数据
+        # 收集市场宽度数据（辅助情绪分，不再作为三态主判据）
         above_ma20_count = 0
         total_count = 0
         daily_changes = []
@@ -178,8 +165,6 @@ class QuantReportEnhancer:
             total_count += 1
 
             ma20 = np.mean(close[-20:])
-            ma60 = np.mean(close[-60:])
-
             if close[-1] > ma20:
                 above_ma20_count += 1
 
@@ -190,29 +175,40 @@ class QuantReportEnhancer:
                 if change >= 0.095:
                     limit_up_count += 1
 
-        if total_count == 0:
-            return {"regime": "unknown", "sentiment": 50, "position_limit": 0.7}
-
-        # 市场宽度
-        breadth = above_ma20_count / total_count  # 站上MA20的比例
-
-        # 情绪指标
+        breadth = above_ma20_count / total_count if total_count > 0 else 0.5
         avg_change = np.mean(daily_changes) if daily_changes else 0
         advance_ratio = sum(1 for c in daily_changes if c > 0) / len(daily_changes) if daily_changes else 0.5
 
-        # 三态判断
-        if breadth > 0.6 and avg_change > 0:
-            regime = "牛市"
-            position_limit = 1.0
-            regime_color = "#2e7d32"
-        elif breadth < 0.35 and avg_change < 0:
-            regime = "熊市"
-            position_limit = 0.3
-            regime_color = "#d32f2f"
-        else:
-            regime = "震荡"
-            position_limit = 0.6
-            regime_color = "#f57c00"
+        # ---- 主判据: 沪深300基准检测器(进程内当日缓存，无额外拉库开销) ----
+        regime = None
+        try:
+            import sys as _sys
+            import os as _os
+            _ts_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            if _ts_dir not in _sys.path:
+                _sys.path.insert(0, _ts_dir)
+            from strategy.market_regime import detect_market_regime
+            _det = detect_market_regime()
+            _r = (_det or {}).get("regime", "")
+            if _r in ("bull", "range", "bear"):
+                regime = {"bull": "牛市", "range": "震荡", "bear": "熊市"}[_r]
+        except Exception:
+            regime = None
+
+        # ---- 降级: 门面不可用时回退原持仓池宽度逻辑 ----
+        if regime is None:
+            if total_count == 0:
+                return {"regime": "unknown", "sentiment": 50, "position_limit": 0.7}
+            if breadth > 0.6 and avg_change > 0:
+                regime = "牛市"
+            elif breadth < 0.35 and avg_change < 0:
+                regime = "熊市"
+            else:
+                regime = "震荡"
+
+        # 仓位上限与market_regime.POSITION_MAP口径对齐(牛0.9/熊0.3/震0.6)
+        position_limit = {"牛市": 0.9, "熊市": 0.3, "震荡": 0.6}.get(regime, 0.6)
+        regime_color = {"牛市": "#2e7d32", "熊市": "#d32f2f", "震荡": "#f57c00"}.get(regime, "#999")
 
         # 综合情绪分(0-100)
         sentiment = int(
@@ -232,8 +228,8 @@ class QuantReportEnhancer:
             "advance_ratio": round(advance_ratio, 2),
             "limit_up_count": limit_up_count,
             "position_limit": position_limit,
-            "advice": f"{regime}环境，建议仓位{position_limit:.0%}" +
-                     ("，积极进攻" if regime == "牛市" else "，防守为主" if regime == "熊市" else "，灵活应对"),
+            "advice": f"{regime}环境，建议仓位上限{position_limit:.0%}" +
+                     ("，趋势跟踪不追高" if regime == "牛市" else "，防守为主不抄底" if regime == "熊市" else "，高抛低吸灵活应对"),
         }
 
     # ============================================================

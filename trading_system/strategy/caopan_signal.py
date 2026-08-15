@@ -365,6 +365,126 @@ def generate_dk_signals_v2(df: pd.DataFrame, stock_code: str = "") -> pd.DataFra
     # === 假信号回检（D点ATR动态窗口 + K点对称回检）===
     df = _detect_false_signals(df, false_days, stock_code)
 
+    # === D点回踩加仓信号（Dp）=== V1.0 2026-08-07
+    df = _detect_d_point_pullback(df, stock_code)
+
+    return df
+
+
+def _detect_d_point_pullback(df: pd.DataFrame, stock_code: str = "") -> pd.DataFrame:
+    """
+    D点回踩加仓信号检测（Dp信号）V1.0
+
+    核心逻辑:
+      对已出现的D点（均线金叉），检测后续是否出现"回踩不破支撑"的加仓机会。
+      适用于持仓股的回调加仓场景。
+
+    触发条件:
+      1. 近3~10日内出现过D点（金叉，grade != "false"）
+      2. 金叉后价格回踩至LL2附近（偏离<3%）但未有效跌破
+      3. 回踩过程中缩量（量<均量60%）
+      4. 当日收盘企稳（收盘价>=LL2*0.99）
+
+    信号标记:
+      dk_signal = "Dp" (D-point pullback)
+      dk_grade = "pullback_add"
+    """
+    # 查找近期D点
+    d_points = []
+    for i in range(len(df)):
+        sig = df.iloc[i].get("dk_signal")
+        grade = df.iloc[i].get("dk_grade", "")
+        if sig == "D" and grade not in ("false", "weak"):
+            d_points.append(i)
+
+    if not d_points:
+        return df
+
+    # 初始化Dp信号列（如果不存在）
+    if "dp_signal" not in df.columns:
+        df["dp_signal"] = None
+        df["dp_strength"] = 0
+        df["dp_reason"] = ""
+        df["dp_days_since_d"] = 0
+
+    lookback_min = 3   # 金叉后至少3天才算回踩
+    lookback_max = 10  # 金叉后10天内的回踩有效
+
+    for d_idx in d_points:
+        # 检查金叉后3~10天
+        for j in range(d_idx + lookback_min, min(d_idx + lookback_max + 1, len(df))):
+            row = df.iloc[j]
+            close = row.get("close", 0)
+            low = row.get("low", 0)
+            ll2 = row.get("ll_slow", 0)
+            volume = row.get("volume", 0)
+            vol_ma20 = row.get("vol_ma20", 0)
+
+            if ll2 <= 0 or close <= 0:
+                continue
+
+            # 条件1: 回踩至LL2附近（偏离<3%）
+            deviation = (close - ll2) / ll2
+            if abs(deviation) > 0.03:
+                continue  # 偏离太远，不是回踩
+
+            # 条件2: 未有效跌破LL2（收盘价>=LL2*0.99）
+            if close < ll2 * 0.99:
+                continue  # 跌破支撑，不是有效回踩
+
+            # 条件3: 缩量（量<均量60%）
+            if vol_ma20 > 0 and volume > vol_ma20 * 0.60:
+                continue  # 未缩量
+
+            # 条件4: 当日盘中低点未大幅跌破LL2
+            if ll2 > 0 and low < ll2 * 0.97:
+                continue  # 盘中跌破LL2超3%，支撑失效
+
+            # 满足所有条件，标记Dp信号
+            days_since_d = j - d_idx
+            score = 50  # 基础分
+            reasons = [f"D点后{days_since_d}日回踩"]
+
+            # 缩量程度加分
+            if vol_ma20 > 0:
+                vol_ratio = volume / vol_ma20
+                if vol_ratio < 0.4:
+                    score += 20
+                    reasons.append(f"极致缩量{vol_ratio:.0%}")
+                elif vol_ratio < 0.5:
+                    score += 15
+                    reasons.append(f"明显缩量{vol_ratio:.0%}")
+                elif vol_ratio < 0.6:
+                    score += 10
+                    reasons.append(f"缩量{vol_ratio:.0%}")
+
+            # 贴近支撑加分
+            if abs(deviation) < 0.01:
+                score += 15
+                reasons.append("精准触线")
+            elif deviation < 0:
+                score += 10
+                reasons.append("略破线企稳")
+
+            # 趋势强度加分
+            trend = row.get("trend_level", 3)
+            if trend >= 4:
+                score += 15
+                reasons.append(f"趋势{trend}级")
+            elif trend >= 3:
+                score += 10
+                reasons.append(f"震荡{trend}级")
+
+            # 标记信号（仅当该位置尚无更强信号时）
+            existing_sig = df.iloc[j].get("dk_signal")
+            existing_grade = df.iloc[j].get("dk_grade", "")
+            if existing_sig is None or (existing_sig == "Dp" and score > df.iloc[j].get("dp_strength", 0)):
+                df.iloc[j, df.columns.get_loc("dp_signal")] = "Dp"
+                df.iloc[j, df.columns.get_loc("dp_strength")] = min(score, 100)
+                df.iloc[j, df.columns.get_loc("dp_reason")] = "+".join(reasons)
+                df.iloc[j, df.columns.get_loc("dp_days_since_d")] = days_since_d
+                logger.info(f"D点回踩加仓信号: {stock_code} 第{j}日 D点后{days_since_d}日回踩企稳 score={score}")
+
     return df
 
 

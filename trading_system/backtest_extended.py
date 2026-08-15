@@ -363,7 +363,7 @@ def save_results(result: dict):
     today = datetime.date.today().strftime("%Y%m%d")
     
     # 保存统计数据
-    stats_path = os.path.join(output_dir, f"backtest_v6_stats_{today}.json")
+    stats_path = os.path.join(output_dir, f"backtest_ext_stats_{today}.json")
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump({
             "stats": result["stats"],
@@ -377,7 +377,7 @@ def save_results(result: dict):
     logger.info(f"统计结果: {stats_path}")
     
     # 保存交易明细
-    trades_path = os.path.join(output_dir, f"backtest_v6_trades_{today}.json")
+    trades_path = os.path.join(output_dir, f"backtest_ext_trades_{today}.json")
     with open(trades_path, "w", encoding="utf-8") as f:
         json.dump(result["trades"], f, ensure_ascii=False, indent=2)
     logger.info(f"交易明细: {trades_path}")

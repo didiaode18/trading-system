@@ -49,6 +49,7 @@ class FundamentalAnalyzer:
     def __init__(self):
         self.cache = self._load_cache()
         self.today = datetime.date.today().strftime("%Y-%m-%d")
+        self._today_date = datetime.date.today()
 
     # ============================================================
     # 一、财务指标获取
@@ -92,6 +93,10 @@ class FundamentalAnalyzer:
 
         if not HAS_AKSHARE:
             logger.warning(f"[基本面] akshare未安装，无法获取{code}财务数据")
+            # P0-3: 实时获取失败时回退到过期缓存
+            stale = self._get_stale_cache(code, "financial")
+            if stale:
+                return stale
             return result
 
         try:
@@ -105,6 +110,16 @@ class FundamentalAnalyzer:
             self._fetch_financial_analysis(code, result)
         except Exception as e:
             logger.debug(f"[基本面] {code}财务指标获取失败: {e}")
+
+        # P0-3: 实时获取全部失败时回退到过期缓存
+        has_real_data = any(
+            result.get(k) is not None
+            for k in ("pe_ttm", "pb", "roe", "net_profit_growth", "revenue_growth")
+        )
+        if not has_real_data:
+            stale = self._get_stale_cache(code, "financial")
+            if stale:
+                return stale
 
         # 存入缓存
         self._save_to_cache(code, "financial", result)
@@ -188,6 +203,10 @@ class FundamentalAnalyzer:
         }
 
         if not HAS_AKSHARE:
+            # P0-3: 实时获取失败时回退到过期缓存
+            stale = self._get_stale_cache(code, "capital_flow")
+            if stale:
+                return stale
             return result
 
         try:
@@ -220,6 +239,13 @@ class FundamentalAnalyzer:
                     result["signal"] = "outflow"
         except Exception as e:
             logger.debug(f"[基本面] {code}资金流向获取失败: {e}")
+
+        # P0-3: 实时获取全部失败时回退到过期缓存
+        has_real_data = result.get("main_net_inflow") is not None
+        if not has_real_data:
+            stale = self._get_stale_cache(code, "capital_flow")
+            if stale:
+                return stale
 
         self._save_to_cache(code, "capital_flow", result)
         return result
@@ -445,6 +471,30 @@ class FundamentalAnalyzer:
             cached = self.cache[key]
             if cached.get("update_date") == self.today:
                 return cached
+        return None
+
+    def _get_stale_cache(self, code: str, data_type: str, max_days: int = 7) -> dict:
+        """P0-3: 过期缓存回退（最多max_days天），当实时获取失败时使用"""
+        key = f"{code}_{data_type}"
+        if key not in self.cache:
+            return None
+        cached = self.cache[key]
+        cache_date_str = cached.get("update_date", "")
+        try:
+            cache_date = datetime.datetime.strptime(cache_date_str, "%Y-%m-%d").date()
+            age_days = (self._today_date - cache_date).days
+            if 0 < age_days <= max_days:
+                # 检查是否全空（全空则不值得回退）
+                has_data = any(
+                    v is not None and v != 0
+                    for k, v in cached.items()
+                    if k not in ("code", "update_date", "signal")
+                )
+                if has_data:
+                    logger.debug(f"[基本面] {code}使用{age_days}天前缓存({data_type})")
+                    return cached
+        except (ValueError, TypeError):
+            pass
         return None
 
     def _save_to_cache(self, code: str, data_type: str, data: dict):

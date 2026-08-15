@@ -547,7 +547,7 @@ def run_once():
 
     success = send_email(subject, html)
     if success:
-        print(f"\n  邮件发送成功 -> 563646039@qq.com")
+        print(f"\n  邮件发送成功")
     else:
         print(f"\n  邮件发送失败!")
 

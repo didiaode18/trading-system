@@ -248,80 +248,9 @@ def calc_adaptive_stop_loss(price: float, atr: float,
     return result
 
 
-def calc_trailing_stop(current_price: float, highest_since_buy: float,
-                       atr: float, profit_pct: float) -> dict:
-    """
-    ATR连续移动止损计算（V8.3新增）
-
-    将移动止损从固定档位改为基于浮盈百分比的连续函数，
-    结合ATR动态调整止损距离，浮盈越多止损越紧。
-
-    参数:
-        current_price: 当前价格
-        highest_since_buy: 买入以来的最高价
-        atr: 20日ATR绝对值（元）
-        profit_pct: 浮盈百分比（如0.10表示10%）
-
-    返回:
-        {
-            "trailing_stop": float,    # 移动止损价
-            "lock_profit_pct": float,  # 已锁定利润百分比
-            "method": "atr_trailing"   # 止损方法标识
-        }
-    """
-    unified_cfg = getattr(config, 'RISK_UNIFIED_CONFIG', {})
-    trailing_mult = unified_cfg.get('trailing_atr_multiplier', 1.5)
-    fixed_stop_pct = unified_cfg.get('initial_stop_loss_pct',
-                                      getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10))
-
-    # 反推成本价（所有分支都需要）
-    cost_price = current_price / (1 + profit_pct) if profit_pct > -0.99 else current_price * 0.9
-
-    if profit_pct < 0.03:
-        # 浮盈 < 3%：止损 = 成本价（保本）
-        trailing_stop = cost_price
-        lock_pct = 0.0
-
-    elif profit_pct < 0.15:
-        # 浮盈 3%-15%：V3.2: 止损距离从ATR*1.5放宽至ATR*2.0（让利润奔跑，避免过早止盈）
-        atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * 2.0)  # V3.2: 1.5→2.0
-        lock_pct = max(0, (trailing_stop / cost_price - 1))
-
-    elif profit_pct < 0.30:
-        # 浮盈 15%-30%：V3.2: 从ATR*1.0放宽至ATR*1.3（回测显示过早收紧导致平均盈利偏小）
-        atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * 1.3)  # V3.2: 1.0→1.3
-        lock_pct = max(0, (trailing_stop / cost_price - 1))
-
-    else:
-        # 浮盈 > 30%：止损 = highest * (1 - ATR * 0.8 / price)（V3.2: 0.7→0.8，略微放宽）
-        atr_ratio = atr / current_price if current_price > 0 else 0.05
-        trailing_stop = highest_since_buy * (1 - atr_ratio * 0.8)  # V3.2: 0.7→0.8
-        lock_pct = max(0, (trailing_stop / cost_price - 1))
-
-    # 终极兜底：固定百分比止损（防止ATR异常时止损太远）
-    fixed_stop = cost_price * (1 - fixed_stop_pct)
-    trailing_stop = max(trailing_stop, fixed_stop)
-
-    # 确保止损不超过当前价
-    trailing_stop = min(trailing_stop, current_price * 0.99)
-
-    lock_pct = max(0, (trailing_stop / cost_price - 1)) if cost_price > 0 else 0.0
-
-    result = {
-        "trailing_stop": round(trailing_stop, 3),
-        "lock_profit_pct": round(lock_pct, 4),
-        "method": "atr_trailing"
-    }
-
-    logger.debug(
-        f"ATR移动止损: 现价={current_price:.2f}, 最高={highest_since_buy:.2f}, "
-        f"ATR={atr:.4f}, 浮盈={profit_pct:.2%}, "
-        f"移动止损={trailing_stop:.2f}, 锁定利润={lock_pct:.2%}, 固定兜底={fixed_stop:.2f}"
-    )
-
-    return result
+# FIX: 删除死函数 calc_trailing_stop（全库零调用）。止损口径已统一为
+# strategy.trend_strategy.compute_trailing_stop（权威源，盘后由
+# risk.risk_control.sync_authoritative_stop_loss 写回 holdings.stop_loss）
 
 
 def calc_max_shares_by_risk(buy_price: float, stop_loss_price: float,
@@ -454,6 +383,23 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
         kelly_shares = (kelly_shares // 100) * 100
         # Kelly只能使仓位更小
         final_shares = min(final_shares, kelly_shares)
+
+    # ---- P2-5: 策略失效检测器联动 ----
+    # 当策略处于降级/暂停/熔断状态时，进一步缩减仓位
+    try:
+        from risk.risk_control import StrategyFailureDetector
+        _sfd = StrategyFailureDetector()
+        _sfd_status = _sfd.get_status()
+        _sfd_level = _sfd_status.get("level", "normal")
+        _sfd_scale = {"normal": 1.0, "degrade": 0.5, "pause": 0.0, "breaker": 0.0}
+        _scale = _sfd_scale.get(_sfd_level, 1.0)
+        if _scale < 1.0:
+            scaled_shares = int(final_shares * _scale)
+            scaled_shares = (scaled_shares // 100) * 100
+            final_shares = scaled_shares
+            logger.info(f"P2-5策略失效联动: level={_sfd_level}, 仓位×{_scale}, 最终={final_shares}股")
+    except Exception:
+        pass  # 静默降级
 
     # ---- V8.2 ATR波动率调整 ----
     atr_adj = 1.0

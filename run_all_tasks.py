@@ -2,7 +2,7 @@
 """
 全任务串行执行脚本 - 按时间顺序手动触发所有核心定时任务
 =====================================================
-绕过交易时段检查，依次执行并发送邮件到 563646039@qq.com
+绕过交易时段检查，依次执行并发送邮件到配置的收件人邮箱
 """
 import sys
 import os
@@ -128,19 +128,9 @@ def task_5_daily_analysis():
 
 
 # ============================================================
-# 任务6: 盘后趋势预测 (15:35) - 已废弃
+# 任务6: 条件单生成 (19:00)
 # ============================================================
-def task_6_forecast_pm():
-    """已合并到盘后综合日报，仅打印说明"""
-    from scheduler import run_forecast_afternoon
-    run_forecast_afternoon()
-    return False  # 标记为跳过
-
-
-# ============================================================
-# 任务7: 条件单生成 (19:00)
-# ============================================================
-def task_7_orders():
+def task_6_orders():
     """调用 run_morning_reminder (条件单)"""
     from scheduler import run_morning_reminder
     run_morning_reminder()
@@ -202,7 +192,7 @@ def main():
     print("  交易系统 - 全任务串行执行")
     print(f"  时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  邮箱: {config.EMAIL_RECEIVER}")
-    print(f"  任务数: 8个核心任务")
+    print(f"  任务数: 7个核心任务")
     print("=" * 70)
 
     tasks = [
@@ -211,9 +201,8 @@ def main():
         ("3. 盘中异动预警(每10min)", task_3_intraday_alert),
         ("4. 盘中决策报告(每15min)", task_4_intraday_decision),
         ("5. 盘后完整分析(15:30)", task_5_daily_analysis),
-        ("6. 盘后趋势预测(15:35)", task_6_forecast_pm),
-        ("7. 条件单生成(19:00)", task_7_orders),
-        ("8. 持仓深度预警(每3min)", task_8_alert_engine),
+        ("6. 条件单生成(19:00)", task_6_orders),
+        ("7. 持仓深度预警(每3min)", task_8_alert_engine),
     ]
 
     total_start = time.time()

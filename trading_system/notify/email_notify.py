@@ -56,7 +56,9 @@ def send_email(subject: str, html_content: str,
     返回: 是否发送成功
     """
     if not config.EMAIL_SENDER or not config.EMAIL_AUTH_CODE:
-        logger.warning("邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过发送")
+        # FIX: 配置缺失提示补充具体解决指引
+        logger.warning("邮箱未配置（EMAIL_SENDER或EMAIL_AUTH_CODE为空），跳过发送。"
+                       "请设置 EMAIL_AUTH_CODE 环境变量或 config.py 邮箱配置")
         logger.info(f"邮件内容预览: [{subject}] {html_content[:200]}...")
         return False
 
@@ -77,9 +79,13 @@ def send_email(subject: str, html_content: str,
         return False
 
     max_retries = 3
+    # FIX: 重试等待改为指数退避（第1次等15秒、第2次等30秒），替代固定5秒
+    _retry_wait_seconds = [15, 30]
     for attempt in range(1, max_retries + 1):
         try:
-            with smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT) as smtp:
+            # FIX: SMTP连接增加超时参数，避免网络异常时长时间挂起
+            with smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT,
+                                  timeout=getattr(config, "EMAIL_SMTP_TIMEOUT", 30)) as smtp:
                 smtp.login(config.EMAIL_SENDER, config.EMAIL_AUTH_CODE)
                 smtp.sendmail(config.EMAIL_SENDER, [receiver], msg.as_string())
             logger.info(f"邮件发送成功: {subject} -> {receiver}")
@@ -90,14 +96,90 @@ def send_email(subject: str, html_content: str,
         except smtplib.SMTPException as e:
             logger.error(f"SMTP错误(第{attempt}次): {e}")
             if attempt < max_retries:
-                time.sleep(5)
+                time.sleep(_retry_wait_seconds[min(attempt, len(_retry_wait_seconds)) - 1])
         except Exception as e:
             logger.error(f"邮件发送异常(第{attempt}次): {e}")
             if attempt < max_retries:
-                time.sleep(5)
+                time.sleep(_retry_wait_seconds[min(attempt, len(_retry_wait_seconds)) - 1])
 
     logger.error(f"邮件发送失败，已重试{max_retries}次: {subject}")
     return False
+
+
+def send_with_fallback(subject: str, html_content: str,
+                       archive_path: str = None, receiver: str = None) -> tuple:
+    """
+    FIX: 新增发送+落盘降级封装（不改动send_email的bool返回值签名）
+
+    先调用send_email；成功返回 (True, "sent")；
+    失败时若archive_path存在且落盘文件确实存在，logger.error明确提示
+    "报告已落盘: <path>，邮件发送失败原因: <reason>"，返回 (False, 原因)。
+    """
+    reason = "send_email返回失败（详见上方SMTP日志）"
+    try:
+        ok = send_email(subject, html_content, receiver=receiver)
+    except Exception as e:
+        ok = False
+        reason = str(e)
+    if ok:
+        return True, "sent"
+    if archive_path and os.path.exists(archive_path):
+        logger.error(f"报告已落盘: {archive_path}，邮件发送失败原因: {reason}")
+        return False, reason
+    if archive_path:
+        logger.error(f"邮件发送失败原因: {reason}，且报告落盘文件不存在: {archive_path}")
+    else:
+        logger.error(f"邮件发送失败原因: {reason}（无落盘备份）")
+    return False, reason
+
+
+# ============================================================
+# V4.4: 异步邮件发送工作线程（队列+后台消费，防SMTP重试阻塞调度主循环）
+# ============================================================
+# 背景: send_email内置3次重试(15s/30s退避)+10s超时，最坏单封阻塞约75秒；
+# 盘中预警链路对发送结果无依赖（冷却/台账另登记），改异步避免拖慢轮询。
+# 需要成功/失败语义的报告链路仍用 send_email / send_with_fallback。
+
+import queue as _queue
+import threading as _threading
+
+_EMAIL_QUEUE = _queue.Queue()
+_EMAIL_WORKER_STARTED = False
+_EMAIL_WORKER_LOCK = _threading.Lock()
+
+
+def _email_worker_loop():
+    """后台消费邮件队列，逐封调用send_email（内部含重试）"""
+    while True:
+        item = _EMAIL_QUEUE.get()
+        try:
+            if item is None:
+                break
+            subject, html, receiver = item
+            try:
+                ok = send_email(subject, html, receiver=receiver)
+                if not ok:
+                    logger.error(f"[异步邮件] 发送失败(已耗尽重试): {subject}")
+            except Exception as e:
+                logger.error(f"[异步邮件] 发送异常: {subject} | {e}")
+        finally:
+            _EMAIL_QUEUE.task_done()
+
+
+def send_email_async(subject: str, html_content: str, receiver: str = None) -> bool:
+    """V4.4: 入队即返回，后台线程实际发送（含重试）
+
+    返回: 恒True（仅表示入队成功）；发送结果见日志。
+    """
+    global _EMAIL_WORKER_STARTED
+    with _EMAIL_WORKER_LOCK:
+        if not _EMAIL_WORKER_STARTED:
+            _threading.Thread(target=_email_worker_loop, daemon=True,
+                              name="EmailWorker").start()
+            _EMAIL_WORKER_STARTED = True
+    _EMAIL_QUEUE.put((subject, html_content, receiver))
+    logger.info(f"[异步邮件] 已入队: {subject} (队列深度{_EMAIL_QUEUE.qsize()})")
+    return True
 
 
 # ============================================================

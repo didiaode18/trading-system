@@ -60,6 +60,11 @@ SHORT_ANOMALY_THRESHOLD = CFG.get("margin_short_anomaly_threshold", 0.5)  # 50%
 SHORT_SQUEEZE_PRICE_PCT = CFG.get("margin_short_squeeze_price_pct", 0.10)  # 10%
 NET_BUY_MIN_DAYS = CFG.get("margin_net_buy_min_days", 3)  # 连续净买入最少天数
 CACHE_TTL_SECONDS = CFG.get("margin_cache_ttl_seconds", 3600 * 6)  # 6小时缓存
+# FIX(review): 网络异常时的负缓存短TTL（15分钟）——瞬时网络抖动不应被当作
+# "数据未发布"缓存6小时并跨进程扩散到所有报告，短周期后自动重试
+NEG_CACHE_TTL_ON_ERROR = 900
+# FIX(perf): 缓存修剪保留的最近daily_*日期key数量
+CACHE_PRUNE_KEEP_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +123,21 @@ def _get_exchange(code: str) -> str:
 # ---------------------------------------------------------------------------
 
 class MarginMonitor:
-    """融资融券数据监控器"""
+    """融资融券数据监控器
+
+    FIX(review): 并发写说明——本模块缓存为构造时整读、退出/公开入口结束时整写。
+    若与调度任务并发运行两融相关报告，后写者会覆盖先写者的新增条目，
+    影响有界——被覆盖的key会按TTL重新拉取，无需加跨进程锁。
+    """
 
     def __init__(self):
         if not HAS_AKSHARE:
             logger.error("akshare 不可用，MarginMonitor 功能受限")
+        # FIX(perf): 缓存文件(可达数十MB)构造时一次性载入内存，
+        # 避免每次调用反复整体读盘；写盘集中在公开分析入口结束时单次执行
+        self._cache = _load_cache()
+        self._cache_dirty = False   # 内存缓存是否有未落盘变更
+        self._auto_flush = True     # batch_analyze批量期间置False，批量结束统一落盘
 
     # ------------------------------------------------------------------
     # 内部：获取单日全市场融资融券明细（带缓存）
@@ -134,16 +149,30 @@ class MarginMonitor:
         :param date_str: YYYYMMDD 格式日期字符串
         :return: 统一列名后的 DataFrame，失败返回 None
         """
-        cache = _load_cache()
+        # FIX(perf): 改用实例内存缓存，不再每次调用全量读盘
+        cache = self._cache
         cache_key = f"daily_{date_str}"
 
-        if _is_cache_fresh(cache, cache_key):
-            try:
-                return pd.DataFrame(cache[cache_key]["data"])
-            except Exception:
-                pass
+        # FIX(review): 负缓存条目按条目内TTL分别判定——网络异常条目用短TTL(15分钟)，
+        # 数据未发布及无reason/ttl字段的旧条目沿用原CACHE_TTL_SECONDS兼容
+        _entry = cache.get(cache_key)
+        if isinstance(_entry, dict) and _entry.get("timestamp") is not None:
+            _age = datetime.datetime.now().timestamp() - _entry["timestamp"]
+            if _entry.get("data") is None:
+                if _age < _entry.get("ttl", CACHE_TTL_SECONDS):
+                    # V5修复: 负缓存命中 —— 该日两所数据确认不可得(如当日明细
+                    # 晚间才发布)，TTL内不重试，避免逐持仓重复拉取刷日志
+                    return None
+            elif _age < CACHE_TTL_SECONDS:
+                try:
+                    return pd.DataFrame(_entry.get("data"))
+                except Exception:
+                    pass
 
         frames = []
+        # FIX(review): 记录各所请求是否抛出异常，用于区分"网络抖动"与"数据未发布"
+        _sz_fetch_error = False
+        _sh_fetch_error = False
 
         # 深交所
         try:
@@ -163,6 +192,7 @@ class MarginMonitor:
                 df_sz["date"] = date_str
                 frames.append(df_sz)
         except Exception as e:
+            _sz_fetch_error = True
             logger.debug(f"深交所融资融券明细获取失败({date_str}): {e}")
 
         # 上交所
@@ -183,10 +213,28 @@ class MarginMonitor:
                 df_sh["date"] = date_str
                 frames.append(df_sh)
         except Exception as e:
+            _sh_fetch_error = True
             logger.debug(f"上交所融资融券明细获取失败({date_str}): {e}")
 
         if not frames:
-            logger.warning(f"融资融券: {date_str} 两所数据均获取失败")
+            # FIX(review): 区分两类失败——任一请求抛异常视为网络抖动，负缓存用短TTL
+            # (15分钟后重试)；连接正常但无数据视为未发布，沿用原6h TTL
+            _is_network_error = _sz_fetch_error or _sh_fetch_error
+            _neg_reason = "network_error" if _is_network_error else "no_data"
+            _neg_ttl = NEG_CACHE_TTL_ON_ERROR if _is_network_error else CACHE_TTL_SECONDS
+            logger.warning(f"融资融券: {date_str} 两所数据均获取失败 (reason={_neg_reason})")
+            # V5修复: 写入负缓存(data=None)，TTL内同日失败不重复请求
+            # FIX(perf): 仅标记脏位，写盘延迟到公开分析入口结束时单次执行
+            try:
+                cache[cache_key] = {
+                    "timestamp": datetime.datetime.now().timestamp(),
+                    "data": None,
+                    "reason": _neg_reason,
+                    "ttl": _neg_ttl,
+                }
+                self._cache_dirty = True
+            except Exception:
+                pass
             return None
 
         combined = pd.concat(frames, ignore_index=True)
@@ -205,16 +253,73 @@ class MarginMonitor:
             combined["short_balance"] = 0.0
 
         # 写缓存
+        # FIX(perf): 仅更新内存缓存并标记脏位，写盘延迟到公开分析入口结束时单次执行
         try:
             cache[cache_key] = {
                 "timestamp": datetime.datetime.now().timestamp(),
                 "data": combined.to_dict(orient="records"),
             }
-            _save_cache(cache)
+            self._cache_dirty = True
         except Exception:
             pass
 
         return combined
+
+    # ------------------------------------------------------------------
+    # 内部：缓存集中落盘（原子写 + 旧key修剪）
+    # ------------------------------------------------------------------
+    def _maybe_flush(self):
+        """FIX(perf): 公开分析入口结束时调用；批量分析期间由batch_analyze统一控制"""
+        if self._auto_flush:
+            self._flush_cache()
+
+    def _flush_cache(self):
+        """FIX(perf): 单次集中写盘：先修剪旧key，再原子写（临时文件+os.replace，
+        参照notify/buy_point_alert.py的原子写模式）；无变更时直接跳过。
+        FIX(review): 构造时整读、此处整写——与调度任务并发运行两融报告时，
+        后写者可能覆盖先写者的新条目，影响有界（被覆盖key按TTL重新拉取）"""
+        if not self._cache_dirty:
+            return
+        tmp = MARGIN_CACHE_FILE + ".tmp"
+        try:
+            self._prune_cache()
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._cache, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, MARGIN_CACHE_FILE)
+            self._cache_dirty = False
+        except Exception as e:
+            logger.debug(f"融资融券缓存写入失败: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _prune_cache(self):
+        """FIX(perf): daily_*日期key超过最近30个时删除多余旧key；
+        修剪前把原缓存文件备份为 margin_monitor_cache_backup_<YYYYMMDD>.json（已存在则跳过）"""
+        daily_keys = sorted(
+            (k for k in self._cache if k.startswith("daily_") and k[6:].isdigit()),
+            reverse=True)
+        if len(daily_keys) <= CACHE_PRUNE_KEEP_DAYS:
+            return
+        try:
+            backup_path = os.path.join(
+                CACHE_DIR,
+                f"margin_monitor_cache_backup_{datetime.date.today().strftime('%Y%m%d')}.json")
+            if not os.path.exists(backup_path) and os.path.exists(MARGIN_CACHE_FILE):
+                import shutil
+                shutil.copyfile(MARGIN_CACHE_FILE, backup_path)
+                logger.info(f"融资融券缓存修剪前备份: {backup_path}")
+        except Exception as e:
+            logger.warning(f"融资融券缓存备份失败(继续修剪): {e}")
+        _drop = daily_keys[CACHE_PRUNE_KEEP_DAYS:]
+        for k in _drop:
+            del self._cache[k]
+        logger.info(f"融资融券缓存修剪: 保留最近{CACHE_PRUNE_KEEP_DAYS}天, 删除{len(_drop)}个旧daily_*key")
 
     # ------------------------------------------------------------------
     # 内部：获取指定交易日列表
@@ -266,12 +371,14 @@ class MarginMonitor:
 
         if not rows:
             logger.info(f"融资融券: {stock_code} 最近{days}天无数据")
+            self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
             return pd.DataFrame()
 
         result = pd.DataFrame(rows)
         # 按日期升序排列（最旧在前）
         result = result.sort_values("date").reset_index(drop=True)
         logger.info(f"融资融券: {stock_code} 获取到{len(result)}天数据")
+        self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
         return result
 
     # ------------------------------------------------------------------
@@ -298,6 +405,7 @@ class MarginMonitor:
 
         df = self.get_margin_data(stock_code, days=days)
         if df.empty or len(df) < 5:
+            self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
             return default_result
 
         # --- 融资净买入连续天数 ---
@@ -430,6 +538,7 @@ class MarginMonitor:
             f"余额趋势{balance_trend}, 信号={signal}({confidence:.2f})"
         )
 
+        self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
         return {
             "net_buy_days": net_buy_days,
             "balance_trend": balance_trend,
@@ -462,6 +571,7 @@ class MarginMonitor:
 
         df = self.get_margin_data(stock_code, days=30)
         if df.empty or len(df) < 10:
+            self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
             return default_result
 
         # 融券余额是否偏高（相对自身20日均值）
@@ -510,6 +620,7 @@ class MarginMonitor:
         else:
             desc_parts.append("无轧空风险")
 
+        self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
         return {
             "risk_level": risk_level,
             "short_balance_high": short_balance_high,
@@ -530,24 +641,33 @@ class MarginMonitor:
         """
         results = {}
         total = len(stock_codes)
-        for idx, code in enumerate(stock_codes, 1):
-            code = _normalize_stock_code(code)
-            try:
-                logger.info(f"批量分析进度: {idx}/{total} - {code}")
-                signal = self.calc_margin_signal(code)
-                squeeze = self.detect_short_squeeze_risk(code)
-                results[code] = {
-                    "signal": signal,
-                    "short_squeeze": squeeze,
-                    "factor": self._signal_to_factor(signal, squeeze),
-                }
-            except Exception as e:
-                logger.error(f"批量分析失败({code}): {e}")
-                results[code] = {
-                    "signal": {"signal": "neutral", "confidence": 0, "description": f"分析失败: {e}"},
-                    "short_squeeze": {"risk_level": "unknown"},
-                    "factor": 50.0,
-                }
+        # FIX(perf): 批量分析期间暂停逐标的落盘，批量结束后统一单次写盘
+        self._auto_flush = False
+        try:
+            for idx, code in enumerate(stock_codes, 1):
+                try:
+                    # FIX(review): normalize移入per-code try内，单个异常代码不中断整批
+                    code = _normalize_stock_code(code)
+                    logger.info(f"批量分析进度: {idx}/{total} - {code}")
+                    signal = self.calc_margin_signal(code)
+                    squeeze = self.detect_short_squeeze_risk(code)
+                    results[code] = {
+                        "signal": signal,
+                        "short_squeeze": squeeze,
+                        "factor": self._signal_to_factor(signal, squeeze),
+                    }
+                except Exception as e:
+                    logger.error(f"批量分析失败({code}): {e}")
+                    results[code] = {
+                        "signal": {"signal": "neutral", "confidence": 0, "description": f"分析失败: {e}"},
+                        "short_squeeze": {"risk_level": "unknown"},
+                        "factor": 50.0,
+                    }
+        finally:
+            # FIX(review): 异常路径也恢复auto_flush并落盘，避免缓存变更丢失；
+            # _flush_cache内部按_cache_dirty判定，正常路径已落盘时不重复写
+            self._auto_flush = True
+            self._flush_cache()  # FIX(perf): 批量结束统一落盘
         return results
 
     # ------------------------------------------------------------------
@@ -570,7 +690,9 @@ class MarginMonitor:
         try:
             signal = self.calc_margin_signal(stock_code)
             squeeze = self.detect_short_squeeze_risk(stock_code)
-            return self._signal_to_factor(signal, squeeze)
+            factor = self._signal_to_factor(signal, squeeze)
+            self._maybe_flush()  # FIX(perf): 公开入口结束单次落盘
+            return factor
         except Exception as e:
             logger.error(f"融资融券因子计算失败({stock_code}): {e}")
             return 50.0

@@ -335,3 +335,73 @@ def fetch_index_realtime(index_code: str = "000300") -> dict:
     except Exception as e:
         logger.warning(f"指数实时行情获取失败: {e}")
         return {}
+
+
+# ============================================================
+# 五、行业板块当日涨跌幅（内存缓存，批1-B公共模块）
+# ============================================================
+
+# 模块级内存缓存: {"date": "YYYY-MM-DD", "data": {...}} 或失败状态 {"date": ..., "failed": True}
+_SECTOR_CHANGES_CACHE = {"date": None, "data": None, "failed": False}
+
+
+def fetch_sector_changes_cached() -> dict:
+    """
+    获取东财行业板块当日涨跌幅（模块级内存缓存，当日只请求一次）
+
+    返回: {"板块名": 涨跌幅百分比}，失败/未启用/非交易日无数据时返回 None
+
+    缓存策略:
+        - 当日命中直接返回（O(1)）
+        - 失败状态记忆：当日不重试直接返回 None
+        - 跨日自动失效重新拉取
+    绝不抛异常。
+    """
+    global _SECTOR_CHANGES_CACHE
+    try:
+        today = datetime.date.today().strftime("%Y-%m-%d")
+
+        # 当日命中（成功或失败记忆）直接返回
+        if _SECTOR_CHANGES_CACHE.get("date") == today:
+            if _SECTOR_CHANGES_CACHE.get("failed"):
+                return None
+            return _SECTOR_CHANGES_CACHE.get("data")
+
+        # 跨日失效，重新拉取
+        try:
+            import akshare as ak  # 函数内延迟导入，缺失时降级
+        except ImportError:
+            _SECTOR_CHANGES_CACHE = {"date": today, "data": None, "failed": True}
+            logger.debug("akshare未安装，板块涨跌幅不可用")
+            return None
+
+        df = ak.stock_board_industry_name_em()
+        if df is None or df.empty:
+            _SECTOR_CHANGES_CACHE = {"date": today, "data": None, "failed": True}
+            return None
+
+        result = {}
+        for _, row in df.iterrows():
+            name = row.get("板块名称", "")
+            pct = row.get("涨跌幅", None)
+            if not name or pct is None:
+                continue
+            try:
+                result[str(name)] = float(pct)
+            except (TypeError, ValueError):
+                continue
+
+        if not result:
+            _SECTOR_CHANGES_CACHE = {"date": today, "data": None, "failed": True}
+            return None
+
+        _SECTOR_CHANGES_CACHE = {"date": today, "data": result, "failed": False}
+        return result
+    except Exception as e:
+        logger.warning(f"板块涨跌幅获取失败: {e}")
+        try:
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            _SECTOR_CHANGES_CACHE = {"date": today, "data": None, "failed": True}
+        except Exception:
+            pass
+        return None

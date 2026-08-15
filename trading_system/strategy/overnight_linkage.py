@@ -400,7 +400,7 @@ class OvernightLinkage:
         bias_color = "#e74c3c" if bias == "偏多" else "#27ae60" if bias == "偏空" else "#666"
 
         html = f"""
-<div style="background:linear-gradient(135deg,#1a237e 0%,#283593 100%);color:#fff;
+<div style="background:#1a237e;color:#fff;
      border-radius:8px;padding:16px 20px;margin:15px 0">
   <h3 style="margin:0 0 10px;color:#fff;font-size:16px">🌍 隔夜外盘前瞻（次日开盘预判）</h3>
   <div style="margin-bottom:10px">{idx_html}</div>

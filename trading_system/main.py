@@ -21,10 +21,12 @@
 
 import os
 import sys
+import time
 import argparse
 import datetime
 import logging
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import pandas as pd
 
 # 确保项目根目录在sys.path中
@@ -33,27 +35,29 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import config
 from data.data_loader import init_db, batch_update_all, load_daily_data, get_all_candidate_codes
-from strategy.trend_strategy import generate_strategy_signal, scan_all_stocks, compute_indicators
+# FIX: 清理死代码无用 import（generate_strategy_signal / notify_risk_alert /
+# send_daily_report / send_risk_alert / send_eastmoney_orders_email /
+# send_screener_email / send_portfolio_email / send_risk_report_email /
+# send_forecast_email 均 grep 确认本文件零使用）
+from strategy.trend_strategy import scan_all_stocks, compute_indicators
 from strategy.position import calc_first_batch
 from risk.risk_control import (RiskState, risk_check, judge_market_strength,
                                 get_max_position_ratio, daily_risk_summary)
 from notify.wechat_notify import (notify_buy_signal, notify_sell_signal,
-                                   notify_risk_alert, notify_daily_summary)
-from notify.email_notify import send_daily_report, send_risk_alert
+                                   notify_daily_summary)
 from output.condition_sheet import generate_condition_sheet, generate_simple_report
-from output.eastmoney_orders import send_eastmoney_orders_email
-from strategy.stock_screener import run_stock_screener, send_screener_email
-from strategy.portfolio_analyzer import analyze_portfolio, send_portfolio_email
+from strategy.stock_screener import run_stock_screener, hard_filter
+from strategy.portfolio_analyzer import analyze_portfolio
 from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
 # V3.0 新增模块
-from strategy.portfolio_risk import PortfolioRiskManager, send_risk_report_email
+from strategy.portfolio_risk import PortfolioRiskManager
 from strategy.fundamental import FundamentalAnalyzer
 from strategy.mean_reversion import MeanReversionStrategy
 from strategy.multi_timeframe import MultiTimeframeAnalyzer
 from strategy.capital_flow import CapitalFlowAnalyzer
 from strategy.market_regime import MarketRegimeDetector
 from strategy.trade_journal import TradeJournal
-from strategy.trend_forecast import TrendForecaster, send_forecast_email
+from strategy.trend_forecast import TrendForecaster
 # V7.1 新增模块
 from strategy.anti_manipulation import AntiManipulationAnalyzer
 from strategy.consensus import batch_consensus
@@ -168,18 +172,7 @@ _prev_vol_scale = _load_vol_scale_state()
 
 def load_holdings() -> dict:
     """
-    加载当前持仓数据
-    持仓文件格式 holdings.json:
-    {
-        "002049": {
-            "shares": 400,
-            "buy_price": 195.0,
-            "highest_price": 210.0,
-            "first_batch_done": true,
-            "sector": "半导体",
-            "stock_type": "龙头"
-        }
-    }
+    加载当前持仓数据（统一使用 config.get_holdings_file 解析路径）
     """
     global HOLDINGS_FILE
     HOLDINGS_FILE = config.get_holdings_file()
@@ -227,6 +220,107 @@ def compute_indicators_cached(code: str, df: pd.DataFrame) -> pd.DataFrame:
 def get_current_market_regime() -> dict:
     """获取当前大盘状态检测结果（供CaopanEngine等模块调用）"""
     return _current_market_regime
+
+
+# ============================================================
+# Step9 动态扫描扩面：两阶段候选拉取（批2-S7）
+# ============================================================
+
+def _expand_scan_candidates(new_codes: list, scan_result: dict,
+                            data_dict: dict, conn) -> int:
+    """两阶段处理扫描新增候选（阶段A内存粗筛 + 阶段B预算制日线拉取）
+
+    阶段A（零成本）: 利用扫描快照 details 字段过滤指数/ETF/ST/零成交等无效标的
+    阶段B（预算制）: ThreadPoolExecutor(max_workers=5) 拉取日线，worker 内
+        sleep(0.3) 节流；总预算60秒，超时即截断；失败率>30% 自动降级（本批上限50只）。
+    拉取成功者经 compute_indicators + hard_filter 二次筛选后合并进 data_dict。
+
+    返回: 实际入库的股票数量。任何阶段异常向上抛出，由调用方降级为原有行为。
+    """
+    details_map = {str(d.get("code", "")): d for d in scan_result.get("details", [])}
+
+    # ---- 阶段A: 零成本内存粗筛 ----
+    # 排除口径与 stock_screener.filter_strong_sectors 一致：
+    # 指数(000300)/创业板(300)/科创板(688)/ETF(588/159)
+    _EXCLUDE_PREFIX = ("300", "688", "588", "159")
+    coarse = []
+    for code in new_codes:
+        if code == "000300" or code.startswith(_EXCLUDE_PREFIX):
+            continue
+        detail = details_map.get(code, {})
+        name = str(detail.get("name", ""))
+        if "ST" in name.upper() or "退" in name:
+            continue
+        amount = detail.get("amount")  # details中amount单位为亿
+        if amount is None or pd.isna(amount) or float(amount) <= 0:
+            continue  # 成交额为0/无效，直接排除
+        coarse.append(code)
+
+    if not coarse:
+        logger.info("扫描扩面: 粗筛0只→日线成功0只(失败0只, 耗时0.0s)→hard_filter通过0只")
+        return 0
+
+    # ---- 阶段B: 日线拉取（线程池5并发 + 0.3s节流 + 60s总预算）----
+    t0 = time.time()
+
+    def _fetch_one(code):
+        time.sleep(0.3)  # 拉取前节流，避免触发数据源限流
+        # 跨线程连接规避：主线程的 SQLite conn 默认禁止跨线程使用
+        # （未设 check_same_thread=False，worker 内共用会抛 ProgrammingError），
+        # 故传 None 让 load_daily_data 在 worker 线程内自建独立连接并在内部关闭
+        return load_daily_data(code, None, days=120)
+
+    budget_sec = 60
+    ok_dfs = {}
+    fail_count = 0
+    truncated = False
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut_map = {ex.submit(_fetch_one, c): c for c in coarse}
+        try:
+            for fut in as_completed(fut_map, timeout=budget_sec):
+                code = fut_map[fut]
+                try:
+                    df_new = fut.result()
+                    if df_new is not None and not df_new.empty and len(df_new) >= config.MA_SHORT:
+                        ok_dfs[code] = df_new
+                    else:
+                        fail_count += 1
+                except Exception:
+                    fail_count += 1  # 单只失败静默跳过，计入失败数
+        except FuturesTimeoutError:
+            truncated = True
+            logger.warning(f"扫描扩面: 日线拉取超过{budget_sec}s预算，截断剩余"
+                           f"{len(fut_map) - len(ok_dfs) - fail_count}只")
+    elapsed = time.time() - t0
+
+    # 失败率>30% → 自动降级：本批处理上限降回50只
+    attempted = len(ok_dfs) + fail_count
+    fail_rate = (fail_count / attempted) if attempted else 0.0
+    batch_cap = None
+    if fail_rate > 0.3:
+        batch_cap = 50
+        logger.warning(f"扫描扩面: 日线拉取失败率{fail_rate:.0%}(>{30}%)，本批处理上限降级为{batch_cap}只")
+
+    # ---- 二次筛选并合并进 data_dict ----
+    pass_count = 0
+    for code, df_new in ok_dfs.items():
+        if batch_cap is not None and pass_count >= batch_cap:
+            break
+        df_ind = compute_indicators(df_new)
+        try:
+            # hard_filter 适合单只调用（需带均线指标的df）；market_state 默认"up"，
+            # 此处M因子尚未计算，与选股引擎内部二次判定的强势模式口径保持一致
+            hf = hard_filter(df_ind, code)
+        except Exception:
+            hf = {"pass": True}  # hard_filter异常时沿用旧行为：直接入库
+        if hf.get("pass"):
+            data_dict[code] = df_ind
+            pass_count += 1
+
+    logger.info(f"扫描扩面: 粗筛{len(coarse)}只→日线成功{len(ok_dfs)}只"
+                f"(失败{fail_count}只, 耗时{elapsed:.1f}s)→hard_filter通过{pass_count}只"
+                + ("（预算截断）" if truncated else ""))
+    return pass_count
 
 
 # ============================================================
@@ -803,19 +897,26 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         # 全市场动态扫描，发现强势股补充候选池
         logger.info("  [市场扫描] 尝试全市场动态扫描...")
         try:
-            scan_result = scan_market_hot_stocks(total_max=15)
+            scan_result = scan_market_hot_stocks(total_max=getattr(config, "SCAN_TOTAL_MAX", 100))
             if scan_result["success"]:
                 new_codes = merge_scan_results_to_pool(scan_result, set(data_dict.keys()))
-                # 拉取新发现股票的历史数据
-                for code in new_codes[:10]:  # 最多追加10只
-                    try:
-                        df_new = load_daily_data(code, conn, days=120)
-                        if not df_new.empty and len(df_new) >= config.MA_SHORT:
-                            df_new = compute_indicators(df_new)
-                            data_dict[code] = df_new
-                    except Exception:
-                        pass
-                logger.info(f"  动态扫描完成，新增{len(new_codes)}只候选股")
+                # 两阶段扩面处理全部新增候选（内存粗筛 → 预算制日线拉取 → hard_filter）
+                added_count = 0
+                try:
+                    added_count = _expand_scan_candidates(new_codes, scan_result, data_dict, conn)
+                except Exception as exp_e:
+                    # 两阶段扩面异常 → 回退原有行为：最多拉取10只直接入库
+                    logger.warning(f"  扫描扩面两阶段处理异常，回退原有逻辑: {exp_e}")
+                    for code in new_codes[:10]:  # 最多追加10只
+                        try:
+                            df_new = load_daily_data(code, conn, days=120)
+                            if not df_new.empty and len(df_new) >= config.MA_SHORT:
+                                df_new = compute_indicators(df_new)
+                                data_dict[code] = df_new
+                                added_count += 1
+                        except Exception:
+                            pass
+                logger.info(f"  动态扫描完成，新增{len(new_codes)}只候选股（实际入库{added_count}只）")
             else:
                 logger.info("  全市场扫描未成功（可能非交易时间），使用已有候选池")
         except Exception as e:

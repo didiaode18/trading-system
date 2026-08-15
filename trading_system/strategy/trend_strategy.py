@@ -573,8 +573,10 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
     profit_pct = (close - buy_price) / buy_price
 
     # 持仓期间最高价
-    if current_position and current_position.get("highest_price"):
-        highest = current_position["highest_price"]
+    # FIX: 修复字段名错位导致永远fallback到全区间最高价、回落止盈基准失真：
+    # holdings.json 实际字段为 highest；保留 highest_price 兼容回测broker等其他调用方
+    if current_position and (current_position.get("highest") or current_position.get("highest_price")):
+        highest = current_position.get("highest") or current_position["highest_price"]
     else:
         highest = df_ind["high"].max()
 
@@ -887,13 +889,24 @@ def generate_strategy_signal(df: pd.DataFrame, holding: dict = None) -> dict:
         best_result = breakout_result
 
     if best_result and best_result["signal"]:
-        result["buy_signal"] = True
-        result["buy_price"] = best_result["buy_price"]
-        result["stop_loss_initial"] = best_result["stop_loss"]
-        result["stop_loss_current"] = best_result["stop_loss"]
-        result["quality_score"] = best_result.get("quality_score", 50)
-        result["buy_type"] = best_result.get("buy_type", "回踩支撑")
-        result["signal_reason"] = f"[买入] {best_result['reason']}"
+        # P0-2: 信号质量硬门槛（低于阈值不生成买入信号）
+        _min_qs = getattr(config, 'MIN_SIGNAL_QUALITY_LIVE', 62)
+        _qs = best_result.get("quality_score", 50)
+        if _qs < _min_qs:
+            result["quality_score"] = _qs
+            result["buy_type"] = None
+            result["signal_reason"] = (
+                f"[观望-质量分不足] {_qs}分 < 门槛{_min_qs}分 | "
+                f"{best_result.get('reason', '')}"
+            )
+        else:
+            result["buy_signal"] = True
+            result["buy_price"] = best_result["buy_price"]
+            result["stop_loss_initial"] = best_result["stop_loss"]
+            result["stop_loss_current"] = best_result["stop_loss"]
+            result["quality_score"] = _qs
+            result["buy_type"] = best_result.get("buy_type", "回踩支撑")
+            result["signal_reason"] = f"[买入] {best_result['reason']}"
     else:
         result["quality_score"] = 0
         result["buy_type"] = None

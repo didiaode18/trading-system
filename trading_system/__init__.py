@@ -20,7 +20,7 @@ V9.0新增: VWAP均价线 | 内外盘委比 | 集合竞价分析 | K线形态识
     position/    仓位层 - Kelly/风险平价/波动率目标
     quant/       量化层 - 多因子引擎/组合优化/绩效归因
     ml/          机器学习 - 特征工程/预测/监控
-    execution/   执行层 - TWAP/滑点追踪
+    execution/   执行层 - 滑点追踪（FIX: 清理 twap.py 死代码后更新描述）
     monitor/     监控层 - 盘中实时预警
     attribution/ 归因层 - Alpha/Beta/Barra
 

@@ -59,7 +59,8 @@ from output.report_charts import (
 )
 from strategy.stock_screener import run_stock_screener, send_screener_email
 from strategy.capital_flow import CapitalFlowAnalyzer
-from strategy.market_scanner import scan_market_hot_stocks, merge_scan_results_to_pool
+from strategy.market_scanner import (scan_market_hot_stocks, merge_scan_results_to_pool,
+                                     build_investable_universe)
 from strategy.pool_manager import PoolManager
 from data.realtime import fetch_realtime_batch
 
@@ -134,7 +135,8 @@ def fetch_stock_data(code: str, days: int = 500):
         import baostock as bs
         import pandas as pd
         _ensure_bs_login()
-        prefix = "sh" if code.startswith(("6", "5", "9")) else "sz"
+        # FIX: 沪深300指数(000300)在baostock中为sh.000300，与data_loader._to_baostock_code保持一致
+        prefix = "sh" if (code.startswith(("6", "5", "9")) or code == "000300") else "sz"
         bs_code = f"{prefix}.{code}"
         end = datetime.date.today().strftime("%Y-%m-%d")
         start = (datetime.date.today() - datetime.timedelta(days=days * 2)).strftime("%Y-%m-%d")
@@ -171,7 +173,8 @@ def fetch_batch_data(codes: list, days: int = 500) -> dict:
     
     for code in codes:
         try:
-            prefix = "sh" if code.startswith(("6", "5", "9")) else "sz"
+            # FIX: 沪深300指数(000300)必须用sh前缀，否则M因子取不到指数数据、永远降级中性半仓
+            prefix = "sh" if (code.startswith(("6", "5", "9")) or code == "000300") else "sz"
             bs_code = f"{prefix}.{code}"
             rs = bs.query_history_k_data_plus(
                 bs_code, "date,open,high,low,close,volume,amount",
@@ -200,13 +203,25 @@ def _merge_realtime_row(df, quote: dict):
       - 否则 → 追加今日新行
     """
     import pandas as pd
-    if not quote or quote.get("price", 0) <= 0:
+    # FIX: 实时行情字段可能为None（腾讯接口个别字段缺失），统一float化防御，避免单只异常中断整个融合循环
+    try:
+        price = float(quote.get("price") or 0)
+    except (TypeError, ValueError):
+        return df
+    if not quote or price <= 0:
         return df
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    price = quote["price"]
-    high = quote.get("high", price)
-    low = quote.get("low", price)
-    volume = quote.get("volume", 0) * 100  # 手→股
+
+    def _f(key, default):
+        try:
+            v = quote.get(key, default)
+            return float(v) if v is not None else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    high = _f("high", price)
+    low = _f("low", price)
+    volume = _f("volume", 0) * 100  # 手→股
 
     if len(df) > 0 and df["date"].iloc[-1] == today_str:
         # 更新当日数据
@@ -221,33 +236,20 @@ def _merge_realtime_row(df, quote: dict):
         prev_close = df["close"].iloc[-1] if len(df) > 0 else price
         new_row = {
             "date": today_str,
-            "open": quote.get("open", prev_close),
+            "open": _f("open", prev_close),
             "high": high,
             "low": low,
             "close": price,
             "volume": volume,
-            "amount": quote.get("amount", 0) * 10000,
+            "amount": _f("amount", 0) * 10000,
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     return df
 
 
 def load_holdings() -> dict:
-    """加载持仓"""
-    NAME_MAP = {
-        "588000": "科创50", "002415": "海康威视", "603501": "豪威集团",
-        "002409": "雅克科技", "002185": "华天科技", "600036": "招商银行",
-        "159205": "创业东财", "600276": "恒瑞医药", "603993": "洛阳钼业",
-    }
-    holdings_file = os.path.join(BASE_DIR, "holdings.json")
-    if os.path.exists(holdings_file):
-        with open(holdings_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for code in data:
-            if "name" not in data[code]:
-                data[code]["name"] = NAME_MAP.get(code, code)
-        return data
-    return {code: {"name": name} for code, name in NAME_MAP.items()}
+    """加载持仓（统一委托 config.load_holdings）"""
+    return config.load_holdings(validated=False)
 
 
 def run_full_analysis(holdings: dict) -> list:
@@ -622,7 +624,59 @@ def generate_weekly_report(results: list, holdings: dict) -> str:
     except Exception:
         pass
 
-    # 4. 下周策略
+    # 4. V4.0(G11): 执行归因（滑点/条件单）——执行质量反馈闭环
+    lines.append(f"\n  ━━ 执行归因 ━━")
+    try:
+        from execution.slippage_tracker import SlippageTracker
+        _slip = SlippageTracker().generate_report(lookback_days=7)
+        if _slip.get("total_trades", 0) > 0:
+            _bd = _slip.get("by_direction", {})
+            lines.append(f"     滑点(近7日{_slip['total_trades']}笔): 平均{_slip['avg_slippage']*100:+.3f}% "
+                         f"| 成本{_slip['slippage_cost']:,.0f}元 "
+                         f"| 买{_bd.get('buy', {}).get('avg', 0)*100:+.3f}%/卖{_bd.get('sell', {}).get('avg', 0)*100:+.3f}%")
+            for _hs in _slip.get("high_slippage_stocks", []):
+                lines.append(f"     ⚠️ 高滑点 {_hs['code']}: 均值{_hs['avg_slippage']*100:.2f}%"
+                             f"({_hs['count']}笔)，建议改限价分批执行")
+            for _cv in _slip.get("backtest_calibration", {}).values():
+                lines.append(f"     📐 回测校准: {_cv.get('suggestion', '')}")
+        else:
+            lines.append("     近7日无成交/滑点记录")
+    except Exception:
+        lines.append("     (执行归因数据获取失败)")
+    try:
+        # 条件单生成统计：本周orders_*.json批次与单量
+        _out_dir = os.path.join(TRADING_SYSTEM_DIR, "output")
+        _week_files = []
+        for _i in range(7):
+            _d = (datetime.date.today() - datetime.timedelta(days=_i)).strftime("%Y%m%d")
+            _p = os.path.join(_out_dir, f"orders_{_d}.json")
+            if os.path.exists(_p):
+                _week_files.append(_p)
+        _total_orders = 0
+        for _p in _week_files:
+            try:
+                with open(_p, "r", encoding="utf-8") as _f:
+                    _ods = json.load(_f).get("orders", [])
+                    _total_orders += len(_ods)
+            except Exception:
+                pass
+        lines.append(f"     条件单: 本周生成{len(_week_files)}批共{_total_orders}条")
+    except Exception:
+        pass
+    # V4.1(M2): 条件单执行归因——生成 vs 真实成交匹配，衡量条件单体系是否执行到位
+    try:
+        from execution.order_attribution import collect_order_execution_stats
+        _oa = collect_order_execution_stats(lookback_days=7)
+        if _oa.get("available"):
+            lines.append(f"     条件单执行: 成交{_oa['filled']}/{_oa['total_orders']}条"
+                         f"（成交率{_oa['fill_rate']*100:.0f}%）")
+            if _oa["unfilled_high_priority"] > 0:
+                lines.append(f"     ⚠️ {_oa['unfilled_high_priority']}条★★★必挂单未见成交，请检查是否漏挂/撤单"
+                             f"（成交未录入系统也会计为未成交）")
+    except Exception:
+        pass
+
+    # 5. 下周策略
     lines.append(f"\n  ━━ 下周策略 ━━")
     # 基于趋势和信号给出策略
     strong = [r for r in results if r.get("trend_level", 3) >= 4]
@@ -723,14 +777,25 @@ def run_screener():
     if pool_new > 0:
         print(f"  观察池补充: +{pool_new}只 (PoolManager)")
 
-    # ---- 第3层: 全市场动态扫描 ----
+    # ---- 第3层: 全市场动态扫描（V4.0 G3: 先构建可投资域，共享单次行情拉取）----
+    # V1.1扩面: total_max 从 hardcoded 15 → config.SCREENER_SCAN_MAX(30)
+    _expand = getattr(config, 'CANDIDATE_POOL_EXPAND_ENABLED', True)
+    _screener_scan_max = getattr(config, 'SCREENER_SCAN_MAX', 30) if _expand else 15
     scan_new = 0
+    scan_ok = False  # V4.0(G12): 扫描失败时报告需标注数据降级
+    _universe_info = None
     try:
-        scan_result = scan_market_hot_stocks(total_max=15)
+        _uni = build_investable_universe()
+        _spot_df = _uni.get("df") if _uni.get("success") else None
+        if _uni.get("success"):
+            _universe_info = {"size": _uni["size"], "total": _uni["total"],
+                              "filter_stats": _uni["filter_stats"]}
+        scan_result = scan_market_hot_stocks(total_max=_screener_scan_max, spot_df=_spot_df)
         if scan_result.get("success"):
+            scan_ok = True
             new_codes = merge_scan_results_to_pool(scan_result, all_codes)
-            # 最多追加15只动态发现股（控制baostock拉取耗时）
-            for code in new_codes[:15]:
+            # V1.1扩面: 最多追加 SCREENER_SCAN_MAX 只动态发现股（原15→30）
+            for code in new_codes[:_screener_scan_max]:
                 all_codes.add(code)
                 scan_new += 1
             if scan_new > 0:
@@ -783,8 +848,34 @@ def run_screener():
         print("  ❌ 数据不足，无法运行选股")
         return None
 
+    # FIX: 接入新闻风险扫描（与main.py一致）。此前本入口从不传news_risk，
+    # 导致config.NEWS_FILTER_IN_SCREENER=True实际失效，高风险新闻股可能被推荐买入
+    news_risk = {}
+    if getattr(config, 'NEWS_MONITOR_ENABLED', False):
+        try:
+            from trading_system.strategy.news_monitor import scan_news_risk
+            scan_codes = list(holdings.keys()) + list(data_dict.keys())
+            news_risk = scan_news_risk(scan_codes, holdings)
+            _alert_n = sum(1 for v in news_risk.values() if v.get("level", 0) >= 2)
+            print(f"  新闻风险扫描: {len(scan_codes)}只 | 风险预警{_alert_n}只")
+        except Exception as e:
+            logger.warning(f"  新闻扫描异常(不影响选股): {e}")
+
     # 运行选股引擎
-    result = run_stock_screener(data_dict, holdings)
+    result = run_stock_screener(data_dict, holdings, news_risk=news_risk)
+
+    # V4.0(G12): 动态扫描失败时标注数据降级，随报告警示区展示
+    if not scan_ok:
+        result.setdefault("_data_degraded", []).append(
+            "全市场动态扫描未成功（网络异常/非盘中），本期仅使用静态+观察池候选，可能遗漏池外强势股")
+
+    # V4.0(G3): 可投资域覆盖率度量
+    if _universe_info:
+        _cov = len(all_codes) / max(_universe_info["size"], 1) * 100
+        _universe_info["coverage_pct"] = round(_cov, 1)
+        result["_universe_info"] = _universe_info
+        print(f"  可投资域{_universe_info['size']}只 | 候选池覆盖率{_cov:.1f}%")
+
     buy_count = result.get('buy_recommend_count', 0)
     watch_count = result.get('watch_only_count', 0)
     min_buy = result.get('min_buy_score', 50)
@@ -799,6 +890,12 @@ def run_screener():
             else:
                 print(f"     {i:2d}. [{tag}] {s['code']} {s['name']} | 评分{s['factor_score']} | "
                       f"{s.get('watch_reason', '')}")
+
+    # V3.5: 持仓深亏风控处置清单（选股引擎不推荐买入，仅提示按硬止损线处置）
+    if result.get("holdings_risk_watch"):
+        print(f"\n  ⚠ 持仓风控处置（浮亏超8%，禁止加仓/再买入）:")
+        for _h in result["holdings_risk_watch"]:
+            print(f"     【{_h['code']}】{_h['name']} 浮亏{_h['loss_pct']:.1f}% — {_h['note']}")
 
     # V2.2: 选股后同步更新PoolManager观察池（将入选股加入观察池）
     try:
@@ -870,10 +967,17 @@ def run_screener():
     # V3.2: 短线动量筛选通道（与CANSLIM并行，增量输出）
     try:
         from trading_system.strategy.stock_screener import run_momentum_screener
-        # 复用涨停池数据（如已获取）
+        # V3.5修复: 原代码读取 zt_report["ladder"]["stocks"]，但 analyze_ladder 返回结构中
+        # 不存在"stocks"键（只有top_stocks且仅前5只），导致连板加分从未生效。
+        # 改为直接获取完整涨停池（含consecutive_days），真正打通涨停天梯→动量通道。
         _zt_pool_for_momentum = None
-        if zt_report and zt_report.get("ladder", {}).get("stocks"):
-            _zt_pool_for_momentum = zt_report["ladder"]["stocks"]
+        if HAS_ZT:
+            try:
+                _zt_pool_for_momentum = ZTMonitor().get_zt_pool() or None
+                if _zt_pool_for_momentum:
+                    print(f"  涨停池接入动量通道: {len(_zt_pool_for_momentum)}只（含连板数）")
+            except Exception:
+                _zt_pool_for_momentum = None
         momentum_result = run_momentum_screener(
             market_df=None,  # 自动获取全市场实时行情
             zt_pool=_zt_pool_for_momentum,
@@ -885,16 +989,22 @@ def run_screener():
             print(f"\n  ⚡ 短线动量筛选: {momentum_result['summary']}")
             for i, p in enumerate(momentum_result["picks"][:5], 1):
                 yizi_tag = " [一字板-不可买]" if p.get("is_yizi") else ""
+                _tags = "/".join(p.get("risk_tags", []))
                 print(f"     {i}. {p['code']} {p['name']} | 涨{p['change_pct']:+.1f}% | "
                       f"量比{p['vol_ratio']:.1f} | 动量{p['momentum_score']}分 | "
-                      f"{p['sector']}{yizi_tag}")
+                      f"{_tags}{yizi_tag}")
         else:
             print(f"  短线动量: {momentum_result.get('summary', '无结果')}")
     except Exception as e:
         logger.warning(f"  短线动量筛选异常(不影响CANSLIM): {e}")
 
     # 发送选股报告邮件
-    success = send_screener_email(result)
+    # FIX: 邮件发送异常不应中断CLI后续流程（如观察池已在前面更新完毕）
+    try:
+        success = send_screener_email(result)
+    except Exception as e:
+        logger.error(f"  选股报告邮件发送异常: {e}")
+        success = False
     if success:
         print(f"  📧 选股报告邮件已发送")
     else:
@@ -1167,30 +1277,6 @@ def _build_alert_html(alerts: list) -> str:
 </body></html>"""
 
 
-def start_scheduler():
-    """DEPRECATED: 调度功能已统一由 trading_system/scheduler.py 负责
-    
-    本函数保留仅为兼容，不再注册任何定时任务。
-    请使用:
-      python trading_system/scheduler.py  # 启动主调度器
-      python caopan_report.py --morning   # CLI手动生成报告
-    """
-    print("=" * 50)
-    print("  ⚠️  本调度器已废弃 (V2.0)")
-    print("  定时任务已统一由 trading_system/scheduler.py 负责")
-    print("  如需手动生成报告，请使用:")
-    print("    python caopan_report.py --morning")
-    print("    python caopan_report.py --evening")
-    print("    python caopan_report.py --weekly")
-    print("    python caopan_report.py --screener")
-    print("=" * 50)
-    print("\n正在启动主调度器 scheduler.py ...")
-    # 转发到主调度器
-    import subprocess
-    scheduler_path = os.path.join(TRADING_SYSTEM_DIR, "scheduler.py")
-    subprocess.run([sys.executable, scheduler_path], cwd=TRADING_SYSTEM_DIR)
-
-
 def install_tasks():
     """安装Windows定时任务"""
     import subprocess
@@ -1251,7 +1337,8 @@ def main():
     elif args.weekly:
         run_weekly()
     else:
-        start_scheduler()
+        print("用法: python caopan_report.py [--morning|--evening|--weekly|--screener]")
+        print("提示: 定时任务请运行 python trading_system/scheduler.py")
 
     # 统一登出baostock会话
     _bs_logout()
