@@ -84,14 +84,16 @@ MAX_SINGLE_ETF_RATIO = 0.20      # ETF单只最大仓位20%
 
 # 个股硬性筛选标准
 MIN_DAILY_AMOUNT = 5e8           # 日均成交额下限（5亿元，V2.3降低避免中小盘龙头被误杀）
-WEAK_SCORE_THRESHOLD = 40        # V5.1: 弱势模式通过门槛（V2.0原25分过松，40分要求至少2个正向信号）
+WEAK_SCORE_THRESHOLD = 30        # V6.0: 弱势模式通过门槛（V5.1=40过严导致弱势市0通过，30分要求至少1个正向信号）
 MAX_HIGH_AMPLITUDE_DAYS = 3      # 近30日振幅>10%的天数上限
 MAX_HIGH_AMPLITUDE_DAYS_20CM = 5 # FIX P2: 20%涨跌幅板(科创/创业)高波动板块放宽上限，避免半导体等被系统性误杀
 CRASH_THRESHOLD = -0.08          # 单日暴跌阈值（-8%）
 CRASH_VOLUME_RATIO = 2.0         # 暴跌放量倍数（量>均量2倍）
 # V3.5 深跌防护（2026-08-06诊断修复：防止弱势模式把"下跌途中企稳"股推荐为买入标的）
 SCREENER_MAX_DRAWDOWN_FROM_HIGH = -0.12  # V5.1: 距近20日最高价回撤超12%拒绝入选（原8%与止损10%矛盾，放宽至12%留足呼吸空间）
+SCREENER_MAX_DRAWDOWN_WEAK = -0.18       # V6.0 P0-3: 弱势市场自适应深跌阈值（弱势市整体回撤偏大，12%→18%避免过度误杀）
 SCREENER_MAX_60D_DECLINE = -0.20         # 60日累计跌幅超20%拒绝入选（明确下降趋势防护）
+SCREENER_MAX_60D_DECLINE_WEAK = -0.28    # V6.0 P0-3: 弱势市场60日跌幅阈值（弱势市整体跌幅更大，20%→28%）
 SCREENER_HOLDING_LOSS_LIMIT = -0.08      # 已持仓股浮亏超8%禁止再入买入推荐，仅标记"风控处置"
 DYNAMIC_SCAN_MAX_PRICE = 1500    # FIX P2: 动态扫描股价上限（原500元误杀寒武纪等高价龙头）
 
@@ -586,11 +588,11 @@ SCREENER_CONFIG = {
     "max_stocks_per_sector": 3,     # 每个行业最多入选3只
     "min_score": 40,                # CANSLIM排序参考分（V2.4: 不再作为硬性淘汰门槛）
     "min_buy_score": 45,            # V5.2: 买入推荐分界线（V2.4=50过高，回测验证45分WR≥50分，增加有效信号）
-    "min_buy_score_weak": 35,       # V2.7: 弱势/震荡市买入线（market_state=down/weak/neutral）
+    "min_buy_score_weak": 28,       # V6.0 P0-2: 弱势/震荡市买入线（V5.2=35在弱势市理论最高分≈24不可达，28分≈60%理论上限可操作）
     "min_buy_score_strong": 45,     # V2.8: 强势市买入线（回测验证: 45分WR=44.9% > 50分WR=43.9%，降低5分增加有效信号）
     "total_max": 10,                # 基准输出10只（V5.2: 实际由regime动态调整: up=15/neutral=10/down=7）
     "total_max_up": 15,              # V5.2: 强势市场输出上限（breadth>55%）
-    "total_max_down": 7,             # V5.2: 弱势市场输出上限（down/weak状态）
+    "total_max_down": 10,            # V6.0 P0-2: 弱势市场输出上限（V5.2=7过严，10只容纳更多观察标的）
     "max_stocks_per_sector_max": 5,  # V5.2: 单赛道入选上限（V2.4=3过严，强势赛道应容纳更多优质标的）
     "prefer_strong_sector": True,   # 优先从强势赛道中选
     "sector_dynamic_adjust": True,  # 根据行情动态调整行业配额
@@ -1648,7 +1650,14 @@ UNIVERSE_RESCAN_POOL_ADD_MAX = 5          # 单次最多补充观察池数量
 # P0P1功能开关（2026-08-07 全量实施，观察模式项默认关闭）
 # 消费点一律用 getattr(config, "XXX", 安全默认值) 读取
 # ============================================================
-IC_DEWEIGHT_ENABLED = True             # V5.1: IC自动降权启用（CANSLIM因子≥5样本且5日均IC<-0.02→半权）
+IC_DEWEIGHT_ENABLED = True             # V6.0 P1-4: IC自动降权启用（CANSLIM因子≥5样本且5日均IC<-0.02→半权）
+M_FACTOR_FLEXIBLE_ENABLED = True       # V6.0 P0-1: M因子柔性化启用（down状态允许轻仓15%而非完全禁止买入）
+M_FACTOR_DOWN_POSITION_LIMIT = 0.15    # V6.0 P0-1: down状态下最大新建仓比例（15%轻仓试探）
+BUY_SCORE_BREADTH_ADJUST_ENABLED = True  # V6.0 P0-2: 买入线随breadth动态下调启用
+CAI_MULTI_PROXY_ENABLED = True         # V6.0 P1-1: CAI多代理指标启用（动量+波动率+换手率综合代理替代固定中性分）
+V_FACTOR_ENABLED = True                # V6.0 P1-2: 估值因子V_估值启用（PE/PB百分位反向打分）
+V_FACTOR_WEIGHT = 5                    # V6.0 P1-2: 估值因子满分（5分，辅助因子不主导）
+IC_IR_WEIGHT_ENABLED = True            # V6.0 P1-3: IC_IR动态加权启用（IC/|IC|比率替代固定权重）
 ATR_ADAPTIVE_STOP_LOG_ONLY = True      # ATR梯度档位（True=仅日志对比ATR建议值，不改变触发）
 SECTOR_CHANGE_PCT_ENABLED = False      # 板块涨跌注入（影响洗盘/真跌判定，先双算日志观察）
 CAI_NEUTRAL_PROXY_ENABLED = True       # V5.1: CAI中性分代理启用（无基本面数据时固定10分，消除动量伪装）

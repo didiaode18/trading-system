@@ -255,7 +255,8 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
                       retry_times: int = None, retry_interval: int = None) -> pd.DataFrame:
     """
     获取单只股票日线数据（带重试 + 自动切换数据源）
-    优先使用 baostock，失败后尝试 akshare
+    优先使用 baostock，失败后尝试 akshare，最后回退到本地数据库
+    V6.0 P2-4: 新增本地数据库兜底，避免网络故障时完全无数据
     """
     if retry_times is None:
         retry_times = config.DATA_RETRY_TIMES
@@ -289,7 +290,17 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
         if attempt < retry_times:
             time.sleep(retry_interval)
 
-    raise RuntimeError(f"[{code}] 所有数据源均失败: {last_error}")
+    # V6.0 P2-4: 本地数据库兜底 —— 网络数据源全部失败时尝试从 stock_db.db 读取
+    try:
+        from data.data_loader import load_daily_data
+        df = load_daily_data(code, days=120)
+        if df is not None and not df.empty and len(df) >= 30:
+            logger.warning(f"[{code}] 网络数据源均失败，已回退到本地数据库({len(df)}条)")
+            return df
+    except Exception as db_err:
+        logger.debug(f"[{code}] 本地数据库兜底也失败: {db_err}")
+
+    raise RuntimeError(f"[{code}] 所有数据源(含本地DB)均失败: {last_error}")
 
 
 # ============================================================

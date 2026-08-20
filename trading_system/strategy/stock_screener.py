@@ -349,17 +349,34 @@ def check_market_direction(data_dict: dict) -> dict:
         detail = f"震荡偏弱（沪深300在MA60上方但跌破MA20）→ 轻仓操作"
     else:
         state = "down"
-        can_buy = False
-        limit = 0.0
-        detail = f"下降趋势（沪深300跌破MA20和MA60）→ 不建议买入"
+        # V6.0 P0-1: M因子柔性化 —— down状态允许轻仓15%而非完全禁止
+        # 诊断: 原逻辑can_buy=False导致弱势市完全无法开仓，即使有优质标的也被埋没
+        _flex_enabled = getattr(config, 'M_FACTOR_FLEXIBLE_ENABLED', True)
+        _down_limit = getattr(config, 'M_FACTOR_DOWN_POSITION_LIMIT', 0.15)
+        if _flex_enabled:
+            can_buy = True  # 允许轻仓买入
+            limit = _down_limit  # 但限制15%仓位
+            detail = f"下降趋势（沪深300跌破MA20和MA60）→ V6.0柔性化: 允许轻仓{_down_limit:.0%}试探"
+        else:
+            can_buy = False
+            limit = 0.0
+            detail = f"下降趋势（沪深300跌破MA20和MA60）→ 不建议买入"
     
-    # P1-2: 市场环境硬过滤 —— MA20<MA60且收盘<MA20时禁止新开仓
-    # 诊断: 此条件下开仓胜率极低，属于“熊市接飞刀”
+    # V6.0 P0-1: 市场环境硬过滤柔性化 —— MA20<MA60且收盘<MA20时允许轻仓而非完全禁止
+    # 原逻辑: can_buy=False完全禁止 → 新逻辑: 限制仓位至_down_limit
     if ma20 < ma60 and close < ma20:
-        can_buy = False
-        limit = 0.0
-        state = "down"
-        detail += " | P1-2: MA20<MA60且收盘<MA20，禁止新开仓"
+        _flex_enabled = getattr(config, 'M_FACTOR_FLEXIBLE_ENABLED', True)
+        _down_limit = getattr(config, 'M_FACTOR_DOWN_POSITION_LIMIT', 0.15)
+        if _flex_enabled:
+            can_buy = True
+            limit = _down_limit
+            state = "down"
+            detail += f" | V6.0 P0-1: MA20<MA60且收盘<MA20，轻仓{_down_limit:.0%}操作"
+        else:
+            can_buy = False
+            limit = 0.0
+            state = "down"
+            detail += " | P1-2: MA20<MA60且收盘<MA20，禁止新开仓"
 
     # V5.1: 市场宽度（breadth）—— 为regime detection提供前置数据
     above_ma20_count = 0
@@ -493,8 +510,11 @@ def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
         return result
     
     # ---- V5.1: 深跌防护前置（强势/弱势模式均生效，优先于弱势评分）----
-    # 海天味业案例：距高点回撤>10%仍通过"近5日企稳"入选。必须在弱势评分之前拦截。
+    # 海天味业案例：距高点回撤>10%仍通过“近5日企稳”入选。必须在弱势评分之前拦截。
+    # V6.0 P0-3: 弱势市场自适应深跌阈值 —— 弱势市整体回撤偏大，12%→18%避免过度误杀
     max_dd_high = getattr(config, 'SCREENER_MAX_DRAWDOWN_FROM_HIGH', -0.12)
+    if is_weak_market:
+        max_dd_high = getattr(config, 'SCREENER_MAX_DRAWDOWN_WEAK', -0.18)
     if len(df) >= 20:
         high_20d = df["high"].iloc[-20:].max()
         drawdown = close / high_20d - 1 if high_20d > 0 else 0
@@ -504,6 +524,8 @@ def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
             result["reason"] = f"距20日高点回撤{drawdown:.1%}（>{abs(max_dd_high):.0%}），深跌未止跌"
             return result
     max_60d_dec = getattr(config, 'SCREENER_MAX_60D_DECLINE', -0.20)
+    if is_weak_market:
+        max_60d_dec = getattr(config, 'SCREENER_MAX_60D_DECLINE_WEAK', -0.28)
     if len(df) >= 61:
         chg_60d = close / df["close"].iloc[-61] - 1
         if chg_60d < max_60d_dec:
@@ -1135,14 +1157,38 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         (has_inst is True)
     )
     if not has_positive_signal:
-        # V3.2: 动量代理 - 20日涨幅>10%给10分, 5-10%给8分, 0-5%给6分, <0%给4分
-        _proxy_chg = (current_price / df["close"].iloc[-21] - 1) * 100 if len(df) >= 21 else 0
-        # 2026-08-07 CAI中性代理开关：True=改用中性分10（满分20的50%），False=维持动量代理并双算日志观察
+        # V6.0 P1-1: CAI多代理指标 —— 动量+波动率+换手率综合代理替代固定中性分
+        # 诊断: 原V5.1固定中性分10分导致80%+股票无区分度，改用综合代理恢复区分度
+        _multi_proxy_enabled = getattr(config, 'CAI_MULTI_PROXY_ENABLED', True)
         _neutral_score = 10
-        if getattr(config, "CAI_NEUTRAL_PROXY_ENABLED", False):
+        if _multi_proxy_enabled:
+            # ① 动量代理: 20日涨幅（权重40%）
+            _proxy_chg = (current_price / df["close"].iloc[-21] - 1) * 100 if len(df) >= 21 else 0
+            _mom_score = max(0, min(20, 10 + _proxy_chg * 0.5))  # 涨10%→15分, 跌10%→5分
+            # ② 波动率代理: 20日波动率越低越好（权重30%）
+            _vol_std = df["close"].pct_change().iloc[-20:].std() * 100 if len(df) >= 20 else 3
+            _vol_score = max(0, min(20, 15 - _vol_std * 2))  # 波动率1%→13分, 3%→9分, 5%→5分
+            # ③ 换手率代理: 近5日换手率适中最好（权重30%）
+            try:
+                _turnover_avg = float(latest.get("turnover", 5) or 5)
+                if 2 <= _turnover_avg <= 8:
+                    _turn_score = 15  # 健康换手
+                elif _turnover_avg > 15:
+                    _turn_score = 5   # 过度换手
+                else:
+                    _turn_score = 8   # 偏低/偏高
+            except (TypeError, ValueError):
+                _turn_score = 10
+            # 综合: 40%动量 + 30%波动 + 30%换手
+            cai_score = round(_mom_score * 0.4 + _vol_score * 0.3 + _turn_score * 0.3)
+            cai_score = max(2, min(18, cai_score))  # 限制在2-18分，保留区分度但不主导
+            signals.append(f"CAI多代理({cai_score}分:动{_mom_score:.0f}/波{_vol_score:.0f}/换{_turn_score:.0f})")
+            logger.debug(f"[CAI多代理] {code} 综合={cai_score} (动量={_mom_score:.1f} 波动={_vol_score:.1f} 换手={_turn_score})")
+        elif getattr(config, "CAI_NEUTRAL_PROXY_ENABLED", False):
             cai_score = _neutral_score
             signals.append("基本面数据缺失(中性分)")
         else:
+            _proxy_chg = (current_price / df["close"].iloc[-21] - 1) * 100 if len(df) >= 21 else 0
             if _proxy_chg > 10:
                 cai_score = 10
             elif _proxy_chg > 5:
@@ -1152,9 +1198,53 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
             else:
                 cai_score = 4
             signals.append(f"CAI动量代理({_proxy_chg:+.0f}%)")
-            logger.debug(f"[CAI双算] {code} 动量代理={cai_score} vs 中性分对照值={_neutral_score}")
 
     factors["CAI_基本面"] = max(0, min(cai_score, 20))
+
+    # ---- V6.0 P1-2: V因子：估值因子（0-5分）----
+    # 原理: PE/PB百分位反向打分，低估值高分，高估值低分
+    # 数据源: FUNDAMENTAL_DATA中的pe_ttm/pb字段
+    v_score = 0
+    if getattr(config, 'V_FACTOR_ENABLED', True):
+        _v_max = getattr(config, 'V_FACTOR_WEIGHT', 5)
+        _pe = fund_data.get("pe_ttm", None)
+        _pb = fund_data.get("pb", None)
+        _pe_pct = fund_data.get("pe_percentile", None)  # PE百分位(0-100)
+        _pb_pct = fund_data.get("pb_percentile", None)  # PB百分位(0-100)
+        
+        # PE百分位打分（百分位越低越好）
+        if _pe_pct is not None:
+            if _pe_pct < 20:
+                v_score += 3  # PE历史低位
+            elif _pe_pct < 40:
+                v_score += 2
+            elif _pe_pct < 60:
+                v_score += 1
+            # >60不给分
+        elif _pe is not None and _pe > 0:
+            # 无百分位时用绝对值估算
+            if _pe < 15:
+                v_score += 3
+            elif _pe < 25:
+                v_score += 2
+            elif _pe < 40:
+                v_score += 1
+        
+        # PB百分位打分
+        if _pb_pct is not None:
+            if _pb_pct < 20:
+                v_score += 2
+            elif _pb_pct < 40:
+                v_score += 1
+        elif _pb is not None and _pb > 0:
+            if _pb < 1.5:
+                v_score += 2
+            elif _pb < 3:
+                v_score += 1
+        
+        factors["V_估值"] = min(v_score, _v_max)
+        if v_score > 0:
+            signals.append(f"估值偏低+{v_score}(PE={_pe or '?'}/PB={_pb or '?'})")
 
     # ---- 综合评分（V5.1: IC动态降权 + regime-aware动态权重）----
     # 读取IC历史，对持续负IC的因子自动降权
@@ -1182,6 +1272,8 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     
     total = (factors["N_新事物"] * _n_w + factors["S_供需"] * _s_w +
              factors["L_龙头"] * _l_w + factors["CAI_基本面"] * _cai_w)
+    # V6.0 P1-2: V因子加入总分（估值因子，满分5分，不受IC权重影响）
+    total += factors.get("V_估值", 0)
 
     # ---- 前瞻性预测加分（0-10分）----
     # V2.8回测优化: P因子从0-20缩减为0-10（回测显示P因子高分组20d=+1.38% vs 低分组=+2.09%，差=-0.72%，负相关）
@@ -1228,7 +1320,7 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     # ---- V9.2: P因子反转处理 ----
     # 当IC历史显示P因子持续负相关(avg IC<-0.05)时，反转P因子分数
     # 原理: P因子高分=追高信号，在A股常标记顶部而非底部，反转后变为“回避过热”信号
-    _get_ic_weights()  # 触发IC权重计算（含反转检测）
+    _get_ic_factor_weights()  # 触发IC权重计算（含反转检测）
     if _P_FACTOR_REVERSE:
         _raw_p = factors["P_前瞻"]
         factors["P_前瞻"] = 10 - _raw_p  # 反转: 高分变低分，低分变高分
@@ -1424,6 +1516,8 @@ def _get_ic_factor_weights() -> dict:
 
     # 2026-08-07 观察模式开关（缓存未命中分支处理日志，避免刷屏）
     _deweight_enabled = getattr(config, "IC_DEWEIGHT_ENABLED", False)
+    # V6.0 P1-3: IC_IR动态加权启用标记
+    _ic_ir_enabled = getattr(config, "IC_IR_WEIGHT_ENABLED", True)
 
     weights = {"N_新事物": 1.0, "S_供需": 1.0, "L_龙头": 1.0, "CAI_基本面": 1.0, "P_前瞻": 1.0}
     meta = {}
@@ -1439,21 +1533,39 @@ def _get_ic_factor_weights() -> dict:
                 records = ic_data.get(factor_key, ic_data.get(display_name, []))
                 samples = len(records)
                 avg_ic = None
+                ic_ir = None
                 if samples >= 5:
                     recent_ics = [r['ic'] if isinstance(r, dict) else float(r)
                                   for r in records[-5:]]
                     avg_ic = sum(recent_ics) / len(recent_ics)
-                    if avg_ic < -0.02:
-                        weights[display_name] = 0.5  # IC持续为负 → 半权
+                    # V6.0 P1-3: 计算IC_IR (IC均值 / IC标准差)，衡量因子稳定性
+                    import math as _math
+                    _ic_std = _math.sqrt(sum((ic - avg_ic) ** 2 for ic in recent_ics) / len(recent_ics))
+                    ic_ir = avg_ic / _ic_std if _ic_std > 0.001 else (10.0 if avg_ic > 0 else (-10.0 if avg_ic < 0 else 0))
+                    
+                    if _ic_ir_enabled and ic_ir is not None:
+                        # IC_IR动态加权: IC_IR>1.5→1.2权, 0.5~1.5→1.0权, -0.5~-0.5→0.7权, <-0.5→0.5权
+                        if ic_ir > 1.5:
+                            weights[display_name] = 1.2  # 因子稳定且正向，加权
+                        elif ic_ir > 0.5:
+                            weights[display_name] = 1.0  # 正常
+                        elif ic_ir > -0.5:
+                            weights[display_name] = 0.7  # 因子不稳定/弱负，降权
+                        else:
+                            weights[display_name] = 0.5  # 因子持续负相关，大幅降权
+                    elif avg_ic < -0.02:
+                        weights[display_name] = 0.5  # IC持续为负 → 半权（原规则兼容）
                     elif all(abs(ic) < 0.02 for ic in recent_ics):
                         weights[display_name] = 0.7  # IC衰减 → 7折
                 meta[display_name] = {
                     "samples": samples,
                     "recent_avg_ic": avg_ic,
+                    "ic_ir": round(ic_ir, 3) if ic_ir is not None else None,
                     "proposed_weight": weights[display_name],
                     "status": ("样本不足" if samples < 5 else
                                ("持续负IC" if weights[display_name] == 0.5 else
-                                ("IC衰减" if weights[display_name] == 0.7 else "正常"))),
+                                ("IC衰减" if weights[display_name] == 0.7 else
+                                 ("★因子有效" if weights[display_name] >= 1.2 else "正常")))),
                 }
     except Exception:
         pass  # 读取失败不影响正常评分
@@ -2550,6 +2662,36 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
+    # V6.0 P2-1: 因子正交化 —— 检测因子间高度相关并去相关，避免多重共线性导致重复计分
+    # 原理: 当N因子和L因子相关性>0.8时，两者实际在度量同一东西，应降权次要因子
+    if len(candidates) >= 5:
+        try:
+            _factor_keys = ["N_新事物", "S_供需", "L_龙头", "CAI_基本面"]
+            _factor_vals = {k: [c["factors"].get(k, 0) for c in candidates] for k in _factor_keys}
+            _corr_adjusted = False
+            for i, k1 in enumerate(_factor_keys):
+                for k2 in _factor_keys[i+1:]:
+                    v1, v2 = _factor_vals[k1], _factor_vals[k2]
+                    _n = len(v1)
+                    _m1 = sum(v1) / _n
+                    _m2 = sum(v2) / _n
+                    _cov = sum((v1[j] - _m1) * (v2[j] - _m2) for j in range(_n)) / _n
+                    _s1 = (sum((v - _m1) ** 2 for v in v1) / _n) ** 0.5
+                    _s2 = (sum((v - _m2) ** 2 for v in v2) / _n) ** 0.5
+                    _corr = _cov / (_s1 * _s2) if _s1 > 0.01 and _s2 > 0.01 else 0
+                    if abs(_corr) > 0.8:
+                        _penalty_pct = 0.05
+                        for cand in candidates:
+                            _orig = cand["factors"].get(k2, 0)
+                            cand["factors"][k2] = round(_orig * (1 - _penalty_pct), 1)
+                            cand["score"] = round(cand["score"] - _orig * _penalty_pct, 1)
+                        _corr_adjusted = True
+                        logger.info(f"  [P2-1正交化] {k1}↔{k2} corr={_corr:.2f}>0.8, {k2}降权{_penalty_pct:.0%}")
+            if _corr_adjusted:
+                candidates.sort(key=lambda x: x["score"], reverse=True)
+        except Exception as _e:
+            logger.debug(f"  [P2-1] 因子正交化失败(不影响主流程): {_e}")
+
     # P1-4: 相关性惩罚 —— 与持仓高度相关的候选股降权，避免同质化风险
     if holdings and len(holdings) >= 2:
         try:
@@ -2627,10 +2769,22 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     # V2.7: 买入推荐分界线动态化（根据market_state选择不同阈值）
     _screener_cfg = getattr(config, 'SCREENER_CONFIG', {})
     if market_state in ("down", "weak", "neutral", "neutral_weak"):
-        min_buy_score = _screener_cfg.get("min_buy_score_weak", 35)
+        min_buy_score = _screener_cfg.get("min_buy_score_weak", 28)
     else:
-        # FIX(review): 兜底值50改45，与config.SCREENER_CONFIG实际值一致，防键缺失时静默回到旧口径
+        # FIX(review): 兗底值50改45，与config.SCREENER_CONFIG实际值一致，防键缺失时静默回到旧口径
         min_buy_score = _screener_cfg.get("min_buy_score_strong", 45)
+    # V6.0 P0-2: 买入线随breadth动态下调 —— 弱势市breadth越低，买入线应更宽松
+    # 原理: breadth=20%时市场极度超跌，此时要求35分不现实，应降至25分捕捉反弹机会
+    if getattr(config, 'BUY_SCORE_BREADTH_ADJUST_ENABLED', True):
+        _breadth = (regime_info or {}).get("breadth", 50)
+        if _breadth < 30:
+            _adj = -5  # 极度超卖(breadth<30%): 买入线额外降5分
+            min_buy_score = max(20, min_buy_score + _adj)
+            logger.info(f"  V6.0 P0-2: breadth={_breadth:.0f}%<30%，买入线下调{_adj}分→{min_buy_score}")
+        elif _breadth < 40:
+            _adj = -3  # 轻度超卖(breadth<40%): 买入线降3分
+            min_buy_score = max(22, min_buy_score + _adj)
+            logger.info(f"  V6.0 P0-2: breadth={_breadth:.0f}%<40%，买入线下调{_adj}分→{min_buy_score}")
     # FIX P1(2026-08-07): 消费调用方传入的min_score（只抬不降），
     # 使report_dispatcher"下跌市严格模式45分"真正生效（此前下跌市反按弱势35分放行）
     if _min_score_override is not None and _min_score_override > min_buy_score:
