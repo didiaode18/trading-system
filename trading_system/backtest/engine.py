@@ -35,7 +35,10 @@ except ImportError:
     from backtest.broker import SimBroker, Order, CostConfig
     from backtest.data_feed import DataFeed
     from backtest.metrics import generate_performance_report, format_report_text
-from attribution.trade_log import TradeLog
+try:
+    from ..attribution.trade_log import TradeLog
+except ImportError:
+    from attribution.trade_log import TradeLog
 
 logger = logging.getLogger(__name__)
 

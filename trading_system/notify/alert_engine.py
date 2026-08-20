@@ -66,6 +66,8 @@ ALERT_CONFIG = {
     "profit_ratio_drop": 0.10,     # 获利盘骤降阈值(10%)
     "stop_loss_pct": -0.10,        # 止损线(-10%) FIX: 统一使用config.INITIAL_STOP_LOSS_PCT(10%)，原-8%与主系统不一致
     "alert_cooldown_min": 30,      # 同一标的预警冷却时间(分钟) FIX(2026-08-12): 15→30，与scheduler统一冷却口径一致
+    # V2-FIX: 分级冷却与scheduler统一 —— critical缩短至15分钟加快止损再提醒
+    "alert_cooldown_by_level": None,  # 延迟从config初始化，见下方_init_cooldown_config
     "alert_log_file": "alerts.json",  # 预警记录文件
     "trend_drop_alert": True,      # 趋势降级预警开关
     # V3.4: R18加仓机会提醒纳入邮件链路（默认开启）
@@ -139,8 +141,8 @@ def _save_json_state(path: str, data: dict):
 #   R1-DK金叉买入  = 35分 | 买入机会(非紧急)
 #   R3-乖离率超卖   = 30分 | 反弹机会(非紧急)
 #   R2-站上生命线   = 25分 | 反转观察
-#   R17-止盈≥10%   = 50分 | 第一止盈位，建议减仓1/3
-#   R17-止盈≥20%   = 65分 | 第二止盈位，建议再减1/3
+#   R17-止盈≥10%   = 70分 | 第一止盈位，建议减仓1/3（V9.2: 50→70，提升级别达钉钉门槛）
+#   R17-止盈≥20%   = 75分 | 第二止盈位，建议再减1/3（V9.2: 65→75，提升级别达钉钉门槛）
 #   R18-加仓机会   = 20分 | 趋势加速+缩量回踩，可小幅加仓
 # ============================================================
 
@@ -150,8 +152,16 @@ class AlertEngine:
 
     def __init__(self, config: dict = None, holdings: dict = None):
         self.cfg = {**ALERT_CONFIG, **(config or {})}
+        # V2-FIX: 分级冷却从全局 config 初始化（与scheduler统一口径）
+        if self.cfg.get("alert_cooldown_by_level") is None:
+            import config as _gcfg
+            self.cfg["alert_cooldown_by_level"] = getattr(
+                _gcfg, "ALERT_COOLDOWN_MINUTES",
+                {"critical": 15, "high": 30, "warning": 30}
+            )
         self.holdings = holdings or {}
         self._alert_history = {}  # {code: last_alert_time}
+        self._alert_last_level = {}  # V2-FIX: {code: last_level} 分级冷却所需的上次级别
         self._today_alerts = []   # 今日所有预警
         self._stop_touch_time = {}  # V3.1: {code: datetime} 止损首次触及时间（缓冲确认）
         # FIX P2-13: 从持久化文件加载首次触及时间戳，进程重启不重置缓冲计时
@@ -182,12 +192,15 @@ class AlertEngine:
             self._deep_loss_daily = {}
         self._load_history()
 
-    def check_alerts(self, results: List[dict]) -> List[dict]:
+    def check_alerts(self, results: List[dict], push: bool = True) -> List[dict]:
         """
         检查所有标的的预警条件（V3.0: 同标的合并去重）
 
         参数:
             results: CaopanEngine.analyze()的结果列表
+            push: 是否执行内部推送(Windows桌面通知+控制台)。
+                  当由scheduler调用时应传False(由send_alert_email统一推送)，
+                  避免双通道重复推送导致用户收到重复预警。
 
         返回:
             触发的预警列表（每只标的最多1条，取urgency_score最高的规则为主预警）
@@ -202,8 +215,8 @@ class AlertEngine:
                     self.holdings[code].get("watch_pool"):
                 name = "[观察池]" + name
 
-            # 冷却检查
-            if self._in_cooldown(code):
+            # 冷却检查（V2-FIX: 传入上次预警级别，实现分级冷却）
+            if self._in_cooldown(code, level=self._alert_last_level.get(code, "")):
                 continue
 
             alerts = self._check_single(r)
@@ -217,6 +230,11 @@ class AlertEngine:
                 # V3.4: 纯机会型预警(R18)不占用引擎15分钟冷却，避免压制同标的后续风险预警
                 if not all(is_opportunity_alert(a) for a in alerts):
                     self._alert_history[code] = datetime.datetime.now()
+                    # V2-FIX: 记录本次预警级别，供下次分级冷却使用
+                    # 取最高级别（最紧急）的alert的level
+                    _LEVEL_RANK = {"info": 0, "warning": 1, "high": 2, "critical": 3}
+                    highest = max(alerts, key=lambda a: _LEVEL_RANK.get(a.get("level", ""), 0))
+                    self._alert_last_level[code] = highest.get("level", "warning")
 
         # V3.0: 同标的合并 — 每只标的只保留1条预警（最高urgency为主，其余为附加原因）
         from collections import defaultdict
@@ -253,7 +271,8 @@ class AlertEngine:
 
         # 推送
         if merged:
-            self._push_alerts(merged)
+            if push:
+                self._push_alerts(merged)
             self._today_alerts.extend(merged)
             self._save_history()
 
@@ -769,10 +788,11 @@ class AlertEngine:
                     "type": "profit_target_1",
                     "rule_name": "R17-第一止盈位(浮盈≥10%)",
                     "rule_detail": f"浮盈{profit_pct*100:.1f}%达第一止盈位(10%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
-                    "level": "info",
+                    # V9.2 FIX: level从"info"提升为"high"，否则低于ALERT_DINGTALK_MIN_LEVEL被钉钉静默过滤
+                    "level": "high",
                     "icon": "🎯",
                     "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第一止盈位! 建议卖出{sell_1_3}股(1/3)锁定利润",
-                    "urgency_score": 50,
+                    "urgency_score": 70,
                     "r17_tier": "tier1",  # FIX: 供发送成功后登记档位记忆
                 })
 
@@ -785,10 +805,11 @@ class AlertEngine:
                     "type": "profit_target_2",
                     "rule_name": "R17-第二止盈位(浮盈≥20%)",
                     "rule_detail": f"浮盈{profit_pct*100:.1f}%达第二止盈位(20%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
-                    "level": "warning",
+                    # V9.2 FIX: level从"warning"提升为"high"，否则低于ALERT_DINGTALK_MIN_LEVEL被钉钉静默过滤
+                    "level": "high",
                     "icon": "",
                     "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第二止盈位! 建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
-                    "urgency_score": 65,
+                    "urgency_score": 75,
                     "r17_tier": "tier2",  # FIX: 供发送成功后登记档位记忆
                 })
 
@@ -805,10 +826,11 @@ class AlertEngine:
                     "type": "drawdown_stop_profit",
                     "rule_name": "R17-回落止盈(高点回落>阈值)",
                     "rule_detail": f"浮盈{profit_pct*100:.1f}%，从最高{highest:.3f}回落{drawdown_from_high*100:.1f}%(>{drawdown_threshold*100:.0f}%触发)",
-                    "level": "warning",
+                    # V9.2 FIX: level从"warning"提升为"high"，否则低于ALERT_DINGTALK_MIN_LEVEL被钉钉静默过滤
+                    "level": "high",
                     "icon": "📉",
                     "msg": f"{name} 利润回落! 浮盈{profit_pct*100:.1f}%但从高点回落{drawdown_from_high*100:.1f}%，建议卖出{sell_half}股(50%)保住利润",
-                    "urgency_score": 60,
+                    "urgency_score": 75,
                     "r17_tier": "drawdown",  # FIX: 供发送成功后登记档位记忆
                 })
 
@@ -933,13 +955,23 @@ class AlertEngine:
 
         return alerts
 
-    def _in_cooldown(self, code: str) -> bool:
-        """检查是否在冷却期内"""
+    def _in_cooldown(self, code: str, level: str = "") -> bool:
+        """检查是否在冷却期内（V2-FIX: 支持分级冷却，与scheduler统一口径）
+
+        参数:
+            code: 股票代码
+            level: 预警级别 (critical/high/warning/info)，空则取最长档保守防轰炸
+        """
         last_time = self._alert_history.get(code)
         if last_time is None:
             return False
         elapsed = (datetime.datetime.now() - last_time).total_seconds() / 60
-        return elapsed < self.cfg["alert_cooldown_min"]
+        # 分级冷却：按级别取对应冷却时长
+        cooldown_map = self.cfg.get("alert_cooldown_by_level") or {
+            "critical": 15, "high": 30, "warning": 30
+        }
+        cooldown_min = cooldown_map.get(level, max(cooldown_map.values()))
+        return elapsed < cooldown_min
 
     @staticmethod
     def _calc_kdj_j(df, n: int = 9) -> float:
@@ -1309,36 +1341,69 @@ def send_alert_email(alerts: List[dict]):
                   and not is_opportunity_alert(a)]
     if _dt_alerts:
         try:
-            from notify.wechat_notify import send_notification
-            _cards = []
-            for a in _dt_alerts[:3]:
+            # V6.0: 钉钉ActionCard + ACK确认按钮
+            # 先为每个预警生成操作建议文本(供ACK模块解析数量)
+            for a in _dt_alerts:
                 hi = a.get("holdings_info", {})
-                _buy_p = hi.get("buy_price", 0)
-                _cur_p = hi.get("current_price", 0)
-                _stop_p = hi.get("stop_loss", 0)
-                _shares = hi.get("shares", 0)
-                _pnl = hi.get("pnl_pct", 0)
-                _score = a.get("urgency_score", 0)
-                _action = _generate_action(a, hi)
-                # 附加规则
-                _extra = a.get("extra_rules", [])
-                _extra_str = " | ".join([er.get("rule_name", "") for er in _extra[:2]]) if _extra else ""
-                _card = (
-                    f"{a.get('icon', '🚨')} **{a.get('name', '')}({a.get('code', '')})** "
-                    f"紧急度{_score}\n\n"
-                    f"📌 {a.get('rule_name', '')} — {a.get('rule_detail', a.get('msg', ''))}\n\n"
-                    + (f"➕ 附加: {_extra_str}\n\n" if _extra_str else "")
-                    + f"🎯 **{_action}**\n\n"
-                    f"📊 成本{_buy_p:.2f} | 现价{_cur_p:.2f} | 止损{_stop_p:.2f} | "
-                    f"浮盈亏{_pnl:+.1f}% | 持仓{_shares}股"
-                )
-                _cards.append(_card)
-            _n_dt = len(_dt_alerts)
-            _md = (f"### {header_title}\n\n---\n\n"
-                   + "\n\n---\n\n".join(_cards)
-                   + (f"\n\n---\n\n...其余{_n_dt - 3}条见预警邮件" if _n_dt > 3 else "")
-                   + f"\n\n> {today} {now} | 紧急度90+=立即操作 / 70-89=尽快处理")
-            send_notification(subject, _md)
+                a["_action_text"] = _generate_action(a, hi)
+
+            # 尝试ActionCard模式(含确认按钮)，失败回退普通Markdown
+            _ack_ok = False
+            try:
+                import config as _cfg_ack
+                _ack_enabled = getattr(_cfg_ack, "ALERT_ACK_ENABLED", True)
+            except Exception:
+                _ack_enabled = True
+
+            if _ack_enabled:
+                try:
+                    from notify.alert_ack import build_action_card_payload
+                    from notify.wechat_notify import send_dingtalk_action_card
+                    _confirm_base = getattr(_cfg_ack, "ALERT_ACK_CALLBACK_URL",
+                                            "http://192.168.88.101:9876/ack/")
+                    _payload = build_action_card_payload(
+                        _dt_alerts[:3], header_title, now, today, _confirm_base)
+                    _ack_ok = send_dingtalk_action_card(_payload)
+                except Exception as _ack_e:
+                    logger.debug(f"ActionCard发送失败，回退Markdown: {_ack_e}")
+
+            if not _ack_ok:
+                # 回退: 普通Markdown格式
+                from notify.wechat_notify import send_notification
+                _cards = []
+                for a in _dt_alerts[:3]:
+                    hi = a.get("holdings_info", {})
+                    _buy_p = hi.get("buy_price", 0)
+                    _cur_p = hi.get("current_price", 0)
+                    _stop_p = hi.get("stop_loss", 0)
+                    _shares = hi.get("shares", 0)
+                    _pnl = hi.get("pnl_pct", 0)
+                    _score = a.get("urgency_score", 0)
+                    _action = a.get("_action_text", "") or _generate_action(a, hi)
+                    _extra = a.get("extra_rules", [])
+                    _extra_str = " | ".join([er.get("rule_name", "") for er in _extra[:2]]) if _extra else ""
+                    _card = (
+                        f"{a.get('icon', '🚨')} **{a.get('name', '')}({a.get('code', '')})** "
+                        f"紧急度{_score}\n\n"
+                        f"📌 {a.get('rule_name', '')} — {a.get('rule_detail', a.get('msg', ''))}\n\n"
+                        + (f"➕ 附加: {_extra_str}\n\n" if _extra_str else "")
+                        + f"🎯 **{_action}**\n\n"
+                        f"📊 成本{_buy_p:.2f} | 现价{_cur_p:.2f} | 止损{_stop_p:.2f} | "
+                        f"浮盈亏{_pnl:+.1f}% | 持仓{_shares}股"
+                    )
+                    _cards.append(_card)
+                _n_dt = len(_dt_alerts)
+                # V9.2: 钉钉标题包含具体标的信息（而非笼统的"N只异常"）
+                _top3_names = [a.get("name", a.get("code", "")) for a in _dt_alerts[:3]]
+                _dt_title_detail = "、".join(_top3_names)
+                if _n_dt > 3:
+                    _dt_title_detail += f"等{_n_dt}只"
+                _dt_subject = f"[操盘密码] ⚠️盘中预警 {now} | {_dt_title_detail}"
+                _md = (f"### {header_title}\n\n---\n\n"
+                       + "\n\n---\n\n".join(_cards)
+                       + (f"\n\n---\n\n...其余{_n_dt - 3}条见预警邮件" if _n_dt > 3 else "")
+                       + f"\n\n> {today} {now} | 紧急度90+=立即操作 / 70-89=尽快处理")
+                send_notification(_dt_subject, _md)
         except Exception as _e:
             logger.debug(f"预警钉钉推送异常(不阻断): {_e}")
     else:
@@ -1389,6 +1454,20 @@ def _generate_action(alert: dict, holdings_info: dict) -> str:
     # V3.4: R18加仓机会属机会型，操作建议不能输出"禁止加仓"误导文案
     elif atype in OPPORTUNITY_ALERT_TYPES:
         return "可小幅加仓(不超现持20%)，加仓后同步上移止损，具体股数见触发说明"
+    # V9.2 FIX: 止盈类预警操作建议（原落入else分支输出"禁止加仓"完全误导）
+    elif atype == "profit_target_1":
+        return (f"第一止盈位触发! 建议卖出{sell_30}股(1/3)锁定利润, "
+                f"挂单价{price_high:.2f}-{cur_price:.2f} | 剩余持仓止损上移至成本价上方")
+    elif atype == "profit_target_2":
+        return (f"第二止盈位触发! 建议再卖{sell_30}股(1/3), 已锁定大部分利润 | "
+                f"剩余持仓止损上移，跌破则全部止盈离场")
+    elif atype == "drawdown_stop_profit":
+        return (f"利润回落保护! 建议卖出{sell_50}股(50%)保住利润, "
+                f"挂单价{price_low:.2f}-{price_high:.2f} | "
+                f"若继续回落至止损位则全部清仓")
+    elif atype in ("止盈提醒", "回落止盈"):
+        # intraday_monitor 产生的止盈信号
+        return "建议分批止盈锁定利润，剩余持仓上移止损"
     else:
         return "密切关注，禁止加仓，等待企稳信号"
 
@@ -1428,7 +1507,8 @@ def run_alert_loop(holdings: dict = None, interval_min: int = None):
             # 获取数据并分析
             results = _fetch_and_analyze(holdings)
             if results:
-                triggered = engine.check_alerts(results)
+                # FIX: push=False 禁止引擎内部推送，由下方 send_alert_email() 统一推送
+                triggered = engine.check_alerts(results, push=False)
                 if triggered:
                     # V3.4: 开关开启时R18加仓机会提醒也计入需推送列表
                     _opp_on = ALERT_CONFIG.get("opportunity_alert_email", True)
@@ -1660,7 +1740,8 @@ if __name__ == "__main__":
         results = _fetch_and_analyze(_holdings)
         if results:
             engine = AlertEngine(holdings=_holdings)
-            triggered = engine.check_alerts(results)
+            # FIX: push=False 禁止引擎内部推送，由下方 send_alert_email() 统一推送
+            triggered = engine.check_alerts(results, push=False)
             if triggered:
                 print(f"\n触发 {len(triggered)} 条预警:")
                 for a in triggered:

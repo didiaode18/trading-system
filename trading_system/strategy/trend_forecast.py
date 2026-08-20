@@ -77,10 +77,14 @@ class TrendForecaster:
         # ---- 5. 量价关系 ----
         volume_result = self._analyze_volume(df)
 
-        # ---- 6. 综合评分 ----
+        # ---- 6. K线形态分析（V10.0新增第六维度）----
+        pattern_result = self._analyze_patterns(df)
+
+        # ---- 7. 综合评分（含形态维度）----
         composite = self._composite_score(
             trend_result, momentum_result, levels_result,
-            volatility_result, volume_result, current_price
+            volatility_result, volume_result, current_price,
+            pattern_result=pattern_result
         )
 
         # ---- 7. 持仓盈亏分析 ----
@@ -122,6 +126,7 @@ class TrendForecaster:
             "levels": levels_result,
             "volatility": volatility_result,
             "volume": volume_result,
+            "pattern": pattern_result,
             "composite": composite,
             "holding": holding_analysis,
             "advice": advice,
@@ -537,16 +542,59 @@ class TrendForecaster:
         }
 
     # ============================================================
+    # 六-B、K线形态分析（V10.0新增）
+    # ============================================================
+
+    def _analyze_patterns(self, df: pd.DataFrame) -> dict:
+        """
+        K线形态分析维度（V10.0新增）
+        调用 CandlestickPatternEngine 识别形态，计算形态净分
+        
+        返回:
+            {"score": float(-15~+15), "patterns": [...], "signal": "看涨"/"看跌"/"中性"}
+        """
+        empty_result = {"score": 0, "patterns": [], "signal": "中性",
+                        "bullish_count": 0, "bearish_count": 0, "top_patterns": []}
+        try:
+            from strategy.candlestick_pattern import CandlestickPatternEngine
+            engine = CandlestickPatternEngine()
+            # 自动判断趋势上下文
+            trend_context = engine._auto_trend(df)
+            patterns = engine.detect_all(df, trend_context=trend_context)
+            if not patterns:
+                return empty_result
+            # 过滤低置信度
+            min_conf = self.cfg.get("min_confidence_threshold", 0.6) if hasattr(self, 'cfg') else \
+                       getattr(config, 'KLINE_PATTERN_CONFIG', {}).get('min_confidence_threshold', 0.6)
+            patterns = [p for p in patterns if p["confidence"] >= min_conf]
+            # 计算综合评分
+            score_result = engine.score_patterns(patterns)
+            return {
+                "score": score_result["score"],
+                "patterns": patterns,
+                "signal": score_result["signal"],
+                "bullish_count": score_result["bullish_count"],
+                "bearish_count": score_result["bearish_count"],
+                "top_patterns": score_result["top_patterns"],
+            }
+        except Exception as e:
+            logger.debug(f"K线形态分析失败: {e}")
+            return empty_result
+
+    # ============================================================
     # 七、综合评分
     # ============================================================
 
-    def _composite_score(self, trend, momentum, levels, volatility, volume, current_price) -> dict:
+    def _composite_score(self, trend, momentum, levels, volatility, volume, current_price,
+                          pattern_result=None) -> dict:
         """
         综合评分（0-100分）
-        - 趋势权重 40%
-        - 动量权重 25%
-        - 量价权重 20%
-        - 位置权重 15%（距支撑/压力）
+        V10.0: 新增K线形态维度（11%权重）
+        - 趋势权重 36%（原40%）
+        - 动量权重 22%（原25%）
+        - 量价权重 18%（原20%）
+        - 位置权重 13%（原15%）
+        - K线形态 11%（新增）
         """
         # 趋势分（-5~+5 映射到 0~100）
         trend_norm = (trend["score"] + 5) / 10 * 100
@@ -565,12 +613,22 @@ class TrendForecaster:
         else:
             position_norm = 50
 
-        # 加权综合
+        # K线形态分（pattern_score -15~+15 映射到 0~100）
+        pattern_score = 0
+        if pattern_result and "score" in pattern_result:
+            pattern_score = pattern_result["score"]
+        pattern_norm = (pattern_score + 15) / 30 * 100  # -15~+15 → 0~100
+        pattern_norm = max(0, min(100, pattern_norm))
+
+        # V10.1: 加权综合（形态权重降至8%，其余维度按比例缩放）
+        w_pattern = getattr(config, 'KLINE_PATTERN_CONFIG', {}).get('composite_weight_pattern', 0.08)
+        w_remain = 1.0 - w_pattern
         total_score = (
-            trend_norm * 0.40 +
-            momentum_norm * 0.25 +
-            volume_norm * 0.20 +
-            position_norm * 0.15
+            trend_norm * 0.375 * w_remain / 0.92 +
+            momentum_norm * 0.25 * w_remain / 0.92 +
+            volume_norm * 0.20 * w_remain / 0.92 +
+            position_norm * 0.175 * w_remain / 0.92 +
+            pattern_norm * w_pattern
         )
 
         # 评级
@@ -612,6 +670,8 @@ class TrendForecaster:
             "momentum_score": round(momentum_norm, 1),
             "volume_score": round(volume_norm, 1),
             "position_score": round(position_norm, 1),
+            "pattern_score": round(pattern_norm, 1),
+            "pattern_detail": pattern_result if pattern_result else {},
             "forecast_3d": forecast_3d,
             "forecast_confidence": forecast_confidence,
         }
@@ -1065,3 +1125,71 @@ if __name__ == "__main__":
         print(f"\n邮件发送: {'成功' if ok else '失败'}")
     else:
         print("\n邮箱未配置，跳过邮件发送")
+
+
+# ============================================================
+# V9.2: 趋势预测维度权重验证 + 时间窗口统计
+# ============================================================
+
+# 默认权重（可通过验证结果动态调整）
+_TREND_WEIGHTS = {
+    "trend": 0.40,
+    "momentum": 0.25,
+    "volume": 0.20,
+    "position": 0.15,
+}
+
+
+def get_trend_weights() -> dict:
+    """获取当前趋势预测权重（支持动态调整）"""
+    return dict(_TREND_WEIGHTS)
+
+
+def verify_dimension_weights(sample_results: list) -> dict:
+    """V9.2: 基于历史预测验证数据，评估各维度对收益的解释力
+    
+    Args:
+        sample_results: TrendForecaster 的历史分析结果列表
+            每个元素包含 composite 中各维度分数 + 后续实际收益
+    
+    Returns:
+        {"recommended_weights": dict, "dimension_ic": dict, "sample_size": int}
+    """
+    try:
+        import pandas as pd
+        from scipy import stats
+
+        if len(sample_results) < 20:
+            return {"recommended_weights": _TREND_WEIGHTS,
+                    "dimension_ic": {}, "sample_size": len(sample_results),
+                    "message": "样本不足20条，使用默认权重"}
+
+        # 计算各维度与实际收益的Spearman IC
+        dimension_ic = {}
+        for dim in ["trend_score", "momentum_score", "volume_score", "position_score"]:
+            dim_values = [r.get("composite", {}).get(dim, 50) for r in sample_results]
+            actual_returns = [r.get("actual_return_5d", 0) for r in sample_results
+                              if r.get("actual_return_5d") is not None]
+            if len(actual_returns) >= 10:
+                dim_values = dim_values[:len(actual_returns)]
+                ic, _ = stats.spearmanr(dim_values, actual_returns)
+                dimension_ic[dim] = round(ic, 4) if not pd.isna(ic) else 0.0
+
+        # 根据IC绝对值归一化为权重
+        total_abs_ic = sum(abs(v) for v in dimension_ic.values())
+        if total_abs_ic > 0.01:
+            recommended = {k.replace("_score", ""): round(abs(v) / total_abs_ic, 2)
+                           for k, v in dimension_ic.items()}
+        else:
+            recommended = _TREND_WEIGHTS
+
+        return {
+            "recommended_weights": recommended,
+            "dimension_ic": dimension_ic,
+            "sample_size": len(sample_results),
+            "current_weights": _TREND_WEIGHTS,
+        }
+    except Exception as e:
+        logger.warning(f"[权重验证] 异常: {e}")
+        return {"recommended_weights": _TREND_WEIGHTS, "dimension_ic": {},
+                "sample_size": 0, "message": str(e)}

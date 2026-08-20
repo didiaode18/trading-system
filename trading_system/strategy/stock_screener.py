@@ -41,6 +41,7 @@ import logging
 import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 import pandas as pd
@@ -83,7 +84,7 @@ def _get_ml_predictor():
     try:
         from ml.predictor import MLPredictor
         _ml = MLPredictor()
-        if _ml.load_model("xgb_v1"):
+        if _ml.load_model("xgb_daily"):
             _ML_PREDICTOR = _ml
             logger.info("[ML预测] 模型加载成功，将注入P_前瞻因子")
         else:
@@ -113,29 +114,40 @@ def _get_stock_sector(code: str) -> str:
     return ""
 
 
+# FIX-P0(2026-08-17): py_mini_racer (V8引擎) 多线程初始化崩溃保护
+# V8 的 partition address space 是线程局部的，多线程同时首次创建 MiniRacer 上下文
+# 会触发 FATAL:partition_address_space Check failed 导致进程直接崩溃。
+# 此锁序列化所有可能触发 py_mini_racer 初始化的 akshare 调用。
+_PY_MINI_RACER_LOCK = threading.Lock()
+
+
 def _load_market_rps() -> list:
     """
     加载全市场60日涨幅数据（用于RPS排名）
     
     数据源: akshare stock_zh_a_spot_em() 的 '60日涨跌幅' 字段
     失败时返回空列表，降级为候选池内排名
+    
+    FIX-P0(2026-08-17): 加锁序列化 py_mini_racer 初始化，防止多线程V8崩溃。
     """
     global _MARKET_RPS_CACHE
-    if _MARKET_RPS_CACHE is not None:
-        return _MARKET_RPS_CACHE
-    
-    _MARKET_RPS_CACHE = []
-    try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty and "60日涨跌幅" in df.columns:
-            changes = pd.to_numeric(df["60日涨跌幅"], errors="coerce").dropna().tolist()
-            _MARKET_RPS_CACHE = changes
-            logger.info(f"[选股引擎V3] 全市场RPS加载成功: {len(changes)}只 (用于L因子排名)")
-        else:
-            logger.info("[选股引擎V3] 全市场RPS: 无60日涨跌幅字段，降级为池内排名")
-    except Exception as e:
-        logger.info(f"[选股引擎V3] 全市场RPS加载失败({e})，降级为池内排名")
+    # FIX-P0: 每次调用都加锁，确保每个worker线程的V8初始化严格串行
+    with _PY_MINI_RACER_LOCK:
+        if _MARKET_RPS_CACHE is not None:
+            return _MARKET_RPS_CACHE
+        
+        _MARKET_RPS_CACHE = []
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty and "60日涨跌幅" in df.columns:
+                changes = pd.to_numeric(df["60日涨跌幅"], errors="coerce").dropna().tolist()
+                _MARKET_RPS_CACHE = changes
+                logger.info(f"[选股引擎V3] 全市场RPS加载成功: {len(changes)}只 (用于L因子排名)")
+            else:
+                logger.info("[选股引擎V3] 全市场RPS: 无60日涨跌幅字段，降级为池内排名")
+        except Exception as e:
+            logger.info(f"[选股引擎V3] 全市场RPS加载失败({e})，降级为池内排名")
     
     return _MARKET_RPS_CACHE
 
@@ -1178,18 +1190,23 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     factors["P_前瞻"] = min(prediction["score"], 10)  # 上限从20压缩到10
     signals.extend(prediction["signals"])
 
-    # ---- V3.0: 外盘前瞻加分（0-3分，叠加到P因子）----
-    # 约束: 只加不减 | P因子上限仍为10 | 下跌市无效（系统性风险优先）
+    # ---- V3.0: 外盘前瞻加分（-3~+3分，叠加到P因子）----
+    # V9.2 FIX: 取消 max(score,0) 限制，外盘利空也扣分（双向联动）
     if market_state != "down":
         _on_data = _get_overnight_data()
         if _on_data.get("available"):
             _sector = _get_stock_sector(code)
             if _sector:
                 _impact = _on_data.get("sector_impacts", {}).get(_sector, {})
-                _foreign_bonus = min(max(_impact.get("score", 0), 0), config.OVERNIGHT_MAX_BONUS)
-                if _foreign_bonus > 0:
-                    factors["P_前瞻"] = min(factors["P_前瞻"] + _foreign_bonus, 10)
-                    signals.append(f"外盘利好+{_foreign_bonus:.0f}({_impact.get('reason', '')})")
+                _foreign_score = _impact.get("score", 0)
+                _foreign_adj = max(-config.OVERNIGHT_MAX_BONUS,
+                                   min(config.OVERNIGHT_MAX_BONUS, _foreign_score))
+                if _foreign_adj != 0:
+                    factors["P_前瞻"] = max(0, min(factors["P_前瞻"] + _foreign_adj, 10))
+                    if _foreign_adj > 0:
+                        signals.append(f"外盘利好+{_foreign_adj:.0f}({_impact.get('reason', '')})")
+                    else:
+                        signals.append(f"外盘利空{_foreign_adj:.0f}({_impact.get('reason', '')})")
 
     # ---- V5.2: ML预测注入P_前瞻因子加分（0-3分）----
     # 当ML上涨概率>0.70时，按比例注入加分，增强前瞻预测能力
@@ -1207,6 +1224,15 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
                 signals.append(f"ML确认+{_ml_bonus}(概率{_ml_prob:.0%})")
             else:
                 logger.debug(f"[ML预测] {code} 概率{_ml_prob:.0%}<{_ml_threshold:.0%}，不加分")
+
+    # ---- V9.2: P因子反转处理 ----
+    # 当IC历史显示P因子持续负相关(avg IC<-0.05)时，反转P因子分数
+    # 原理: P因子高分=追高信号，在A股常标记顶部而非底部，反转后变为“回避过热”信号
+    _get_ic_weights()  # 触发IC权重计算（含反转检测）
+    if _P_FACTOR_REVERSE:
+        _raw_p = factors["P_前瞻"]
+        factors["P_前瞻"] = 10 - _raw_p  # 反转: 高分变低分，低分变高分
+        signals.append(f"P因子反转({10-_raw_p:.0f}←{_raw_p:.0f},IC负相关)")
 
     total += factors["P_前瞻"] * _p_w
 
@@ -1358,6 +1384,7 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
 # ============================================================
 _IC_WEIGHTS_CACHE = None       # V4.0(G5): 缓存升级为 (weights, meta) 二元组
 _IC_WEIGHTS_CACHE_TIME = 0
+_P_FACTOR_REVERSE = False       # V9.2: P因子反转标记（IC持续<-0.05时激活）
 
 
 def _get_ic_weight_meta() -> dict:
@@ -1444,6 +1471,19 @@ def _get_ic_factor_weights() -> dict:
 
     _IC_WEIGHTS_CACHE = (applied, meta)
     _IC_WEIGHTS_CACHE_TIME = now
+
+    # V9.2: P因子反转检测 —— 当P因子IC连续5期<-0.02时标记反转
+    global _P_FACTOR_REVERSE
+    p_meta = meta.get("P_前瞻", {})
+    p_samples = p_meta.get("samples", 0)
+    p_avg_ic = p_meta.get("recent_avg_ic")
+    if p_samples >= 5 and p_avg_ic is not None and p_avg_ic < -0.05:
+        _P_FACTOR_REVERSE = True
+        if _deweight_enabled:
+            logger.info(f"P因子反转激活: 平均IC={p_avg_ic:.4f}<-0.05, 将反转P因子分数(10-原分)")
+    else:
+        _P_FACTOR_REVERSE = False
+
     return applied
 
 
@@ -1505,22 +1545,26 @@ def _get_capital_flow_bonus(code: str) -> int:
     - 个股主力连续3日净流出 → -1
     
     缓存: 每小时刷新一次
+    
+    FIX-P0(2026-08-17): 加锁序列化 py_mini_racer 初始化，防止多线程V8崩溃。
     """
     global _FLOW_BONUS_CACHE, _FLOW_BONUS_CACHE_TIME
     import time
     now = time.time()
     
-    # 加载北向资金大环境（缓存）
-    if _FLOW_BONUS_CACHE is None or (now - _FLOW_BONUS_CACHE_TIME) > 3600:
-        try:
-            from strategy.capital_flow import CapitalFlowAnalyzer
-            analyzer = CapitalFlowAnalyzer()
-            nb = analyzer.get_northbound_flow()
-            _FLOW_BONUS_CACHE = nb
-            _FLOW_BONUS_CACHE_TIME = now
-        except Exception:
-            _FLOW_BONUS_CACHE = {}
-            _FLOW_BONUS_CACHE_TIME = now
+    # FIX-P0: 加锁确保 CapitalFlowAnalyzer (→akshare→py_mini_racer) 的V8初始化串行
+    with _PY_MINI_RACER_LOCK:
+        # 加载北向资金大环境（缓存）
+        if _FLOW_BONUS_CACHE is None or (now - _FLOW_BONUS_CACHE_TIME) > 3600:
+            try:
+                from strategy.capital_flow import CapitalFlowAnalyzer
+                analyzer = CapitalFlowAnalyzer()
+                nb = analyzer.get_northbound_flow()
+                _FLOW_BONUS_CACHE = nb
+                _FLOW_BONUS_CACHE_TIME = now
+            except Exception:
+                _FLOW_BONUS_CACHE = {}
+                _FLOW_BONUS_CACHE_TIME = now
     
     nb_data = _FLOW_BONUS_CACHE or {}
     bonus = 0
@@ -2426,30 +2470,58 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
             continue
         _scorable[code] = df
         
-    logger.info(f"  并行评分启动: {len(_scorable)}只候选 (4线程)")
+    logger.info(f"  顺序评分启动: {len(_scorable)}只候选 (单线程, py_mini_racer安全)")
     import time as _time
     _t0 = _time.time()
-        
-    # 阶段2: ThreadPoolExecutor并行评分
+    
+    # ================================================================
+    # FIX-P0(2026-08-17): 预热 akshare/py_mini_racer 缓存
+    # py_mini_racer (V8引擎) 的 partition address space 是线程级别的。
+    # 多线程触发 V8 初始化会导致 FATAL:partition_address_space 崩溃。
+    # 方案: 主线程预热缓存 → 主线程顺序评分（彻底不用ThreadPoolExecutor）。
+    # ================================================================
+    try:
+        _load_market_rps()
+        logger.info("  [预热] 全市场RPS缓存已加载")
+    except Exception as _e:
+        logger.warning(f"  [预热] RPS缓存加载失败(不影响主流程): {_e}")
+    try:
+        for _pc in list(_scorable.keys())[:5]:
+            _get_capital_flow_bonus(_pc)
+        logger.info("  [预热] 资金流缓存已预热")
+    except Exception as _e:
+        logger.warning(f"  [预热] 资金流缓存预热失败(不影响主流程): {_e}")
+    try:
+        for _pc in list(_scorable.keys())[:5]:
+            _get_sector_rotation_adj(_pc)
+    except Exception:
+        pass
+    
+    # 阶段2: 主线程顺序评分（FIX-P0: 替代ThreadPoolExecutor，避免V8多线程崩溃）
+    # V9.2: 评分循环中保持心跳写入，防止 scheduler_daemon 因心跳超时误杀进程
+    _HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "output", ".scheduler_heartbeat")
+    _PID = str(os.getpid())
     _worker_results = []
-    _n_workers = min(4, len(_scorable) or 1)
-    with ThreadPoolExecutor(max_workers=_n_workers) as executor:
-        fut_map = {
-            executor.submit(
-                _score_stock_worker, code, df, market_state, regime_info,
-                fund_flow_data, _is_weak_market, news_risk
-            ): code
-            for code, df in _scorable.items()
-        }
-        for fut in as_completed(fut_map):
+    for _hb_idx, (_code, _df) in enumerate(_scorable.items()):
+        # 每10只股票写入一次心跳（约10-20秒一次，远低于180秒超时阈值）
+        if _hb_idx % 10 == 0:
             try:
-                _worker_results.append(fut.result())
-            except Exception as e:
-                _code = fut_map[fut]
-                logger.warning(f"  {_code} 并行评分异常: {e}")
+                with open(_HEARTBEAT_FILE, "w") as _f:
+                    _f.write(f"{datetime.datetime.now().isoformat()}|{_PID}|screener")
+            except Exception:
+                pass
+        try:
+            _wr = _score_stock_worker(
+                _code, _df, market_state, regime_info,
+                fund_flow_data, _is_weak_market, news_risk
+            )
+            _worker_results.append(_wr)
+        except Exception as e:
+            logger.warning(f"  {_code} 评分异常: {e}")
         
     _elapsed = _time.time() - _t0
-    logger.info(f"  并行评分完成: {len(_worker_results)}只, 耗时{_elapsed:.1f}s")
+    logger.info(f"  顺序评分完成: {len(_worker_results)}只, 耗时{_elapsed:.1f}s")
         
     # 阶段3: 主线程收集结果（设置冷却期标记 + 填充共享状态）
     for wr in _worker_results:

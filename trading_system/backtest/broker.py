@@ -13,6 +13,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from ..utils.board_rules import is_limit_up as _board_is_limit_up, is_limit_down as _board_is_limit_down
+except ImportError:
+    from utils.board_rules import is_limit_up as _board_is_limit_up, is_limit_down as _board_is_limit_down
+
 logger = logging.getLogger(__name__)
 
 
@@ -170,17 +177,22 @@ class SimBroker:
     # 涨跌停检查
     # ----------------------------------------------------------
     @staticmethod
-    def _is_limit_up(row: dict) -> bool:
-        """判断是否涨停（涨幅>=9.8%视为涨停）"""
+    def _is_limit_up(row: dict, code: str = "", name: str = "") -> bool:
+        """判断是否涨停（V2: 区分板块 — 主板10%/创业板20%/ST 5%/科创板20%）"""
         if "pre_close" in row and row["pre_close"] > 0:
+            if code:
+                return _board_is_limit_up(code, row["close"], row["pre_close"], name=name)
+            # 无code时回退旧逻辑（兼容无code调用）
             change_pct = (row["close"] - row["pre_close"]) / row["pre_close"]
             return change_pct >= 0.098
         return False
 
     @staticmethod
-    def _is_limit_down(row: dict) -> bool:
-        """判断是否跌停"""
+    def _is_limit_down(row: dict, code: str = "", name: str = "") -> bool:
+        """判断是否跌停（V2: 区分板块）"""
         if "pre_close" in row and row["pre_close"] > 0:
+            if code:
+                return _board_is_limit_down(code, row["close"], row["pre_close"], name=name)
             change_pct = (row["close"] - row["pre_close"]) / row["pre_close"]
             return change_pct <= -0.098
         return False
@@ -199,8 +211,9 @@ class SimBroker:
         返回:
             Fill 或 None（资金不足/涨停无法买入）
         """
-        # 涨停检查：涨停板无法买入
-        if market_data and self._is_limit_up(market_data):
+        # 涨停检查：涨停板无法买入（V2: 区分板块）
+        if market_data and self._is_limit_up(market_data, code=order.code,
+                                              name=market_data.get("name", "")):
             logger.debug(f"{order.code} 涨停，无法买入")
             return None
 
@@ -292,8 +305,9 @@ class SimBroker:
 
         pos = self.positions[order.code]
 
-        # 跌停检查：跌停板无法卖出
-        if market_data and self._is_limit_down(market_data):
+        # 跌停检查：跌停板无法卖出（V2: 区分板块）
+        if market_data and self._is_limit_down(market_data, code=order.code,
+                                                name=market_data.get("name", "")):
             logger.debug(f"{order.code} 跌停，无法卖出")
             return None
 

@@ -9,11 +9,11 @@
 约束: 单只最大15%，总仓位不超90%
 """
 
-from position.kelly import kelly_position, half_kelly_position
-from position.risk_parity import risk_parity_weights
+from .kelly import kelly_position, half_kelly_position
+from .risk_parity import risk_parity_weights
 # FIX: 清理 dynamic_sizing 死代码导出（仅 validate_v8.py 直接引用该模块，无需包级导出；
 # pyramid/black_litterman 已整文件删除，原本就未在此导出）
-from position.rebalance import RebalanceTrigger
+from .rebalance import RebalanceTrigger
 
 __all__ = [
     "kelly_position", "half_kelly_position",

@@ -154,7 +154,8 @@ def task_8_alert_engine():
     engine = AlertEngine(holdings=holdings_data)
     results = _fetch_and_analyze(holdings_data)
     if results:
-        triggered = engine.check_alerts(results)
+        # FIX: push=False 禁止引擎内部推送，由下方 send_alert_email() 统一推送
+        triggered = engine.check_alerts(results, push=False)
         if triggered:
             critical = [a for a in triggered if a.get("level") in ("critical", "high")]
             print(f"  持仓预警触发{len(triggered)}条(critical/high: {len(critical)}条)")

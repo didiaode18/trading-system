@@ -70,7 +70,7 @@ TIERS = (
 # V1.1 盘中闸门参数（模块级常量，不在config.py新增配置项）
 # 阈值与 intraday_decision.DECISION_CONFIG 的 market_risk_pct/market_crash_pct 口径对齐
 GATE_L1_WEAK = -0.5        # 上证/沪深300较差者 ≤-0.5% → L1走弱(买点降级)
-GATE_L2_DOWN = -1.5        # ≤-1.5% → L2整体走跌(暂停全部新增买入提醒)
+GATE_L2_DOWN = -1.0        # V6.2: ≤-1.0% → L2整体走跌(原-1.5%收紧，熊市命中率仅33.2%需更早拦截)
 GATE_L3_CRASH = -2.5       # ≤-2.5% → L3系统性风险(禁止买入)
 INTRA_DAY_CRASH_PCT = -3.0  # 个股当日跌幅≤-3% → 当日作废其买点(对齐config.REJECT_DROP_PCT)
 ALERT_VALID_MINUTES = 15    # 买点提醒有效窗口（分钟），过期作废不得追价
@@ -579,6 +579,11 @@ def _build_push_text(lv: dict, tier_label: str, tier_price: float,
     expire_at = now + datetime.timedelta(minutes=ALERT_VALID_MINUTES)
 
     title = f"[操盘密码·买点到价] {name}({code}) {tier_label}买点"
+    # V9.2: 标题区分持仓加仓 vs 候选新建仓，提升信息辨识度
+    if held_shares > 0:
+        title += f" [持仓加仓·已持{held_shares}股]"
+    elif over_limit:
+        title += " [候选新建仓]"
     
     # V5.0: 钉钉卡片美化 —— 分区布局+分隔线+醒目标题
     # 顶部横幅（L1降级/持仓超限）
@@ -637,23 +642,66 @@ def _push_invalidate_notice(lv: dict, change_pct: float, price: float,
     return _push_alert(title, content)
 
 
-def _push_alert(title: str, content: str):
-    """推送: V5.0分级路由 —— 买点到价属P0紧急，仅走钉钉（延迟<1秒）
+def _push_alert(title: str, content: str, alert_meta: dict = None):
+    """推送: V5.0分级路由 + V6.0 ACK确认按钮
 
     V4.4: 钉钉+邮件双发（邮件SMTP延迟5-75秒，对盘中快速决策无意义）
     V5.0: BUY_POINT_ALERT_DINGTALK_ONLY=True时仅钉钉，延迟从~20秒降到<1秒；
           钉钉webhook未配置时自动降级邮件（安全网）；
           DINGTALK_ONLY=False时回退旧双发模式。
+    V6.0: ACK开启时，钉钉推送升级为ActionCard(含"✅ 已处理"确认按钮)，
+          用户确认后当日同标的同档位买点静默；ActionCard失败回退Markdown。
+
+    alert_meta: 可选，{"code", "name", "tier", "tier_price", "price", ...}
+                用于构建ActionCard确认按钮和令牌。
     """
     channel_ok = False
     _dingtalk_only = getattr(config, "BUY_POINT_ALERT_DINGTALK_ONLY", True)
 
     # ---- 钉钉/企微推送 ----
     try:
-        from notify.wechat_notify import send_notification
-        res = send_notification(title, content)
-        if any(res.values()):
-            channel_ok = True
+        # V6.0: ACK开启 + 有alert_meta → ActionCard(含确认按钮)
+        _ack_ok = False
+        if alert_meta and getattr(config, "ALERT_ACK_ENABLED", True):
+            try:
+                from notify.alert_ack import build_action_card_payload
+                from notify.wechat_notify import send_dingtalk_action_card
+                _confirm_base = getattr(config, "ALERT_ACK_CALLBACK_URL",
+                                        "http://192.168.88.101:9876/ack/")
+                _now_str = datetime.datetime.now().strftime("%H:%M")
+                _today_str2 = datetime.date.today().strftime("%Y-%m-%d")
+                # 构造单条预警的alerts列表(复用ACK模块的ActionCard构建)
+                _bp_alerts = [{
+                    "code": alert_meta.get("code", ""),
+                    "name": alert_meta.get("name", ""),
+                    "level": "high",
+                    "urgency_score": 80,
+                    "rule_name": f"买点到价-{alert_meta.get('tier', '')}",
+                    "rule_detail": content[:120],
+                    "msg": "",
+                    "icon": "",
+                    "holdings_info": {},
+                    "_action_text": f"建议买入{alert_meta.get('tier', '')}买点",
+                    "extra_rules": [],
+                }]
+                _header = f"[股票] 🎯 买点到价提醒 ({alert_meta.get('name', '')})"
+                _payload = build_action_card_payload(
+                    _bp_alerts, _header, _now_str, _today_str2, _confirm_base)
+                _ack_ok = send_dingtalk_action_card(_payload)
+                if _ack_ok:
+                    channel_ok = True
+                    logger.info(f"[买点提醒] ActionCard发送成功(含ACK按钮): "
+                                f"{alert_meta.get('code', '')} "
+                                f"{alert_meta.get('tier', '')}")
+            except Exception as _ack_e:
+                logger.debug(f"[买点提醒] ActionCard失败，回退Markdown: {_ack_e}")
+
+        if not _ack_ok:
+            # 回退: 普通Markdown格式
+            from notify.wechat_notify import send_notification
+            res = send_notification(title, content)
+            if any(res.values()):
+                channel_ok = True
     except Exception as e:
         logger.debug(f"买点提醒钉钉/企微推送异常: {e}")
 
@@ -900,9 +948,21 @@ def check_buy_point_alerts(skip_codes=None) -> list:
                         minutes=ALERT_VALID_MINUTES)).isoformat(timespec="seconds"),
                     "date": today_str,
                     "time": now.strftime("%H:%M"),
+                    # V9.2: 区分持仓加仓 vs 候选新建仓
+                    "is_holding": code in held_map,
+                    "held_shares": int(held_map.get(code, 0)),
                 }
+                # V6.0: ACK静默检查 —— 用户已确认的同标的同档位买点当日不再推送
+                try:
+                    from notify.alert_ack import is_silenced as _bp_silenced
+                    if _bp_silenced(code, f"买点到价-{hit_label}", "high", 80):
+                        logger.info(f"  [买点提醒] ACK静默: {code} {hit_label}档 "
+                                    f"(用户已确认，当日不再推送)")
+                        continue
+                except Exception as _bp_e:
+                    logger.debug(f"[买点提醒] ACK静默检查异常(不阻断): {_bp_e}")
                 # H2修复: 先推送，仅成功后才登记去重；失败记失败计数允许下轮重试
-                alert["pushed"] = _push_alert(title, content)
+                alert["pushed"] = _push_alert(title, content, alert_meta=alert)
                 triggered.append(alert)
                 if alert["pushed"]:
                     entry["pushed"] = sorted(
@@ -958,6 +1018,9 @@ def _record_signal(alert: dict):
             "degraded": bool(alert.get("degraded")),
             "trigger_type": alert.get("trigger_type", "direct"),
             "expires_at": alert.get("expires_at"),
+            # V9.2: 持仓标记（用于后续统计持仓加仓 vs 候选新建仓的信号质量差异）
+            "is_holding": bool(alert.get("is_holding", False)),
+            "held_shares": int(alert.get("held_shares", 0)),
             "r1": None, "r3": None, "r5": None, "settled": False,
         })
         data["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1012,6 +1075,7 @@ def settle_signal_history() -> dict:
         df_cache = {}
         tx_cache = {}
         changed = False
+        _settle_ok = _settle_timeout = 0
         for s in signals:
             if s.get("settled"):
                 continue
@@ -1020,6 +1084,13 @@ def settle_signal_history() -> dict:
                 continue
             try:
                 trig_d = datetime.datetime.strptime(tdate, "%Y-%m-%d").date()
+                # V9.2 FIX: 超12自然日直接标记过期（不再依赖数据源，防止网络故障导致永久未结算）
+                if (today - trig_d).days > 12:
+                    s["settled"] = True
+                    s["settle_status"] = "expired"
+                    changed = True
+                    _settle_ok += 1
+                    continue
                 # ---- 日线源: 腾讯优先，失败降级baostock/akshare ----
                 dates = closes = None
                 if code not in tx_cache:
@@ -1035,6 +1106,8 @@ def settle_signal_history() -> dict:
                             end_date=today.strftime("%Y-%m-%d"))
                     df = df_cache[code]
                     if df is None or len(df) == 0:
+                        _settle_timeout += 1
+                        logger.info(f"[买点提醒] {code} {tdate} 数据源暂不可得，等待下次结算")
                         continue
                     dates = ([str(d)[:10] for d in df["date"].tolist()]
                              if "date" in df.columns
@@ -1051,11 +1124,13 @@ def settle_signal_history() -> dict:
                         s[key] = round((closes[i + n] / trig_close - 1) * 100, 2)
                         changed = True
                 done = all(s.get(k) is not None for k in ("r1", "r3", "r5"))
-                if done or (today - trig_d).days > 12:
+                if done:
                     s["settled"] = True
+                    s["settle_status"] = "complete"
                     changed = True
+                    _settle_ok += 1
             except Exception as e:
-                logger.debug(f"[买点提醒] 单标的结算异常({code}): {e}")
+                logger.warning(f"[买点提醒] 单标的结算异常({code}): {e}")
                 continue
 
         if changed:
@@ -1078,7 +1153,8 @@ def settle_signal_history() -> dict:
             f"均{stats[k]['avg_ret']:+.2f}%"
             for n, k in ((1, "r1"), (3, "r3"), (5, "r5")) if k in stats)
         logger.info(f"[买点提醒] 信号结算完成: 累计{stats['total']}条"
-                    f"{(' | ' + summary) if summary else '(前瞻数据暂不可得)'}")
+                    f"{(' | ' + summary) if summary else '(前瞻数据暂不可得)'}"
+                    f" | 本次成功{_settle_ok}条 数据暂缺{_settle_timeout}条")
         return stats
     except Exception as e:
         logger.warning(f"[买点提醒] 信号结算失败(静默跳过): {e}")

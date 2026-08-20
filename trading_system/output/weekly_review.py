@@ -383,6 +383,10 @@ def build_weekly_review_html(weekly_data: dict) -> str:
     html += _section_signal_quality(weekly_data)
     html += _section_stress_test(weekly_data)
     html += _section_health(weekly_data)
+    # V10.0: 持仓健康度与末位淘汰排名
+    _ranking_html = weekly_data.get("ranking_section_html", "")
+    if _ranking_html:
+        html += _ranking_html
     html += _section_next_week(weekly_data)
 
     html += f"""
@@ -555,6 +559,52 @@ def prepare_weekly_data(holdings: dict, data_dict: dict) -> dict:
     except Exception as e:
         logger.debug(f"  波段指标计算失败: {e}")
         weekly_data["wave_metrics"] = {}
+
+    # 8. 持仓健康度与末位淘汰排名（V10.0新增）
+    try:
+        from strategy.holding_ranking import rank_holdings, generate_ranking_html
+        # 构建rank_holdings所需的持仓字典
+        _ranking_holdings = {}
+        _ranking_tech = {}
+        for _rk_code, _rk_pos in holdings.items():
+            _rk_shares = _rk_pos.get("shares", 0)
+            if _rk_shares <= 0:
+                continue
+            _rk_buy_price = _rk_pos.get("buy_price", 0)
+            _rk_current = _rk_pos.get("current_price", _rk_pos.get("close", _rk_buy_price))
+            _ranking_holdings[_rk_code] = {
+                "name": _rk_pos.get("name", _rk_code),
+                "shares": _rk_shares,
+                "buy_price": _rk_buy_price,
+                "current_price": _rk_current,
+                "sector": _rk_pos.get("sector", "其他"),
+                "buy_date": _rk_pos.get("buy_date", ""),
+            }
+            # 技术评分从data_dict中获取（如果有）
+            _rk_df = data_dict.get(_rk_code)
+            if _rk_df is not None and not _rk_df.empty:
+                try:
+                    from strategy.trend_strategy import compute_indicators
+                    _rk_df_ind = compute_indicators(_rk_df)
+                    _rk_close = _rk_df_ind.iloc[-1]
+                    # 简单技术评分: 基于均线排列+动量
+                    _rk_ma5 = _rk_close.get("ma5", 0) or 0
+                    _rk_ma20 = _rk_close.get("ma20", 0) or 0
+                    _rk_ma60 = _rk_close.get("ma60", 0) or 0
+                    _rk_score = 50  # 默认中性
+                    if _rk_ma5 > _rk_ma20 > _rk_ma60 > 0:
+                        _rk_score = 75  # 多头排列
+                    elif _rk_ma5 < _rk_ma20 < _rk_ma60 > 0:
+                        _rk_score = 25  # 空头排列
+                    _ranking_tech[_rk_code] = {"composite": _rk_score, "trend": "偏多" if _rk_score >= 60 else "偏空" if _rk_score <= 40 else "横盘"}
+                except Exception:
+                    pass
+        _ranking_result = rank_holdings(_ranking_holdings, _ranking_tech)
+        weekly_data["ranking_section_html"] = generate_ranking_html(_ranking_result)
+        logger.info(f"持仓排名: 健康度{_ranking_result['health_score']:.0f} | 淘汰建议{len(_ranking_result['eliminate_suggestions'])}只")
+    except Exception as e:
+        logger.debug(f"  持仓排名计算失败: {e}")
+        weekly_data["ranking_section_html"] = ""
 
     # 事件日历检查
     try:

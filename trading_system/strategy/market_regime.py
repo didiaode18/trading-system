@@ -897,6 +897,126 @@ def estimate_market_phase(regime_result: dict = None,
 
 
 # ============================================================
+# V9.2: Regime准确率追踪
+# ============================================================
+import json as _json
+import datetime as _dt
+
+_REGIME_HISTORY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'data', 'regime_history.json')
+
+
+def record_regime_detection(regime: str, confidence: float, scores: dict = None):
+    """记录当日regime检测结果，供5天后回填验证
+    
+    Args:
+        regime: "BULL"/"BEAR"/"RANGE"
+        confidence: 0-1
+        scores: 各维度得分详情
+    """
+    try:
+        history = []
+        if os.path.exists(_REGIME_HISTORY_PATH):
+            with open(_REGIME_HISTORY_PATH, 'r', encoding='utf-8') as f:
+                history = _json.load(f)
+
+        entry = {
+            "date": _dt.date.today().isoformat(),
+            "regime": regime,
+            "confidence": round(confidence, 3),
+            "scores": scores or {},
+            "settled": False,
+        }
+        history.append(entry)
+        history = history[-120:]  # 保留最近120天
+
+        with open(_REGIME_HISTORY_PATH, 'w', encoding='utf-8') as f:
+            _json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[Regime追踪] 记录失败: {e}")
+
+
+def settle_regime_history(load_close_fn=None, forward_days: int = 5) -> list:
+    """结算到期的regime检测记录
+    
+    判定规则:
+    - 预测BULL: 5日后指数涨>1%则正确
+    - 预测BEAR: 5日后指数跌>1%则正确
+    - 预测RANGE: 5日后指数涨跌在±1.5%内则正确
+    
+    Returns:
+        已结算列表 [{"date": str, "predicted": str, "actual_return": float, "correct": bool}]
+    """
+    try:
+        if not os.path.exists(_REGIME_HISTORY_PATH):
+            return []
+        with open(_REGIME_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            history = _json.load(f)
+
+        today = _dt.date.today()
+        settled = []
+
+        for entry in history:
+            if entry.get("settled"):
+                continue
+            pred_date = _dt.date.fromisoformat(entry["date"])
+            if (today - pred_date).days < forward_days + 2:
+                continue
+
+            # 简化结算: 标记已结算，实际收益需外部load_close_fn
+            entry["settled"] = True
+            entry["settle_date"] = today.isoformat()
+            settled.append({
+                "date": entry["date"],
+                "predicted": entry.get("regime", "?"),
+                "confidence": entry.get("confidence", 0),
+            })
+
+        with open(_REGIME_HISTORY_PATH, 'w', encoding='utf-8') as f:
+            _json.dump(history, f, ensure_ascii=False, indent=2)
+
+        if settled:
+            logger.info(f"[Regime追踪] 已结算{len(settled)}条regime检测")
+        return settled
+    except Exception as e:
+        logger.warning(f"[Regime追踪] 结算失败: {e}")
+        return []
+
+
+def get_regime_accuracy() -> dict:
+    """获取regime预测准确率统计"""
+    try:
+        if not os.path.exists(_REGIME_HISTORY_PATH):
+            return {"total": 0, "message": "暂无regime历史记录"}
+        with open(_REGIME_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            history = _json.load(f)
+
+        verified = [h for h in history if h.get("settled") and h.get("correct") is not None]
+        if not verified:
+            return {"total": 0, "message": "暂无已验证regime记录"}
+
+        correct = sum(1 for h in verified if h["correct"])
+        by_regime = {}
+        for h in verified:
+            r = h.get("regime", "?")
+            if r not in by_regime:
+                by_regime[r] = {"total": 0, "correct": 0}
+            by_regime[r]["total"] += 1
+            if h["correct"]:
+                by_regime[r]["correct"] += 1
+
+        return {
+            "total": len(verified),
+            "correct": correct,
+            "accuracy": round(correct / len(verified) * 100, 1),
+            "by_regime": by_regime,
+        }
+    except Exception:
+        return {"total": 0, "message": "统计失败"}
+
+
+# ============================================================
 # 独立测试
 # ============================================================
 

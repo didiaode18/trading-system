@@ -70,13 +70,26 @@ def load_current_holdings():
 
 
 def save_holdings(holdings: dict):
-    """保存holdings.json到所有路径（保持同步）"""
+    """保存holdings.json到所有路径（原子写 + 异常降级，防止进程中断导致文件截断）"""
     paths = get_holdings_paths()
+    ok_count = 0
     for path in paths:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(holdings, f, ensure_ascii=False, indent=2)
-    print(f"  ✅ holdings.json 已更新 ({len(paths)}个路径同步)")
+        try:
+            from utils.file_io import atomic_json_write
+            if atomic_json_write(path, holdings):
+                ok_count += 1
+            else:
+                print(f"  ⚠️ {path} 原子写入失败")
+        except ImportError:
+            # 降级: utils 模块不可用时回退到直接写入
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(holdings, f, ensure_ascii=False, indent=2)
+                ok_count += 1
+            except Exception as e2:
+                print(f"  ⚠️ {path} 降级写入也失败: {e2}")
+    print(f"  ✅ holdings.json 已更新 ({ok_count}/{len(paths)}个路径同步)")
 
 
 def update_config_runtime(total_capital: float, available_cash: float):
@@ -108,10 +121,22 @@ def save_daily_snapshot(holdings: dict) -> bool:
         path = os.path.join(SNAPSHOT_DIR, f"holdings_{datetime.date.today().strftime('%Y%m%d')}.json")
         if os.path.exists(path):
             return False
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(holdings, f, ensure_ascii=False, indent=2)
-        print(f"  📸 每日首次状态快照已保存: {os.path.basename(path)}")
+        from utils.file_io import atomic_json_write
+        if atomic_json_write(path, holdings):
+            print(f"  📸 每日首次状态快照已保存: {os.path.basename(path)}")
+        else:
+            print(f"  ⚠️ 快照原子写入失败")
         return True
+    except ImportError:
+        # 降级: utils 模块不可用时回退到直接写入
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(holdings, f, ensure_ascii=False, indent=2)
+            print(f"  📸 每日首次状态快照已保存(降级): {os.path.basename(path)}")
+            return True
+        except Exception as e:
+            print(f"  ⚠️ 快照写入失败，不阻断更新: {e}")
+            return False
     except Exception as e:
         print(f"  ⚠️ 快照写入失败，不阻断更新: {e}")
         return False

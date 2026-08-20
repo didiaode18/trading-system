@@ -24,7 +24,7 @@ class MLPredictor:
     
     用法:
         predictor = MLPredictor()
-        predictor.load_model("xgb_v1")
+        predictor.load_model("xgb_daily")
         prob = predictor.predict(df)  # 返回上涨概率
         confirmed = predictor.confirm_signal(df, traditional_signal="buy")
     """
@@ -39,7 +39,19 @@ class MLPredictor:
         self.model_name = ""
 
     def load_model(self, name: str) -> bool:
-        """加载模型"""
+        """加载模型
+        
+        V9.3: 先检查ML_CONFIG["enabled"]总开关，关闭时跳过加载。
+        """
+        # V9.3: ML_CONFIG总开关检查
+        try:
+            import config as _cfg
+            _ml_cfg = getattr(_cfg, 'ML_CONFIG', {})
+            if not _ml_cfg.get('enabled', True):
+                logger.info("ML模型加载跳过: ML_CONFIG.enabled=False")
+                return False
+        except Exception:
+            pass  # 配置读取失败不阻断，继续尝试加载
         from ml.trainer import ModelTrainer
         trainer = ModelTrainer()
         self.model = trainer.load(name)

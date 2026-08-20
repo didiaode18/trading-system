@@ -58,26 +58,27 @@ class WalkForwardAnalyzer:
         result = wf.run(data_dict, stock_codes)
     """
 
-    def __init__(self, train_days: int = 150, test_days: int = 40,
+    def __init__(self, train_days: int = None, test_days: int = None,
                  param_grid: dict = None, initial_capital: float = None,
                  max_windows: int = None):
         """
         参数:
-            train_days: 训练窗口天数（V2.1: 120→150，覆盖更长周期减少过拟合）
-            test_days: 验证窗口天数（V2.0: 20→40，增加统计显著性）
+            train_days: 训练窗口天数（V6.1: 默认从 config.WF_CONFIG 读取 200天）
+            test_days: 验证窗口天数（V6.1: 默认从 config.WF_CONFIG 读取 60天）
             param_grid: 参数网格 {"参数名": [值1, 值2, ...]}
             initial_capital: 初始资金
             max_windows: 最大窗口数（限制运行时间）
         """
-        self.train_days = train_days
-        self.test_days = test_days
-        self.max_windows = max_windows
+        wf_cfg = getattr(config, 'WF_CONFIG', {})
+        self.train_days = train_days or wf_cfg.get('train_days', 200)
+        self.test_days = test_days or wf_cfg.get('test_days', 60)
+        self.max_windows = max_windows or wf_cfg.get('max_windows', 10)
         # P1-6: 精简参数网格，仅2个核心参数×2-3值=6组合（原27组合过拟合维度太高）
-        # min_signal_quality对齐P0-2新门槛62，取60/65/70
-        self.param_grid = param_grid or {
+        # min_signal_quality对齐V6.1新门槛65，取60/65/70
+        self.param_grid = param_grid or wf_cfg.get('param_grid', {
             "initial_stop_loss": [0.06, 0.08],
             "min_signal_quality": [60, 65, 70],
-        }
+        })
         self.initial_capital = initial_capital or config.TOTAL_CAPITAL
 
     def run(self, data_dict: dict, stock_codes: list = None) -> dict:
@@ -353,10 +354,10 @@ class WalkForwardAnalyzer:
 # ============================================================
 
 def run_walk_forward(data_dict: dict, stock_codes: list = None,
-                     train_days: int = 60, test_days: int = 20,
+                     train_days: int = None, test_days: int = None,
                      param_grid: dict = None) -> dict:
     """
-    便捷Walk-Forward接口
+    便捷Walk-Forward接口（V6.1: 默认从 config.WF_CONFIG 读取）
     
     返回:
         Walk-Forward分析结果
@@ -365,7 +366,7 @@ def run_walk_forward(data_dict: dict, stock_codes: list = None,
     return wf.run(data_dict, stock_codes)
 
 
-def format_walk_forward_report(result: dict) -> str:
+def format_walk_forward_report(result: dict, train_days: int = 200, test_days: int = 60) -> str:
     """格式化Walk-Forward报告"""
     if "error" in result:
         return f"Walk-Forward失败: {result['error']}"
@@ -375,7 +376,7 @@ def format_walk_forward_report(result: dict) -> str:
         "  Walk-Forward 滚动窗口分析报告",
         "=" * 60,
         f"  窗口数量:     {result['num_windows']}",
-        f"  训练/验证:    60天/20天",
+        f"  训练/验证:    {train_days}天/{test_days}天",
         "",
         "  ─── 样本外表现 ───",
         f"  平均夏普:     {result['oos_sharpe']:.2f} ± {result['oos_sharpe_std']:.2f}",

@@ -55,6 +55,10 @@ def build_features(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     # 标准化
     factor_df = (factor_df - factor_df.mean()) / factor_df.std().replace(0, 1)
 
+    # V9.3 FIX: 标准化后仍可能产生NaN（如常数因子std=0导致0/0），统一填充为0
+    # 同时处理inf/-inf（极端数值情况），防止sklearn/lightgbm训练崩溃
+    factor_df = factor_df.fillna(0).replace([np.inf, -np.inf], 0)
+
     return factor_df
 
 

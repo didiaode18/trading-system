@@ -14,9 +14,9 @@
 - composite.py: 因子正交化 + 加权合成
 """
 
-from factors.registry import FactorRegistry, compute_all_factors
-from factors.ic_monitor import ICMonitor
-from factors.composite import CompositeFactor
+from .registry import FactorRegistry, compute_all_factors
+from .ic_monitor import ICMonitor
+from .composite import CompositeFactor
 
 __all__ = [
     "FactorRegistry", "compute_all_factors",

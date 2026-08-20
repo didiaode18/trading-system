@@ -131,6 +131,19 @@ class IntradayMonitor:
         self.day_phase_label = {}        # {code: str} 当日定性标签
         self.price_history = {}          # {code: [(time, price)]} 分时价格序列(P2-3用)
 
+        # V9.1: 大盘门控 — 延迟预警队列与状态跟踪
+        self._pending_alerts_queue = []  # [(alert, alert_key)] 门控延迟的非紧急预警
+        self._prev_gate_state = "pass"   # 上轮门控状态（用于检测 delay→pass 转换）
+        self._queued_alert_keys = set()  # 被门控延迟的预警key（防止重复入队）
+
+        # V9.2: 跨日状态跟踪（进程不重启时检测日期变化自动清理日内状态）
+        self._state_date = datetime.date.today().isoformat()
+
+        # V9.2: 持仓热重载跟踪（检测 holdings.json 变更后自动刷新监控列表）
+        self._holdings_file = config.get_holdings_file()
+        self._holdings_mtime = 0.0
+        self._reload_check_counter = 0  # 每N轮检查一次文件变更（降低IO）
+
         # FIX: 从持久化文件加载当日状态（盘中重启不重复报警/不重置缓冲计时）
         self._load_state()
 
@@ -139,7 +152,9 @@ class IntradayMonitor:
     # ============================================================
 
     def _load_state(self):
-        """FIX: 加载当日盘中监控状态（跨日自动重置为空状态，失败降级不阻断）"""
+        """FIX: 加载当日盘中监控状态（跨日自动重置为空状态，失败降级不阻断）
+        V9.2: 补充加载 day_lows / stop_touch_prices / _queued_alert_keys 防止盘中重启丢失
+        """
         try:
             if not os.path.exists(_INTRADAY_STATE_FILE):
                 return
@@ -160,13 +175,21 @@ class IntradayMonitor:
                     continue
             self.opening_phase_done = bool(data.get("opening_phase_done", False))
             self.closing_alerts_sent = set(data.get("closing_alerts_sent", []))
+            # V9.2: 补充加载日内状态字段
+            self.day_lows = {c: float(v) for c, v in data.get("day_lows", {}).items() if v > 0}
+            self.stop_touch_prices = {c: float(v) for c, v in data.get("stop_touch_prices", {}).items() if v > 0}
+            self._queued_alert_keys = set(data.get("queued_alert_keys", []))
+            self._state_date = data.get("date", self._state_date)
             logger.info(f"[盘中监控] 已恢复当日状态: 已发预警{len(self.alerts_sent)}条, "
-                        f"缓冲计时{len(self.stop_loss_first_touch)}只")
+                        f"缓冲计时{len(self.stop_loss_first_touch)}只, "
+                        f"日内低点{len(self.day_lows)}只, 门控队列{len(self._queued_alert_keys)}条")
         except Exception as e:
             logger.debug(f"[盘中监控] 状态加载失败，使用空状态: {e}")
 
     def _save_state(self):
-        """FIX: 当日状态落盘（按交易日key，失败仅debug不阻断监控）"""
+        """FIX: 当日状态落盘（原子写 + 补全日内状态字段，失败仅debug不阻断监控）
+        V9.2: 补充持久化 day_lows / stop_touch_prices / _queued_alert_keys
+        """
         try:
             data = {
                 "date": datetime.date.today().isoformat(),
@@ -179,12 +202,59 @@ class IntradayMonitor:
                 },
                 "opening_phase_done": self.opening_phase_done,
                 "closing_alerts_sent": list(self.closing_alerts_sent),
+                # V9.2: 补充持久化日内状态字段
+                "day_lows": dict(self.day_lows),
+                "stop_touch_prices": dict(self.stop_touch_prices),
+                "queued_alert_keys": list(self._queued_alert_keys),
             }
-            os.makedirs(os.path.dirname(_INTRADAY_STATE_FILE), exist_ok=True)
-            with open(_INTRADAY_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+            try:
+                from utils.file_io import atomic_json_write
+                atomic_json_write(_INTRADAY_STATE_FILE, data, indent=None)
+            except ImportError:
+                os.makedirs(os.path.dirname(_INTRADAY_STATE_FILE), exist_ok=True)
+                with open(_INTRADAY_STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
         except Exception as e:
             logger.debug(f"[盘中监控] 状态持久化失败: {e}")
+
+    def _daily_reset_if_new_day(self):
+        """V9.2: 检测日期变化，自动清理所有日内增长的 dict/set，防止内存泄漏
+
+        解决的问题:
+          - 进程跨日运行时 alerts_sent / price_history / day_lows 等不释放
+          - 内存持续膨胀（数天/数周不重启时）
+          - 旧日状态干扰新日逻辑（如 day_lows 残留昨日值）
+        """
+        today = datetime.date.today().isoformat()
+        if self._state_date == today:
+            return  # 同日，无需清理
+
+        logger.info(f"[盘中监控] 检测到跨日({self._state_date}→{today})，清理日内状态")
+
+        # 清理所有日内增长的 dict/set
+        self.alerts_sent.clear()
+        self.price_history.clear()
+        self.day_lows.clear()
+        self.day_volumes.clear()
+        self.stop_loss_first_touch.clear()
+        self.stop_touch_prices.clear()
+        self.vwap_below_count.clear()
+        self.prev_vwap_above.clear()
+        self.prev_bid1_vol.clear()
+        self.closing_alerts_sent.clear()
+        self.day_phase_label.clear()
+        self.opening_prices.clear()
+        self._queued_alert_keys.clear()
+        self._pending_alerts_queue.clear()
+        self._atr_obs_logged.clear()
+        self.gradient_triggered.clear()
+
+        # 重置标记
+        self.opening_phase_done = False
+        self._sector_switch_logged = False
+        self._prev_gate_state = "pass"
+        self._state_date = today
+        self._atr_cache = {"date": today, "values": {}}
 
     # ============================================================
     # 一、启动监控
@@ -219,6 +289,12 @@ class IntradayMonitor:
                 time.sleep(300)
                 continue
 
+            # V9.2: 持仓热重载（每10轮≈5分钟检查一次holdings.json变更）
+            self._reload_check_counter += 1
+            if self._reload_check_counter >= 10:
+                self._reload_holdings_if_changed()
+                self._reload_check_counter = 0
+
             try:
                 self._check_all()
             except Exception as e:
@@ -228,6 +304,66 @@ class IntradayMonitor:
             self._write_heartbeat("active")
 
             time.sleep(self.poll_interval)
+
+    def _reload_holdings_if_changed(self):
+        """V9.2: 检测 holdings.json 文件变更，自动刷新监控列表
+
+        解决的问题:
+          - 盘中更新持仓后（如新增3只标的），监控线程仍用启动时的旧数据
+          - 导致新标的完全无盘中监控覆盖（止损/VWAP/抛压等全部缺失）
+
+        策略:
+          - 比较文件 mtime，变更时重新加载
+          - 新增标的: 加入监控（补充必要字段）
+          - 已清仓标的(shares=0): 从监控列表移除
+          - 存续标的: 更新 stop_loss/buy_price 等关键字段
+        """
+        try:
+            if not os.path.exists(self._holdings_file):
+                return
+            mtime = os.path.getmtime(self._holdings_file)
+            if mtime <= self._holdings_mtime:
+                return  # 文件未变更
+
+            logger.info(f"[盘中监控] 检测到 holdings.json 变更，重新加载持仓...")
+            with open(self._holdings_file, "r", encoding="utf-8") as f:
+                new_holdings = json.load(f)
+
+            # 过滤已清仓标的
+            new_holdings = {c: v for c, v in new_holdings.items()
+                           if isinstance(v, dict) and v.get("shares", 0) > 0}
+
+            old_codes = set(self.holdings.keys())
+            new_codes = set(new_holdings.keys())
+            added = new_codes - old_codes
+            removed = old_codes - new_codes
+
+            # 补充必要字段
+            for code, pos in new_holdings.items():
+                pos["name"] = config.get_stock_name(code)
+                if "stop_loss" not in pos:
+                    pos["stop_loss"] = pos.get("buy_price", 0) * (1 - config.INITIAL_STOP_LOSS_PCT)
+
+            # 更新持仓
+            self.holdings = new_holdings
+            self._holdings_mtime = mtime
+
+            # 清理已移除标的的日内状态
+            for code in removed:
+                self.day_lows.pop(code, None)
+                self.day_volumes.pop(code, None)
+                self.stop_touch_prices.pop(code, None)
+                self.price_history.pop(code, None)
+                self.last_prices.pop(code, None)
+
+            if added or removed:
+                logger.info(f"[盘中监控] 持仓刷新完成: 新增{len(added)}只{list(added)}, "
+                           f"移除{len(removed)}只{list(removed)}, 当前监控{len(self.holdings)}只")
+            else:
+                logger.info(f"[盘中监控] 持仓字段更新（标的不变），当前监控{len(self.holdings)}只")
+
+        except Exception as e:
+            logger.warning(f"[盘中监控] 持仓热重载失败(不影响当前监控): {e}")
 
     def _write_heartbeat(self, status: str):
         """V4.0(G8): 写入监控心跳文件（时间戳|PID|状态），失败不影响主流程"""
@@ -259,6 +395,9 @@ class IntradayMonitor:
         alerts = []
         today = datetime.date.today().isoformat()
 
+        # V9.2: 跨日自动清理日内状态（进程不重启时防止内存泄漏）
+        self._daily_reset_if_new_day()
+
         # 获取实时行情
         quotes = self._get_realtime_quotes(list(self.holdings.keys()))
         if not quotes:
@@ -266,6 +405,33 @@ class IntradayMonitor:
 
         # 获取大盘行情
         market_quote = self._get_index_quote()
+
+        # ---- V9.1: 大盘门控（方案4）----
+        # 大盘急跌/极端下跌时压制或延迟个股预警，避免"情绪冰点"发出不可靠信号
+        gate_state = self._market_gate_check(market_quote)
+        if gate_state == "suppress":
+            logger.info("[大盘门控] 大盘极端下跌中，压制个股预警（避免情绪极值误报）")
+            return alerts
+        elif gate_state == "delay":
+            # 大盘急跌中: warning/critical/emergency 风控信号立即发送，
+            # 仅 info 级预警入队列延迟等待企稳后补发
+            pass  # 在 _send_alert 中按 level 分流
+        
+        # V9.2: 门控/均值回归周期性存活日志（每20轮≈10分钟输出一次，便于确认功能存活）
+        if not hasattr(self, '_gate_log_counter'):
+            self._gate_log_counter = 0
+        self._gate_log_counter += 1
+        if self._gate_log_counter >= 20:
+            mkt_chg = market_quote.get("change_pct", 0) if market_quote else 0
+            logger.info(f"[门控状态] {gate_state} | 大盘{mkt_chg:+.2f}% | "
+                       f"延迟队列{len(self._pending_alerts_queue)}条 | "
+                       f"监控{len(self.holdings)}只 | 已发预警{len(self.alerts_sent)}条")
+            self._gate_log_counter = 0
+
+        # V9.1: 门控从 delay→pass 转换时，补发延迟队列中的预警
+        if gate_state == "pass" and self._prev_gate_state == "delay" and self._pending_alerts_queue:
+            self._dispatch_pending_alerts(quotes, today)
+        self._prev_gate_state = gate_state
 
         for code, holding in self.holdings.items():
             if code not in quotes:
@@ -290,7 +456,8 @@ class IntradayMonitor:
 
             # V7.1: 更新当日最低价（用于V反保护）
             day_low = quote.get("low", current_price)
-            if code not in self.day_lows or day_low < self.day_lows[code]:
+            # V9.2: 防止 0/负值 写入导致后续除零或反弹计算失效
+            if day_low > 0 and (code not in self.day_lows or day_low < self.day_lows[code]):
                 self.day_lows[code] = day_low
 
             # ---- 检查1: 止损位触发（V7.2: 反洗盘保护增强版）----
@@ -320,6 +487,7 @@ class IntradayMonitor:
                                 "time": now.strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
                         continue  # 不触发止损
@@ -341,6 +509,7 @@ class IntradayMonitor:
                                 "time": now.strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
                         # 重置首次触及时间
@@ -367,6 +536,7 @@ class IntradayMonitor:
                                 "time": now.strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
                         self.stop_loss_first_touch.pop(code, None)
@@ -396,6 +566,7 @@ class IntradayMonitor:
                                     "time": now.strftime("%H:%M:%S"),
                                 }
                                 alerts.append(alert)
+                                alert["_alert_key"] = alert_key
                                 self.alerts_sent.add(alert_key)
                                 self._send_alert(alert)
                             # 被动跌破: 延长缓冲期×1.5
@@ -436,6 +607,7 @@ class IntradayMonitor:
                             "time": now.strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
+                        alert["_alert_key"] = alert_key
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
                     continue  # 等待缓冲期
@@ -448,6 +620,31 @@ class IntradayMonitor:
                 )
 
                 if elapsed_minutes >= dynamic_buffer:
+                    # V9.1: 均值回归过滤器（方案1）
+                    # 价格极端偏离VWAP时，止损信号可靠性极低，暂缓确认等待回归
+                    is_mr_zone, z_score = self._is_mean_reversion_zone(code, current_price, quote)
+                    if is_mr_zone and z_score < -2.0:
+                        mr_key = f"{today}_{code}_mr_defer"
+                        if mr_key not in self.alerts_sent:
+                            loss_pct = round((current_price / buy_price - 1) * 100, 2)
+                            alert = {
+                                "level": "info",
+                                "type": "均值回归暂缓止损",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "z_score": round(z_score, 2),
+                                "message": f"💡 {name}({code}) 偏离VWAP达{z_score:.1f}倍ATR | "
+                                          f"处于均值回归区域，止损信号暂缓 | "
+                                          f"浮亏{loss_pct:.1f}% | 等待价格回归后再评估",
+                                "time": now.strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            alert["_alert_key"] = mr_key
+                            self.alerts_sent.add(mr_key)
+                            self._send_alert(alert)
+                        continue  # 本轮不确认止损，等待回归
+
                     # 缓冲期到: 确认止损
                     confirm_price = stop_loss * (1 - self.BUFFER_CONFIRM_PCT)
                     if current_price <= confirm_price:
@@ -476,6 +673,7 @@ class IntradayMonitor:
                                 "time": now.strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
                             # V8.0 P1-3: 止损确认时自动生成卖出条件单+紧急邮件
@@ -524,6 +722,7 @@ class IntradayMonitor:
                                 "time": datetime.datetime.now().strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
                 self.stop_loss_first_touch.pop(code, None)
@@ -546,59 +745,68 @@ class IntradayMonitor:
                         "time": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
                     alerts.append(alert)
+                    alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 
-            # ---- 检查3: 止盈位到达（V3.3: 阶梯止盈+回落止盈）----
+            # ---- 检查3: 止盈位到达（V6.2: 阈值提高，回测10%/20%提醒过早）----
             if self.PROFIT_TARGET_ALERT and buy_price > 0:
                 profit_pct = (current_price / buy_price - 1)
                 highest = holding.get("highest", buy_price)
                 drawdown_from_high = (current_price - highest) / highest if highest > 0 else 0
 
-                # 第一止盈位: 浮盈≥10%（V6.0: 8%→10%）
-                if profit_pct >= 0.10:
+                # V6.2: 止盈提醒阈值从config读取（15%/25%，回测超半数提醒后继续上涨）
+                _profit_levels = getattr(config, 'PROFIT_ALERT_LEVELS', [0.15, 0.25])
+
+                # 第一止盈位: 浮盈≥15%（V6.2: 10%→15%）
+                if len(_profit_levels) >= 1 and profit_pct >= _profit_levels[0]:
                     alert_key = f"{today}_{code}_profit_10"
                     if alert_key not in self.alerts_sent:
                         # FIX: 修复100股持仓减1/3取整为0的问题（建议卖出量不超持有股数）
                         sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
                         alert = {
-                            "level": "info",
+                            # V9.2 FIX: level从"info"提升为"high"，确保通过钉钉分级路由(ALERT_DINGTALK_MIN_LEVEL=high)
+                            "level": "high",
                             "type": "止盈提醒",
                             "code": code,
                             "name": name,
                             "current_price": current_price,
                             "profit_pct": round(profit_pct * 100, 2),
-                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第一止盈位(10%)！"
+                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第一止盈位({int(_profit_levels[0]*100)}%)！"
                                       f"建议卖出{sell_1_3}股(1/3)锁定利润",
                             "time": datetime.datetime.now().strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
+                        alert["_alert_key"] = alert_key
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
 
-                # 第二止盈位: 浮盈≥20%
-                if profit_pct >= 0.20:
+                # 第二止盈位: 浮盈≥25%（V6.2: 20%→25%）
+                if len(_profit_levels) >= 2 and profit_pct >= _profit_levels[1]:
                     alert_key = f"{today}_{code}_profit_20"
                     if alert_key not in self.alerts_sent:
                         # FIX: 修复100股持仓减1/3取整为0的问题（建议卖出量不超持有股数）
                         sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
                         alert = {
-                            "level": "warning",
+                            # V9.2 FIX: level从"warning"提升为"high"，确保通过钉钉分级路由(ALERT_DINGTALK_MIN_LEVEL=high)
+                            "level": "high",
                             "type": "止盈提醒",
                             "code": code,
                             "name": name,
                             "current_price": current_price,
                             "profit_pct": round(profit_pct * 100, 2),
-                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第二止盈位(20%)！"
+                            "message": f"🎯 {name}({code}) 浮盈{profit_pct*100:.1f}%达第二止盈位({int(_profit_levels[1]*100)}%)！"
                                       f"建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
                             "time": datetime.datetime.now().strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
+                        alert["_alert_key"] = alert_key
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
 
-                # 回落止盈: 浮盈>5%且从最高点回落超过阈值
-                if profit_pct >= 0.05:
+                # 回落止盈: V6.2提高门槛（浮盈>6%且从最高点回落超过阈值）
+                _min_profit_dd = getattr(config, 'DRAWDOWN_PROFIT_MIN_PROFIT', 0.06)
+                if profit_pct >= _min_profit_dd:
                     from config import DRAWDOWN_STOP
                     stock_type = holding.get("stock_type", "龙头稳健")
                     dd_threshold = DRAWDOWN_STOP.get(stock_type, DRAWDOWN_STOP.get("龙头稳健", 0.07))
@@ -608,7 +816,8 @@ class IntradayMonitor:
                             # FIX: 修复100股持仓减半取整为0的问题（建议卖出量不超持有股数）
                             sell_half = min(shares, max(100, int(shares * 0.5 / 100) * 100)) if shares >= 100 else shares
                             alert = {
-                                "level": "warning",
+                                # V9.2 FIX: level从"warning"提升为"high"，确保通过钉钉分级路由(ALERT_DINGTALK_MIN_LEVEL=high)
+                                "level": "high",
                                 "type": "回落止盈",
                                 "code": code,
                                 "name": name,
@@ -621,12 +830,17 @@ class IntradayMonitor:
                                 "time": datetime.datetime.now().strftime("%H:%M:%S"),
                             }
                             alerts.append(alert)
+                            alert["_alert_key"] = alert_key
                             self.alerts_sent.add(alert_key)
                             self._send_alert(alert)
 
-            # ---- 检查4: 振幅异常 ----
+            # ---- 检查4: 振幅异常（V6.2: 结合趋势位置过滤）----
             amplitude = quote.get("amplitude", 0)
-            if amplitude and amplitude > self.AMPLITUDE_ALERT_PCT * 100:
+            _amp_trend_filter = getattr(config, 'AMPLITUDE_TREND_FILTER', True)
+            # V6.2: 仅当股价<MA20时预警（高位振幅可能是拉升，不预警）
+            _ma20 = holding.get("ma20", 0)
+            _below_ma20 = (_ma20 > 0 and current_price < _ma20) if _amp_trend_filter else True
+            if amplitude and amplitude > self.AMPLITUDE_ALERT_PCT * 100 and _below_ma20:
                 alert_key = f"{today}_{code}_amplitude"
                 if alert_key not in self.alerts_sent:
                     alert = {
@@ -639,6 +853,7 @@ class IntradayMonitor:
                         "time": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
                     alerts.append(alert)
+                    alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 
@@ -710,6 +925,7 @@ class IntradayMonitor:
                         "time": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
                     alerts.append(alert)
+                    alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 
@@ -784,9 +1000,30 @@ class IntradayMonitor:
     # ============================================================
 
     def _send_alert(self, alert: dict):
-        """发送预警通知"""
+        """发送预警通知
+
+        FIX: 禁用监控线程的独立钉钉推送，统一由scheduler的send_alert_email()
+        单通道发送（含冷却/合并/去重），避免同一预警通过两条独立通道重复推送。
+        监控线程仅保留日志记录 + 企业微信 + critical邮件 + 回调。
+
+        V9.1: 大盘门控 — delay状态下非 critical 预警入队列延迟发送。
+        """
         message = alert.get("message", "")
         level = alert.get("level", "info")
+
+        # V9.1: 大盘门控 — delay状态下仅 info 级预警入队列延迟
+        # FIX(2026-08-19): 原 level!="critical" 误将 warning(梯度减仓-5%)
+        # 也延迟发送，导致风控预警被门控吞掉。修正为仅 info 级延迟，
+        # warning/critical/emergency 均为风控信号，必须穿透门控立即发送。
+        if (self._prev_gate_state == "delay" and level == "info"
+                and not message.startswith("[延迟补发]")):
+            alert_key = alert.get("_alert_key", "")
+            if alert_key and alert_key not in self._queued_alert_keys:
+                self._pending_alerts_queue.append((alert, alert_key))
+                self._queued_alert_keys.add(alert_key)
+                logger.info(f"[大盘门控] 大盘急跌中，{alert.get('type','')}预警延迟: "
+                           f"{alert.get('name','')}({alert.get('code','')})")
+            return  # 不实际发送
 
         logger.warning(f"[盘中预警-{level.upper()}] {message}")
 
@@ -794,9 +1031,12 @@ class IntradayMonitor:
         if config.WECHAT_WORK_WEBHOOK:
             self._send_wechat(message, level)
 
-        # 钉钉推送
-        if config.DINGTALK_WEBHOOK:
-            self._send_dingtalk(message, level)
+        # FIX: 钉钉推送已禁用 —— 统一由scheduler.send_alert_email()单通道发送
+        # 原独立钉钉推送与scheduler统一预警各自治冷却/去重，导致同一标的
+        # 短时间内收到两条内容相同的钉钉预警。禁用后监控线程的预警仍通过
+        # scheduler统一链路（含30分钟冷却+同标的合并）发送，不再重复。
+        # if config.DINGTALK_WEBHOOK:
+        #     self._send_dingtalk(message, level)
 
         # 邮件推送（仅critical级别）
         if level == "critical" and config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
@@ -1001,6 +1241,7 @@ class IntradayMonitor:
                               f"每日仅提醒1次，请结合当日走势自主决策处置",
                     "time": datetime.datetime.now().strftime("%H:%M:%S"),
                 }
+                alert["_alert_key"] = dl_key
                 alerts.append(alert)
                 self._send_alert(alert)
             return alerts
@@ -1366,6 +1607,107 @@ class IntradayMonitor:
             return cfg.get("default_buffer_minutes", 8)
 
     # ============================================================
+    # V9.1: 大盘门控机制（方案4: 大盘急跌时延迟/压制个股预警）
+    # ============================================================
+
+    def _market_gate_check(self, market_quote: dict) -> str:
+        """大盘门控: 根据大盘状态决定个股预警的发送策略
+
+        返回:
+            "pass"     — 正常发送所有预警
+            "delay"    — 大盘急跌中，非 critical 预警入队列延迟
+            "suppress" — 大盘极端下跌，完全压制个股预警（此时信号不可靠）
+
+        设计逻辑:
+          大盘急跌(-1%~-2.5%)时，个股普遍跟跌，此时发出的止损/减仓预警
+          在大盘企稳后往往迅速失效（价格反弹），导致"卖在最低点"。
+          通过门控延迟，等大盘企稳后再补发，显著提高预警有效性。
+        """
+        if not market_quote:
+            return "pass"
+
+        mkt_chg = market_quote.get("change_pct", 0)
+
+        # 大盘极端下跌(<-2.5%): 完全压制
+        # 此时所有个股预警都不可靠，且用户操作也大概率是错误的
+        if mkt_chg <= -2.5:
+            new_state = "suppress"
+        # 大盘明显下跌(-1%~-2.5%): 延迟非紧急预警
+        elif mkt_chg < -1.0:
+            new_state = "delay"
+        else:
+            new_state = "pass"
+
+        # V9.2: 门控状态转换日志（便于事后复盘门控行为）
+        # FIX(2026-08-19): 不再在此处更新 _prev_gate_state —— 由 _check_all
+        # 统一维护，否则 delay→pass 转换检测永远为 False（延迟队列永远不补发）
+        if new_state != self._prev_gate_state:
+            logger.info(f"[大盘门控] 状态转换: {self._prev_gate_state}→{new_state} "
+                        f"(大盘涨跌{mkt_chg:+.2f}%)")
+
+        return new_state
+
+    # ============================================================
+    # V9.1: 均值回归过滤器（方案1: ATR+VWAP Z-Score 检测极端偏离）
+    # ============================================================
+
+    def _is_mean_reversion_zone(self, code: str, current_price: float,
+                                 quote: dict) -> tuple:
+        """判断当前价格是否处于均值回归高概率区域
+
+        使用 VWAP + ATR 计算标准化偏离度(Z-Score):
+          Z = (价格 - VWAP) / ATR
+          |Z| > 2 意味着价格偏离日内均价超过2倍真实波幅，回归概率极高
+
+        返回:
+            (is_zone: bool, z_score: float)
+            is_zone=True 且 z_score<-2 → 极端低估，止损信号不可靠
+            is_zone=True 且 z_score>2  → 极端高估，止盈信号可加强
+        """
+        vwap = quote.get("vwap", 0)
+        if vwap <= 0 or current_price <= 0:
+            return False, 0.0
+
+        atr = self._get_atr_cached(code)
+        if not atr or atr <= 0:
+            return False, 0.0
+
+        z_score = (current_price - vwap) / atr
+        return (abs(z_score) > 2.0), z_score
+
+    # ============================================================
+    # V9.1: 延迟预警补发（大盘企稳后释放门控期间积压的预警）
+    # ============================================================
+
+    def _dispatch_pending_alerts(self, quotes: dict, today: str):
+        """大盘企稳后补发延迟队列中的预警
+
+        仅在 _market_gate_check 从 "delay" 转回 "pass" 时调用。
+        补发前验证标的仍在持仓中且行情可用，过期预警直接丢弃。
+        """
+        if not self._pending_alerts_queue:
+            return
+
+        dispatched = 0
+        for alert, alert_key in self._pending_alerts_queue:
+            code = alert.get("code", "")
+            if code not in quotes:
+                continue
+            # 已被正式流程确认/发送的跳过（缓冲期内价格回升等场景）
+            if alert_key in self.alerts_sent and alert_key not in self._queued_alert_keys:
+                continue
+
+            # 补发时追加"延迟"标注，让用户知道这是之前积压的信号
+            alert["message"] = f"[延迟补发] {alert.get('message', '')}"
+            self.alerts_sent.add(alert_key)
+            self._queued_alert_keys.discard(alert_key)
+            self._send_alert(alert)
+            dispatched += 1
+
+        logger.info(f"[大盘门控] 大盘企稳，补发{dispatched}条延迟预警")
+        self._pending_alerts_queue.clear()
+
+    # ============================================================
     # 八、V8.0 监控级别状态管理（P0-2 供scheduler变频使用）
     # ============================================================
 
@@ -1445,6 +1787,14 @@ class IntradayMonitor:
         if not self.vwap_cfg.get("enabled", True):
             return alerts
 
+        # V9.2: 开盘15分钟静默期（09:30-09:45 VWAP不稳定，信号不可靠）
+        _now = datetime.datetime.now()
+        _open_time = _now.replace(hour=9, minute=30, second=0, microsecond=0)
+        _quiet_end = _open_time + datetime.timedelta(
+            minutes=self.vwap_cfg.get("quiet_minutes", 15))
+        if _now < _quiet_end:
+            return alerts  # 开盘静默期内不触发VWAP信号
+
         vwap = quote.get("vwap", 0)
         if vwap <= 0 or current_price <= 0:
             return alerts
@@ -1479,6 +1829,7 @@ class IntradayMonitor:
                     "time": datetime.datetime.now().strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1502,6 +1853,7 @@ class IntradayMonitor:
                         "time": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
                     alerts.append(alert)
+                    alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
         else:
@@ -1572,6 +1924,7 @@ class IntradayMonitor:
                     "time": datetime.datetime.now().strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1626,6 +1979,7 @@ class IntradayMonitor:
                     "time": datetime.datetime.now().strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1696,6 +2050,7 @@ class IntradayMonitor:
                     "time": now.strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1716,6 +2071,7 @@ class IntradayMonitor:
                     "time": now.strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1770,6 +2126,7 @@ class IntradayMonitor:
                     "time": now.strftime("%H:%M:%S"),
                 }
                 alerts.append(alert)
+                alert["_alert_key"] = alert_key
                 self.alerts_sent.add(alert_key)
                 self._send_alert(alert)
 
@@ -1799,6 +2156,7 @@ class IntradayMonitor:
                             "time": now.strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
+                        alert["_alert_key"] = alert_key
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
 
@@ -1819,6 +2177,7 @@ class IntradayMonitor:
                             "time": now.strftime("%H:%M:%S"),
                         }
                         alerts.append(alert)
+                        alert["_alert_key"] = alert_key
                         self.alerts_sent.add(alert_key)
                         self._send_alert(alert)
 
@@ -1891,6 +2250,7 @@ class IntradayMonitor:
                         "time": now.strftime("%H:%M:%S"),
                     }
                     alerts.append(alert)
+                    alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 

@@ -9,7 +9,7 @@
 约束: ML仅做"确认/否决"，不独立产生交易信号
 """
 
-from ml.predictor import MLPredictor
-from ml.monitor import ModelMonitor
+from .predictor import MLPredictor
+from .monitor import ModelMonitor
 
 __all__ = ["MLPredictor", "ModelMonitor"]

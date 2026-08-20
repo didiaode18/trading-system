@@ -538,13 +538,19 @@ class SlippageTracker:
             return ""
 
     def save(self, path: str):
-        """将滑点历史记录保存到指定JSON文件"""
+        """将滑点历史记录保存到指定JSON文件（原子写，防止进程中断导致文件截断）"""
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.records, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"滑点历史保存失败({path}): {e}")
+            from utils.file_io import atomic_json_write
+            if not atomic_json_write(path, self.records):
+                logger.warning(f"滑点历史原子写入失败({path})")
+        except ImportError:
+            # 降级: utils 模块不可用时回退到直接写入
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.records, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"滑点历史保存失败({path}): {e}")
 
     def load(self, path: str) -> list:
         """从JSON文件恢复滑点历史记录"""

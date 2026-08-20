@@ -415,12 +415,13 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
 
 def _precompute_market_regime(df: pd.DataFrame, benchmark_df: pd.DataFrame = None) -> dict:
     """
-    P0: 预计算市场环境序列（性能优化版: numpy向量化）
+    P0: 预计算市场环境序列（V9.2: 增强版，对齐实盘5维加权逻辑）
     
-    基于大盘指数的MA20/MA60关系判定市场状态：
-      - BULL: 指数>MA20 且 MA20>MA60
-      - BEAR: 指数<MA60 且 MA20<MA60
-      - RANGE: 其他
+    V9.2升级: 从纯MA20/MA60规则升级为4维加权评分，更接近实盘MarketRegimeDetector:
+      - 趋势(40%): MA20/MA60关系 + MA20斜率
+      - 波动率(20%): 10日滚动波动率 vs 20日均值
+      - 量能(20%): 5日均量 vs 20日均量
+      - 动量(20%): 10日涨跌幅
     
     返回: {date_str: "BULL"/"BEAR"/"RANGE"}
     """
@@ -433,23 +434,60 @@ def _precompute_market_regime(df: pd.DataFrame, benchmark_df: pd.DataFrame = Non
     dates = source_df["date"].values
     n = len(source_df)
     
-    # 向量化计算MA20和MA60
     close_s = pd.Series(close)
     ma20_arr = close_s.rolling(20).mean().values
     ma60_arr = close_s.rolling(60).mean().values
     
-    # 向量化判定市场环境（替代Python for循环）
-    bull_mask = (close > ma20_arr) & (ma20_arr > ma60_arr)
-    bear_mask = (close < ma60_arr) & (ma20_arr < ma60_arr)
+    # V9.2: 4维加权评分（向量化）
+    # 1. 趋势维度: MA关系 + MA20斜率
+    ma_bull = ((close > ma20_arr) & (ma20_arr > ma60_arr)).astype(float)
+    ma_bear = ((close < ma60_arr) & (ma20_arr < ma60_arr)).astype(float)
+    # MA20斜率（正=趋势向上）
+    ma20_slope = pd.Series(ma20_arr).pct_change(5).values
+    trend_score = np.where(ma_bull > 0, 1.0, np.where(ma_bear > 0, -1.0, 0.0))
+    trend_score += np.clip(ma20_slope * 100, -0.5, 0.5)  # 斜率加成
+    trend_score = np.clip(trend_score, -1.5, 1.5)
+    
+    # 2. 波动率维度: 10日std vs 20日均std
+    vol_10 = close_s.pct_change().rolling(10).std().values
+    vol_20_mean = close_s.pct_change().rolling(20).std().values
+    vol_ratio = np.where(vol_20_mean > 0, vol_10 / np.maximum(vol_20_mean, 1e-8), 1.0)
+    # 低波动=中性/牛市特征，高波动=熊市特征
+    vol_score = np.where(vol_ratio < 0.8, 0.5, np.where(vol_ratio > 1.5, -0.5, 0.0))
+    
+    # 3. 量能维度: 5日均量 vs 20日均量（如有volume列）
+    vol_score_arr = np.zeros(n)
+    if "volume" in source_df.columns:
+        vol_data = source_df["volume"].values.astype(float)
+        vol_5 = pd.Series(vol_data).rolling(5).mean().values
+        vol_20 = pd.Series(vol_data).rolling(20).mean().values
+        vol_ma_ratio = np.where(vol_20 > 0, vol_5 / np.maximum(vol_20, 1), 1.0)
+        # 放量上涨=牛市特征，放量下跌=熊市特征
+        price_up = close > pd.Series(close).shift(5).values
+        vol_score_arr = np.where(
+            price_up & (vol_ma_ratio > 1.2), 0.5,
+            np.where(~price_up & (vol_ma_ratio > 1.3), -0.5, 0.0)
+        )
+    
+    # 4. 动量维度: 10日涨跌幅
+    momentum_10d = close_s.pct_change(10).values
+    mom_score = np.clip(momentum_10d * 10, -1.0, 1.0)
+    
+    # 加权总分（趋势40% + 波动率20% + 量能20% + 动量20%）
+    weighted = (trend_score * 0.40 + vol_score * 0.20 +
+                vol_score_arr * 0.20 + mom_score * 0.20)
     
     regime_map = {}
     for idx in range(60, n):
         if np.isnan(ma20_arr[idx]) or np.isnan(ma60_arr[idx]):
             continue
         date_str = str(dates[idx])
-        if bull_mask[idx]:
+        w = weighted[idx]
+        if np.isnan(w):
+            regime_map[date_str] = "RANGE"
+        elif w > 0.3:
             regime_map[date_str] = "BULL"
-        elif bear_mask[idx]:
+        elif w < -0.3:
             regime_map[date_str] = "BEAR"
         else:
             regime_map[date_str] = "RANGE"
@@ -526,6 +564,9 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
     # V5.3: 连续亏损冷却机制
     consec_losses = 0       # 当前连续亏损笔数
     cooldown_until_idx = 0  # 冷却期截止的bar索引
+    # V6.1: 同股信号最小间隔（避免同一股票短期内重复开仓）
+    min_signal_interval = getattr(config, 'MIN_SIGNAL_INTERVAL_DAYS', 3)
+    last_sell_bar_idx = -999  # 上次卖出的bar索引
 
     for i in range(60, n):
         date = dates_arr[i]
@@ -682,9 +723,11 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                         if consec_limit >= 3:
                             buy_signal = False
 
-                # 质量分门槛
+                # 质量分门槛（V6.1: 从 config 读取，分市场环境）
                 current_regime = regime_series.get(date, "RANGE")
-                min_quality = 70 if current_regime == "BEAR" else 60
+                min_quality_bear = getattr(config, 'MIN_SIGNAL_QUALITY_BEAR', 70)
+                min_quality_non_bear = getattr(config, 'MIN_SIGNAL_QUALITY_NON_BEAR', 65)
+                min_quality = min_quality_bear if current_regime == "BEAR" else min_quality_non_bear
                 if signal_quality < min_quality:
                     buy_signal = False
 
@@ -700,6 +743,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     buy_signal = False
 
             if not buy_signal:
+                continue
+
+            # V6.1: 同股信号最小间隔检查
+            if (i - last_sell_bar_idx) < min_signal_interval:
                 continue
 
             # ==== T+1执行买入 ====
@@ -791,31 +838,37 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             # 比亚迪教训: 8天<-2%导致6笔0%胜率，而移除后19笔58%胜率+94.6%
             # 替代: 依靠ATR止损(4-10%)自然截断亏损
 
-            # ---- 双轨止盈: 第一轨阶梯止盈 ----
+            # ---- 双轨止盈: 第一轨阶梯止盈（V6.1: 从 config.LADDER_SELL_LEVELS 读取）----
             if not sell_signal and position_shares > 0:
-                # 第1档: 浮盈8% 卖1/3
-                if not ladder_sold[0] and profit_pct >= 0.08:
+                ladder_levels = getattr(config, 'LADDER_SELL_LEVELS', [(0.12, 1/3), (0.25, 1/3)])
+                # 第1档
+                if not ladder_sold[0] and profit_pct >= ladder_levels[0][0]:
                     sell_signal = True
                     sell_type = "阶梯止盈1"
-                    sell_ratio = 1/3
+                    sell_ratio = ladder_levels[0][1]
                     ladder_sold[0] = True
-                # 第2档: 浮盈20% 再卖1/3
-                elif not ladder_sold[1] and profit_pct >= 0.20:
+                # 第2档
+                elif not ladder_sold[1] and profit_pct >= ladder_levels[1][0]:
                     sell_signal = True
                     sell_type = "阶梯止盈2"
-                    sell_ratio = 1/3
+                    sell_ratio = ladder_levels[1][1]
                     ladder_sold[1] = True
 
             # ---- 双轨止盈: 第二轨回落止盈（底仓）----
-            # OPTIMIZE: 龙头回落止盈从5%放宽至6%，让利润多跑一段（回测显示回落止盈300笔、胜率91%、平均+4.70%）
-            # P0: 市场环境自适应 - BULL时回落止盈放宽至8%（让利润充分奔跑）
+            # V6.1: 从 config.DRAWDOWN_STOP 读取，BULL市场额外放宽
             if not sell_signal and highest_since_buy > buy_price * 1.05:
                 current_regime = regime_series.get(date, "RANGE")
+                drawdown_stop_cfg = getattr(config, 'DRAWDOWN_STOP', {"龙头稳健": 0.08, "成长赛道": 0.07, "高弹性": 0.06})
+                bull_boost = getattr(config, 'DRAWDOWN_STOP_BULL_BOOST', 0.02)
                 if stock_type == "龙头":
-                    drawdown_threshold = 0.08 if current_regime == "BULL" else 0.06  # BULL: 8%, 其他: 6%
+                    drawdown_threshold = drawdown_stop_cfg.get("龙头稳健", 0.08)
+                    if current_regime == "BULL":
+                        drawdown_threshold += bull_boost  # BULL: 龙头8%+2%=10%
                 else:
-                    drawdown_threshold = 0.03  # 弹性标的保持3%不变
-                # FIX: 用盘中最低价计算回撇（与V4 L348一致，实盘条件单盘中触发）
+                    drawdown_threshold = drawdown_stop_cfg.get("高弹性", 0.06)
+                    if current_regime == "BULL":
+                        drawdown_threshold += bull_boost  # BULL: 弹性6%+2%=8%
+                # FIX: 用盘中最低价计算回撤（与V4 L348一致，实盘条件单盘中触发）
                 drawdown = (highest_since_buy - low) / highest_since_buy
                 if drawdown >= drawdown_threshold and profit_pct > 0:
                     sell_signal = True
@@ -902,6 +955,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                 if position_shares <= 0 or sell_ratio >= 1.0:
                     in_position = False
                     position_shares = 0
+                    last_sell_bar_idx = i  # V6.1: 记录卖出bar索引
 
     # 回测结束仍持仓
     if in_position and position_shares > 0:

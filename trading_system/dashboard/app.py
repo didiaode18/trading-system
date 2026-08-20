@@ -234,6 +234,10 @@ def render_signals():
 def render_lifecycle():
     """策略管理页"""
     st.header("🔄 策略生命周期")
+    # V9.3: 检查模拟盘开关
+    paper_cfg = getattr(config, 'PAPER_TRADING_CONFIG', {})
+    if paper_cfg.get('enabled', False):
+        st.info("🔵 模拟盘已启用")
     lifecycle = load_lifecycle()
 
     if not lifecycle:

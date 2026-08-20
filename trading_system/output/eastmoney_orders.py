@@ -547,7 +547,7 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
         buy_price = sig["buy_price"]
         stop_loss = sig.get("stop_loss_initial", buy_price * 0.9)
 
-        from strategy.position import calc_first_batch
+        from trading_system.strategy.position import calc_first_batch
         batch = calc_first_batch(buy_price, stop_loss, stock_type, config.TOTAL_CAPITAL)
         shares = batch["shares"] if batch["pass_risk"] else 0
 
@@ -587,7 +587,7 @@ def _map_signal_to_order(code: str, sig: dict, holding: dict = None, data_df=Non
         shares = holding.get("shares", 0)
 
         if add_price > 0 and shares > 0:
-            from strategy.position import calc_second_batch
+            from trading_system.strategy.position import calc_second_batch
             first_batch = {"shares": shares}
             second = calc_second_batch(add_price, first_batch, stock_type, config.TOTAL_CAPITAL)
             add_shares = second["shares"]
@@ -936,7 +936,7 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
     # V9.0: 信号衰减检查
     expired_signals = []
     try:
-        from strategy.signal_decay import SignalDecayManager
+        from trading_system.strategy.signal_decay import SignalDecayManager
         decay_mgr = SignalDecayManager()
         for code, sig in signals:
             freshness = decay_mgr.evaluate_freshness(sig)
@@ -980,7 +980,7 @@ def send_eastmoney_orders_email(signals: list, holdings: dict = None, data_dict:
     # 追加新闻/政策风险预警板块（仅供参考，非交易信号）
     if news_risk:
         try:
-            from strategy.news_monitor import generate_news_alert_html
+            from trading_system.strategy.news_monitor import generate_news_alert_html
             news_html = generate_news_alert_html(news_risk)
             if news_html:
                 # 插入到</body>之前

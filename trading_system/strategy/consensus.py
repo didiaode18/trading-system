@@ -241,11 +241,13 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     # ============================================================
     # 7. 置信度计算
     # ============================================================
-    # 四模块方向一致性越高，置信度越高
+    # V9.2: 引入历史准确率加权（各模块历史预测表现影响置信度）
     directions = [strategy_direction, forecast_direction, vp_direction, flow_direction]
+    module_names = ["trend_forecast", "trend_forecast", "trend_forecast", "consensus"]
     bullish_count = sum(1 for d in directions if "多" in d)
     bearish_count = sum(1 for d in directions if "空" in d)
 
+    # 基础置信度（一致性计数）
     if bullish_count == 4 or bearish_count == 4:
         confidence = 90  # 四模块一致
     elif bullish_count == 3 or bearish_count == 3:
@@ -256,6 +258,22 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
         confidence = 40  # 存在矛盾
     else:
         confidence = 55  # 中性
+
+    # V9.2: 历史准确率校准加成
+    try:
+        from monitor.prediction_tracker import PredictionTracker
+        _pt = PredictionTracker()
+        _acc_report = _pt.get_accuracy_report()
+        _by_source = _acc_report.get("by_source", {})
+        # 各模块历史准确率
+        _forecast_acc = _by_source.get("trend_forecast", {}).get("accuracy", 0.5)
+        _consensus_acc = _by_source.get("consensus", {}).get("accuracy", 0.5)
+        # 校准: 历史准确率高时提升置信度，低时降低
+        _avg_acc = (_forecast_acc + _consensus_acc) / 2 if (_forecast_acc + _consensus_acc) > 0 else 0.5
+        _calibration_bonus = (_avg_acc - 0.5) * 20  # 准确率60%→+2, 40%→-2, 70%→+4
+        confidence = int(confidence + _calibration_bonus)
+    except Exception:
+        pass  # 无历史数据时使用原始置信度
 
     # 信号强度加成
     signal_strength = abs(total_score) / 100
@@ -272,6 +290,31 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     )
     result["action"] = action
     result["action_confidence"] = f"{action_conf}%"
+
+    # ============================================================
+    # 9. V9.2: 共识预测接入PredictionTracker（打通预测验证闭环）
+    # ============================================================
+    try:
+        from monitor.prediction_tracker import PredictionTracker
+        _tracker = PredictionTracker()
+        # 方向映射: 看多/偏多 → "偏多", 看空/偏空 → "偏空", 分歧/中性 → "中性"
+        _dir = result.get("direction", "中性")
+        if "多" in _dir:
+            _pt_dir = "偏多"
+        elif "空" in _dir:
+            _pt_dir = "偏空"
+        else:
+            _pt_dir = "中性"
+        _tracker.record_forecast(
+            code=code,
+            direction=_pt_dir,
+            confidence=confidence,
+            composite_score=total_score,
+            source="consensus",
+            extra={"action": action, "conflict": result.get("conflict", False)},
+        )
+    except Exception:
+        pass  # 持久化失败不影响主流程
 
     return result
 

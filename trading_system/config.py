@@ -269,6 +269,7 @@ SECTOR_CANDIDATES = {
             "600879": {"名称": "航天电子", "细分": "航天电子", "类型": "龙头"},
             "601698": {"名称": "中国卫通", "细分": "卫星通信", "类型": "龙头"},
             "001270": {"名称": "铖昌科技", "细分": "相控阵芯片", "类型": "弹性"},
+            "600760": {"名称": "中航沈飞", "细分": "军工主机厂", "类型": "龙头"},
         }
     },
     # ==================== 二、新能源类（大类权重合计15%）====================
@@ -601,6 +602,9 @@ SCREENER_CONFIG = {
     "final_blend_prediction": 0.60,    # 前瞻评分在最终排序中的权重
     "crowded_penalty_threshold": 15.0, # 拥挤度惩罚触发阈值（5日涨幅%）
     "crowded_penalty_max": 10.0,       # 拥挤度最大扣分
+    # V9.3: 赛道强弱阈值（原硬编码默认值，现显式配置可调）
+    "sector_strong_score": 60,         # 赛道评分≥60分视为强势赛道
+    "sector_weak_score": 40,           # 赛道评分≤40分视为弱势赛道
     # V5.1: 动态权重（regime-aware）
     "dynamic_weight_enabled": True,    # 动态权重总开关
     # 趋势模式(breadth>55%): N/L因子权重×1.2（强势股继续领涨）
@@ -622,6 +626,23 @@ SCREENER_CONFIG = {
 # FIX: 调仓评分阈值单一来源（GAP=评分差门槛, SELL=卖出阈值, BUY=买入阈值）
 # 与 generate_holdings_report.py V3.2 口径一致，供回测/报告共用，避免多处硬编码漂移
 REBALANCE_CONFIG = {"score_gap": 25, "sell_threshold": 30, "buy_threshold": 70}
+
+# V10.0: 持仓末位淘汰配置（holding_ranking.py）
+# 当持仓数超过目标时，按四维加权评分淘汰最弱标的，释放资金用于更强候选
+ELIMINATION_CONFIG = {
+    "min_holdings_to_trigger": 7,      # 持仓数≥7只时触发淘汰建议
+    "max_holdings_target": 6,          # 淘汰目标数量（精简到此数）
+    "eliminate_count": 1,              # 每次最多建议淘汰1只（保守策略）
+    "weight_tech_score": 0.40,         # 技术评分权重
+    "weight_pnl_rank": 0.30,           # 盈亏表现排名权重
+    "weight_trend_strength": 0.20,     # 趋势强度权重
+    "weight_capital_efficiency": 0.10, # 资金效率权重
+    "eliminate_score_threshold": 35,   # 综合分<35标记"建议淘汰"
+    "eliminate_score_warning": 45,     # 综合分<45标记"关注"
+    "protect_recent_buy_days": 5,      # 买入≤5天不淘汰（观察期）
+    "protect_profit_above_pct": 15,    # 浮盈>15%不淘汰（强势保护）
+    "protect_sector_unique": True,     # 唯一赛道标的保护
+}
 
 # 新闻/政策风控配置（仅做风控刹车+选股过滤，不产生买卖信号）
 NEWS_MONITOR_ENABLED = True          # 是否启用新闻监控
@@ -794,6 +815,13 @@ BREAKOUT_HOLD_PCT = 0.99         # 回踩不破突破位（收盘>=突破日收�
 REJECT_DROP_PCT = -0.03          # 当日跌幅>3%且放量 → 排除
 REJECT_VOLUME_RATIO = 1.5        # 放量下跌的量能阈值
 MIN_SIGNAL_QUALITY_LIVE = 62     # P0-2: 实盘信号质量硬门槛（回测55→62，减少假信号30%+）
+# V6.1: 信号质量分市场环境（回测50万验证: 57.2%胜率/盈亏比1.00，提高门槛过滤低质量信号）
+MIN_SIGNAL_QUALITY_BEAR = 75     # V6.2: 熊市门槛70→75（回测熊市命中率仅33.2%，提高拦截）
+MIN_SIGNAL_QUALITY_NON_BEAR = 65 # V6.1: 非熊市从60提升至65（预期减少15%假信号，胜率+2-3%）
+
+# V6.2: 买点下跌趋势过滤（回测假信号率23.1%，加强过滤）
+BUY_SIGNAL_MA60_SLOPE_FILTER = True   # MA60下行时不买（下降趋势中回踩大概率破位）
+BUY_SIGNAL_VOL_CONFIRM = True         # 回踩后需放量阳线确认（量>均量×0.8 且 收阳）
 
 # ============================================================
 # 五、建仓参数（分批建仓）
@@ -832,24 +860,47 @@ TIME_STOP_PROFIT = 0.05          # 超期且浮盈<5%则卖出（中线标准提
 MACD_DEATH_CROSS_ENABLED = False  # 关闭MACD死叉卖出（假信号太多）
 TREND_BREAK_ENABLED = False       # 关闭趋势破位卖出（40笔全亏，假破位严重）
 
+# V6.1: 同股信号最小间隔（避免同一股票短期内重复开仓）
+MIN_SIGNAL_INTERVAL_DAYS = 3      # 同一只股票两次买入信号至少间隔3个交易日
+
 # ============================================================
-# 七、止盈参数（双轨制）V6.0优化版
+# 七、止盈参数（双轨制）V6.1优化版
 # ============================================================
-# V6.0优化: 阶梯第1档从8%提高到10%（让利润跑更远再分批）
+# V6.1优化: 阶梯第1档从10%提高到12%（回测盈亏比1.00→目标1.20+，让盈利单充分奔跑）
 # 第一轨：阶梯目标止盈
 LADDER_SELL_LEVELS = [
     # (浮盈阈值, 卖出比例)
-    (0.10, 1/3),                   # 浮盈10%: 卖出1/3（V6.0: 8%→10%）
-    (0.20, 1/3),                   # 浮盈20%: 再卖出1/3
+    (0.12, 1/3),                   # 浮盈12%: 卖出1/3（V6.1: 10%→12%，提升盈亏比）
+    (0.25, 1/3),                   # 浮盈25%: 再卖出1/3（V6.1: 20%→25%，让大牛股跑更远）
+]
+
+# V6.2: 盘中止盈提醒阈值（与阶梯止盈对齐，回测10%/20%提醒过早，超半数继续上涨）
+PROFIT_ALERT_LEVELS = [
+    0.15,                          # 第一止盈提醒: 浮盈15%（V6.2: 10%→15%）
+    0.25,                          # 第二止盈提醒: 浮盈25%（V6.2: 20%→25%）
 ]
 
 # 第二轨：回落止盈（按股票类型区分）
-# V6.0优化: 放宽回落阈值（让利润跑更远，减少过早止盈）
+# V6.1优化: 龙头回落从7%放宽至8%（BULL市场10%），弹性从5%放宽至6%
 DRAWDOWN_STOP = {
-    "龙头稳健": 0.07,              # 稳健龙头：高点回落7%（V6.0: 5%→7%）
-    "成长赛道": 0.06,              # 成长赛道：回落6%（V6.0: 4%→6%）
-    "高弹性":   0.05,              # 高弹性小票：回落5%（V6.0: 3%→5%）
+    "龙头稳健": 0.08,              # 稳健龙头：高点回落8%（V6.1: 7%→8%）
+    "成长赛道": 0.07,              # 成长赛道：回落7%（V6.1: 6%→7%）
+    "高弹性":   0.06,              # 高弹性小票：回落6%（V6.1: 5%→6%）
 }
+# V6.2: 回落止盈最低浮盈门槛（回测41.3%有效率，提高门槛减少误报）
+DRAWDOWN_PROFIT_MIN_PROFIT = 0.06  # V6.2: 浮盈>6%才触发回落止盈（原5%过松）
+DRAWDOWN_PROFIT_TIME_WINDOW = 3    # V6.2: 回撤需在3日内发生（防滞后误报）
+
+# V6.2: 振幅异常趋势过滤（回测43.2%有效率，结合趋势位置判断）
+AMPLITUDE_TREND_FILTER = True      # 仅当股价<MA20时预警振幅（高位振幅可能是拉升）
+
+# V6.2: 趋势破位增强（回测49.7%有效率接近随机，增加确认条件）
+TREND_BREAK_MA60_SLOPE_THRESHOLD = -0.005  # MA60日斜率<-0.5%才算下行（原0太敏感）
+TREND_BREAK_CONSECUTIVE_DAYS = 3          # 需连续3日收盘<MA60（原1日太容易假破位）
+TREND_BREAK_VOL_CONFIRM = 1.3            # 破位日量>均量×1.3（放量破位更可信）
+
+# V6.1: 牛市回落止盈额外放宽（让利润在趋势行情中充分奔跑）
+DRAWDOWN_STOP_BULL_BOOST = 0.02   # BULL市场回落阈值额外+2%（龙头8%→10%，弹性6%→8%）
 
 # ============================================================
 # 八、风控熔断参数
@@ -907,7 +958,7 @@ RISK_UNIFIED_CONFIG = {
     "consecutive_loss_pause": 5,      # V3.2: 连续亏损3笔 → 暂停5天（原3天）
     "consecutive_loss_today": 2,      # 连续亏损2笔 → 暂停2天（V3.2: 原"当日禁止"升级）
     "consecutive_loss_2_pause": 2,    # V3.2新增: 连亏2笔暂停天数
-    "cool_down_days": 2,              # 卖出后冷却天数
+    "cool_down_days": 2,              # 卖出后冷却天数（V9.3: 统一命名，原DISCIPLINE_CONFIG.cooldown_days=3已合并至此）
 
     # --- 满仓防护 ---
     "full_position_threshold": 0.90,  # 仓位>=90%绝对禁止买入
@@ -932,6 +983,43 @@ RISK_UNIFIED_CONFIG = {
     "max_stop_loss_pct": 0.15,        # 最大止损比例15%（防止止损太近）
     "trailing_atr_multiplier": 1.5,   # 移动止损ATR倍数
     "stop_loss_close_confirm": True,  # V3.2新增: 止损需收盘确认（避免盘中假突破误杀）
+
+    # --- 渐进式回撤控制（V6.1新增，替代硬熔断避免恐慌性止损）---
+    "drawdown_scale_levels": [
+        # (回撤阈值, 仓位缩放比例) — 渐进式降仓而非硬熔断
+        (-0.05, 0.80),                # 浮亏5%: 仓位降至80%
+        (-0.08, 0.60),                # 浮亏8%: 仓位降至60%
+        (-0.10, 0.00),                # 浮亏10%: 禁止新开仓（原硬熔断线）
+    ],
+}
+
+# ============================================================
+# 八''、策略失效检测器配置（V6.1: 从类内部提取到config，便于调优）
+# ============================================================
+# 回测问题: 50万回测中频繁触发breaker级别，导致大量"P2-5策略失效联动"日志
+# 根因: 20笔窗口太小 + 40%降级阈值太敏感 → 正常回撤也触发熔断
+SFD_CONFIG = {
+    "window_size": 30,                # V6.1: 滚动窗口20→30笔（更大窗口减少噪音触发）
+    "degrade_win_rate": 35,           # V6.1: 降级阈值40%→35%（减少误触发）
+    "pause_win_rate": 25,             # V6.1: 暂停阈值30%→25%（只在严重失效时暂停）
+    "breaker_expectancy": -1.0,       # V6.1: 熔断阈值0%→-1%（允许小幅负期望不熔断）
+    "consec_loss_breaker": 7,         # V6.1: 连续亏损熔断5→7笔（5笔太敏感）
+    "auto_recovery_days": 5,          # 暂停/熔断超过5天自动降级为degrade
+    "recovery_trades": 5,             # 恢复后前5笔仓位减半（试探性恢复）
+}
+
+# ============================================================
+# 八''''、Walk-Forward防过拟合配置（V6.1: 从walk_forward.py提取到config）
+# ============================================================
+# 回测问题: 过拟合度2886.7%，根因是训练窗口太短+参数网格维度太高
+WF_CONFIG = {
+    "train_days": 200,                # V6.1: 训练窗口150→200天（覆盖完整牛熊周期）
+    "test_days": 60,                  # V6.1: 验证窗口40→60天（增加统计显著性）
+    "max_windows": 10,                # 最多10个窗口（控制运行时间）
+    "param_grid": {
+        "initial_stop_loss": [0.06, 0.08],  # 2个止损值
+        "min_signal_quality": [60, 65, 70], # 3个质量门槛
+    },  # 共2×3=6组合（原6组合已足够，保持）
 }
 
 # ============================================================
@@ -1037,6 +1125,11 @@ BUY_POINT_ALERT_DINGTALK_ONLY = True   # True=仅钉钉; False=钉钉+邮件双�
 ALERT_DINGTALK_MIN_LEVEL = "high"  # 钉钉推送最低级别门槛: "critical"/"high"/"warning"
 # 竞价预警: critical级是否补发钉钉
 AUCTION_ALERT_DINGTALK = True
+
+# V6.0: 预警确认(ACK)机制 —— 用户点击"已处理"后当日静默同标的同规则预警
+ALERT_ACK_ENABLED = True            # ACK机制总开关
+ALERT_ACK_CALLBACK_URL = "http://192.168.88.101:9876/ack/"  # 回调服务器URL前缀(钉钉按钮点击目标, 用局域网IP让手机可访问)
+ALERT_ACK_SERVER_PORT = 9876        # 回调服务器监听端口
 
 # ============================================================
 # 十二、邮件通知配置（QQ邮箱SMTP）
@@ -1254,8 +1347,8 @@ POSITION_CONFIG = {
 # 二十、ML信号增强配置（V8.0新增）
 # ============================================================
 ML_CONFIG = {
-    "enabled": False,                   # 是否启用ML确认（需先训练模型）
-    "model_name": "xgb_v1",            # 模型文件名
+    "enabled": True,                    # V9.3: 启用ML确认（LightGBM已安装+NaN修复）
+    "model_name": "xgb_daily",         # V9.3: 统一模型名（与周度训练保存的模型名一致）
     "confirm_threshold": 0.65,          # ML确认阈值
     "retrain_accuracy": 0.55,           # 重训练触发准确率
     "retrain_window": 10,               # 重训练观察窗口(天)
@@ -1267,21 +1360,25 @@ ML_CONFIG = {
 # 验证结论: 胜率46.9%, 盈亏比0.79, 总亏损-315,162元
 # 核心病因: 日均18笔买入/62.8%小单<1万/持仓越长胜率越低
 DISCIPLINE_CONFIG = {
+    # --- 交易纪律硬约束（V9.3: 所有键均已接入scheduler.py盘前检查）---
     "max_daily_buys": 3,              # 每日最多3笔买入（验证: 日均18笔→巨亏）
     "min_trade_amount": 20000,        # 单笔最低2万元（验证: 62.8%小单<1万被手续费吃掉）
-    "max_holdings_hard": 7,           # 持仓硬限制7只（验证: 173只→无研究深度）
-    "max_single_etf_ratio": 0.20,     # 单只ETF最大20%（当前科创50占53%严重超限）
-    "cooldown_days": 3,               # 同标的卖出后冷却3天
-    "min_holding_days": 3,            # 最小持仓3天（止损除外）
-    "max_consecutive_loss": 5,        # 连亏5次强制休息1天
-    "monthly_loss_limit": -0.10,      # 月亏损>10%降仓至5成
+    "min_holding_days": 3,            # 最小持仓3天（止损除外）→ scheduler盘前检查
+    "max_consecutive_loss": 5,        # 连亏5次强制休息1天 → scheduler盘前检查
+    "monthly_loss_limit": -0.10,      # 月亏损>10%降仓至5成 → scheduler盘前检查
+    # V9.3: 以下键已统一到RISK_UNIFIED_CONFIG，此处删除避免重复定义
+    # max_holdings_hard → RISK_UNIFIED_CONFIG.max_holdings (=7)
+    # max_single_etf_ratio → RISK_UNIFIED_CONFIG.etf_max_ratio (=0.20)
+    # cooldown_days → RISK_UNIFIED_CONFIG.cool_down_days (=2)
 }
 
 # ============================================================
 # 二十一、模拟盘配置（V8.0新增）
 # ============================================================
 PAPER_TRADING_CONFIG = {
-    "enabled": False,                   # 是否启用模拟盘
+    # V9.3: 模拟盘功能尚未实现，此配置为预留。
+    # 当enabled=True时，dashboard/app.py将显示模拟盘入口。
+    "enabled": False,                   # 是否启用模拟盘（功能未实现，保持False）
     "graduation_days": 20,              # 毕业所需天数
     "min_sharpe": 1.0,                  # 毕业最低夏普
     "max_drawdown": 0.10,               # 毕业最大回撤
@@ -1304,7 +1401,6 @@ CAOPAN_CONFIG = {
     # --- 乖离率分级交易指引 ---
     "deviation_overbought": 0.10,      # 偏离>10%: 超买区，减仓1/2
     "deviation_high": 0.05,            # 偏离5%~10%: 偏高区，减仓1/3
-    "deviation_normal": 0.05,          # 偏离-5%~5%: 正常区间，持有
     "deviation_oversold": -0.10,       # 偏离<-10%: 超卖区，仅强上升可低吸
 
     # --- DK买卖点（三重共振确认）---
@@ -1318,7 +1414,7 @@ CAOPAN_CONFIG = {
     "dk_pullback_days": 5,             # D点后N日内回踩LL1视为有效入场
 
     # --- 资金监控（多维验证）---
-    "fund_flow_method": "estimate",    # "akshare" / "estimate"
+    "fund_flow_method": "estimate",    # "akshare" / "estimate"  # V9.3: 保留供未来多数据源切换
     "large_order_ratio": 0.20,         # 大单占比阈值
     "fund_flow_ma_period": 5,          # 资金流均线周期
     "fund_min_layers_confirm": 2,      # 最少N层同向才确认有效
@@ -1335,10 +1431,6 @@ CAOPAN_CONFIG = {
     "stop_loss_below_ll2": 0.02,       # 止损位: LL2下方2%（从3%收紧至2%）
     "max_risk_atr_mult": 2.0,          # 最大风险不超过2倍ATR（防止止损太远）
     "rr_position_scale": True,         # 盈亏比联动仓位
-
-    # --- 多周期共振 ---
-    "weekly_trend_required": True,     # 周线趋势必须同向
-    "weekly_ma_period": 10,            # 周线均线周期
 
     # --- 回测参数 ---
     "backtest_years": 3,
@@ -1414,9 +1506,10 @@ VOL_RATIO_CONFIG = {
     "high_level_profit_pct": 5.0,       # 浮盈>5%时放量滞涨 → 出货嫌疑
 }
 
-# --- P1-2: K线形态识别 ---
+# --- P1-2: K线形态识别（V10.0: 扩展为完整形态引擎参数）---
 KLINE_PATTERN_CONFIG = {
     "enabled": True,
+    # 基础形态参数
     "min_body_ratio": 0.3,              # 实体占振幅最小比例(十字星判定)
     "long_shadow_ratio": 2.0,           # 影线>实体2倍 → 长影线
     "doji_body_pct": 0.10,              # 实体<振幅10% → 十字星
@@ -1424,6 +1517,30 @@ KLINE_PATTERN_CONFIG = {
     "three_crows_min_drop": -0.02,      # 三只乌鸦: 每根跌幅>2%
     "alert_email_on_top": True,         # 顶部形态发邮件
     "lookback_days": 5,                 # 形态识别回看天数
+    # V10.0: 形态评分参数（接入trend_forecast第六维度）
+    "pattern_score_bullish_valid": 10,    # 有效看涨形态加分（位置正确）
+    "pattern_score_bearish_valid": -10,   # 有效看跌形态扣分（位置正确）
+    "pattern_score_invalid_location": 0,  # 位置不对时不加分（中性）
+    "min_confidence_threshold": 0.65,     # 最低置信度阈值（V10.1: 0.6→0.65，减少噪音形态干扰）
+    "composite_weight_pattern": 0.08,     # K线形态在综合评分中的权重（V10.1: 11%→8%，降低形态维度对综合评分的扰动）
+    # V10.1: 形态加分非对称化（4档趋势×方向组合）
+    "pattern_bonus_bullish_trend_up": 4,    # 看涨+趋势向上（顺势适度加分）
+    "pattern_bonus_bearish_trend_up": -1,   # 看跌+趋势向上（正常回调不重扣）
+    "pattern_bonus_bullish_trend_down": 0,  # 看涨+趋势向下（逆势信号不可信）
+    "pattern_bonus_bearish_trend_down": -4, # 看跌+趋势向下（顺势可信，保持力度）
+    # V10.1: 形态类型分级加权（A股中线波段有效性）
+    "pattern_type_weight": {
+        "看涨吞没": 2.0, "曙光初现": 2.0, "早晨之星": 2.0, "看跌吞没": 2.0, "黄昏之星": 2.0, "倾盆大雨": 1.5,
+        "红三兵": 1.5, "三只乌鸦": 1.5, "锤子线": 1.0, "大阳线": 1.0, "大阴线": 1.0,
+        "射击之星": 1.0, "刺透形态": 1.5, "乌云盖顶": 1.5,
+        "十字星": 0.5, "纺锤线": 0.3, "螺旋桨": 0.3, "平底": 0.3, "平顶": 0.3,
+    },
+    # V10.1: 行业差异化形态权重（高波动行业形态更有效，低波动行业形态多为噪音）
+    "sector_pattern_weight": {
+        "半导体": 1.5, "电子": 1.5, "AI": 1.2, "军工": 1.0,
+        "新能源": 1.0, "有色": 1.0, "面板": 1.0,
+        "金融": 0.3, "白酒": 0.3, "消费": 0.3, "医药": 0.5,
+    },
 }
 
 # --- P1-3: 主力四阶段 ---

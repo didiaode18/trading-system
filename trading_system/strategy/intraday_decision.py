@@ -57,7 +57,7 @@ try:
 except ImportError:
     HAS_AKSHARE = False
 
-from data.realtime import fetch_realtime_batch, fetch_index_realtime
+from ..data.realtime import fetch_realtime_batch, fetch_index_realtime
 
 
 # ============================================================
@@ -88,6 +88,10 @@ _MA5_CACHE = {"date": None, "data": {}}
 
 # 决策优先级排序权重
 _URGENCY_ORDER = {"紧急卖出": 0, "禁止加仓": 1, "建议减仓": 2, "回调加仓": 3, "持有观察": 4, "可以加仓": 5}
+
+# V9.2: 回调加仓信号冷却（同标的同类型信号30分钟内不重复发送，防止每15分钟反复触发）
+_PULLBACK_ADD_COOLDOWN = {}  # {code: datetime} 上次触发时间
+_PULLBACK_ADD_COOLDOWN_MIN = 30  # 冷却分钟数
 
 
 # ============================================================
@@ -594,6 +598,14 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
                         market_drop_pct=market_pct / 100
                     )
                     if pb_result.get("pass"):
+                        # V9.2: 回调加仓冷却检查（同标的30分钟内不重复触发）
+                        _now = datetime.datetime.now()
+                        _last = _PULLBACK_ADD_COOLDOWN.get(code)
+                        if _last and (_now - _last).total_seconds() < _PULLBACK_ADD_COOLDOWN_MIN * 60:
+                            logger.debug(f"[盘中决策] {code} 回调加仓冷却中"
+                                        f"(距上次{(_now - _last).total_seconds()/60:.0f}分钟)，跳过")
+                            continue
+                        _PULLBACK_ADD_COOLDOWN[code] = _now
                         # 覆盖决策为"回调加仓"
                         d["decision"] = "回调加仓"
                         d["decision_icon"] = "📉"

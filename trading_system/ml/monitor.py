@@ -247,3 +247,52 @@ class ModelMonitor:
                 'predictions': list(self.predictions),
                 'is_degraded': self.is_degraded,
             }, f, ensure_ascii=False)
+
+    def auto_retrain_if_needed(self, prepare_data_fn=None) -> bool:
+        """V9.2: 检测到模型漂移时自动触发重训练
+        
+        Args:
+            prepare_data_fn: 可选的数据准备函数，返回 (X, y)
+                            如果为None，使用默认的训练数据准备逻辑
+        
+        Returns:
+            True 如果触发了重训练，False 否则
+        """
+        if not self.needs_retrain():
+            return False
+
+        verified = [p for p in self.predictions if p.get('verified')]
+        if len(verified) < 20:
+            logger.info("[ML自动重训练] 已验证样本不足20条，跳过重训练")
+            return False
+
+        logger.warning(f"[ML自动重训练] 检测到模型漂移，启动自动重训练...")
+        try:
+            from ml.trainer import ModelTrainer
+            trainer = ModelTrainer(model_type="lightgbm")
+
+            if prepare_data_fn is not None:
+                X, y = prepare_data_fn()
+            else:
+                # 默认逻辑: 使用最近120天数据重训练
+                logger.info("[ML自动重训练] 使用默认数据准备逻辑")
+                return False  # 无外部数据源时跳过
+
+            if X is None or X.empty or y is None or y.empty:
+                logger.warning("[ML自动重训练] 训练数据不足，跳过")
+                return False
+
+            model = trainer.train(X, y)
+            if model is not None:
+                trainer.save(model, "xgb_daily")
+                # 重置降级状态
+                self.is_degraded = False
+                self.save()
+                logger.info("[ML自动重训练] ✅ 重训练完成，模型已更新，降级已解除")
+                return True
+            else:
+                logger.warning("[ML自动重训练] 训练返回空模型")
+                return False
+        except Exception as e:
+            logger.error(f"[ML自动重训练] 异常: {e}")
+            return False

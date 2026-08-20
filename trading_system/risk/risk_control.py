@@ -23,6 +23,10 @@ import logging
 # FIX: 清理 RiskGate 死代码，同步移除无引用的 Dict 导入
 from typing import List, Optional, Tuple
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
+
 logger = logging.getLogger(__name__)
 
 # 延迟导入ATR止损函数（避免循环导入）
@@ -79,6 +83,25 @@ RISK_CONFIG = {
     # --- 盈亏比准入 ---
     "min_risk_reward": 2.5,         # 最低盈亏比（不达标拦截）
 }
+
+# V9.3: 将config.RISK_UNIFIED_CONFIG作为唯一调优源覆盖本地默认值
+# 优先级: RISK_UNIFIED_CONFIG(config.py) > RISK_CONFIG(本地默认)
+try:
+    _unified = getattr(config, 'RISK_UNIFIED_CONFIG', {})
+    for _k, _v in _unified.items():
+        # 仅覆盖RISK_CONFIG中已存在的键，或新增组合风控键
+        if _k in RISK_CONFIG or _k in (
+            'sector_concentration_limit', 'portfolio_drawdown_limit',
+            'drawdown_scale_levels', 'trailing_atr_multiplier',
+            'stop_loss_close_confirm', 'max_single_loss_ratio',
+            'initial_stop_loss_pct', 'min_stop_loss_pct', 'max_stop_loss_pct',
+            'atr_stop_multiplier', 'flexible_max_ratio',
+            'daily_loss_limit', 'daily_loss_limit_l2',
+            'near_full_position', 'full_position_threshold',
+        ):
+            RISK_CONFIG[_k] = _v
+except Exception:
+    pass  # 配置读取失败时使用本地默认值
 
 # 状态文件路径（记录熔断/冷却状态）
 STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -264,16 +287,19 @@ class RiskStateManager:
 
 class StrategyFailureDetector:
     """
-    策略失效检测器 V1.0
+    策略失效检测器 V2.0
     
     基于滚动窗口胜率/期望收益的三级熔断机制：
-      - 降级（DEGRADE）: 滚动20笔胜率 < 40% → 仓位减半
-      - 暂停（PAUSE）:  滚动20笔胜率 < 30% → 禁止买入
-      - 熔断（BREAKER）: 滚动20笔期望 < 0% → 全面暂停
+      - 降级（DEGRADE）: 滚动N笔胜率 < degrade_win_rate% → 仓位减半
+      - 暂停（PAUSE）:  滚动N笔胜率 < pause_win_rate% → 禁止买入
+      - 熔断（BREAKER）: 滚动N笔期望 < breaker_expectancy% → 全面暂停
     
-    设计原理：
-      回测显示最大连续亏损17次，说明策略在特定市场环境下会持续失效。
-      与其等到连续亏损熔断（3笔暂停），不如提前通过滚动胜率检测策略退化。
+    V2.0优化（基于50万回测诊断）:
+      - 所有阈值从 config.SFD_CONFIG 读取，便于调优
+      - 窗口20→30笔（减少噪音触发）
+      - 降级40%→35%、暂停30%→25%（减少误触发）
+      - 熔断0%→-1%（允许小幅负期望）
+      - 连续亏损熔断5→7笔
     
     使用方式:
         detector = StrategyFailureDetector()
@@ -281,16 +307,16 @@ class StrategyFailureDetector:
         status = detector.get_status()  # 获取当前状态
     """
     
-    # 三级阈值（不修改config.py，使用类内默认值）
-    WINDOW_SIZE = 20          # 滚动窗口大小
-    DEGRADE_WIN_RATE = 40     # 胜率<40% → 降级（仓位减半）
-    PAUSE_WIN_RATE = 30       # 胜率<30% → 暂停买入
-    BREAKER_EXPECTANCY = 0    # 期望<0% → 全面熔断
-    RECOVERY_TRADES = 5       # 恢复后前5笔仓位减半（试探性恢复）
-    AUTO_RECOVERY_DAYS = 5    # V3.2: 暂停/熔断超过5天自动降级为degrade
-    CONSEC_LOSS_BREAKER = 5   # V3.2: 连续5笔亏损直接熔断
-    
     def __init__(self):
+        # V6.1: 从 config.SFD_CONFIG 读取阈值，便于外部调优
+        sfd_cfg = getattr(config, 'SFD_CONFIG', {})
+        self.WINDOW_SIZE = sfd_cfg.get('window_size', 30)
+        self.DEGRADE_WIN_RATE = sfd_cfg.get('degrade_win_rate', 35)
+        self.PAUSE_WIN_RATE = sfd_cfg.get('pause_win_rate', 25)
+        self.BREAKER_EXPECTANCY = sfd_cfg.get('breaker_expectancy', -1.0)
+        self.CONSEC_LOSS_BREAKER = sfd_cfg.get('consec_loss_breaker', 7)
+        self.AUTO_RECOVERY_DAYS = sfd_cfg.get('auto_recovery_days', 5)
+        self.RECOVERY_TRADES = sfd_cfg.get('recovery_trades', 5)
         self.state = self._load_state()
     
     def _load_state(self) -> dict:
@@ -427,9 +453,9 @@ class StrategyFailureDetector:
         
         level_map = {
             "normal": {"scale": 1.0, "allow_buy": True, "msg": "策略正常运行"},
-            "degrade": {"scale": 0.5, "allow_buy": True, "msg": f"策略降级: 胜率{win_rate:.0f}%<40%, 仓位减半"},
-            "pause": {"scale": 0.0, "allow_buy": False, "msg": f"策略暂停: 胜率{win_rate:.0f}%<30%, 禁止买入"},
-            "breaker": {"scale": 0.0, "allow_buy": False, "msg": f"策略熔断: 期望{expectancy:+.2f}%<0%, 全面暂停"},
+            "degrade": {"scale": 0.5, "allow_buy": True, "msg": f"策略降级: 胜率{win_rate:.0f}%<{self.DEGRADE_WIN_RATE}%, 仓位减半"},
+            "pause": {"scale": 0.0, "allow_buy": False, "msg": f"策略暂停: 胜率{win_rate:.0f}%<{self.PAUSE_WIN_RATE}%, 禁止买入"},
+            "breaker": {"scale": 0.0, "allow_buy": False, "msg": f"策略熔断: 期望{expectancy:+.2f}%<{self.BREAKER_EXPECTANCY}%, 全面暂停"},
         }
         info = level_map.get(level, level_map["normal"])
         

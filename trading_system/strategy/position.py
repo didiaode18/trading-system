@@ -23,8 +23,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from position.kelly import half_kelly_position
-from strategy.trade_journal import JOURNAL_DB_PATH
+from trading_system.position.kelly import half_kelly_position
+from .trade_journal import JOURNAL_DB_PATH
 
 logger = logging.getLogger(__name__)
 

@@ -41,7 +41,7 @@ class ModelTrainer:
     用法:
         trainer = ModelTrainer()
         model = trainer.train(X, y)
-        trainer.save(model, "xgb_v1")
+        trainer.save(model, "xgb_daily")
     """
 
     def __init__(self, model_type: str = "lightgbm"):
@@ -159,9 +159,10 @@ class ModelTrainer:
         # TimeSeriesSplit时序交叉验证
         tscv = TimeSeriesSplit(n_splits=cv_folds)
         try:
+            # V9.3 FIX: sklearn 1.7+已移除cross_val_score/cross_validate的fit_params参数
+            # CV仅用于评估指标，不带权重；全量训练在下方仍使用组合权重
             scores = cross_val_score(
-                model, X, y, cv=tscv, scoring="f1_macro",
-                fit_params={"sample_weight": sample_weights}
+                model, X, y, cv=tscv, scoring="f1_macro"
             )
             logger.info(f"LightGBM CV F1-macro: {scores.mean():.3f} ± {scores.std():.3f}")
         except Exception as e:

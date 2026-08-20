@@ -147,33 +147,31 @@ print("模块2: 综合分析报告测试")
 print("="*70)
 
 # 测试2.1: 持仓数据加载
-print("\n[测试2.1] 持仓数据加载（17只标的）")
+print("\n[测试2.1] 持仓数据加载")
 try:
     holdings = json.load(open(config.HOLDINGS_FILE, encoding='utf-8'))
     active_holdings = {c: h for c, h in holdings.items() if h.get('shares', 0) > 0}
+    max_hold = getattr(config, 'MAX_HOLDINGS', len(active_holdings))
     
-    if len(active_holdings) == 17:
-        result.add_pass("综合报告", "持仓数据加载", f"加载{len(active_holdings)}只持仓")
+    if len(active_holdings) > 0 and len(active_holdings) <= max_hold:
+        result.add_pass("综合报告", "持仓数据加载", f"加载{len(active_holdings)}只持仓（上限{max_hold}）")
     else:
-        result.add_fail("综合报告", "持仓数据加载", f"期望17只，实际{len(active_holdings)}只")
+        result.add_fail("综合报告", "持仓数据加载", f"持仓{len(active_holdings)}只，上限{max_hold}")
 except Exception as e:
     result.add_fail("综合报告", "持仓数据加载", f"异常：{e}")
 
 # 测试2.2: 资金配置准确性
 print("\n[测试2.2] 资金配置准确性")
 try:
-    expected_capital = 673519.80
-    expected_cash = 18271.80
-    
-    if abs(config.TOTAL_CAPITAL - expected_capital) < 0.01:
+    if config.TOTAL_CAPITAL > 0:
         result.add_pass("综合报告", "总资产配置", f"{config.TOTAL_CAPITAL:,.2f}")
     else:
-        result.add_fail("综合报告", "总资产配置", f"期望{expected_capital}，实际{config.TOTAL_CAPITAL}")
+        result.add_fail("综合报告", "总资产配置", f"TOTAL_CAPITAL={config.TOTAL_CAPITAL}（请在config_local.py填写）")
     
-    if abs(config.AVAILABLE_CASH - expected_cash) < 0.01:
+    if config.AVAILABLE_CASH > 0:
         result.add_pass("综合报告", "可用资金配置", f"{config.AVAILABLE_CASH:,.2f}")
     else:
-        result.add_fail("综合报告", "可用资金配置", f"期望{expected_cash}，实际{config.AVAILABLE_CASH}")
+        result.add_fail("综合报告", "可用资金配置", f"AVAILABLE_CASH={config.AVAILABLE_CASH}（请在config_local.py填写）")
 except Exception as e:
     result.add_fail("综合报告", "资金配置", f"异常：{e}")
 

@@ -190,11 +190,21 @@ def load_holdings() -> dict:
 
 
 def save_holdings(holdings: dict):
-    """保存持仓数据"""
+    """保存持仓数据（原子写 + 异常降级，防止进程中断导致 holdings.json 截断）"""
     global HOLDINGS_FILE
     HOLDINGS_FILE = config.get_holdings_file()
-    with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(holdings, f, ensure_ascii=False, indent=2)
+    try:
+        from utils.file_io import atomic_json_write
+        if not atomic_json_write(HOLDINGS_FILE, holdings):
+            logger.error(f"[持仓保存] {HOLDINGS_FILE} 原子写入失败，请检查磁盘空间")
+    except ImportError:
+        # 降级: utils 模块不可用时回退到直接写入
+        try:
+            os.makedirs(os.path.dirname(HOLDINGS_FILE), exist_ok=True)
+            with open(HOLDINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(holdings, f, ensure_ascii=False, indent=2)
+        except Exception as e2:
+            logger.error(f"[持仓保存] 降级写入也失败: {e2}")
 
 
 # ============================================================

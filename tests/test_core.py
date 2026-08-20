@@ -58,10 +58,12 @@ class TestRiskControl:
         assert allowed  # 胜率75%应该允许
 
     def test_strategy_failure_consecutive_loss(self):
-        """策略失效检测: 连续5笔亏损触发熔断"""
+        """策略失效检测: 连续亏损触发熔断（V9.3: 阈值从5调整为7，与SFD_CONFIG.consec_loss_breaker一致）"""
         from trading_system.risk.risk_control import StrategyFailureDetector
+        import config as _cfg
+        _threshold = getattr(_cfg, 'SFD_CONFIG', {}).get('consec_loss_breaker', 7)
         detector = StrategyFailureDetector()
-        for _ in range(5):
+        for _ in range(_threshold):
             detector.record_trade(-0.05)
         status = detector.get_status()
         assert status["level"] in ("breaker", "pause")

@@ -493,10 +493,11 @@ def validate_close_prices(codes: list = None, tolerance: float = 0.02) -> dict:
         realtime = fetch_realtime_batch(codes)
     except Exception as e:
         logger.warning(f"多源校验: 实时行情获取失败: {e}")
-        return {}
+        return {"_error": f"实时行情获取失败: {e}"}
     
     if not realtime:
-        return {}
+        logger.warning("多源校验: 实时行情返回空结果，可能全部数据源失败")
+        return {"_error": "实时行情返回空结果"}
     
     conn = init_db()
     cursor = conn.cursor()

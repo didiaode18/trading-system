@@ -36,6 +36,7 @@ from strategy.recommend_engine import run_recommendation, generate_trading_plan
 # FIX B4: 统一使用UnifiedRiskEngine替代已废弃的RiskGate
 # V4.0(G4): 新增 pre_trade_check_orders 条件单下单前硬校验
 from risk.risk_control import UnifiedRiskEngine, RISK_CONFIG, pre_trade_check_orders
+from utils.board_rules import is_limit_up as _board_is_limit_up, get_limit_pct
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -213,7 +214,10 @@ def generate_condition_orders(holding, df, realtime_price):
         if prev_close > 0:
             today_change_pct = (price / prev_close - 1) * 100
 
-    if today_change_pct >= 9.5:  # 当日涨停（主板≥9.5%）
+    # V2: 统一涨跌停判定（区分板块 — 主板10%/创业板20%/ST 5%/科创板20%）
+    _limit_pct = get_limit_pct(code, name) * 100  # 转为百分比
+    _limit_tol = _limit_pct - 0.2  # 容差0.2%处理四舍五入
+    if today_change_pct >= _limit_tol:  # 当日涨停
         # 涨停板不触发止损，改为生成"次日止盈单"
         next_day_stop = round(price * 0.97, 3)  # 次日从涨停价回落3%触发
         _log_price_check(code, name, "涨停止盈", next_day_stop, price)

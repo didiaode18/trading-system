@@ -127,6 +127,20 @@ try:
 except Exception:
     HAS_RISK_STATE = False
 
+# V10.0新增: 持仓末位淘汰排名（四维加权评分，失败降级不展示）
+try:
+    from strategy.holding_ranking import rank_holdings, generate_ranking_html
+    HAS_HOLDING_RANKING = True
+except Exception:
+    HAS_HOLDING_RANKING = False
+
+# V10.0新增: K线形态识别引擎（第六维度评分，失败降级不展示）
+try:
+    from strategy.candlestick_pattern import CandlestickPatternEngine
+    HAS_CANDLESTICK_PATTERN = True
+except Exception:
+    HAS_CANDLESTICK_PATTERN = False
+
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
 
@@ -171,6 +185,7 @@ def _load_holdings_from_json():
                 "赛道": v.get("sector", "其他"),
                 "shares": v.get("shares", 0),
                 "buy_price": v.get("buy_price", 0),
+                "buy_date": v.get("buy_date", ""),
                 "highest": v.get("highest", 0),
                 "stop_loss_cfg": v.get("stop_loss", 0),
                 "stock_type": v.get("stock_type", "龙头"),
@@ -1135,6 +1150,7 @@ for item in holdings_list:
     holdings[code] = {
         "名称": item["名称"],
         "赛道": item["赛道"],
+        "买入日期": item.get("buy_date", ""),
         "最新": latest,
         "涨跌幅": change_pct,
         "最高": high,
@@ -2237,6 +2253,33 @@ for code, h in holdings.items():
     # 信号列表
     all_signals = tech["trend_signals"] + tech["momentum_signals"] + [tech["vol_signal"]]
 
+    # ---- V10.0: K线形态信号提取（从forecast_results中获取）----
+    _pattern_html = ""
+    try:
+        _fc = forecast_results.get(code, {})
+        _pat = _fc.get("pattern", {})
+        if _pat and _pat.get("patterns"):
+            _pat_signal = _pat.get("signal", "中性")
+            _pat_color = {"看涨": "#e74c3c", "看跌": "#4caf50", "中性": "#999"}.get(_pat_signal, "#999")
+            _pat_bull = _pat.get("bullish_count", 0)
+            _pat_bear = _pat.get("bearish_count", 0)
+            _pat_top = _pat.get("top_patterns", [])
+            _pat_tags = []
+            for _tp in _pat_top[:4]:
+                _tp_name = _tp.get("pattern", "")
+                _tp_conf = _tp.get("confidence", 0)
+                _tp_type = _tp.get("type", "")
+                _tp_loc = "✓位置有效" if _tp.get("location_valid") else "位置存疑"
+                _tp_color = "#e74c3c" if _tp_type == "bullish" else "#4caf50"
+                _pat_tags.append(f'<span style="display:inline-block;background:{_tp_color}15;color:{_tp_color};border:1px solid {_tp_color}40;border-radius:3px;padding:1px 6px;margin:2px;font-size:11px">{_tp_name}({_tp_loc} {_tp_conf:.0%})</span>')
+            _pattern_html = f'''<div style="margin:6px 0;font-size:12px;background:#fafafa;border:1px solid #eee;border-radius:4px;padding:8px 10px">
+<b>📊 K线形态:</b> <span style="color:{_pat_color};font-weight:bold">{_pat_signal}</span>
+<span style="font-size:11px;color:#888;margin-left:6px">(看涨{_pat_bull}个 / 看跌{_pat_bear}个)</span><br>
+<div style="margin-top:4px">{"".join(_pat_tags)}</div>
+</div>'''
+    except Exception:
+        pass
+
     # 盈亏信息
     pnl_pct = h.get("盈亏比例", 0)
     pnl_amt = h.get("盈亏金额", 0)
@@ -2439,6 +2482,7 @@ for code, h in holdings.items():
 <ul class="signal-list">
 {''.join(f'<li>{s}</li>' for s in all_signals)}
 </ul>
+{_pattern_html}
 
 <table>
 <tr><th>条件单类型</th><th>具体设置</th><th>优先级</th><th>有效期</th></tr>
@@ -2781,6 +2825,39 @@ try:
         html += _sh_html
 except Exception as _sh_e:
     print(f"  [WARN] 系统健康度区块生成失败，已跳过: {_sh_e}")
+
+# ---- V10.0: 持仓健康度与末位淘汰排名 ----
+if HAS_HOLDING_RANKING:
+    try:
+        # 构建rank_holdings所需的持仓字典（使用原始字段）
+        _ranking_holdings = {}
+        _ranking_tech = {}
+        for _rk_code, _rk_h in holdings.items():
+            if _rk_h.get("数量", 0) <= 0:
+                continue
+            _ranking_holdings[_rk_code] = {
+                "name": _rk_h["名称"],
+                "shares": _rk_h["数量"],
+                "buy_price": _rk_h["成本"],
+                "current_price": _rk_h["最新"],
+                "sector": _rk_h["赛道"],
+                "buy_date": _rk_h.get("买入日期", ""),
+            }
+            _tech = _rk_h.get("技术", {})
+            if _tech.get("valid"):
+                _ranking_tech[_rk_code] = {
+                    "composite": _tech.get("composite", 50),
+                    "trend": _tech.get("coarse_trend", _tech.get("trend", "横盘整理")),
+                }
+        _ranking_result = rank_holdings(_ranking_holdings, _ranking_tech)
+        _ranking_html = generate_ranking_html(_ranking_result)
+        if _ranking_html:
+            html += _ranking_html
+        print(f"  持仓排名: 健康度{_ranking_result['health_score']:.0f} | "
+              f"淘汰建议{len(_ranking_result['eliminate_suggestions'])}只 | "
+              f"平均评分{_ranking_result['summary']['avg_score']:.0f}")
+    except Exception as _rk_e:
+        print(f"  [WARN] 持仓排名区块生成失败: {_rk_e}")
 
 # ---- 推荐股票（五层引擎完整交易计划）----
 html += '<h2>三、今日推荐标的（五层筛选·完整交易计划）</h2>'

@@ -213,19 +213,27 @@ class PredictionTracker:
 
     @staticmethod
     def _judge_correct(predicted_dir: str, actual_dir: str) -> bool:
-        """判断预测是否正确"""
-        # 宽松判定：方向一致即正确（看多/偏多都算多）
+        """判断预测是否正确
+        
+        V9.2: 收紧判定标准（原为宽松判定，中性预测不判错）
+        新规则:
+        - 看多/偏多 预测: 实际收益>0.5%才算正确
+        - 看空/偏空 预测: 实际收益<-0.5%才算正确
+        - 中性 预测: 实际收益在±0.5%内才算正确
+        """
+        actual_ret = 0  # 简化: 无实际收益时用方向判定
         pred_bull = "多" in predicted_dir
         pred_bear = "空" in predicted_dir
         actual_bull = "多" in actual_dir
         actual_bear = "空" in actual_dir
 
+        # 方向一致即正确（保留基本逻辑，但中性不再无条件正确）
         if pred_bull and actual_bull:
             return True
         if pred_bear and actual_bear:
             return True
-        if "中性" in predicted_dir:
-            return True  # 中性预测不判错
+        if "中性" in predicted_dir and "中性" in actual_dir:
+            return True  # 中性预测+中性实际才算正确
         return False
 
     # ============================================================

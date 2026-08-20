@@ -119,10 +119,16 @@ def compute_indicators(df):
 # 二、CANSLIM因子评分(简化回测版)
 # ============================================================
 
-def calc_canslim_factors(df, idx, all_data=None):
+def calc_canslim_factors(df, idx, all_data=None, use_v2=False):
     """
     在df的第idx行计算CANSLIM六因子评分(简化版,与stock_screener.py逻辑一致)
     返回: {N, S, L, CAI, P, W, total}
+
+    V2改进:
+      P0-1: P因子从均值回归(RSI超卖)改为动量导向(RSI偏强+MACD金叉)
+      P0-2: CAI从固定8分改为20日动量代理(对齐实盘stock_screener.py)
+      P2-1: N因子增加120日新高维度
+      P2-2: S因子满分对齐实盘(20→10)
     """
     if idx < 60:
         return None
@@ -147,21 +153,28 @@ def calc_canslim_factors(df, idx, all_data=None):
             n_score += 12
         if close > ma20 and ma20 > ma60:
             n_score += 8
+        # V2: 120日新高维度(更长期的突破更可靠)
+        if use_v2 and idx >= 120:
+            high_120 = df["high"].iloc[idx-120:idx].max()
+            if close >= high_120:
+                n_score += 5  # 创半年新高额外加分
     factors["N"] = min(n_score, 20)
 
-    # S因子(供需): 量价配合 (满分20)
+    # S因子(供需): 量价配合
+    # V2: 满分对齐实盘(20→10)
+    s_max = 10 if use_v2 else 20
     s_score = 0
     if not pd.isna(vol_ma20) and vol_ma20 > 0:
         vol_ratio = volume / vol_ma20
         if vol_ratio < 0.7 and close >= ma20 * 0.99:
-            s_score += 12  # 缩量回踩
+            s_score += 6 if use_v2 else 12  # 缩量回踩
         if vol_ratio > 1.5 and close > df["close"].iloc[max(0, idx-1)]:
-            s_score += 8   # 放量上涨
+            s_score += 4 if use_v2 else 8   # 放量上涨
         if idx >= 5:
             vol_5d = df["volume"].iloc[idx-5:idx].mean()
             if vol_5d < vol_ma20 * 0.8:
-                s_score += 5  # 近5日缩量
-    factors["S"] = min(s_score, 20)
+                s_score += 3 if use_v2 else 5  # 近5日缩量
+    factors["S"] = min(s_score, s_max)
 
     # L因子(龙头): 相对强度 (满分20)
     l_score = 0
@@ -173,30 +186,75 @@ def calc_canslim_factors(df, idx, all_data=None):
             l_score += 8
         elif change_20d > 0:
             l_score += 4
+        # V2: 60日相对强度(更长期的龙头更可靠)
+        if use_v2 and idx >= 60:
+            change_60d = (close / df["close"].iloc[idx-60] - 1) * 100
+            if change_60d > 20:
+                l_score += 5
+            elif change_60d > 10:
+                l_score += 3
     if not pd.isna(ma20) and close > ma20:
         l_score += 5
     if not pd.isna(ma60) and close > ma60:
         l_score += 3
     factors["L"] = min(l_score, 20)
 
-    # CAI因子(基本面): 回测中使用中性分8/20(V2.7规则)
-    factors["CAI"] = 8
+    # CAI因子(基本面)
+    if use_v2:
+        # V2(P0-2): 用20日动量代理替代固定8分(对齐实盘stock_screener.py逻辑)
+        if idx >= 21:
+            _proxy_chg = (close / df["close"].iloc[idx-21] - 1) * 100
+            if _proxy_chg > 10:
+                cai_score = 10
+            elif _proxy_chg > 5:
+                cai_score = 8
+            elif _proxy_chg > 0:
+                cai_score = 6
+            else:
+                cai_score = 4
+        else:
+            cai_score = 6
+        factors["CAI"] = cai_score
+    else:
+        # V1: 固定中性分
+        factors["CAI"] = 8
 
     # P因子(买点): 回踩支撑+技术形态 (满分20)
-    p_score = 0
-    ma20_slope = row["ma20_slope"]
-    if not pd.isna(ma20_slope) and ma20_slope > 0:
-        p_score += 6  # MA20向上
-    if not pd.isna(row.get("rsi")):
-        rsi = row["rsi"]
-        if 30 < rsi < 50:
-            p_score += 8  # RSI超卖回升区间
-        elif 50 <= rsi < 70:
-            p_score += 5  # RSI偏强
-    low = row["low"]
-    if not pd.isna(ma20) and low <= ma20 * 1.01 and close >= ma20:
-        p_score += 6  # 回踩MA20确认
-    factors["P"] = min(p_score, 20)
+    if use_v2:
+        # V2(P0-1): 从均值回归(RSI超卖)改为动量导向
+        p_score = 0
+        ma20_slope = row["ma20_slope"]
+        if not pd.isna(ma20_slope) and ma20_slope > 0:
+            p_score += 6  # MA20向上(趋势确认)
+        if not pd.isna(row.get("rsi")):
+            rsi = row["rsi"]
+            # V2: 动量导向 - RSI偏强(50-70)给高分，超卖(30-50)不再奖励
+            if 50 <= rsi < 70:
+                p_score += 8  # 健康动量区间
+            elif 40 <= rsi < 50:
+                p_score += 4  # 中性偏弱(给少量分)
+            # RSI<30不再给分(超跌不等于买点)
+        # V2: MACD金叉确认(替代MA20回踩)
+        if not pd.isna(row.get("macd_dif")) and not pd.isna(row.get("macd_dea")):
+            if row["macd_dif"] > row["macd_dea"]:
+                p_score += 6  # MACD在零轴上方/金叉
+        factors["P"] = min(p_score, 20)
+    else:
+        # V1: 原逻辑(RSI超卖+MA20回踩)
+        p_score = 0
+        ma20_slope = row["ma20_slope"]
+        if not pd.isna(ma20_slope) and ma20_slope > 0:
+            p_score += 6  # MA20向上
+        if not pd.isna(row.get("rsi")):
+            rsi = row["rsi"]
+            if 30 < rsi < 50:
+                p_score += 8  # RSI超卖回升区间
+            elif 50 <= rsi < 70:
+                p_score += 5  # RSI偏强
+        low = row["low"]
+        if not pd.isna(ma20) and low <= ma20 * 1.01 and close >= ma20:
+            p_score += 6  # 回踩MA20确认
+        factors["P"] = min(p_score, 20)
 
     # W因子(大盘): 简化为基于指数均线(满分+5/-5)
     w_score = 0
@@ -225,8 +283,11 @@ def calc_canslim_factors(df, idx, all_data=None):
 # 三、Composite评分(与generate_holdings_report.py一致)
 # ============================================================
 
-def calc_composite(df, idx):
-    """计算composite = 50 + trend_score*8 + momentum_score*6"""
+def calc_composite(df, idx, use_v2=False):
+    """计算composite = 50 + trend_score*8 + momentum_score*6
+
+    V2改进: 增加量价维度(volume_trend)
+    """
     if idx < 60:
         return None
 
@@ -267,7 +328,18 @@ def calc_composite(df, idx):
     if not pd.isna(macd_dif) and not pd.isna(macd_dea):
         momentum_score += 1 if macd_dif > macd_dea else -1
 
-    composite = 50 + trend_score * 8 + momentum_score * 6
+    # V2: 量价维度
+    vol_trend = 0
+    if use_v2:
+        vol_ma20 = row.get("vol_ma20", np.nan)
+        if not pd.isna(vol_ma20) and vol_ma20 > 0:
+            vol_ratio = row["volume"] / vol_ma20
+            if vol_ratio > 1.3 and close > row.get("open", close):
+                vol_trend = 1   # 放量上涨
+            elif vol_ratio < 0.6 and close < ma20:
+                vol_trend = -1  # 缩量下跌
+
+    composite = 50 + trend_score * 8 + momentum_score * 6 + (vol_trend * 4 if use_v2 else 0)
     composite = max(0, min(100, composite))
     return {"composite": composite, "trend_score": trend_score, "momentum_score": momentum_score}
 
@@ -276,7 +348,7 @@ def calc_composite(df, idx):
 # 四、CANSLIM选股引擎回测
 # ============================================================
 
-def run_canslim_backtest(data_dict):
+def run_canslim_backtest(data_dict, use_v2=False):
     """
     A. CANSLIM选股引擎回测
     - 每SCAN_INTERVAL天扫描一次,记录推荐信号
@@ -356,7 +428,7 @@ def run_canslim_backtest(data_dict):
                     continue
 
             # CANSLIM评分
-            factors = calc_canslim_factors(df, idx, precomputed)
+            factors = calc_canslim_factors(df, idx, precomputed, use_v2=use_v2)
             if factors is None:
                 continue
 
@@ -562,7 +634,7 @@ def run_canslim_backtest(data_dict):
 # 五、综合分析报告回测
 # ============================================================
 
-def run_composite_backtest(data_dict, precomputed):
+def run_composite_backtest(data_dict, precomputed, use_v2=False):
     """
     B. 综合分析报告逻辑回测
     - composite评分预测力
@@ -594,7 +666,7 @@ def run_composite_backtest(data_dict, precomputed):
                 continue
             idx = date_mask.sum() - 1
 
-            result = calc_composite(df, idx)
+            result = calc_composite(df, idx, use_v2=use_v2)
             if result is None:
                 continue
 
@@ -754,9 +826,18 @@ def run_composite_backtest(data_dict, precomputed):
 # 六、组合模拟回测(完整策略)
 # ============================================================
 
-def run_portfolio_backtest(data_dict, precomputed):
+def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
+                          stop_loss_pct=None, max_positions=None, scan_interval=None):
     """
     完整组合回测: 模拟CANSLIM选股+composite评分+止损+调仓
+
+    V2(use_v2=True): 激进改进 - V2因子+熊市闸门完全暂停+时间止损15d/3%+阶梯止盈12%/3%+动态仓位
+    V3(version="v3"): 最小改进 - V1因子+V1组合规则+仅增加熊市闸门(完全暂停买入)
+
+    参数优化(仅对version="v3"生效):
+      stop_loss_pct: 止损幅度(默认config.INITIAL_STOP_LOSS_PCT=0.10)
+      max_positions: 最大持仓数(默认7)
+      scan_interval: 扫描间隔天数(默认SCAN_INTERVAL=5)
     """
     logger.info("\n" + "=" * 60)
     logger.info("  [C] 组合模拟回测(完整策略)")
@@ -771,11 +852,14 @@ def run_portfolio_backtest(data_dict, precomputed):
 
     # 组合状态
     cash = INITIAL_CAPITAL
-    positions = {}  # {code: {shares, buy_price, buy_date, buy_idx}}
+    positions = {}  # {code: {shares, buy_price, buy_date, buy_idx, hold_days}}
     trades = []
     daily_values = []
     max_value = INITIAL_CAPITAL
     max_drawdown = 0
+
+    # V2: 市场环境跟踪
+    _bear_pause_count = 0  # 熊市暂停计数
 
     for t_idx, date in enumerate(trade_dates):
         # 更新持仓市值
@@ -794,7 +878,19 @@ def run_portfolio_backtest(data_dict, precomputed):
         if dd > max_drawdown:
             max_drawdown = dd
 
-        # 每日止损检查
+        # 判断当日市场环境
+        idx_df = precomputed["000300"]
+        idx_mask = idx_df["date"] <= date
+        _regime = "RANGE"
+        if idx_mask.sum() >= 60:
+            _idx_row = idx_df[idx_mask].iloc[-1]
+            if not pd.isna(_idx_row.get("ma20")) and not pd.isna(_idx_row.get("ma60")):
+                if _idx_row["close"] > _idx_row["ma20"] > _idx_row["ma60"]:
+                    _regime = "BULL"
+                elif _idx_row["close"] < _idx_row["ma60"] and _idx_row["ma20"] < _idx_row["ma60"]:
+                    _regime = "BEAR"
+
+        # 每日止损/止盈/时间止损检查
         for code in list(positions.keys()):
             pos = positions[code]
             df = precomputed[code]
@@ -804,9 +900,11 @@ def run_portfolio_backtest(data_dict, precomputed):
             row = df[mask].iloc[0]
             price = row["close"]
             pnl_pct = (price - pos["buy_price"]) / pos["buy_price"]
+            pos["hold_days"] = pos.get("hold_days", 0) + 1
 
             # 止损
-            if pnl_pct <= -config.INITIAL_STOP_LOSS_PCT:
+            _sl = stop_loss_pct if stop_loss_pct is not None else config.INITIAL_STOP_LOSS_PCT
+            if pnl_pct <= -_sl:
                 sell_price = price * (1 - SLIPPAGE)
                 revenue = sell_price * pos["shares"]
                 cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -819,12 +917,41 @@ def run_portfolio_backtest(data_dict, precomputed):
                 del positions[code]
                 continue
 
-            # 移动止盈(浮盈>15%后回落5%止盈)
-            if pnl_pct > 0.15:
-                highest = pos.get("highest", pos["buy_price"])
-                pos["highest"] = max(highest, price)
-                drawdown_from_high = (pos["highest"] - price) / pos["highest"]
-                if drawdown_from_high > 0.06:
+            # 移动止盈
+            highest = pos.get("highest", pos["buy_price"])
+            pos["highest"] = max(highest, price)
+            drawdown_from_high = (pos["highest"] - price) / pos["highest"]
+
+            if use_v2:
+                # V2(P1-4): 阶梯式移动止盈
+                # 浮盈>12%: 回落3%止盈 | 浮盈>20%: 回落5%止盈
+                if pnl_pct > 0.20 and drawdown_from_high > 0.05:
+                    sell_price = price * (1 - SLIPPAGE)
+                    revenue = sell_price * pos["shares"]
+                    cost = revenue * (COMMISSION_RATE + STAMP_TAX)
+                    cash += revenue - cost
+                    trades.append({
+                        "code": code, "action": "sell", "date": date,
+                        "price": sell_price, "shares": pos["shares"],
+                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_20"
+                    })
+                    del positions[code]
+                    continue
+                elif pnl_pct > 0.12 and drawdown_from_high > 0.03:
+                    sell_price = price * (1 - SLIPPAGE)
+                    revenue = sell_price * pos["shares"]
+                    cost = revenue * (COMMISSION_RATE + STAMP_TAX)
+                    cash += revenue - cost
+                    trades.append({
+                        "code": code, "action": "sell", "date": date,
+                        "price": sell_price, "shares": pos["shares"],
+                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_12"
+                    })
+                    del positions[code]
+                    continue
+            else:
+                # V1: 浮盈>15%后回落6%止盈
+                if pnl_pct > 0.15 and drawdown_from_high > 0.06:
                     sell_price = price * (1 - SLIPPAGE)
                     revenue = sell_price * pos["shares"]
                     cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -835,12 +962,39 @@ def run_portfolio_backtest(data_dict, precomputed):
                         "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop"
                     })
                     del positions[code]
+                    continue
 
-        # 每周扫描买入(每SCAN_INTERVAL天)
-        if t_idx % SCAN_INTERVAL != 0 or t_idx < 60:
+            # V2(P1-2): 时间止损 - 持仓>15天且浮盈<3%则卖出(提高资金效率)
+            if use_v2 and pos["hold_days"] >= 15 and pnl_pct < 0.03:
+                sell_price = price * (1 - SLIPPAGE)
+                revenue = sell_price * pos["shares"]
+                cost = revenue * (COMMISSION_RATE + STAMP_TAX)
+                cash += revenue - cost
+                trades.append({
+                    "code": code, "action": "sell", "date": date,
+                    "price": sell_price, "shares": pos["shares"],
+                    "pnl_pct": pnl_pct * 100 - 0.35, "reason": "time_stop"
+                })
+                del positions[code]
+                continue
+
+        # 扫描买入
+        _si = scan_interval if scan_interval is not None else SCAN_INTERVAL
+        if t_idx % _si != 0 or t_idx < 60:
             continue
 
-        if len(positions) >= 7:  # 最大持仓7只
+        _mp = max_positions if max_positions is not None else 7
+        if len(positions) >= _mp:  # 最大持仓
+            continue
+
+        # V2: 熊市闸门 - BEAR市场暂停买入
+        if use_v2 and _regime == "BEAR":
+            _bear_pause_count += 1
+            continue
+
+        # V3: 熊市闸门 - BEAR市场暂停买入(唯一与V1不同的地方)
+        if version == "v3" and _regime == "BEAR":
+            _bear_pause_count += 1
             continue
 
         # 扫描候选
@@ -854,11 +1008,11 @@ def run_portfolio_backtest(data_dict, precomputed):
                 continue
             idx = date_mask.sum() - 1
 
-            factors = calc_canslim_factors(df, idx, precomputed)
+            factors = calc_canslim_factors(df, idx, precomputed, use_v2=use_v2)
             if factors is None:
                 continue
 
-            # 买入条件: score >= 50(强势) or >= 35(弱势)
+            # 买入条件
             idx_df = precomputed["000300"]
             idx_mask = idx_df["date"] <= date
             if idx_mask.sum() < 60:
@@ -866,24 +1020,40 @@ def run_portfolio_backtest(data_dict, precomputed):
             idx_row = idx_df[idx_mask].iloc[-1]
             market_up = (not pd.isna(idx_row.get("ma20")) and not pd.isna(idx_row.get("ma60")) and
                          idx_row["close"] > idx_row["ma20"] > idx_row["ma60"])
-            min_score = 50 if market_up else 35
+
+            if use_v2:
+                # V2: 弱势门槛收紧 - 非强势市场>=50
+                min_score = 50  # 统一门槛
+            else:
+                # V1/V3: 原逻辑
+                min_score = 50 if market_up else 35
 
             if factors["total"] >= min_score:
                 # 硬性筛选
                 row = df.iloc[idx]
                 if row["close"] < row["ma20"] * 0.95:
                     continue
+                # V2 only: MA60下行不买
+                if use_v2 and not pd.isna(row.get("ma60")) and idx >= 5:
+                    ma60_5ago = df["ma60"].iloc[max(0, idx-5)]
+                    if not pd.isna(ma60_5ago) and row["ma60"] < ma60_5ago * 0.995:
+                        continue
                 day_signals.append({"code": code, "score": factors["total"], "close": row["close"]})
 
         # 按评分排序,买入前2只
         day_signals.sort(key=lambda x: x["score"], reverse=True)
         for sig in day_signals[:2]:
-            if len(positions) >= 7:
+            if len(positions) >= _mp:
                 break
             code = sig["code"]
             buy_price = sig["close"] * (1 + SLIPPAGE)
-            # 仓位: 总资金/7
-            position_size = INITIAL_CAPITAL / 7
+
+            # V2(P1-3): 动态仓位 - 震荡市缩减仓位
+            if use_v2 and _regime == "RANGE":
+                position_size = INITIAL_CAPITAL / 10  # 震荡市10分仓(原7分仓)
+            else:
+                position_size = INITIAL_CAPITAL / 7
+
             shares = int(position_size / buy_price / 100) * 100
             if shares < 100:
                 continue
@@ -894,7 +1064,7 @@ def run_portfolio_backtest(data_dict, precomputed):
             cash -= cost + commission
             positions[code] = {
                 "shares": shares, "buy_price": buy_price,
-                "buy_date": date, "highest": buy_price
+                "buy_date": date, "highest": buy_price, "hold_days": 0
             }
             trades.append({
                 "code": code, "action": "buy", "date": date,
@@ -1062,20 +1232,162 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 # 八、主函数
 # ============================================================
 
+def generate_comparison_html(v1_cs, v2_cs, v1_comp, v2_comp, v1_pf, v2_pf):
+    """生成V1 vs V2对比HTML报告"""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+
+    def _card(label, v1_val, v2_val, fmt="+.1f", suffix="%", higher_better=True):
+        """生成对比卡片"""
+        diff = v2_val - v1_val
+        color = "#e74c3c" if (diff > 0) == higher_better else "#27ae60"
+        return (f'<div class="card"><div class="l">{label}</div>'
+                f'<div class="v">{v1_val:{fmt}}{suffix} → <span style="color:{color}">{v2_val:{fmt}}{suffix}</span></div>'
+                f'<div class="l" style="color:{color}">{diff:+.1f}{suffix}</div></div>')
+
+    cards = ""
+    cards += _card("总收益", v1_pf["total_return"]*100, v2_pf["total_return"]*100)
+    cards += _card("年化收益", v1_pf["annual_return"]*100, v2_pf["annual_return"]*100)
+    cards += _card("最大回撤", v1_pf["max_drawdown"]*100, v2_pf["max_drawdown"]*100, higher_better=False)
+    cards += _card("夏普比率", v1_pf["sharpe"], v2_pf["sharpe"], fmt=".2f", suffix="")
+    cards += _card("胜率", v1_pf["win_rate"], v2_pf["win_rate"], fmt=".1f")
+    cards += _card("盈亏比", v1_pf["profit_factor"], v2_pf["profit_factor"], fmt=".2f", suffix="")
+    cards += _card("交易次数", v1_pf["total_trades"], v2_pf["total_trades"], fmt=".0f", suffix="", higher_better=False)
+    # 信号数
+    _v1_sig = len(v1_cs.get("sig_df", [])) if "sig_df" in v1_cs else 0
+    _v2_sig = len(v2_cs.get("sig_df", [])) if "sig_df" in v2_cs else 0
+    cards += _card("信号数", _v1_sig, _v2_sig, fmt=".0f", suffix="", higher_better=False)
+
+    # 评分分组对比表
+    score_rows = ""
+    v1_scores = {s["group"]: s for s in v1_cs.get("score_stats", [])}
+    v2_scores = {s["group"]: s for s in v2_cs.get("score_stats", [])}
+    for grp in [">=70", "50-69", "35-49", "<35"]:
+        s1 = v1_scores.get(grp, {})
+        s2 = v2_scores.get(grp, {})
+        if s1 or s2:
+            n1 = s1.get("count", 0)
+            n2 = s2.get("count", 0)
+            r5_1 = s1.get("avg_5d", 0)
+            r5_2 = s2.get("avg_5d", 0)
+            r20_1 = s1.get("avg_20d", 0)
+            r20_2 = s2.get("avg_20d", 0)
+            wr1 = s1.get("win_rate_20d", 0)
+            wr2 = s2.get("win_rate_20d", 0)
+            score_rows += (f"<tr><td>{grp}</td>"
+                          f"<td>{n1}</td><td>{r5_1:+.2f}%</td><td>{r20_1:+.2f}%</td><td>{wr1:.1f}%</td>"
+                          f"<td>{n2}</td><td>{r5_2:+.2f}%</td><td>{r20_2:+.2f}%</td><td>{wr2:.1f}%</td></tr>")
+
+    # 因子对比表
+    factor_rows = ""
+    v1_factors = {f["factor"]: f for f in v1_cs.get("factor_stats", [])}
+    v2_factors = {f["factor"]: f for f in v2_cs.get("factor_stats", [])}
+    for fname in ["N", "S", "L", "CAI", "P", "W"]:
+        f1 = v1_factors.get(fname, {})
+        f2 = v2_factors.get(fname, {})
+        sp1 = f1.get("spread", 0)
+        sp2 = f2.get("spread", 0)
+        m1 = "[OK]" if f1.get("effective") else "[WARN]"
+        m2 = "[OK]" if f2.get("effective") else "[WARN]"
+        factor_rows += (f"<tr><td>{fname}</td>"
+                       f"<td>{f1.get('high_20d',0):+.2f}%</td><td>{f1.get('low_20d',0):+.2f}%</td><td>{sp1:+.2f}%</td><td>{m1}</td>"
+                       f"<td>{f2.get('high_20d',0):+.2f}%</td><td>{f2.get('low_20d',0):+.2f}%</td><td>{sp2:+.2f}%</td><td>{m2}</td></tr>")
+
+    # Composite对比表
+    comp_rows = ""
+    v1_comps = {s["group"]: s for s in v1_comp.get("comp_stats", [])}
+    v2_comps = {s["group"]: s for s in v2_comp.get("comp_stats", [])}
+    for grp in [">=70", "55-69", "45-54", "30-44", "<30"]:
+        s1 = v1_comps.get(grp, {})
+        s2 = v2_comps.get(grp, {})
+        if s1 or s2:
+            comp_rows += (f"<tr><td>{grp}</td>"
+                         f"<td>{s1.get('count',0)}</td><td>{s1.get('avg_20d',0):+.2f}%</td><td>{s1.get('win_rate',0):.1f}%</td>"
+                         f"<td>{s2.get('count',0)}</td><td>{s2.get('avg_20d',0):+.2f}%</td><td>{s2.get('win_rate',0):.1f}%</td></tr>")
+
+    # 交易原因统计
+    v1_trades = v1_pf.get("trades", [])
+    v2_trades = v2_pf.get("trades", [])
+    v1_sell = [t for t in v1_trades if t["action"] == "sell"]
+    v2_sell = [t for t in v2_trades if t["action"] == "sell"]
+    v1_reasons = {}
+    v2_reasons = {}
+    for t in v1_sell:
+        r = t.get("reason", "other")
+        v1_reasons[r] = v1_reasons.get(r, 0) + 1
+    for t in v2_sell:
+        r = t.get("reason", "other")
+        v2_reasons[r] = v2_reasons.get(r, 0) + 1
+    reason_rows = ""
+    all_reasons = sorted(set(list(v1_reasons.keys()) + list(v2_reasons.keys())))
+    for r in all_reasons:
+        reason_rows += f"<tr><td>{r}</td><td>{v1_reasons.get(r,0)}</td><td>{v2_reasons.get(r,0)}</td></tr>"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{{font-family:'Microsoft YaHei',sans-serif;padding:20px;background:#f5f5f5}}
+.container{{max-width:1100px;margin:0 auto}}
+h1{{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px}}
+h2{{color:#34495e;margin-top:25px}}
+table{{width:100%;border-collapse:collapse;margin:12px 0;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 4px rgba(0,0,0,.1)}}
+th{{background:#34495e;color:#fff;padding:10px 8px;font-size:13px}}
+td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px}}
+.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:15px 0}}
+.card{{background:#fff;border-radius:8px;padding:15px;text-align:center;box-shadow:0 2px 4px rgba(0,0,0,.1)}}
+.card .v{{font-size:18px;font-weight:bold}}
+.card .l{{font-size:11px;color:#7f8c8d;margin-top:4px}}
+.up{{color:#e74c3c}}.down{{color:#27ae60}}
+.note{{background:#d4edda;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #28a745}}
+.warn{{background:#fff3cd;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #ffc107}}
+.improve{{background:#e8f5e9;padding:12px;border-radius:6px;margin:15px 0;font-size:13px;border-left:4px solid #4caf50}}
+</style></head><body><div class="container">
+<h1>CANSLIM选股引擎 V1 vs V2 改进对比报告</h1>
+<p>回测区间: {START_DATE} ~ {END_DATE} | 初始资金: {INITIAL_CAPITAL:,.0f}元 | 生成: {today}</p>
+
+<div class="improve">
+<b>V2改进清单:</b><br>
+[P0-1] P因子动量化: RSI 30-50超卖不再奖励 → RSI 50-70动量区间给高分 + MACD金叉确认<br>
+[P0-2] CAI动态化: 固定8分 → 20日动量代理(4-10分) 对齐实盘<br>
+[P0-3] 熊市闸门: BEAR市场暂停买入<br>
+[P1-1] 弱势门槛: score>=35 → >=50统一门槛 + MA60下行不买<br>
+[P1-2] 时间止损: 持仓>15天且浮盈<3%自动卖出<br>
+[P1-3] 动态仓位: 震荡市10分仓(原7分仓)<br>
+[P1-4] 阶梯止盈: 12%回落3%止盈 + 20%回落5%止盈<br>
+[P2-1] N因子增强: 加120日新高维度<br>
+[P2-2] S因子对齐: 满分20→10 对齐实盘<br>
+[P2-3] Composite增强: 加量价维度
+</div>
+
+<h2>组合绩效对比</h2>
+<div class="cards">{cards}</div>
+
+<h2>A1: 评分分组前瞻收益对比</h2>
+<table><tr><th rowspan="2">评分组</th><th colspan="4">V1(基线)</th><th colspan="4">V2(改进)</th></tr>
+<tr><th>N</th><th>5d</th><th>20d</th><th>WR20</th><th>N</th><th>5d</th><th>20d</th><th>WR20</th></tr>{score_rows}</table>
+
+<h2>A2: 因子贡献对比</h2>
+<table><tr><th rowspan="2">因子</th><th colspan="4">V1(基线)</th><th colspan="4">V2(改进)</th></tr>
+<tr><th>高分20d</th><th>低分20d</th><th>差值</th><th>有效</th><th>高分20d</th><th>低分20d</th><th>差值</th><th>有效</th></tr>{factor_rows}</table>
+
+<h2>B1: Composite评分预测力对比</h2>
+<table><tr><th rowspan="2">Composite</th><th colspan="3">V1(基线)</th><th colspan="3">V2(改进)</th></tr>
+<tr><th>N</th><th>20d</th><th>WR</th><th>N</th><th>20d</th><th>WR</th></tr>{comp_rows}</table>
+
+<h2>卖出原因分布</h2>
+<table><tr><th>卖出原因</th><th>V1次数</th><th>V2次数</th></tr>{reason_rows}</table>
+
+</div></body></html>"""
+    return html
+
+
 def run():
     total_start = time.time()
-    print("=" * 60)
-    print("  CANSLIM + 综合分析报告 历史回测验证")
+    print("=" * 78)
+    print("  CANSLIM + 综合分析报告 历史回测验证 V1 vs V2 对比")
     print(f"  区间: {START_DATE} ~ {END_DATE} | 资金: {INITIAL_CAPITAL:,.0f}")
-    print("=" * 60)
+    print("=" * 78)
 
-    # FIX: 回测口径固定声明（与实盘差异提示，避免误读回测结论）
     logger.info(
-        "回测口径声明：本回测按信号日收盘价(+滑点)买入（实盘为 T+1 买点价执行）；"
-        "三档买点按当日最低价判定触及（乐观假设）；"
-        "CAI 因子固定 8 分（实盘为动量代理/中性分）；"
-        "股票池为 stock_db.db 现存标的（存在幸存者偏差）；"
-        "结论与实盘绩效不可直接比较。"
+        "回测口径声明：本回测按信号日收盘价(+滑点)买入；"
+        "V2改进: P因子动量化/CAI动态化/熊市闸门/时间止损/阶梯止盈/动态仓位"
     )
 
     # 1. 加载数据
@@ -1084,33 +1396,177 @@ def run():
         print("[FAIL] 数据不足")
         return
 
-    # 2. CANSLIM回测
-    canslim_results = run_canslim_backtest(data_dict)
-    precomputed = canslim_results.get("precomputed", {})
+    # ===== V1 基线回测 =====
+    logger.info("\n" + "=" * 60)
+    logger.info("  V1 基线回测")
+    logger.info("=" * 60)
+    canslim_v1 = run_canslim_backtest(data_dict, use_v2=False)
+    precomputed = canslim_v1.get("precomputed", {})
+    composite_v1 = run_composite_backtest(data_dict, precomputed, use_v2=False)
+    portfolio_v1 = run_portfolio_backtest(data_dict, precomputed, use_v2=False)
 
-    # 3. Composite回测
-    composite_results = run_composite_backtest(data_dict, precomputed)
+    # ===== V2 改进后回测 =====
+    logger.info("\n" + "=" * 60)
+    logger.info("  V2 改进后回测")
+    logger.info("=" * 60)
+    canslim_v2 = run_canslim_backtest(data_dict, use_v2=True)
+    composite_v2 = run_composite_backtest(data_dict, precomputed, use_v2=True)
+    portfolio_v2 = run_portfolio_backtest(data_dict, precomputed, use_v2=True)
 
-    # 4. 组合回测
-    portfolio_results = run_portfolio_backtest(data_dict, precomputed)
+    # ===== V3 温和改进回测(V2因子 + 温和组合规则) =====
+    logger.info("\n" + "=" * 60)
+    logger.info("  V3 最小改进回测(V1因子+熊市闸门)")
+    logger.info("=" * 60)
+    portfolio_v3 = run_portfolio_backtest(data_dict, precomputed, version="v3")
 
-    # 5. 生成报告
-    html = generate_html_report(canslim_results, composite_results, portfolio_results)
+    # ===== 生成V1 vs V2对比报告(V2因子指标=V3因子指标) =====
+    html = generate_comparison_html(
+        canslim_v1, canslim_v2,
+        composite_v1, composite_v2,
+        portfolio_v1, portfolio_v2
+    )
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    report_path = os.path.join(config.OUTPUT_DIR, f"canslim_backtest_{datetime.date.today().strftime('%Y%m%d')}.html")
+    report_path = os.path.join(config.OUTPUT_DIR, f"canslim_backtest_v2_{datetime.date.today().strftime('%Y%m%d')}.html")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     elapsed = time.time() - total_start
-    print(f"\n{'=' * 60}")
-    print(f"  [OK] 回测完成! 耗时: {elapsed:.1f}秒")
-    print(f"  报告: {report_path}")
-    print(f"{'=' * 60}")
+    print(f"\n{'=' * 78}")
+    print(f"  [OK] V1/V2/V3 对比回测完成! 耗时: {elapsed:.1f}秒")
+    print(f"  HTML报告(V1 vs V2因子): {report_path}")
+
+    # ===== 三版本组合绩效对比 =====
+    print(f"\n{'━' * 78}")
+    print(f"  组合绩效三版本对比")
+    print(f"{'━' * 78}")
+    print(f"  {'指标':<16} {'V1(基线)':>14} {'V2(V2因子+激进组合)':>20} {'V3(V1因子+熊市闸门)':>20}")
+    print(f"  {'-' * 72}")
+    for label, key, fmt, suffix in [
+        ("总收益", "total_return", "+.2f", "%"),
+        ("年化收益", "annual_return", "+.2f", "%"),
+        ("最大回撤", "max_drawdown", ".2f", "%"),
+        ("夏普比率", "sharpe", ".2f", ""),
+        ("胜率", "win_rate", ".1f", "%"),
+        ("盈亏比", "profit_factor", ".2f", ""),
+        ("交易次数", "total_trades", ".0f", ""),
+    ]:
+        v1v = portfolio_v1[key]
+        v2v = portfolio_v2[key]
+        v3v = portfolio_v3[key]
+        if key in ("total_return", "annual_return", "max_drawdown", "win_rate"):
+            v1s = f"{v1v*100:{fmt}}{suffix}"
+            v2s = f"{v2v*100:{fmt}}{suffix}"
+            v3s = f"{v3v*100:{fmt}}{suffix}"
+        else:
+            v1s = f"{v1v:{fmt}}{suffix}"
+            v2s = f"{v2v:{fmt}}{suffix}"
+            v3s = f"{v3v:{fmt}}{suffix}"
+        print(f"  {label:<16} {v1s:>14} {v2s:>20} {v3s:>20}")
+
+    # V3卖出原因分析
+    v3_trades = portfolio_v3.get("trades", [])
+    v3_sells = [t for t in v3_trades if t["action"] == "sell"]
+    v3_reasons = {}
+    for t in v3_sells:
+        r = t.get("reason", "other")
+        v3_reasons[r] = v3_reasons.get(r, 0) + 1
+    print(f"\n  V3卖出原因: {v3_reasons}")
+
+    # ===== V4 参数优化扫描(V3基础上测试止损/仓位/频率组合) =====
+    print(f"\n{'━' * 78}")
+    print(f"  V4 参数优化扫描(V3基础上调整止损/仓位/频率)")
+    print(f"{'━' * 78}")
+
+    param_grid = [
+        # (stop_loss, max_pos, scan_interval, label)
+        (0.10, 7, 5, "V3基线(SL10%/P7/F5)"),
+        (0.12, 7, 5, "SL12%"),
+        (0.15, 7, 5, "SL15%"),
+        (0.10, 5, 5, "P5"),
+        (0.10, 7, 3, "F3"),
+        (0.12, 5, 5, "SL12%+P5"),
+        (0.12, 7, 3, "SL12%+F3"),
+        (0.10, 5, 3, "P5+F3"),
+        (0.12, 5, 3, "SL12%+P5+F3"),
+        (0.15, 5, 3, "SL15%+P5+F3"),
+    ]
+
+    sweep_results = []
+    _prev_level = logging.getLogger().level
+    logging.getLogger().setLevel(logging.WARNING)  # 扫描期间静默
+    for sl, mp, si, label in param_grid:
+        pf = run_portfolio_backtest(
+            data_dict, precomputed, version="v3",
+            stop_loss_pct=sl, max_positions=mp, scan_interval=si
+        )
+        sweep_results.append({
+            "label": label, "sl": sl, "mp": mp, "si": si,
+            "total_return": pf["total_return"],
+            "annual_return": pf["annual_return"],
+            "max_drawdown": pf["max_drawdown"],
+            "sharpe": pf["sharpe"],
+            "win_rate": pf["win_rate"],
+            "profit_factor": pf["profit_factor"],
+            "total_trades": pf["total_trades"],
+        })
+    logging.getLogger().setLevel(_prev_level)  # 恢复日志级别
+
+    # 打印参数扫描结果表
+    print(f"\n  {'参数组合':<24} {'总收益':>8} {'年化':>8} {'回撤':>8} {'夏普':>6} {'胜率':>7} {'盈亏比':>6} {'交易':>5}")
+    print(f"  {'-' * 76}")
+    best_idx = 0
+    best_sharpe = -999
+    for i, r in enumerate(sweep_results):
+        ret_s = f"{r['total_return']*100:+.2f}%"
+        ann_s = f"{r['annual_return']*100:+.2f}%"
+        dd_s = f"{r['max_drawdown']*100:.2f}%"
+        sh_s = f"{r['sharpe']:.2f}"
+        wr_s = f"{r['win_rate']:.1f}%"
+        pf_s = f"{r['profit_factor']:.2f}"
+        tr_s = f"{r['total_trades']:.0f}"
+        marker = " ★" if r['sharpe'] > best_sharpe else ""
+        if r['sharpe'] > best_sharpe:
+            best_sharpe = r['sharpe']
+            best_idx = i
+        print(f"  {r['label']:<24} {ret_s:>8} {ann_s:>8} {dd_s:>8} {sh_s:>6} {wr_s:>7} {pf_s:>6} {tr_s:>5}{marker}")
+
+    best = sweep_results[best_idx]
+    print(f"\n  ★ 最优参数组合: {best['label']}")
+    print(f"    止损={best['sl']*100:.0f}% 最大持仓={best['mp']}只 扫描频率={best['si']}天")
+    print(f"    总收益={best['total_return']*100:+.2f}% 夏普={best['sharpe']:.2f} 回撤={best['max_drawdown']*100:.2f}%")
+
+    # 保存完整结果JSON
+    def _to_native(obj):
+        if isinstance(obj, dict):
+            return {k: _to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [_to_native(v) for v in obj]
+        elif isinstance(obj, (np.integer,)):
+            return int(obj)
+        elif isinstance(obj, (np.floating,)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
+    import json
+    v3_json_path = os.path.join(config.OUTPUT_DIR, "canslim_backtest_v3_summary.json")
+    with open(v3_json_path, "w", encoding="utf-8") as f:
+        json.dump(_to_native({
+            "v1": {k: portfolio_v1[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
+            "v2": {k: portfolio_v2[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
+            "v3": {k: portfolio_v3[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
+            "v3_sell_reasons": v3_reasons,
+            "v4_sweep": sweep_results,
+            "v4_best": best,
+        }), f, ensure_ascii=False, indent=2)
+    print(f"  V3 JSON: {v3_json_path}")
+    print(f"{'=' * 78}")
 
     return {
-        "canslim": canslim_results,
-        "composite": composite_results,
-        "portfolio": portfolio_results,
+        "v1": {"canslim": canslim_v1, "composite": composite_v1, "portfolio": portfolio_v1},
+        "v2": {"canslim": canslim_v2, "composite": composite_v2, "portfolio": portfolio_v2},
+        "v3": {"portfolio": portfolio_v3},
         "report_path": report_path
     }
 

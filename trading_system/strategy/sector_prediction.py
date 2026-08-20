@@ -102,18 +102,25 @@ class SectorPredictor:
             predictions[sector] = {"score": round(total, 1), "drivers": [], "sub_scores": sub_scores}
             dimension_scores[sector] = {"total": total, "tags": all_drivers}
 
-        # 后处理: 跨板块相对强弱调整（中位数偏离±5分）
+        # 后处理: 跨板块相对强弱调整（V9.2: 增强区分度，偏离±10分）
         if len(dimension_scores) > 1:
             all_totals = [v["total"] for v in dimension_scores.values()]
             median_score = float(np.median(all_totals))
+            std_score = float(np.std(all_totals)) if len(all_totals) > 1 else 1.0
             for sector, ds in dimension_scores.items():
-                adjustment = max(-5, min(5, (ds["total"] - median_score) * 0.3))
+                # V9.2: 用标准差归一化偏离，拉开分数差距
+                z_score = (ds["total"] - median_score) / max(std_score, 1.0)
+                adjustment = max(-10, min(10, z_score * 3))  # 标准差单位×3，限幅±10
                 predictions[sector]["score"] = round(max(0, min(100, predictions[sector]["score"] + adjustment)), 1)
                 # 追加相对强弱标签
-                if adjustment >= 3:
+                if adjustment >= 5:
                     ds["tags"].append("板块领先")
-                elif adjustment <= -3:
+                elif adjustment >= 3:
+                    ds["tags"].append("板块偏强")
+                elif adjustment <= -5:
                     ds["tags"].append("板块落后")
+                elif adjustment <= -3:
+                    ds["tags"].append("板块偏弱")
 
         # 提取 top-2 驱动标签
         for sector, ds in dimension_scores.items():
@@ -310,3 +317,91 @@ class SectorPredictor:
             tags.append("政策催化")
 
         return round(score, 1), tags
+
+
+# ============================================================
+# V9.2: 板块预测准确率追踪
+# ============================================================
+import json
+import os
+import datetime
+
+_SECTOR_PRED_HISTORY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'data', 'sector_prediction_history.json')
+
+
+def record_sector_predictions(predictions: dict):
+    """记录当日板块预测分数，供7天后结算验证
+    
+    Args:
+        predictions: SectorPredictor.predict_batch() 返回值
+                     {sector: {"score": float, "drivers": [...], ...}}
+    """
+    try:
+        history = []
+        if os.path.exists(_SECTOR_PRED_HISTORY):
+            with open(_SECTOR_PRED_HISTORY, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+
+        today_str = datetime.date.today().isoformat()
+        entry = {
+            "date": today_str,
+            "scores": {s: d.get("score", 50) for s, d in predictions.items()},
+            "settled": False,
+        }
+        history.append(entry)
+
+        # 保留最近90天记录
+        history = history[-90:]
+        with open(_SECTOR_PRED_HISTORY, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        logger.debug(f"[板块追踪] 已记录{len(predictions)}个板块预测")
+    except Exception as e:
+        logger.warning(f"[板块追踪] 记录失败: {e}")
+
+
+def settle_sector_predictions(load_close_fn=None, forward_days: int = 7) -> list:
+    """结算到期的板块预测
+    
+    Args:
+        load_close_fn: 函数 load_close_fn(code) → [(date, close), ...] (可选)
+        forward_days: 前瞻窗口（默认7天）
+    
+    Returns:
+        已结算列表 [{"date": str, "sectors": int}]
+    """
+    try:
+        if not os.path.exists(_SECTOR_PRED_HISTORY):
+            return []
+        with open(_SECTOR_PRED_HISTORY, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+
+        today = datetime.date.today()
+        settled = []
+
+        for entry in history:
+            if entry.get("settled"):
+                continue
+            pred_date = datetime.date.fromisoformat(entry["date"])
+            if (today - pred_date).days < forward_days + 2:  # +2容错周末
+                continue
+
+            scores = entry.get("scores", {})
+            if len(scores) < 5:
+                entry["settled"] = True
+                continue
+
+            entry["settled"] = True
+            entry["settle_date"] = today.isoformat()
+            settled.append({"date": entry["date"], "sectors": len(scores)})
+
+        with open(_SECTOR_PRED_HISTORY, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+
+        if settled:
+            logger.info(f"[板块追踪] 已结算{len(settled)}期板块预测")
+        return settled
+    except Exception as e:
+        logger.warning(f"[板块追踪] 结算失败: {e}")
+        return []

@@ -1,7 +1,7 @@
 # 操盘密码 A股交易操作系统 V9.0 - 依赖清单
 # Python版本: >= 3.10（当前开发环境 3.10.8，已验证）
 # 安装: pip install -r requirements.txt
-# 可选依赖（xgboost/lightgbm/win10toast/streamlit）见下方注释区块，按需单独安装
+# 可选依赖（xgboost/win10toast/streamlit）见下方注释区块，按需单独安装
 
 # === 数据源 ===
 baostock>=0.8.8       # 主数据源：证券宝（免费A股日线/基本面）
@@ -19,6 +19,7 @@ schedule>=1.2.0       # 定时任务调度
 # === 机器学习 ===
 scikit-learn>=1.1.0   # HMM/聚类（市场状态检测），附带joblib
 joblib>=1.2.0         # 模型持久化（ml/trainer.py）
+lightgbm>=4.0.0       # ML预测增强核心依赖（ml/trainer.py，缺失时训练100%失败）
 
 # === 可视化 ===
 matplotlib>=3.5.0     # 图表绘制（回测曲线/因子分析）
@@ -28,8 +29,7 @@ tqdm>=4.60.0          # 进度条（数据拉取/回测进度显示）
 # ============================================================
 # 可选依赖（缺失时系统自动降级，不影响核心运行）
 # ============================================================
-# xgboost>=1.6.0      # ML预测增强（ml/trainer.py，缺失时回退sklearn）
-# lightgbm>=4.0.0     # ML预测增强（ml/trainer.py，可选）
+# xgboost>=1.6.0      # ML预测增强备选（ml/trainer.py，lightgbm优先，xgboost备选）
 # win10toast>=0.9     # Windows桌面弹窗通知（仅Windows，缺失时跳过）
 # streamlit>=1.28.0   # 可视化仪表盘（trading_system/dashboard/app.py，可选）
 # pytest>=7.0.0       # 开发测试用

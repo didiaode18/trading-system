@@ -24,6 +24,28 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# 关键词安全辅助
+# ============================================================
+
+def _ensure_keyword(text: str, return_text: bool = False):
+    """确保文本包含钉钉安全关键词
+
+    当 return_text=False 时返回处理后的 text(str)；
+    当 return_text=True 时返回 (keyword_present: bool)。
+    用于 ActionCard 场景需要单独处理标题/正文时复用。
+    """
+    _kw = getattr(config, "DINGTALK_KEYWORD", "")
+    if not _kw:
+        return "" if return_text else text
+    present = _kw in text
+    if return_text:
+        return present
+    if not present:
+        text = f"[{_kw}] {text}"
+    return text
+
+
+# ============================================================
 # 一、钉钉机器人通知
 # ============================================================
 
@@ -46,9 +68,7 @@ def send_dingtalk(title: str, content: str, webhook_url: str = None) -> bool:
 
     # V4.4: 自定义关键词安全模式 —— 消息体不含关键词时自动给标题加前缀，
     # 避免errcode 310000（关键词不匹配）静默丢推
-    _kw = getattr(config, "DINGTALK_KEYWORD", "")
-    if _kw and _kw not in title and _kw not in content:
-        title = f"[{_kw}] {title}"
+    title = _ensure_keyword(title)
 
     payload = {
         "msgtype": "markdown",
@@ -75,6 +95,47 @@ def send_dingtalk(title: str, content: str, webhook_url: str = None) -> bool:
                 return False
     except Exception as e:
         logger.error(f"钉钉通知异常: {e}")
+        return False
+
+
+# ============================================================
+# 一-b、钉钉ActionCard通知(含确认按钮)
+# ============================================================
+
+def send_dingtalk_action_card(payload: dict, webhook_url: str = None) -> bool:
+    """
+    发送钉钉ActionCard消息(支持按钮回调)
+
+    参数:
+        payload: 完整的ActionCard消息体(由alert_ack.build_action_card_payload生成)
+        webhook_url: 钉钉机器人Webhook地址（默认取config）
+
+    返回: 是否发送成功
+    """
+    if webhook_url is None:
+        webhook_url = config.DINGTALK_WEBHOOK
+    if not webhook_url:
+        logger.warning("钉钉Webhook未配置，跳过发送")
+        return False
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("errcode") == 0:
+                _title = payload.get("actionCard", {}).get("title", "ActionCard")
+                logger.info(f"钉钉ActionCard发送成功: {_title}")
+                return True
+            else:
+                logger.error(f"钉钉ActionCard失败: {result}")
+                return False
+    except Exception as e:
+        logger.error(f"钉钉ActionCard异常: {e}")
         return False
 
 
