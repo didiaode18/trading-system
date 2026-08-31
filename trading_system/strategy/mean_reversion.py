@@ -1,34 +1,31 @@
 """
-均值回归策略模块 V1.0
-======================
-适用于震荡市/弱势行情的短线反弹策略
+均值回归策略（V10.0 P1-① 新增）
+==============================
+震荡市/熊市捕捉超跌反弹，与CANSLIM成长策略互补。
 
 核心逻辑:
-  当市场处于震荡或弱势状态时，趋势策略失效，
-  转而使用均值回归策略捕捉超跌反弹机会。
-
-策略原理:
-  1. 布林带下轨支撑 + RSI超卖 → 反弹概率大
-  2. 股价偏离MA20过远（负偏离>2个标准差）→ 回归动力
-  3. 缩量企稳 + 底部放量 → 确认反弹启动
-  4. 快进快出，目标利润5-8%，严格止损3-5%
-
-入场条件（需满足至少3项）:
-  - RSI(14) < 30（超卖）
-  - 收盘价触及或跌破布林带下轨
-  - 股价较MA20负偏离 > 5%
-  - 近3日缩量（量<均量60%）后当日放量（量>前日1.5倍）
-  - MACD柱状图由负转正（金叉前兆）
-
-出场条件:
-  - 目标止盈: 反弹至布林带中轨（MA20）或浮盈5-8%
-  - 止损: 跌破入场价3-5%无条件离场
-  - 时间止损: 持有超过5天未达目标，平仓
+  1. 超跌识别: RSI<30 + 价格跌破布林下轨 + 偏离MA20超过-8%
+  2. 反弹确认: 当日放量阳线 + 量比>1.5
+  3. 风控硬约束: 硬止损-5% + 止盈+8% + 持仓不超过5天
+  4. Regime门控: BEAR模式禁用，RANGE模式权重50%，BULL模式权重30%
 
 使用方式:
     from strategy.mean_reversion import MeanReversionStrategy
-    mr = MeanReversionStrategy()
-    signals = mr.scan_reversion_signals(data_dict, market_state="weak")
+    strategy = MeanReversionStrategy()
+    candidates = strategy.screen(stock_data, regime="RANGE")
+
+适用场景:
+  - 大盘震荡市（RANGE）: 权重50%，捕捉板块轮动超跌
+  - 大盘熊市（BEAR）: 禁用（风险过高）
+  - 大盘牛市（BULL）: 权重30%，作为成长策略补充
+
+与CANSLIM对比:
+  | 维度 | CANSLIM | 均值回归 |
+  | 策略类型 | 趋势跟踪 | 逆势反弹 |
+  | 适用Regime | BULL | RANGE |
+  | 持仓周期 | 中线(周-月) | 短线(1-5天) |
+  | 止损 | ATR动态 | 硬止损-5% |
+  | 相关系数 | 目标<0.3 |
 """
 
 import os
@@ -44,315 +41,223 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# 策略参数
+RSI_OVERSOLD = 30           # RSI超卖阈值
+BOLLINGER_STD = 2.0         # 布林带标准差倍数
+MA_DEVIATION = -0.08        # 偏离MA20阈值(-8%)
+VOLUME_RATIO = 1.5          # 反弹确认量比
+HARD_STOP_LOSS = -0.05      # 硬止损-5%
+HARD_TAKE_PROFIT = 0.08     # 止盈+8%
+MAX_HOLDING_DAYS = 5        # 最大持仓天数
 
-def calc_half_life(prices: pd.Series, lookback: int = 60) -> float:
-    """
-    V9.0 计算Ornstein-Uhlenbeck半衰期（来源: Ernest Chan《Algorithmic Trading》）
-    
-    原理: 对价格序列做AR(1)回归 ΔP = θ*(P_{t-1} - μ) + ε
-    半衰期 = -ln(2) / ln(1 + θ)
-    
-    解释:
-      - 半衰期 < 5天: 回归太快，信号已过期，不适合入场
-      - 半衰期 5~20天: 最佳均值回归窗口（匹配3天-4周持仓周期）
-      - 半衰期 > 20天: 回归太慢，实质是趋势行情，不适合均值回归
-    
-    返回: 半衰期天数（float），计算失败返回-1
-    """
-    if prices is None or len(prices) < max(20, lookback // 3):
-        return -1.0
-    
-    p = prices.tail(lookback).values.astype(np.float64)
-    p = p[~np.isnan(p)]
-    if len(p) < 20:
-        return -1.0
-    
-    # AR(1)回归: P_t = α + β*P_{t-1} + ε
-    # θ = β - 1 (均值回归速度)
-    y = np.diff(p)          # ΔP = P_t - P_{t-1}
-    x = p[:-1]              # P_{t-1}
-    
-    # OLS: y = θ*x + c  →  θ = cov(x,y) / var(x)
-    x_mean = x.mean()
-    x_demean = x - x_mean
-    var_x = np.dot(x_demean, x_demean)
-    if var_x < 1e-10:
-        return -1.0
-    
-    theta = np.dot(x_demean, y - y.mean()) / var_x
-    
-    # θ必须为负才表示均值回归（价格偏离后回归）
-    if theta >= 0:
-        return -1.0  # 无均值回归特性（趋势行情）
-    
-    # 半衰期 = -ln(2) / ln(1 + θ)
-    # 注意: θ∈(-1, 0) 时 ln(1+θ) < 0，半衰期为正
-    if theta <= -1:
-        return 0.5  # 极端回归，半衰期<1天
-    
-    half_life = -np.log(2) / np.log(1 + theta)
-    return max(0.5, half_life)
+# Regime权重
+REGIME_WEIGHTS = {
+    "BULL": 0.3,    # 牛市: 低权重补充
+    "RANGE": 0.5,   # 震荡: 主战场
+    "BEAR": 0.0,    # 熊市: 禁用
+}
 
 
 class MeanReversionStrategy:
     """均值回归策略"""
 
     def __init__(self):
-        # 策略参数
-        self.rsi_oversold = config.RSI_OVERSOLD          # RSI超卖阈值(30)
-        self.boll_period = config.BOLL_PERIOD            # 布林带周期(20)
-        self.boll_std = config.BOLL_STD                  # 布林带标准差(2)
-        self.ma_period = config.MA_SHORT                 # 均线周期(20)
-        self.target_profit = 0.06                        # 目标利润6%
-        self.stop_loss = 0.04                            # 止损4%
-        self.max_hold_days = 5                           # 最大持有天数
-        self.min_deviation = -0.05                       # 最小负偏离(-5%)
-        self.volume_shrink_ratio = 0.60                  # 缩量标准
-        self.volume_expand_ratio = 1.5                   # 放量标准
-        self.min_conditions = 3                          # 最少满足条件数
-        # V9.0: 半衰期过滤参数 (Ernest Chan方法)
-        self.halflife_min = 5                            # 半衰期下限(天)
-        self.halflife_max = 20                           # 半衰期上限(天)
+        self.name = "均值回归"
+        self.version = "V10.0"
 
-    def scan_reversion_signals(self, data_dict: dict, market_state: str = "normal",
-                                holdings: dict = None) -> list:
-        """
-        扫描所有候选股的均值回归信号
-        
+    def screen(self, df: pd.DataFrame, code: str = "", regime: str = "RANGE") -> dict:
+        """筛选超跌反弹候选
+
         参数:
-            data_dict: {code: DataFrame}
-            market_state: "strong"/"normal"/"weak"
-            holdings: 当前持仓（排除已持有的）
-        
+            df: 个股日线数据 (columns: open, high, low, close, volume)
+            code: 股票代码
+            regime: 当前大盘状态 ("BULL"/"RANGE"/"BEAR")
+
         返回:
-            [{"code", "name", "signal_strength", "conditions_met", "entry_price",
-              "target_price", "stop_price", "reason", ...}]
+            {
+                "signal": bool,         # 是否触发信号
+                "score": float,         # 信号强度(0-10)
+                "reasons": [...],       # 触发原因
+                "entry_price": float,   # 建议入场价
+                "stop_loss": float,     # 止损价
+                "take_profit": float,   # 止盈价
+                "regime_weight": float, # Regime权重
+            }
         """
-        if holdings is None:
-            holdings = {}
+        # Regime门控
+        regime_weight = REGIME_WEIGHTS.get(regime, 0.0)
+        if regime_weight <= 0:
+            return {
+                "signal": False,
+                "score": 0,
+                "reasons": [f"Regime={regime}，策略禁用"],
+                "entry_price": 0,
+                "stop_loss": 0,
+                "take_profit": 0,
+                "regime_weight": 0,
+            }
 
-        # 均值回归策略在弱势/震荡市更有效
-        # 强势市不使用此策略（趋势策略更优）
-        if market_state == "strong":
-            logger.info("[均值回归] 强势行情，不启用均值回归策略")
-            return []
+        if df is None or len(df) < 30:
+            return {
+                "signal": False,
+                "score": 0,
+                "reasons": ["数据不足"],
+                "entry_price": 0,
+                "stop_loss": 0,
+                "take_profit": 0,
+                "regime_weight": regime_weight,
+            }
 
-        signals = []
-        for code, df in data_dict.items():
-            # 跳过指数
-            if code == config.BENCHMARK_INDEX:
-                continue
-            # 跳过已持仓
-            if code in holdings:
-                continue
-            # 数据量检查
-            if len(df) < 60:
-                continue
-
-            signal = self._check_single_stock(code, df)
-            if signal:
-                signals.append(signal)
-
-        # 按信号强度排序
-        signals.sort(key=lambda x: x["signal_strength"], reverse=True)
-
-        logger.info(f"[均值回归] 扫描{len(data_dict)}只，发现{len(signals)}个反弹信号")
-        for sig in signals[:5]:
-            logger.info(f"  {sig['code']} {sig['name']}: "
-                       f"强度{sig['signal_strength']}/5 | "
-                       f"入场{sig['entry_price']:.2f} → "
-                       f"目标{sig['target_price']:.2f}(+{self.target_profit:.0%}) | "
-                       f"止损{sig['stop_price']:.2f}(-{self.stop_loss:.0%})")
-
-        return signals
-
-    def _check_single_stock(self, code: str, df: pd.DataFrame) -> dict:
-        """检查单只股票的均值回归信号"""
-        latest = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) > 1 else latest
-
-        close = latest["close"]
-
-        # ---- V9.0 半衰期前置过滤 (Ernest Chan) ----
-        # 仅在半衰期∈[5,20]天时启用均值回归信号
-        half_life = calc_half_life(df["close"], lookback=60)
-        if half_life < 0:
-            return None  # 无均值回归特性（趋势行情），跳过
-        if half_life < self.halflife_min or half_life > self.halflife_max:
-            return None  # 半衰期不在最佳窗口，跳过
-
-        conditions_met = 0
         reasons = []
+        score = 0
 
         # ---- 条件1: RSI超卖 ----
-        rsi = latest.get("rsi", 50)
-        if pd.notna(rsi) and rsi < self.rsi_oversold:
-            conditions_met += 1
-            reasons.append(f"RSI={rsi:.1f}超卖")
+        rsi = self._calc_rsi(df["close"], period=14)
+        if rsi < RSI_OVERSOLD:
+            score += 3
+            reasons.append(f"RSI超卖({rsi:.1f}<{RSI_OVERSOLD})")
 
-        # ---- 条件2: 触及布林带下轨 ----
-        boll_lower = latest.get("boll_lower", 0)
-        if pd.notna(boll_lower) and boll_lower > 0:
-            if close <= boll_lower * 1.01:  # 容差1%
-                conditions_met += 1
-                reasons.append("触及布林下轨")
+        # ---- 条件2: 跌破布林下轨 ----
+        bollinger_lower = self._calc_bollinger_lower(df["close"], period=20, std=BOLLINGER_STD)
+        current_price = df["close"].iloc[-1]
+        if current_price < bollinger_lower:
+            score += 3
+            reasons.append(f"跌破布林下轨({current_price:.2f}<{bollinger_lower:.2f})")
 
-        # ---- 条件3: MA20负偏离过大 ----
-        ma20 = latest.get("ma20", 0)
-        if pd.notna(ma20) and ma20 > 0:
-            deviation = (close - ma20) / ma20
-            if deviation < self.min_deviation:
-                conditions_met += 1
-                reasons.append(f"偏离MA20达{deviation:.1%}")
+        # ---- 条件3: 偏离MA20超过阈值 ----
+        ma20 = df["close"].rolling(20).mean().iloc[-1]
+        deviation = (current_price - ma20) / ma20
+        if deviation < MA_DEVIATION:
+            score += 2
+            reasons.append(f"偏离MA20({deviation:.1%}<{MA_DEVIATION:.1%})")
 
-        # ---- 条件4: 缩量后放量（底部放量确认）----
-        vol = latest.get("volume", 0)
-        vol_ma = latest.get("vol_ma20", 0)
-        prev_vol = prev.get("volume", 0)
-        if pd.notna(vol_ma) and vol_ma > 0 and vol > 0:
-            # 近3日缩量
-            recent_3_vol = df["volume"].tail(4).head(3).mean()
-            is_shrink = recent_3_vol < vol_ma * self.volume_shrink_ratio
-            # 当日放量
-            is_expand = vol > prev_vol * self.volume_expand_ratio if prev_vol > 0 else False
-            if is_shrink and is_expand:
-                conditions_met += 1
-                reasons.append("缩量后放量确认")
-            elif vol > vol_ma * 1.3 and close > prev["close"]:
-                # 或者当日直接放量上涨
-                conditions_met += 1
-                reasons.append("放量反弹")
+        # ---- 条件4: 反弹确认（当日放量阳线）----
+        if len(df) >= 2:
+            today = df.iloc[-1]
+            yesterday = df.iloc[-2]
+            is_positive = today["close"] > today["open"]
+            volume_ratio = today["volume"] / yesterday["volume"] if yesterday["volume"] > 0 else 1.0
 
-        # ---- 条件5: MACD柱状图改善 ----
-        macd_hist = latest.get("macd_hist", 0)
-        prev_macd_hist = prev.get("macd_hist", 0)
-        if pd.notna(macd_hist) and pd.notna(prev_macd_hist):
-            if macd_hist > prev_macd_hist and macd_hist < 0:
-                # 柱状图缩短（空头动能减弱）
-                conditions_met += 1
-                reasons.append("MACD空头动能减弱")
-            elif macd_hist > 0 and prev_macd_hist <= 0:
-                # 金叉
-                conditions_met += 1
-                reasons.append("MACD金叉")
+            if is_positive and volume_ratio > VOLUME_RATIO:
+                score += 2
+                reasons.append(f"放量阳线(量比{volume_ratio:.1f}>{VOLUME_RATIO})")
 
-        # ---- 额外加分: K线形态 ----
-        # 下影线较长（探底回升）
-        low = latest.get("low", close)
-        high = latest.get("high", close)
-        open_p = latest.get("open", close)
-        if close > 0 and (high - low) > 0:
-            lower_shadow = (min(close, open_p) - low) / (high - low)
-            if lower_shadow > 0.6 and close > open_p:
-                # FIX: 修复conditions_met int/float混用导致信号强度截断不一致，统一为整数
-                conditions_met += 1
-                reasons.append("长下影探底回升")
+        # 信号判定（score >= 5 触发）
+        signal = score >= 5
 
-        # 判断是否满足入场条件
-        if conditions_met < self.min_conditions:
-            return None
-
-        # ---- 计算入场/目标/止损价 ----
-        entry_price = close
-        target_price = round(close * (1 + self.target_profit), 2)
-        stop_price = round(close * (1 - self.stop_loss), 2)
-
-        # 如果布林中轨(MA20)在目标范围内，以MA20为目标
-        if pd.notna(ma20) and ma20 > close and ma20 < target_price:
-            target_price = round(ma20, 2)
-
-        # 信号强度 (1-5)
-        strength = min(5, int(conditions_met))
-
-        # 获取股票名称
-        name = self._get_stock_name(code)
-        sector = self._get_stock_sector(code)
+        # 计算入场/止损/止盈价
+        entry_price = current_price if signal else 0
+        stop_loss = current_price * (1 + HARD_STOP_LOSS) if signal else 0
+        take_profit = current_price * (1 + HARD_TAKE_PROFIT) if signal else 0
 
         return {
-            "code": code,
-            "name": name,
-            "sector": sector,
-            "signal_strength": strength,
-            "conditions_met": conditions_met,
-            "entry_price": entry_price,
-            "target_price": target_price,
-            "stop_price": stop_price,
-            "target_profit_pct": round((target_price / entry_price - 1) * 100, 1),
-            "stop_loss_pct": round((1 - stop_price / entry_price) * 100, 1),
-            "rsi": round(rsi, 1) if pd.notna(rsi) else None,
-            "deviation_ma20": round((close / ma20 - 1) * 100, 1) if pd.notna(ma20) and ma20 > 0 else None,
-            "reason": " | ".join(reasons),
-            "strategy": "mean_reversion",
-            "max_hold_days": self.max_hold_days,
-            "signal_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "signal": signal,
+            "score": min(10, score),
+            "reasons": reasons,
+            "entry_price": round(entry_price, 2),
+            "stop_loss": round(stop_loss, 2),
+            "take_profit": round(take_profit, 2),
+            "regime_weight": regime_weight,
+            "rsi": round(rsi, 1),
+            "deviation": round(deviation, 3),
         }
 
-    def calc_position_size(self, signal: dict) -> dict:
+    def check_exit(self, entry_price: float, current_price: float, holding_days: int) -> dict:
+        """检查是否触发退出条件
+
+        参数:
+            entry_price: 入场价
+            current_price: 当前价
+            holding_days: 持仓天数
+
+        返回:
+            {"exit": bool, "reason": str, "pnl_pct": float}
         """
-        计算均值回归策略的仓位
-        
-        均值回归是短线策略，仓位应小于趋势策略:
-        - 单只不超过总资金8%
-        - 总均值回归仓位不超过20%
-        """
-        price = signal["entry_price"]
-        stop_price = signal["stop_price"]
-        risk_per_share = price - stop_price
+        if entry_price <= 0:
+            return {"exit": False, "reason": "无入场价", "pnl_pct": 0}
 
-        if risk_per_share <= 0:
-            return {"shares": 0, "amount": 0, "ratio": 0}
+        pnl_pct = (current_price - entry_price) / entry_price
 
-        # 单笔风险 = 总资金 × 1.5%（均值回归风险更小）
-        risk_amount = config.TOTAL_CAPITAL * 0.015
-        shares = int(risk_amount / risk_per_share)
-        shares = (shares // 100) * 100
+        # 硬止损
+        if pnl_pct <= HARD_STOP_LOSS:
+            return {"exit": True, "reason": f"触发硬止损({pnl_pct:.1%})", "pnl_pct": pnl_pct}
 
-        # 仓位上限8%
-        max_shares = int(config.TOTAL_CAPITAL * 0.08 / price / 100) * 100
-        shares = min(shares, max_shares)
+        # 止盈
+        if pnl_pct >= HARD_TAKE_PROFIT:
+            return {"exit": True, "reason": f"触发止盈({pnl_pct:.1%})", "pnl_pct": pnl_pct}
 
-        # 可用资金约束
-        available = getattr(config, 'AVAILABLE_CASH', config.TOTAL_CAPITAL * 0.3)
-        max_affordable = int(available * 0.3 / price / 100) * 100  # 最多用30%可用资金
-        shares = min(shares, max_affordable)
+        # 超时退出
+        if holding_days >= MAX_HOLDING_DAYS:
+            return {"exit": True, "reason": f"持仓超时({holding_days}天>={MAX_HOLDING_DAYS})", "pnl_pct": pnl_pct}
 
-        amount = shares * price
-        return {
-            "shares": shares,
-            "amount": round(amount, 2),
-            "ratio": round(amount / config.TOTAL_CAPITAL, 4),
-            "risk_amount": round(shares * risk_per_share, 2),
-        }
+        return {"exit": False, "reason": "继续持有", "pnl_pct": pnl_pct}
 
-    def _get_stock_name(self, code: str) -> str:
-        if code in config.STOCK_POOL:
-            return config.STOCK_POOL[code].get("名称", code)
-        for sector_info in getattr(config, 'SECTOR_CANDIDATES', {}).values():
-            stocks = sector_info.get("stocks", {})
-            if code in stocks:
-                return stocks[code].get("名称", code)
-        return code
+    # ============================================================
+    # 技术指标计算
+    # ============================================================
 
-    def _get_stock_sector(self, code: str) -> str:
-        if code in config.STOCK_POOL:
-            return config.STOCK_POOL[code].get("赛道", "其他")
-        for sector_name, sector_info in getattr(config, 'SECTOR_CANDIDATES', {}).items():
-            if code in sector_info.get("stocks", {}):
-                return sector_name
-        return "其他"
+    def _calc_rsi(self, series: pd.Series, period: int = 14) -> float:
+        """计算RSI指标"""
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1] if len(rsi) > 0 else 50
+
+    def _calc_bollinger_lower(self, series: pd.Series, period: int = 20, std: float = 2.0) -> float:
+        """计算布林带下轨"""
+        ma = series.rolling(window=period).mean()
+        std_dev = series.rolling(window=period).std()
+        lower = ma - std * std_dev
+        return lower.iloc[-1] if len(lower) > 0 else series.iloc[-1]
 
 
 # ============================================================
-# 独立测试
+# 便捷函数（供选股引擎调用）
+# ============================================================
+
+def screen_mean_reversion(df: pd.DataFrame, code: str = "", regime: str = "RANGE") -> dict:
+    """均值回归筛选（便捷函数）"""
+    strategy = MeanReversionStrategy()
+    return strategy.screen(df, code, regime)
+
+
+def check_exit(entry_price: float, current_price: float, holding_days: int) -> dict:
+    """退出检查（便捷函数）"""
+    strategy = MeanReversionStrategy()
+    return strategy.check_exit(entry_price, current_price, holding_days)
+
+
+# ============================================================
+# CLI 入口
 # ============================================================
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    print("=" * 50)
-    print("  均值回归策略 - 测试")
-    print("=" * 50)
-    print("  需要加载数据后调用scan_reversion_signals()")
-    print("  示例:")
-    print("    mr = MeanReversionStrategy()")
-    print("    signals = mr.scan_reversion_signals(data_dict, 'weak')")
-    print("\n[OK] 模块加载正常")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # 示例：从数据库加载数据并筛选
+    from data.data_loader import init_db, load_daily_data
+
+    conn = init_db()
+    test_codes = ["000858", "600519", "000001"]  # 五粮液、茅台、平安
+
+    print("=" * 60)
+    print("均值回归策略筛选示例")
+    print("=" * 60)
+
+    for code in test_codes:
+        try:
+            df = load_daily_data(code, conn, days=60)
+            if df is not None and len(df) >= 30:
+                result = screen_mean_reversion(df, code, regime="RANGE")
+                print(f"\n{code}: signal={result['signal']}, score={result['score']}")
+                if result['signal']:
+                    print(f"  入场价: {result['entry_price']}")
+                    print(f"  止损价: {result['stop_loss']}")
+                    print(f"  止盈价: {result['take_profit']}")
+                    print(f"  原因: {', '.join(result['reasons'])}")
+        except Exception as e:
+            print(f"{code}: 错误 - {e}")
+
+    conn.close()

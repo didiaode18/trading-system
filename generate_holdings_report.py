@@ -189,10 +189,14 @@ def _load_holdings_from_json():
                 "highest": v.get("highest", 0),
                 "stop_loss_cfg": v.get("stop_loss", 0),
                 "stock_type": v.get("stock_type", "龙头"),
+                # FIX(2026-08-26) BUG-01: 券商盈亏字段透传，供主循环交叉验证成本口径
+                "broker_pnl": v.get("pnl"),
             })
         return result
-    except Exception:
-        return _FALLBACK_HOLDINGS
+    except Exception as _e:
+        # FIX(2026-08-26) BUG-06: 禁止静默回退到陈旧硬编码持仓，异常时打日志+返回空列表
+        print(f"[FATAL] holdings.json 加载失败({_e})，使用空列表（不再回退到硬编码）")
+        return []
 
 
 holdings_list = _load_holdings_from_json()
@@ -754,13 +758,26 @@ for item in holdings_list:
             start = (datetime.date.today() - datetime.timedelta(days=200)).strftime("%Y-%m-%d")
             df = fetch_stock_daily_baostock(code, start_date=start)
         if not df.empty and len(df) >= 30:
+            # FIX(2026-08-26) BUG-05: K线新鲜度校验 —— 检测本地DB数据截止日，
+            # 超过1个交易日的数据在报告中标注陈旧风险（技术评分基于过期指标）。
+            _kline_last_date = str(df.index[-1].date()) if hasattr(df.index[-1], 'date') else str(df.index[-1])[:10]
+            _kline_fresh = True
+            _today_str = datetime.date.today().isoformat()
+            try:
+                _days_gap = (datetime.date.fromisoformat(_today_str) - datetime.date.fromisoformat(_kline_last_date)).days
+                if _days_gap > 1:
+                    _kline_fresh = False
+                    print(f"  [数据质量] {code}: 数据缺口{_days_gap}天(最新{_kline_last_date})，技术评分可能失真")
+            except Exception:
+                pass
             df = compute_indicators(df)
             hist_dataframes[code] = df  # 保存原始数据
             rt_price = quotes.get(code, {}).get("price", 0)
             tech_analysis[code] = analyze_technical(df, rt_price)
             comp = tech_analysis[code].get("composite", 0)
             trend = tech_analysis[code].get("trend_dir", "")
-            print(f"  {code} {item['名称']}: {len(df)}根K线 | 评分{comp} | {trend}")
+            _freshness_tag = "" if _kline_fresh else " ⚠️陈旧"
+            print(f"  {code} {item['名称']}: {len(df)}根K线 | 评分{comp} | {trend}{_freshness_tag}")
         else:
             tech_analysis[code] = {"valid": False, "error": "数据不足"}
             print(f"  {code} {item['名称']}: ⚠️数据不足")
@@ -1018,10 +1035,29 @@ for item in holdings_list:
     # 主模式: 止损 = 最新价 × (1-STOP_LOSS_PCT)
     stop_loss = round(latest * (1 - STOP_LOSS_PCT), 2) if latest > 0 else 0
 
+    # FIX(2026-08-26) BUG-02: 持久化止损参与Ratchet取大 —— holdings.json中已抬升的止损
+    # 不应被丢弃（原实现stop_loss_cfg读入后全文零使用，导致长春高新止损87.001已破却漏报）
+    _stop_loss_cfg = item.get("stop_loss_cfg", 0)
+    if _stop_loss_cfg > 0:
+        stop_loss = max(stop_loss, _stop_loss_cfg)
+
     # 成本/持仓数据
     shares = item.get("shares", 0)
     buy_price = item.get("buy_price", 0)
     highest_hist = item.get("highest", 0)
+
+    # FIX(2026-08-26) BUG-01: 成本口径交叉验证 —— 用券商盈亏反推隐含成本价，
+    # 当buy_price(买入均价)与券商持仓盈亏使用的成本价偏差>0.5%时，修正为隐含成本价。
+    # 修复前: 6只持仓盈亏失真(000661偏差+12.56pp, 002603偏差+10.19pp)。
+    _broker_pnl = item.get("broker_pnl")
+    _cost_corrected = False
+    if _broker_pnl is not None and shares > 0 and latest > 0 and buy_price > 0:
+        _implied_cost = latest - _broker_pnl / shares
+        if _implied_cost > 0:
+            _cost_drift = abs(buy_price / _implied_cost - 1)
+            if _cost_drift > 0.005:  # 偏差>0.5%触发修正
+                buy_price = round(_implied_cost, 4)
+                _cost_corrected = True
 
     # FIX: 回落触发改用持仓历史最高价（而非当日high），比例从config.DRAWDOWN_STOP按stock_type读取
     _stock_type = item.get("stock_type", "龙头")
@@ -1553,7 +1589,37 @@ table{{font-size:11px}}
 if HAS_MARKET_PULSE:
     try:
         _pulse_data = get_market_pulse()
+        # ---- FIX(2026-08-28): 报告发送前最终一致性关卡 ----
+        # 情绪数据与实际持仓表现严重矛盾时插入警示横幅，
+        # 不阻塞发送（报告其他段落仍有价值），但让用户一眼看到数据可疑。
+        _pulse_warn = None
+        _act = _pulse_data.get("activity", {}) or {}
+        _p_up = _act.get("up")
+        _p_lu = _act.get("limit_up")
+        _p_level = _pulse_data.get("level", "")
+        if _p_up is not None and _p_lu is not None and holdings:
+            # 持仓标的当日实际涨跌统计（行情已加载）
+            _h_up_count = sum(1 for h in holdings.values()
+                              if h.get("涨跌幅", 0) > 0)
+            _h_total = len(holdings)
+            # 矛盾检测: 持仓多数上涨但情绪"恐慌"，或持仓多数下跌但情绪"狂热"
+            if _h_total > 0:
+                _h_up_ratio = _h_up_count / _h_total
+                if _h_up_ratio >= 0.6 and _p_level == "恐慌":
+                    _pulse_warn = (f"⚠️ 数据矛盾警示: 持仓{_h_up_count}/{_h_total}只上涨"
+                                   f"({_h_up_ratio:.0%})，但市场情绪显示\"恐慌\""
+                                   f"——涨跌家数数据可能陈旧，请以实际行情为准")
+                elif _h_up_ratio <= 0.3 and _p_level == "狂热":
+                    _pulse_warn = (f"⚠️ 数据矛盾警示: 持仓{_h_up_count}/{_h_total}只上涨"
+                                   f"({_h_up_ratio:.0%})，但市场情绪显示\"狂热\""
+                                   f"——涨跌家数数据可能异常，请以实际行情为准")
         html += render_pulse_html(_pulse_data)
+        if _pulse_warn:
+            html += (f'<div class="alert" style="background:#fff3e0;'
+                     f'border-left:4px solid #ff9800;margin-top:4px;'
+                     f'padding:8px 12px;font-size:13px;color:#e65100">'
+                     f'{_pulse_warn}</div>')
+            print(f"  ⚠️ 情绪数据矛盾: {_pulse_warn[:60]}...")
         _pd_deg = _pulse_data.get("degraded", [])
         print(f"  市场情绪面板: {_pulse_data.get('level', '未知')}"
               f"({_pulse_data.get('temperature')}分)" +
@@ -1685,7 +1751,7 @@ except Exception as _rp_render_e:
 
 # ---- 总览表 ----
 html += '<h2>一、持仓综合总览（行情+盈亏+操作建议）</h2>'
-html += f'<div class="alert alert-info">📡 行情源: {data_source} | 时间: {quote_time_str or now} | 止损规则: 浮亏持仓按成本×{1-STOP_LOSS_PCT:.0%}硬止损(Ratchet只升不降)，浮盈持仓按最新价×{1-STOP_LOSS_PCT:.0%} | 止盈基于压力位/ATR推算</div>'
+html += f'<div class="alert alert-info">📡 行情源: {data_source} | 时间: {quote_time_str or now} | 成本口径: 券商成本价(交叉验证修正) | 止损规则: 浮亏持仓按成本×{1-STOP_LOSS_PCT:.0%}硬止损(Ratchet只升不降+持久止损取大)，浮盈持仓按最新价×{1-STOP_LOSS_PCT:.0%} | 止盈基于压力位/ATR推算</div>'
 
 html += '<table><tr><th>代码</th><th>名称</th><th>数量</th><th>成本</th><th>最新价</th><th>盈亏%</th><th>仓位%</th><th>技术评分</th><th>趋势</th><th>止损价</th><th>止盈目标</th><th>操作建议</th></tr>'
 for code, h in holdings.items():
@@ -2174,9 +2240,13 @@ try:
     for _cp_code, _cp_h in holdings.items():
         _cp_df = hist_dataframes.get(_cp_code)
         if _cp_df is not None and len(_cp_df) >= 60:
-            _cp_r = _caopan_engine.analyze(_cp_df, code=_cp_code, name=_cp_h["名称"])
-            if "error" not in _cp_r:
-                _caopan_results_map[_cp_code] = _cp_r
+            try:
+                _cp_r = _caopan_engine.analyze(_cp_df, code=_cp_code, name=_cp_h["名称"])
+                if "error" not in _cp_r:
+                    _caopan_results_map[_cp_code] = _cp_r
+            except Exception as _cp_stock_e:
+                # FIX(2026-08-26) BUG-10: 单只操盘密码失败不影响其余标的（原实现一只KeyError全模块降级）
+                print(f"  操盘密码[{_cp_code}]: 跳过({_cp_stock_e})")
     # 趋势降级预警（提前到逐只分析前）
     _cp_downgrades = [v for v in _caopan_results_map.values() if v.get('trend_level', 3) <= 2]
     if _cp_downgrades:
@@ -2443,7 +2513,7 @@ for code, h in holdings.items():
         _pnl_line_color = '#e74c3c' if pnl_pct >= 0 else '#27ae60'
         _pnl_font_sz = 'font-size:18px;' if abs(pnl_pct) > 5 else ''
         _pnl_line_html = f'<b style="color:{_pnl_line_color};{_pnl_font_sz}">{pnl_pct:+.1f}% ({pnl_amt:+,.0f}元)</b>'
-    _cost_note = '（占位·已回本）' if h.get('占位成本') else ''
+    _cost_note = '（占位·已回本）' if h.get('占位成本') else '<span style="font-size:10px;color:#999">(成本价)</span>'
     # V10.2: 止损价逼近预警（距止损<3%时红底白字）
     _sl_proximity_pct = abs(latest - h['止损价']) / latest * 100 if latest > 0 else 999
     _sl_proximity_warn = '<span style="color:#cf1322;font-weight:bold;font-size:11px"> ⚠️逼近止损</span>' if _sl_proximity_pct < 3 else ''
@@ -2489,7 +2559,7 @@ for code, h in holdings.items():
 <tr><td><b>① 止损单</b></td><td class="{'stop-loss-warn' if _sl_proximity_pct < 3 else ''}" style="{'color:#cf1322;font-weight:bold;background:#fff1f0' if _sl_proximity_pct < 3 else 'color:#e74c3c;font-weight:bold'}">触发价 {h['止损价']:.3f}，委托价 {h['止损价']*0.995:.3f}（最新价×{1-STOP_LOSS_PCT:.0%}）{_dist_str(h['止损价'])}{_sl_proximity_warn}</td><td>★★★必挂</td><td>20天</td></tr>
 <tr><td><b>② 止盈单(减仓)</b></td><td style="color:#1976d2;font-weight:bold">触发价 {tp1:.3f}，卖出{shares//2}股（{tp_basis}）{_dist_str(tp1)}<br><span style="font-size:11px;color:#666;font-weight:normal">触及先减仓锁盈；若后续放量突破该压力位（见加仓计划触发价），剩余仓位可持有</span></td><td>★★建议</td><td>15天</td></tr>
 <tr><td><b>③ 止盈单(清仓)</b></td><td style="color:#1976d2">触发价 {tp2:.3f}，全部清仓{_dist_str(tp2)}</td><td>★可选</td><td>20天</td></tr>
-<tr><td><b>④ 回落卖出</b></td><td style="color:#ff9800">最高{h.get('回落基准', h['最高']):.3f}回落{h.get('回落比例', 0.07)*100:.0f}%至 {h['回落触发']:.3f} 卖出{_dist_str(h['回落触发'])}</td><td>★★建议</td><td>10天</td></tr>
+{('<tr><td><b>④ 回落卖出</b></td><td style="color:#ff9800">最高' + f'{h.get("回落基准", h["最高"]):.3f}' + f'回落{h.get("回落比例", 0.07)*100:.0f}%至 {h["回落触发"]:.3f} 卖出{_dist_str(h["回落触发"])}</td><td>★★建议</td><td>10天</td></tr>') if h.get('回落触发', 0) > 0 else '<tr><td><b>④ 回落卖出</b></td><td style="color:#999;font-size:11px" colspan="3">⚠️ 持仓期最高价未记录，无法生成回落卖出条件单（请运行 update_holdings.py 补写 highest 字段）</td></tr>'}
 <tr><td><b>⑤ 逻辑止损(提前退出)</b></td><td style="color:#ff9800;font-size:11px">{_logic_exit_html}</td><td>★★★心法</td><td>每日盘后检查</td></tr>
 </table>
 {_overnight_hint}
@@ -3186,6 +3256,27 @@ os.makedirs(os.path.dirname(report_path), exist_ok=True)
 with open(report_path, 'w', encoding='utf-8') as f:
     f.write(html)
 print(f"[保存] {report_path}")
+
+# ---- FIX(2026-08-28) P2: 报告发送前摘要打印（供日志事后排查） ----
+try:
+    if HAS_MARKET_PULSE:
+        from trading_system.strategy.market_pulse import get_pulse_summary
+        _summary = get_pulse_summary()
+        _h_up_n = sum(1 for h in holdings.values() if h.get("涨跌幅", 0) > 0)
+        _h_total_n = len(holdings)
+        print(f"[报告摘要] 情绪:{_summary.get('level', '?')}"
+              f"({_summary.get('temperature', '?')}分) | "
+              f"涨/跌:{_summary.get('up', '?')}/{_summary.get('down', '?')} | "
+              f"涨停/跌停:{_summary.get('limit_up', '?')}/{_summary.get('limit_down', '?')} | "
+              f"成交额:{_summary.get('amount', '?')}亿 | "
+              f"持仓涨跌:{_h_up_n}/{_h_total_n}")
+        if _summary.get("warnings"):
+            for _sw in _summary["warnings"]:
+                print(f"  ⚠️ 数据质量: {_sw}")
+        if _summary.get("degraded"):
+            print(f"  ⚠️ 降级: {'；'.join(_summary['degraded'])}")
+except Exception as _rse:
+    print(f"[报告摘要] 打印失败({_rse})")
 
 subject = f"[综合分析报告] {len(holdings)}只标的 技术面+条件单 | {today} {now[:5]}"
 # 样例/定制发送: HOLDINGS_REPORT_SUBJECT 环境变量可整体覆盖标题（默认行为不变）

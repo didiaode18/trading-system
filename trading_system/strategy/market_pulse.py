@@ -176,6 +176,49 @@ def _fetch_amount_baostock():
         return None, None
 
 
+def _fetch_up_down_spot_em() -> dict:
+    """
+    FIX(2026-08-28): 备用涨跌家数源 —— akshare stock_zh_a_spot_em() 实时行情。
+    独立统计全市场上涨/下跌/盘家数及涨停/跌停，用于与乐咕源交叉验证。
+    乐咕偶发返回陈旧数据（日期标为当日但数值为前几日），此源作为校验兖底。
+
+    重试策略: 东财接口偶发断连，重试2次（间隔2秒）提高成功率。
+
+    返回: {"up": int, "down": int, "limit_up": int, "limit_down": int} | None
+    """
+    if not HAS_AKSHARE:
+        return None
+    import time
+    import pandas as pd
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty:
+                return None
+            chg_col = None
+            for c in df.columns:
+                if "涨跌幅" in str(c):
+                    chg_col = c
+                    break
+            if chg_col is None:
+                return None
+            changes = pd.to_numeric(df[chg_col], errors="coerce").dropna()
+            up = int((changes > 0).sum())
+            down = int((changes < 0).sum())
+            # 涨停/跌停: 涨跌幅≥9.8%判定涨停，≤-9.8%判定跌停
+            # (兼容主板10%与科创/创业20%涨跌幅板差异)
+            limit_up = int((changes >= 9.8).sum())
+            limit_down = int((changes <= -9.8).sum())
+            return {"up": up, "down": down, "limit_up": limit_up, "limit_down": limit_down}
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2)
+    logger.debug(f"[市场脉搏] spot_em涨跌家数获取失败(重试3次): {last_err}")
+    return None
+
+
 def _fetch_market_activity() -> dict:
     """
     乐咕市场活跃度: 涨跌家数/涨停跌停/两市成交额
@@ -184,6 +227,11 @@ def _fetch_market_activity() -> dict:
 
     新鲜度校验(V5修复): 乐咕偶发返回前一交易日快照，若"统计日期"非当日
     则整源判失败，杜绝陈旧涨跌家数被当作当日数据缓存并推高情绪分。
+
+    交叉验证(V6修复, 2026-08-28): 乐咕API曾返回日期标为当日但涨跌家数
+    为前几日陈旧数据（如实际3191涨/1821跌却返回1525涨/2996跌），导致
+    报告情绪误判为"恐慌"。新增stock_zh_a_spot_em()独立计数交叉校验，
+    偏差超30%则弃用乐咕涨跌家数、降级为spot_em源。
     """
     out = {"success": False, "up": None, "down": None, "limit_up": None,
            "limit_down": None, "amount": None}
@@ -226,14 +274,79 @@ def _fetch_market_activity() -> dict:
             except (ValueError, TypeError):
                 return None
 
-        out["up"] = _to_int("上涨")
-        out["down"] = _to_int("下跌")
-        out["limit_up"] = _to_int("涨停")
-        out["limit_down"] = _to_int("跌停")
-        out["up_sharp"] = _to_int("急速上涨")
-        out["down_sharp"] = _to_int("急速下跌")
-        out["amount"] = _to_amount("两市成交额")
-        out["success"] = (out["up"] is not None) or (out["limit_up"] is not None)
+        legu_up = _to_int("上涨")
+        legu_down = _to_int("下跌")
+        legu_lu = _to_int("涨停")
+        legu_ld = _to_int("跌停")
+
+        # ---- FIX(2026-08-28): 交叉验证，防止乐咕陈旧数据 ----
+        # 乐咕API曾返回日期正确但数值为前几日的陈旧快照，
+        # 用 spot_em 独立计数做二次校验，偏差>30% 则降级。
+        _CROSS_VAL_THRESHOLD = 0.30
+        spot = None
+        legu_rejected = False
+        if legu_up is not None or legu_lu is not None:
+            spot = _fetch_up_down_spot_em()
+            if spot is not None:
+                # 校验上涨家数
+                if legu_up is not None and spot["up"] > 0:
+                    deviation = abs(legu_up - spot["up"]) / spot["up"]
+                    if deviation > _CROSS_VAL_THRESHOLD:
+                        logger.warning(
+                            f"[市场脉搏] 乐咕涨跌家数交叉验证失败: "
+                            f"乐咕上涨{legu_up} vs spot_em上涨{spot['up']}"
+                            f"(偏差{deviation:.0%}>30%)，判定乐咕数据陈旧，降级为spot_em")
+                        legu_rejected = True
+                # 校验涨停家数（独立校验，防止涨跌家数正确但涨停错误）
+                if not legu_rejected and legu_lu is not None and spot["limit_up"] > 0:
+                    lu_dev = abs(legu_lu - spot["limit_up"]) / max(1, spot["limit_up"])
+                    if lu_dev > 0.50:  # 涨停偏差>50%视为异常
+                        logger.warning(
+                            f"[市场脉搏] 乐咕涨停家数交叉验证失败: "
+                            f"乐咕涨停{legu_lu} vs spot_em涨停{spot['limit_up']}"
+                            f"(偏差{lu_dev:.0%}>50%)，判定乐咕数据陈旧，降级为spot_em")
+                        legu_rejected = True
+
+        if legu_rejected and spot is not None:
+            # 降级: 涨跌家数/涨停跌停用spot_em，成交额保留乐咕（独立字段不受影响）
+            out["up"] = spot["up"]
+            out["down"] = spot["down"]
+            out["limit_up"] = spot["limit_up"]
+            out["limit_down"] = spot["limit_down"]
+            out["amount"] = _to_amount("两市成交额")
+            out["success"] = True
+            out["_legu_rejected"] = True  # 标记供degraded展示
+        elif spot is None and legu_lu is not None:
+            # FIX(2026-08-28): spot_em不可用时的内置合理性兖底校验。
+            # A股正常交易日涨停家数几乎不可能<15（即使极弱势日也有10-20只），
+            # 若乐咕报告涨停<10，极大概率是陈旧数据（前几日弱势日快照）。
+            # 此时整源判失败，不缓存错误数据，情绪面板显示"数据暂不可用"。
+            _LIMIT_UP_FLOOR = 10
+            if legu_lu < _LIMIT_UP_FLOOR:
+                _now_h = datetime.datetime.now().hour
+                # 仅在盘中/盘后(9:30后)执行此校验，盘前数据可能为前日
+                if _now_h >= 10:
+                    logger.warning(
+                        f"[市场脉搏] 乐咕涨停{legu_lu}<{_LIMIT_UP_FLOOR}，"
+                        f"spot_em不可用但数据疑似陈旧，整源判失败")
+                    return out  # success=False, 不缓存
+            out["up"] = legu_up
+            out["down"] = legu_down
+            out["limit_up"] = legu_lu
+            out["limit_down"] = legu_ld
+            out["up_sharp"] = _to_int("急速上涨")
+            out["down_sharp"] = _to_int("急速下跌")
+            out["amount"] = _to_amount("两市成交额")
+            out["success"] = (out["up"] is not None) or (out["limit_up"] is not None)
+        else:
+            out["up"] = legu_up
+            out["down"] = legu_down
+            out["limit_up"] = legu_lu
+            out["limit_down"] = legu_ld
+            out["up_sharp"] = _to_int("急速上涨")
+            out["down_sharp"] = _to_int("急速下跌")
+            out["amount"] = _to_amount("两市成交额")
+            out["success"] = (out["up"] is not None) or (out["limit_up"] is not None)
     except Exception as e:
         logger.debug(f"[市场脉搏] 市场活跃度获取失败: {e}")
     return out
@@ -272,6 +385,85 @@ def _fetch_margin_market() -> dict:
     except Exception as e:
         logger.debug(f"[市场脉搏] 两融余额获取失败: {e}")
     return out
+
+
+# ============================================================
+# 一-B、数据合理性校验（P0 补强 2026-08-28）
+# ============================================================
+
+def _validate_activity_reasonability(act: dict) -> list:
+    """
+    FIX(2026-08-28) P0: 市场活跃度数据合理性校验。
+    在数据源返回后、写入缓存前调用，发现异常时返回告警列表。
+    调用方根据告警列表决定是否标记数据不可靠。
+
+    校验项:
+      1. 涨跌家数之和应在 [3500, 6500]（A股~5300只，含停牌/平盘合理范围）
+      2. 涨停/上涨比例应在 [0.3%, 10%]（正常1%-5%，极端行情0.3%为下限）
+      3. 涨停数下限≥5（即使极弱势日也有5只以上涨停）
+      4. 成交额应在 [1000, 30000] 亿（低于1000亿为异常缩量，高于30000亿为异常放量）
+
+    返回: list[str] 告警列表，空列表表示全部通过。
+    """
+    warnings = []
+    up = act.get("up")
+    down = act.get("down")
+    limit_up = act.get("limit_up")
+    amount = act.get("amount")
+
+    # 1. 涨跌家数之和合理性
+    if up is not None and down is not None:
+        total = up + down
+        if total < 3500 or total > 6500:
+            warnings.append(
+                f"涨跌家数之和{total}超出合理范围[3500,6500]"
+                f"（A股约5300只，含停牌/平盘合理范围）")
+
+    # 2. 涨停/上涨比例一致性
+    if limit_up is not None and up is not None and up > 0:
+        ratio = limit_up / up
+        if ratio < 0.003 or ratio > 0.10:
+            warnings.append(
+                f"涨停/上涨比例{ratio:.1%}超出合理范围[0.3%,10%]"
+                f"（正常交易日通1%-5%）")
+
+    # 3. 涨停数下限
+    if limit_up is not None and limit_up < 5:
+        warnings.append(
+            f"涨停仅{limit_up}只<5，正常交易日几乎不可能")
+
+    # 4. 成交额范围
+    if amount is not None:
+        if amount < 1000:
+            warnings.append(f"两市成交额{amount:.0f}亿<1000亿，异常缩量")
+        elif amount > 30000:
+            warnings.append(f"两市成交额{amount:.0f}亿>30000亿，异常放量")
+
+    return warnings
+
+
+def get_pulse_summary() -> dict:
+    """
+    FIX(2026-08-28) P2: 获取市场情绪摘要（供调度器日志/报告dry-run使用）。
+    轻量级接口，不触发网络请求，仅读缓存或调用 get_market_pulse()。
+
+    返回: {"level": str, "temperature": int, "up": int, "down": int,
+           "limit_up": int, "warnings": [str]}
+    """
+    data = get_market_pulse()
+    act = data.get("activity", {}) or {}
+    warnings = _validate_activity_reasonability(act)
+    return {
+        "level": data.get("level", "未知"),
+        "temperature": data.get("temperature"),
+        "up": act.get("up"),
+        "down": act.get("down"),
+        "limit_up": act.get("limit_up"),
+        "limit_down": act.get("limit_down"),
+        "amount": act.get("amount"),
+        "degraded": data.get("degraded", []),
+        "warnings": warnings,
+    }
 
 
 # ============================================================
@@ -432,6 +624,9 @@ def get_market_pulse(force: bool = False) -> dict:
             act["amount_date"] = _vdate  # 可能为前一交易日，渲染/缓存据此标注
     if not act.get("success"):
         degraded.append("市场活跃度(涨跌家数)获取失败")
+    if act.get("_legu_rejected"):
+        degraded.append("乐咕涨跌家数陈旧→已降级为spot_em实时校验源")
+        act.pop("_legu_rejected", None)  # 内部标记不写入缓存
     if act.get("amount") is None:
         degraded.append("两市成交额获取失败")
 
@@ -465,6 +660,27 @@ def get_market_pulse(force: bool = False) -> dict:
         if prev_amt > 0:
             result["amount_change_pct"] = round(
                 (act["amount"] / prev_amt - 1) * 100, 1)
+
+    # ---- FIX(2026-08-28) P1: 缓存写入前合理性校验 ----
+    # 数据合理性校验: 涨跌家数之和/涨停比例/成交额范围
+    # 发现严重异常时不写入缓存，防止错误数据被后续报告读取
+    data_warnings = _validate_activity_reasonability(act)
+    if data_warnings:
+        for w in data_warnings:
+            logger.warning(f"[市场脉搏] 数据合理性告警: {w}")
+    # 严重告警数≥2时判定数据不可靠，不写入缓存
+    _critical_count = sum(1 for w in data_warnings
+                         if "超出合理范围" in w or "几乎不可能" in w)
+    if _critical_count >= 2:
+        logger.warning(
+            f"[市场脉搏] 数据合理性严重异常({_critical_count}项告警)，"
+            f"不写入缓存，情绪面板显示\"数据暂不可用\"")
+        result["success"] = False
+        result["level"] = "未知"
+        result["temperature"] = None
+        result["data_warnings"] = data_warnings
+        return result
+    result["data_warnings"] = data_warnings
 
     cache["latest"] = result
     _save_cache(cache)
@@ -542,6 +758,17 @@ def render_pulse_html(data: dict, compact: bool = False) -> str:
                 f'⚠️ 数据源降级: {"；".join(data["degraded"])}'
                 f'（缺失成分不计入情绪分，结论可靠性降低）</div>')
 
+        # FIX(2026-08-28) P1: 数据合理性告警渲染
+        _dw = data.get("data_warnings") or []
+        _dw_note = ""
+        if _dw:
+            _dw_items = "；".join(_dw)
+            _dw_note = (
+                '<div style="font-size:12px;color:#e65100;margin-top:6px;'
+                'background:#fff3e0;padding:6px 10px;border-radius:4px;'
+                'border-left:3px solid #ff9800">'
+                f'⚠️ 数据质量告警: {_dw_items}</div>')
+
         return f"""
 <h2>🌡️ 市场情绪与资金面</h2>
 <div class="alert" style="background:#f0f5ff;border-left:4px solid {meta['color']}">
@@ -555,6 +782,7 @@ def render_pulse_html(data: dict, compact: bool = False) -> str:
 </tr></table>
 <div class="alert alert-info">💹 杠杆资金: 沪市融资余额 {mg_txt}（存量博弈看成交额与换手）</div>
 {degraded_note}
+{_dw_note}
 """
     except Exception as e:
         logger.debug(f"[市场脉搏] 渲染失败: {e}")

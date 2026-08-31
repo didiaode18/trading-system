@@ -201,8 +201,16 @@ def merge_holding(existing: dict, parsed: dict, source: str,
             warnings.append(f"ℹ️ {code} 股数{old_shares}→{parsed['shares']}，"
                             f"接受新加权成本{cost:.3f}（首次建仓日期等字段保持不变）")
     elif cost > 0 and abs(cost - existing.get("buy_price", 0)) > 1e-9:
-        # 股数不变但成本不同 → 疑似误覆盖，拒绝（除非--force显式修正）
-        if force:
+        # FIX(2026-08-25): 券商实盘同步时，买入均价是加权平均成本（含减仓重算），
+        # 即使股数不变也应接受——券商可能在两次同步之间做过减仓再买回等操作，
+        # 或系统此前记录的并非真实加权均价而是历史遗留值。
+        # 非券商来源且股数不变时仍视为疑似误覆盖（除非--force）。
+        _is_broker_sync = (source or "").startswith("券商")
+        if _is_broker_sync:
+            merged["buy_price"] = cost
+            warnings.append(f"ℹ️ {code} 券商同步加权成本{existing.get('buy_price',0):.3f}→{cost:.3f}"
+                            f"（股数未变，接受券商买入均价修正）")
+        elif force:
             merged["buy_price"] = cost
             warnings.append(f"⚠️ {code} --force 强制修正成本 "
                             f"{existing.get('buy_price', 0):.3f}→{cost:.3f}")

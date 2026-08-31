@@ -194,6 +194,79 @@ class MLPredictor:
             logger.debug(f"监控器检查失败(不影响预测): {e}")
             return False
 
+    def predict_score(self, df: pd.DataFrame) -> dict:
+        """V10.0 P1-③: 将ML概率映射为CANSLIM独立因子 M_ML (0-5分)
+        
+        参数:
+            df: 单只股票的历史数据
+        
+        返回:
+            {
+                "score": int,       # 0-5分
+                "prob": float,      # 原始概率
+                "confidence": str,  # "high"/"medium"/"low"
+                "available": bool,  # 是否可用（模型加载且未降级）
+            }
+        
+        评分规则:
+            prob < 0.30 → 0分 (强烈看空)
+            0.30-0.45 → 1分 (看空)
+            0.45-0.55 → 2分 (中性偏弱)
+            0.55-0.65 → 3分 (中性偏强)
+            0.65-0.75 → 4分 (看多)
+            prob > 0.75 → 5分 (强烈看多)
+        
+        注意:
+            - 模型未加载或已降级时返回 available=False
+            - 该因子受IC降权管控（与CANSLIM其他因子同等对待）
+        """
+        # 默认返回（模型不可用时）
+        default_result = {
+            "score": 2,  # 中性
+            "prob": 0.5,
+            "confidence": "low",
+            "available": False,
+        }
+        
+        if self.model is None:
+            return default_result
+        
+        # 检查模型是否已降级
+        if self._is_monitor_degraded():
+            return default_result
+        
+        # 获取概率
+        prob = self.predict(df)
+        if prob is None:
+            return default_result
+        
+        # 概率→评分映射
+        if prob < 0.30:
+            score = 0
+            confidence = "high"
+        elif prob < 0.45:
+            score = 1
+            confidence = "medium"
+        elif prob < 0.55:
+            score = 2
+            confidence = "low"
+        elif prob < 0.65:
+            score = 3
+            confidence = "low"
+        elif prob < 0.75:
+            score = 4
+            confidence = "medium"
+        else:
+            score = 5
+            confidence = "high"
+        
+        return {
+            "score": score,
+            "prob": round(prob, 3),
+            "confidence": confidence,
+            "available": True,
+        }
+
     @property
     def is_ready(self) -> bool:
         return self.model is not None

@@ -34,6 +34,77 @@ except ImportError:
 
 
 # ============================================================
+# V9.3: 数据源健康追踪（P0-⑤ 数据源冗余+自动切换）
+# ============================================================
+# 连续失败计数 + 冷却跳过，避免已故障源每轮都浪费超时时间
+# {source_name: {"failures": int, "last_fail": datetime, "cooldown_until": datetime}}
+_SOURCE_HEALTH = {
+    "tencent": {"failures": 0, "last_fail": None, "cooldown_until": None},
+    "eastmoney": {"failures": 0, "last_fail": None, "cooldown_until": None},
+}
+_SOURCE_COOLDOWN_SECONDS = 300  # 连续失败≥2次后冷却5分钟
+_SOURCE_MAX_FAILURES = 2        # 触发冷却的连续失败阈值
+
+
+def _is_source_healthy(name: str) -> bool:
+    """检查数据源是否可用（冷却期内视为不健康）"""
+    health = _SOURCE_HEALTH.get(name)
+    if not health:
+        return True
+    if health["cooldown_until"] and datetime.datetime.now() < health["cooldown_until"]:
+        return False
+    return True
+
+
+def _record_source_success(name: str):
+    """记录数据源成功，重置失败计数"""
+    health = _SOURCE_HEALTH.get(name)
+    if health:
+        health["failures"] = 0
+        health["cooldown_until"] = None
+
+
+def _record_source_failure(name: str):
+    """记录数据源失败，连续失败达阈值则进入冷却"""
+    health = _SOURCE_HEALTH.get(name)
+    if health:
+        health["failures"] += 1
+        health["last_fail"] = datetime.datetime.now()
+        if health["failures"] >= _SOURCE_MAX_FAILURES:
+            health["cooldown_until"] = (
+                datetime.datetime.now() +
+                datetime.timedelta(seconds=_SOURCE_COOLDOWN_SECONDS)
+            )
+            logger.warning(
+                f"[数据源健康] {name} 连续失败{health['failures']}次，"
+                f"冷却{_SOURCE_COOLDOWN_SECONDS}秒"
+            )
+
+
+def get_data_source_status() -> dict:
+    """V9.3: 获取所有数据源健康状态（供监控模块降级感知）
+
+    返回: {"tencent": {"healthy": bool, "failures": int}, ...,
+           "overall": "normal"|"degraded"|"outage"}
+    """
+    now = datetime.datetime.now()
+    status = {}
+    any_healthy = False
+    for name, health in _SOURCE_HEALTH.items():
+        is_healthy = (
+            health["cooldown_until"] is None or now >= health["cooldown_until"]
+        )
+        status[name] = {
+            "healthy": is_healthy,
+            "failures": health["failures"],
+        }
+        if is_healthy:
+            any_healthy = True
+    status["overall"] = "normal" if any_healthy else "outage"
+    return status
+
+
+# ============================================================
 # 一、腾讯行情API（主数据源，批量快速）
 # ============================================================
 
@@ -243,7 +314,7 @@ def fetch_realtime_etf(codes: list) -> dict:
 
 def fetch_realtime_batch(codes: list, source: str = "auto") -> dict:
     """
-    批量获取实时行情（多源容错）
+    批量获取实时行情（多源容错 + V9.3 健康感知）
     
     参数:
         codes: 股票代码列表 ["600584", "002415", ...]
@@ -252,33 +323,55 @@ def fetch_realtime_batch(codes: list, source: str = "auto") -> dict:
     返回:
         {code: {price, change_pct, high, low, volume, amount, name, time, source}}
     
-    容错策略:
-        1. 先用腾讯API批量获取
-        2. 未获取到的用东方财富补全
-        3. 仍未获取到的记录日志
+    容错策略（V9.3增强）:
+        1. 检查数据源健康状态，跳过冷却中的源
+        2. 先用腾讯API批量获取（健康时）
+        3. 未获取到的用东方财富补全（健康时）
+        4. 所有源不可用时记录日志+返回空（由监控模块触发降级预警）
     """
     if not codes:
         return {}
     
     results = {}
+    sources_tried = 0
     
     if source in ("auto", "tencent"):
-        # Phase 1: 腾讯API（快速批量）
-        results = fetch_realtime_tencent(codes)
-        if len(results) >= len(codes) * 0.8:
-            return results  # 80%以上成功，直接返回
+        if _is_source_healthy("tencent"):
+            sources_tried += 1
+            # Phase 1: 腾讯API（快速批量）
+            results = fetch_realtime_tencent(codes)
+            if results:
+                _record_source_success("tencent")
+                if len(results) >= len(codes) * 0.8:
+                    return results  # 80%以上成功，直接返回
+            else:
+                _record_source_failure("tencent")
+        else:
+            logger.debug("[数据源] tencent 冷却中，跳过")
     
     if source in ("auto", "eastmoney"):
-        # Phase 2: 东方财富补全缺失的
-        missing = [c for c in codes if c not in results]
-        if missing:
-            em_results = fetch_realtime_eastmoney(missing)
-            results.update(em_results)
+        if _is_source_healthy("eastmoney"):
+            sources_tried += 1
+            # Phase 2: 东方财富补全缺失的
+            missing = [c for c in codes if c not in results]
+            if missing:
+                em_results = fetch_realtime_eastmoney(missing)
+                if em_results:
+                    _record_source_success("eastmoney")
+                    results.update(em_results)
+                else:
+                    _record_source_failure("eastmoney")
+        else:
+            logger.debug("[数据源] eastmoney 冷却中，跳过")
     
     # 统计
     missing_final = [c for c in codes if c not in results]
     if missing_final:
         logger.warning(f"实时行情未获取到: {missing_final}")
+    
+    # V9.3: 所有源都不可用时记录严重日志
+    if not results and sources_tried == 0:
+        logger.error("[数据源] 所有数据源均在冷却中，行情获取完全不可用！")
     
     return results
 
@@ -295,8 +388,25 @@ def fetch_realtime_single(code: str) -> dict:
 def fetch_index_realtime(index_code: str = "000300") -> dict:
     """
     获取指数实时行情（沪深300/上证指数等）
-    腾讯API: sh000300(沪深300), sh000001(上证指数)
+    V9.3: 腾讯API失败时自动降级到东方财富(akshare)
     """
+    # Phase 1: 腾讯API
+    result = _fetch_index_tencent(index_code)
+    if result:
+        return result
+    
+    # V9.3: Phase 2 备用 — 东方财富(akshare)
+    if _is_source_healthy("eastmoney"):
+        result = _fetch_index_eastmoney(index_code)
+        if result:
+            return result
+    
+    logger.warning(f"指数 {index_code} 所有数据源均不可用")
+    return {}
+
+
+def _fetch_index_tencent(index_code: str = "000300") -> dict:
+    """指数行情 — 腾讯API"""
     # 指数代码转换
     if index_code == "000300":
         tc_code = "sh000300"
@@ -333,7 +443,53 @@ def fetch_index_realtime(index_code: str = "000300") -> dict:
             "source": "tencent",
         }
     except Exception as e:
-        logger.warning(f"指数实时行情获取失败: {e}")
+        logger.debug(f"指数腾讯API获取失败: {e}")
+        return {}
+
+
+def _fetch_index_eastmoney(index_code: str = "000300") -> dict:
+    """V9.3: 指数行情备用 — 东方财富(akshare)"""
+    if not HAS_AKSHARE:
+        return {}
+    try:
+        # 指数代码映射（东方财富格式）
+        em_code_map = {
+            "000300": "sh000300",  # 沪深300
+            "000001": "sh000001",  # 上证指数
+            "399001": "sz399001",  # 深证成指
+            "399006": "sz399006",  # 创业板指
+        }
+        em_code = em_code_map.get(index_code, f"sh{index_code}")
+        market = "1" if em_code.startswith("sh") else "0"
+        pure_code = em_code[2:]
+        
+        df = ak.stock_zh_index_daily_em(symbol=pure_code)
+        if df is None or df.empty:
+            return {}
+        
+        # 取最新一行
+        latest = df.iloc[-1]
+        prev_close = float(latest.get("open", 0) or 0)
+        close = float(latest.get("close", 0) or 0)
+        
+        if close <= 0:
+            return {}
+        
+        change_pct = ((close - prev_close) / prev_close * 100) if prev_close > 0 else 0
+        
+        return {
+            "price": close,
+            "prev_close": prev_close,
+            "change_pct": round(change_pct, 2),
+            "high": float(latest.get("high", 0) or 0),
+            "low": float(latest.get("low", 0) or 0),
+            "volume": float(latest.get("volume", 0) or 0),
+            "name": index_code,
+            "time": datetime.datetime.now().strftime("%H%M%S"),
+            "source": "eastmoney",
+        }
+    except Exception as e:
+        logger.debug(f"指数东方财富API获取失败: {e}")
         return {}
 
 

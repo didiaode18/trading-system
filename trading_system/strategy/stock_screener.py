@@ -72,6 +72,9 @@ _OVERNIGHT_CACHE = None
 _ML_PREDICTOR = None
 _ML_INIT_DONE = False
 
+# V10.1 Top3: 市场风格缓存（每次选股运行计算一次）
+_STYLE_CACHE = {"style": "neutral", "large_cap_chg": 0, "small_cap_chg": 0, "computed": False}
+
 def _get_ml_predictor():
     """V5.2: 获取ML预测器（惰性加载，线程安全由GIL保证）"""
     global _ML_PREDICTOR, _ML_INIT_DONE
@@ -234,10 +237,12 @@ def _load_fundamental_data(stock_codes: list) -> dict:
     """
     通过 FundamentalAnalyzer 批量获取基本面数据，填充 FUNDAMENTAL_DATA
     
+    V10.2: 扩展数据字段，包含ROE/毛利率/负债率等供财报深度分析使用
+    
     参数:
         stock_codes: 需要获取基本面数据的股票代码列表
     返回:
-        {code: {"eps_growth_q": xx, "eps_growth_3y": xx, "has_institution": bool}}
+        {code: {"eps_growth_q": xx, "eps_growth_3y": xx, "has_institution": bool, ...}}
     """
     global FUNDAMENTAL_DATA
     try:
@@ -253,9 +258,12 @@ def _load_fundamental_data(stock_codes: list) -> dict:
     for code in stock_codes:
         try:
             data = fa.get_canslim_fundamental(code)
+            # V10.2: 扩展有效数据判定（新增字段也作为有效信号）
             if data and (data.get("eps_growth_q", 0) != 0
                          or data.get("eps_growth_3y", 0) != 0
-                         or data.get("has_institution") is True):
+                         or data.get("has_institution") is True
+                         or data.get("roe") is not None
+                         or data.get("gross_margin") is not None):
                 FUNDAMENTAL_DATA[code] = data
                 loaded_count += 1
             else:
@@ -462,6 +470,127 @@ def detect_market_regime(data_dict: dict, market_info: dict) -> dict:
         "total_count": total,
         "detail": detail,
     }
+
+
+def _detect_structural_market(data_dict: dict, regime_info: dict) -> dict:
+    """
+    V10.1 Top4: 结构性行情检测
+    
+    原理: 计算全市场个股5日收益的标准差(分化度)。
+    高分化 + 混合regime = 结构性行情（指数横盘但板块极端分化）。
+    
+    结构性行情特征:
+    - 指数涨跌幅 < 2%（横盘）
+    - 个股收益标准差 > 阈值（板块分化严重）
+    - 强势板块少数集中，弱势板块普跌
+    
+    返回:
+        {
+            "structural": bool,       # 是否为结构性行情
+            "dispersion": float,      # 分化度(个股5d收益标准差)
+            "position_adj": float,    # 仓位调整系数(0.8-1.0)
+            "detail": str
+        }
+    """
+    returns_5d = []
+    
+    for code, df in data_dict.items():
+        if code == "000300" or len(df) < 6:
+            continue
+        if code.startswith(("300", "688", "588", "159")):
+            continue
+        chg_5d = (df["close"].iloc[-1] / df["close"].iloc[-6] - 1) * 100
+        returns_5d.append(chg_5d)
+    
+    if len(returns_5d) < 10:
+        return {"structural": False, "dispersion": 0, "position_adj": 1.0, "detail": "数据不足"}
+    
+    dispersion = np.std(returns_5d)
+    
+    # 指数涨跌幅（用000300代理）
+    index_chg = 0
+    if "000300" in data_dict and len(data_dict["000300"]) >= 6:
+        idx_df = data_dict["000300"]
+        index_chg = abs(idx_df["close"].iloc[-1] / idx_df["close"].iloc[-6] - 1) * 100
+    
+    breadth = regime_info.get("breadth", 50)
+    
+    # 结构性行情判定: 指数横盘(<3%) + 高分化(σ>4%) + 混合regime
+    STRUCTURAL_DISPERSION_THRESHOLD = getattr(config, 'STRUCTURAL_DISPERSION_THRESHOLD', 4.0)
+    STRUCTURAL_INDEX_THRESHOLD = getattr(config, 'STRUCTURAL_INDEX_THRESHOLD', 3.0)
+    
+    is_structural = (
+        index_chg < STRUCTURAL_INDEX_THRESHOLD and
+        dispersion > STRUCTURAL_DISPERSION_THRESHOLD and
+        regime_info.get("regime") == "mixed"
+    )
+    
+    # 仓位调整: 结构性行情下降低10-20%仓位（分化越大仓位越低）
+    if is_structural:
+        # 分化度越高，仓位越低: σ=4%→0.9, σ=6%→0.85, σ=8%→0.8
+        position_adj = max(0.8, min(0.95, 1.0 - (dispersion - STRUCTURAL_DISPERSION_THRESHOLD) * 0.025))
+        detail = f"结构性行情: 指数横盘({index_chg:.1f}%) + 高分化(σ={dispersion:.1f}%) → 仓位×{position_adj:.2f}"
+    else:
+        position_adj = 1.0
+        detail = f"非结构性: 指数{'横盘' if index_chg < 3 else '趋势'}({index_chg:.1f}%) 分化σ={dispersion:.1f}%"
+    
+    logger.info(f"[结构性行情] {detail}")
+    
+    return {
+        "structural": is_structural,
+        "dispersion": round(dispersion, 2),
+        "position_adj": round(position_adj, 2),
+        "detail": detail,
+    }
+
+
+# ============================================================
+# 零'、估值安全闸门（V10.1 Top1: 防止高估值陷阱）
+# ============================================================
+
+def _check_valuation_gate(code: str) -> dict:
+    """
+    V10.1 Top1: 估值安全闸门
+    
+    拦截估值过高的股票，防止"好公司但价格太贵"的陷阱。
+    与现有V_估值因子(0-5分加分)互补：V因子是软打分，本闸门是硬拦截。
+    
+    拦截规则:
+      1. PE(TTM) < 0 → 亏损股，直接拦截
+      2. PE百分位 > 80% → 处于历史最贵的20%区间，拦截
+      3. 无估值数据 → 放行（不惩罚信息缺失的股票）
+    
+    返回:
+        {"pass": bool, "reason": str}
+    """
+    result = {"pass": True, "reason": ""}
+    
+    if not getattr(config, 'VALUATION_GATE_ENABLED', True):
+        return result
+    
+    fund_data = FUNDAMENTAL_DATA.get(code, {})
+    if not fund_data:
+        # 无基本面数据，放行
+        return result
+    
+    pe_pct_max = getattr(config, 'VALUATION_GATE_PE_PCT_MAX', 80)
+    
+    _pe = fund_data.get("pe_ttm", None)
+    _pe_pct = fund_data.get("pe_percentile", None)
+    
+    # 规则1: PE<0 亏损股拦截
+    if _pe is not None and _pe < 0:
+        result["pass"] = False
+        result["reason"] = f"估值闸门: PE={_pe:.1f}<0，亏损股"
+        return result
+    
+    # 规则2: PE百分位过高拦截
+    if _pe_pct is not None and _pe_pct > pe_pct_max:
+        result["pass"] = False
+        result["reason"] = f"估值闸门: PE百分位{_pe_pct:.0f}%>{pe_pct_max}%，历史高位"
+        return result
+    
+    return result
 
 
 # ============================================================
@@ -926,6 +1055,78 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
 
 
 # ============================================================
+# 二'、市场风格检测（V10.1 Top3: 大盘vs小盘风格轮动）
+# ============================================================
+
+def _detect_market_style(data_dict: dict) -> dict:
+    """
+    V10.1 Top3: 检测当前市场风格偏好（大盘vs小盘）
+    
+    原理: 计算大盘股(600/601/603)与小盘股(002/300/301)近5日平均涨幅，
+    判断当前资金偏好哪种风格，用于动态调整CANSLIM因子权重。
+    
+    返回:
+        {
+            "style": "large_cap" / "small_cap" / "neutral",
+            "large_cap_chg": float,  # 大盘股5日平均涨幅%
+            "small_cap_chg": float,  # 小盘股5日平均涨幅%
+            "spread": float,         # 风格差 (大盘-小盘)
+        }
+    """
+    global _STYLE_CACHE
+    if _STYLE_CACHE.get("computed", False):
+        return _STYLE_CACHE
+    
+    large_caps = []  # 大盘股5日涨幅
+    small_caps = []  # 小盘股5日涨幅
+    
+    for code, df in data_dict.items():
+        if code == "000300" or len(df) < 6:
+            continue
+        
+        # 计算5日涨幅
+        chg_5d = (df["close"].iloc[-1] / df["close"].iloc[-6] - 1) * 100
+        
+        if code.startswith(("600", "601", "603")):
+            large_caps.append(chg_5d)
+        elif code.startswith(("002", "300", "301")):
+            small_caps.append(chg_5d)
+    
+    if not large_caps or not small_caps:
+        _STYLE_CACHE = {"style": "neutral", "large_cap_chg": 0, "small_cap_chg": 0, "spread": 0, "computed": True}
+        return _STYLE_CACHE
+    
+    avg_large = np.mean(large_caps)
+    avg_small = np.mean(small_caps)
+    spread = avg_large - avg_small
+    
+    # 风格判定: 差值>1%为大盘风格，<-1%为小盘风格
+    STYLE_THRESHOLD = getattr(config, 'STYLE_ROTATION_THRESHOLD', 1.0)
+    if spread > STYLE_THRESHOLD:
+        style = "large_cap"
+    elif spread < -STYLE_THRESHOLD:
+        style = "small_cap"
+    else:
+        style = "neutral"
+    
+    _STYLE_CACHE = {
+        "style": style,
+        "large_cap_chg": round(avg_large, 2),
+        "small_cap_chg": round(avg_small, 2),
+        "spread": round(spread, 2),
+        "computed": True,
+    }
+    logger.info(f"[风格轮动] 大盘5d={avg_large:+.2f}% 小盘5d={avg_small:+.2f}% 差={spread:+.2f}% → {style}")
+    return _STYLE_CACHE
+
+
+def _reset_style_cache():
+    """重置风格缓存（每次选股运行时调用）"""
+    global _STYLE_CACHE
+    _STYLE_CACHE = {"style": "neutral", "large_cap_chg": 0, "small_cap_chg": 0, "computed": False}
+
+
+# ============================================================
 # 三、CANSLIM多因子打分（第二步）
 # ============================================================
 
@@ -1270,6 +1471,23 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         # 回归模式: 周线/均值回归因子加权（在bonus阶段应用）
         pass  # W/MR bonus在后续阶段加权
     
+    # V10.1 Top3: 风格轮动权重调整 —— 根据大盘/小盘风格偏好微调因子权重
+    _style_enabled = getattr(config, 'STYLE_ROTATION_ENABLED', True)
+    if _style_enabled and all_dfs:
+        _style_info = _detect_market_style(all_dfs)
+        _style = _style_info.get("style", "neutral")
+        if _style == "large_cap":
+            # 大盘价值风格: 基本面权重↑（大盘股更看重估值和业绩）
+            _cai_w *= 1.15
+            _n_w *= 0.85  # 动量因子适当降权
+            logger.debug(f"[风格权重] 大盘风格: CAI×1.15 N×0.85")
+        elif _style == "small_cap":
+            # 小盘成长风格: 动量/龙头权重↑（小盘股更看重趋势弹性）
+            _n_w *= 1.15
+            _l_w *= 1.10
+            _cai_w *= 0.90
+            logger.debug(f"[风格权重] 小盘风格: N×1.15 L×1.10 CAI×0.90")
+    
     total = (factors["N_新事物"] * _n_w + factors["S_供需"] * _s_w +
              factors["L_龙头"] * _l_w + factors["CAI_基本面"] * _cai_w)
     # V6.0 P1-2: V因子加入总分（估值因子，满分5分，不受IC权重影响）
@@ -1432,33 +1650,105 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
     factors["E_事件"] = event_adj
     total += event_adj
 
-    # ---- V3.2: 北向资金/主力资金流加分 ----
-    # 北向资金连续流入+个股主力净流入 → 聪明钱信号
-    flow_bonus = 0
+    # ---- V10.0 P0-②: 资金流连续因子 ----
+    # 输出[0,10]连续因子，5=中性，转换为[-5,+5]调整分
+    flow_factor = 5.0  # 默认中性
     try:
-        flow_bonus = _get_capital_flow_bonus(code)
-        if flow_bonus > 0:
-            signals.append(f"资金流+{flow_bonus}(北向/主力)")
-        elif flow_bonus < 0:
-            signals.append(f"资金流{flow_bonus}(流出)")
+        flow_factor = _get_capital_flow_factor(code)
+        flow_adj = flow_factor - 5.0  # 转换为[-5, +5]调整分
+        if flow_adj > 0.5:
+            signals.append(f"资金流+{flow_adj:.1f}(因子{flow_factor:.1f})")
+        elif flow_adj < -0.5:
+            signals.append(f"资金流{flow_adj:.1f}(因子{flow_factor:.1f})")
     except Exception:
         pass
-    factors["F_资金"] = flow_bonus
-    total += flow_bonus
+    factors["F_资金"] = round(flow_factor, 2)
+    total += (flow_factor - 5.0)  # 中性=0调整
 
-    # ---- V3.2: 行业轮动加分/减分 ----
-    # 强势赛道+3，弱势赛道-3，基于sector_rotation模块
-    sector_rot_adj = 0
+    # ---- V10.0 P1-②: 行业轮动连续因子 ----
+    # 输出[0,10]连续因子，5=中性，转换为[-5,+5]调整分
+    sector_rot_factor = 5.0  # 默认中性
     try:
-        sector_rot_adj = _get_sector_rotation_adj(code)
-        if sector_rot_adj > 0:
-            signals.append(f"强势赛道+{sector_rot_adj}")
-        elif sector_rot_adj < 0:
-            signals.append(f"弱势赛道{sector_rot_adj}")
+        sector_rot_factor = _get_sector_rotation_factor(code)
+        rot_adj = sector_rot_factor - 5.0  # 转换为[-5, +5]调整分
+        if rot_adj > 0.5:
+            signals.append(f"强势赛道+{rot_adj:.1f}(因子{sector_rot_factor:.1f})")
+        elif rot_adj < -0.5:
+            signals.append(f"弱势赛道{rot_adj:.1f}(因子{sector_rot_factor:.1f})")
     except Exception:
         pass
-    factors["R_轮动"] = sector_rot_adj
-    total += sector_rot_adj
+    factors["R_轮动"] = round(sector_rot_factor, 2)
+    total += (sector_rot_factor - 5.0)  # 中性=0调整
+
+    # ---- V10.0 P1-③: ML独立因子 M_ML (0-5分) ----
+    # 将ML概率映射为CANSLIM独立因子，受IC降权管控
+    ml_score = 2  # 默认中性
+    ml_available = False
+    try:
+        from ml.predictor import MLPredictor
+        ml_predictor = MLPredictor()
+        if ml_predictor.load_model("xgb_daily"):
+            ml_result = ml_predictor.predict_score(df)
+            ml_available = ml_result.get("available", False)
+            if ml_available:
+                ml_score = ml_result["score"]
+                # 转换为[-2.5, +2.5]调整分（中性=2对应0调整）
+                ml_adj = (ml_score - 2) * 1.25
+                if ml_adj > 0.5:
+                    signals.append(f"ML看多+{ml_adj:.1f}(概率{ml_result['prob']:.0%})")
+                elif ml_adj < -0.5:
+                    signals.append(f"ML看空{ml_adj:.1f}(概率{ml_result['prob']:.0%})")
+                total += ml_adj
+    except Exception:
+        pass
+    factors["M_ML"] = ml_score
+
+    # ---- V10.1 Top5: 行业景气度因子加减分（-3~+3分）----
+    if getattr(config, 'SECTOR_CYCLE_ENABLED', True):
+        try:
+            from strategy.sector_cycle import get_sector_cycle_score
+            _sector_name = _get_stock_sector(code)
+            if _sector_name:
+                _cycle_adj = get_sector_cycle_score(_sector_name)
+                if _cycle_adj != 0:
+                    total += _cycle_adj
+                    factors["SC_景气度"] = _cycle_adj
+                    if _cycle_adj > 0:
+                        signals.append(f"景气上行+{_cycle_adj}({_sector_name})")
+                    else:
+                        signals.append(f"景气下行{_cycle_adj}({_sector_name})")
+        except Exception as _e:
+            logger.debug(f"[景气度] {code} 景气度因子异常: {_e}")
+
+    # ---- V10.1 Top6: 护城河代理指标加分（0-3分）----
+    if getattr(config, 'MOAT_INDICATOR_ENABLED', True):
+        try:
+            from strategy.moat import get_moat_bonus
+            _moat_adj = get_moat_bonus(code, fund_data=fund_data, rps_rank=rps_rank)
+            if _moat_adj > 0:
+                total += _moat_adj
+                factors["MOAT_护城河"] = _moat_adj
+                signals.append(f"护城河+{_moat_adj}")
+        except Exception as _e:
+            logger.debug(f"[护城河] {code} 护城河指标异常: {_e}")
+
+    # ---- V10.2: 财报深度分析加减分（-2~+4分）----
+    # 基于五维评分: 营收趋势/利润质量/毛利率/ROE杜邦/负债结构
+    _fr_summary = ""
+    if getattr(config, 'FINANCIAL_REPORT_ENABLED', True):
+        try:
+            from strategy.financial_report import get_financial_report_bonus, get_financial_report_summary
+            _fr_bonus = get_financial_report_bonus(code, fund_data=fund_data)
+            if _fr_bonus != 0:
+                total += _fr_bonus
+                factors["FR_财报"] = _fr_bonus
+                if _fr_bonus > 0:
+                    signals.append(f"财报优质+{_fr_bonus}")
+                else:
+                    signals.append(f"财报预警{_fr_bonus}")
+            _fr_summary = get_financial_report_summary(code, fund_data=fund_data)
+        except Exception as _e:
+            logger.debug(f"[财报] {code} 财报分析异常: {_e}")
 
     return {
         "total_score": round(total, 1),
@@ -1468,6 +1758,7 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         "rps_rank": round(rps_rank * 100, 1),
         "change_60d": round(change_60d, 2),
         "prediction": prediction,
+        "financial_summary": _fr_summary,  # V10.2: 财报分析摘要
     }
 
 
@@ -1647,14 +1938,19 @@ def record_canslim_ic(all_scores: list, data_dict: dict, forward_days: int = 20)
 _FLOW_BONUS_CACHE = None
 _FLOW_BONUS_CACHE_TIME = 0
 
-def _get_capital_flow_bonus(code: str) -> int:
-    """V3.2: 获取资金流加分（北向+主力）
+def _get_capital_flow_factor(code: str) -> float:
+    """V10.0 P0-②: 资金流连续因子（替代原离散bonus）
     
-    规则:
-    - 北向资金5日净流入>50亿 + 个股主力连续3日净流入 → +3
-    - 北向资金5日净流入>20亿 → +2
-    - 北向资金5日净流出>30亿 → -2
-    - 个股主力连续3日净流出 → -1
+    输出范围: [0, 10] 连续浮点数
+      - 0~2: 强流出（规避）
+      - 2~4: 温和流出
+      - 4~6: 中性
+      - 6~8: 温和流入
+      - 8~10: 强流入（青睐）
+    
+    因子构成:
+      1. 北向资金环境分 [0, 5]: 基于5日净流入连续插值
+      2. 个股主力强度分 [0, 5]: 基于连续流入天数+强度
     
     缓存: 每小时刷新一次
     
@@ -1679,48 +1975,55 @@ def _get_capital_flow_bonus(code: str) -> int:
                 _FLOW_BONUS_CACHE_TIME = now
     
     nb_data = _FLOW_BONUS_CACHE or {}
-    bonus = 0
     
-    # 北向资金大环境
+    # ---- 成分1: 北向资金环境分 [0, 5] ----
+    # 基于5日净流入连续插值（-100亿→0分, +100亿→5分, 线性）
     nb_5d = nb_data.get("5d_net_inflow", 0)  # 单位: 亿
-    if nb_5d > 50:
-        bonus += 2
-    elif nb_5d > 20:
-        bonus += 1
-    elif nb_5d < -30:
-        bonus -= 2
+    # 线性映射: [-100, +100] → [0, 5]
+    nb_score = max(0.0, min(5.0, (nb_5d + 100) / 200 * 5))
     
-    # 个股主力资金流（从缓存读取）
+    # ---- 成分2: 个股主力强度分 [0, 5] ----
+    stock_score = 2.5  # 默认中性
     try:
         from data.data_loader import load_capital_flow_cache
         flow_cache = load_capital_flow_cache()
         stock_flow = flow_cache.get(code, {})
         consec_in = stock_flow.get("consecutive_inflow_days", 0)
         consec_out = stock_flow.get("consecutive_outflow_days", 0)
-        if consec_in >= 3:
-            bonus += 1
-        elif consec_out >= 3:
-            bonus -= 1
+        
+        # 连续流入天数 → 强度分（0~5天 → 2.5~5分）
+        if consec_in > 0:
+            stock_score = 2.5 + min(2.5, consec_in * 0.5)
+        # 连续流出天数 → 强度分（0~5天 → 2.5~0分）
+        elif consec_out > 0:
+            stock_score = 2.5 - min(2.5, consec_out * 0.5)
     except Exception:
         pass
     
-    return max(min(bonus, 3), -2)  # 范围[-2, +3]
+    # 合成最终因子 [0, 10]
+    factor = max(0.0, min(10.0, nb_score + stock_score))
+    return round(factor, 2)
 
 
 # ============================================================
-# 行业轮动加分（V3.2新增）
+# V10.0 P1-②: 行业轮动连续因子（替代原离散adj）
 # ============================================================
 _SECTOR_ROT_CACHE = None
 _SECTOR_ROT_CACHE_TIME = 0
 
-def _get_sector_rotation_adj(code: str) -> int:
-    """V3.2: 获取行业轮动加分/减分
+def _get_sector_rotation_factor(code: str) -> float:
+    """V10.0 P1-②: 获取行业轮动连续因子
     
-    规则:
-    - 强势赛道(score>=60) → +3
-    - 较强赛道(score>=50) → +1
-    - 弱势赛道(score<35) → -3
-    - 较弱赛道(score<45) → -1
+    输出范围: [0, 10] 连续浮点数
+      - 0~2: 弱势赛道（规避）
+      - 2~4: 较弱赛道
+      - 4~6: 中性赛道
+      - 6~8: 较强赛道
+      - 8~10: 强势赛道（青睐）
+    
+    因子构成:
+      1. 板块强度分 [0, 6]: 基于sector_score连续映射
+      2. 轮动动量分 [0, 4]: 基于5日/20日涨幅加速度
     
     缓存: 每小时刷新
     """
@@ -1730,39 +2033,49 @@ def _get_sector_rotation_adj(code: str) -> int:
     
     if _SECTOR_ROT_CACHE is None or (now - _SECTOR_ROT_CACHE_TIME) > 3600:
         try:
-            from strategy.sector_rotation import analyze_sector_rotation
-            # 用当前已有的data_dict缓存（如果有的话）
-            # 简化版：直接从filter_strong_sectors的结果读取
             rot_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                     'data', 'sector_rotation_cache.json')
             if os.path.exists(rot_path):
                 with open(rot_path, 'r', encoding='utf-8') as f:
                     rot_data = json.load(f)
-                _SECTOR_ROT_CACHE = rot_data.get("sector_scores", {})
+                _SECTOR_ROT_CACHE = {
+                    "scores": rot_data.get("sector_scores", {}),
+                    "momentum": rot_data.get("sector_momentum", {}),  # 5日/20日涨幅
+                }
             else:
-                _SECTOR_ROT_CACHE = {}
+                _SECTOR_ROT_CACHE = {"scores": {}, "momentum": {}}
         except Exception:
-            _SECTOR_ROT_CACHE = {}
+            _SECTOR_ROT_CACHE = {"scores": {}, "momentum": {}}
         _SECTOR_ROT_CACHE_TIME = now
     
-    if not _SECTOR_ROT_CACHE:
-        return 0
+    if not _SECTOR_ROT_CACHE or not _SECTOR_ROT_CACHE.get("scores"):
+        return 5.0  # 默认中性
     
     # 查找股票所属赛道
     sector = _get_stock_sector(code)
     if not sector or sector == "其他":
-        return 0
+        return 5.0  # 无板块信息，默认中性
     
-    score = _SECTOR_ROT_CACHE.get(sector, 50)  # 默认中性50
-    if score >= 60:
-        return 3
-    elif score >= 50:
-        return 1
-    elif score < 35:
-        return -3
-    elif score < 45:
-        return -1
-    return 0
+    # ---- 成分1: 板块强度分 [0, 6] ----
+    # sector_score范围[0,100]，线性映射到[0,6]
+    score = _SECTOR_ROT_CACHE["scores"].get(sector, 50)
+    strength_score = max(0.0, min(6.0, score / 100 * 6))
+    
+    # ---- 成分2: 轮动动量分 [0, 4] ----
+    # 基于5日/20日涨幅加速度
+    momentum_data = _SECTOR_ROT_CACHE.get("momentum", {})
+    sector_momentum = momentum_data.get(sector, {})
+    chg_5d = sector_momentum.get("chg_5d", 0)  # 5日涨幅
+    chg_20d = sector_momentum.get("chg_20d", 0)  # 20日涨幅
+    
+    # 加速度 = 5日涨幅 - 20日涨幅/4（归一化到同周期）
+    acceleration = chg_5d - chg_20d / 4
+    # 映射: [-5%, +5%] → [0, 4]
+    momentum_score = max(0.0, min(4.0, (acceleration + 5) / 10 * 4))
+    
+    # 合成最终因子 [0, 10]
+    factor = max(0.0, min(10.0, strength_score + momentum_score))
+    return round(factor, 2)
 
 
 def _canslim_reason(factors: dict, signals: list) -> str:
@@ -1898,21 +2211,21 @@ def predict_forward(df: pd.DataFrame, code: str) -> dict:
             score += 2  # 涨时量大、跌时量小，主力控盘
             signals.append("主力控盘")
     
-    # ---- V5.2: 5. 北向资金/聪明钱信号（3分）----
-    # 北向资金连续流入且个股所在板块获加仓，前瞻性看多
+    # ---- V10.0 P0-②: 5. 北向资金/聪明钱信号（3分）----
+    # 使用连续因子[0,10]替代离散bonus
     try:
         _sector = _get_stock_sector(code)
         if _sector:
-            _flow_bonus = _get_capital_flow_bonus(code)
-            if _flow_bonus >= 3:
-                score += 3  # 北向+主力双确认流入
-                signals.append("北向资金强流入")
-            elif _flow_bonus >= 1:
-                score += 2  # 单向流入
-                signals.append("资金净流入")
-            elif _flow_bonus <= -2:
-                score -= 1  # 明显流出，轻微惩罚
-                signals.append("资金净流出(-1)")
+            _flow_factor = _get_capital_flow_factor(code)
+            if _flow_factor >= 8.0:
+                score += 3  # 强流入（因子≥8）
+                signals.append(f"北向资金强流入(因子{_flow_factor:.1f})")
+            elif _flow_factor >= 6.0:
+                score += 2  # 温和流入（因子≥6）
+                signals.append(f"资金净流入(因子{_flow_factor:.1f})")
+            elif _flow_factor <= 2.0:
+                score -= 1  # 明显流出（因子≤2）
+                signals.append(f"资金净流出(因子{_flow_factor:.1f})")
     except Exception:
         pass
 
@@ -2156,6 +2469,11 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
         # FIX P2(2026-08-07): 仅资金足够时才强制100股，避免高价股超出预算
         if moderate_buy > 0 and 100 * moderate_buy <= first_max_amount:
             first_shares = 100
+        # FIX(2026-08-27): 高价股特殊处理 —— 100股在单标的封顶内但超出首批预算时，
+        # 允许买入100股（德邦/紫金实证：首批预算3.8万<100股×488元，但单标的封顨9.6万可容纳）
+        elif moderate_buy > 0 and 100 * moderate_buy <= max_single_amount:
+            first_shares = 100
+            logger.info(f"  [高价股适配] {code} 100股×{moderate_buy}超出首批预算{first_max_amount:.0f}但在单标的封顨{max_single_amount:.0f}内，允许买入100股")
     first_amount = first_shares * moderate_buy
     if first_shares <= 0 and not _degrade_reasons:
         # 2026-08-13: 首批买不起一手 → 降级观察，不落盘买点
@@ -2377,6 +2695,13 @@ def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
             }
         return result
 
+    # V10.1 Top1: 估值安全闸门（硬筛通过后、评分前拦截高估值）
+    vg_result = _check_valuation_gate(code)
+    if not vg_result["pass"]:
+        result["filtered"] = True
+        result["fate"] = {"sector": sector_name, "fate": "估值闸门拦截", "score": 0, "detail": vg_result["reason"]}
+        return result
+
     # CANSLIM多因子打分
     factor_result = canslim_score(df, code, None, market_state=market_state, regime_info=regime_info)
 
@@ -2401,6 +2726,7 @@ def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
         "weak_below_ma20": bool(is_weak_market and hf_result.get("details", {}).get("below_ma20")),
         "is_cooling": False,  # 冷却期标记由主线程设置
         "prediction": factor_result.get("prediction", {}),
+        "financial_summary": factor_result.get("financial_summary", ""),  # V10.2: 财报摘要
         "df": df
     }
     result["fate"] = {"sector": stock_info.get("赛道", "其他"), "fate": "已评分", "score": factor_result["total_score"], "detail": ""}
@@ -2440,6 +2766,44 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     _min_score_override = min_score
     # V5.2: max_stocks/max_per_sector 在regime检测后动态确定（见下方）
     
+    # FIX(2026-08-27): 数据新鲜度守卫 —— K线数据过时超过阈值时拒绝运行，避免基于陈旧数据输出误导性结果
+    # FIX(2026-08-31): 当最新数据为今日但少数动态候选K线滞后时，降级为警告+跳过过时标的，而非拦截整个选股
+    _DATA_STALE_THRESHOLD = getattr(config, 'SCREENER_DATA_STALE_THRESHOLD', 4)
+    try:
+        from data.data_loader import check_data_freshness
+        _freshness = check_data_freshness(max_stale_days=_DATA_STALE_THRESHOLD)
+        if not _freshness["ok"]:
+            _stale_n = len(_freshness["stale_codes"])
+            _latest = _freshness["latest_date"] or "未知"
+            _days = _freshness["stale_days"]
+            _total = _freshness.get("total_codes", 0)
+            # 降级策略: 最新数据为今日(或昨日)且过时标的占比<30%时，仅警告+跳过
+            _stale_ratio = _stale_n / max(_total, 1)
+            if _days <= 1 and _stale_ratio < 0.3:
+                logger.warning(f"[选股引擎] 数据部分过时(降级运行): 最新={_latest}, {_stale_n}/{_total}只过时({_stale_ratio:.0%}), 将跳过过时标的")
+                if _stale_n > 0:
+                    _examples = [f"{c}({d})" for c, d, _ in _freshness["stale_codes"][:5]]
+                    logger.warning(f"[选股引擎] 过时标的示例: {', '.join(_examples)}")
+                # 从data_dict中移除过时标的
+                _stale_code_set = {c for c, _, _ in _freshness["stale_codes"]}
+                for _sc in _stale_code_set:
+                    data_dict.pop(_sc, None)
+            else:
+                logger.error(f"[选股引擎] 数据已过时! 最新={_latest}, 落后{_days}天, {_stale_n}只标的超时")
+                logger.error(f"[选股引擎] 请先执行数据更新: python main.py 或 batch_update_all()")
+                if _stale_n > 0:
+                    _examples = [f"{c}({d})" for c, d, _ in _freshness["stale_codes"][:5]]
+                    logger.error(f"[选股引擎] 过时标的示例: {', '.join(_examples)}")
+                return {
+                    "stock_pool": [], "qualified_count": 0, "total_candidates": len(data_dict),
+                    "buy_recommend_count": 0, "watch_only_count": 0,
+                    "error": "data_stale", "staleness_days": _days,
+                    "latest_data_date": _latest,
+                    "msg": f"K线数据已过时{_days}天(最新={_latest})，请先执行数据更新",
+                }
+    except Exception as _fresh_err:
+        logger.warning(f"[选股引擎] 数据新鲜度检查异常(继续运行): {_fresh_err}")
+    
     scan_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     logger.info(f"[选股引擎V3] 开始运行（全赛道+弱势模式），候选股票 {len(data_dict)} 只")
 
@@ -2469,6 +2833,18 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     regime_info = detect_market_regime(data_dict, market_info)
     logger.info(f"  Regime: {regime_info['regime']} | 宽度: {regime_info['breadth']}%")
 
+    # V10.1 Top3: 风格轮动检测 —— 重置缓存并预计算（后续canslim_score内复用缓存结果）
+    _reset_style_cache()
+    _style_preview = _detect_market_style(data_dict)
+    logger.info(f"  风格: {_style_preview['style']} | 大盘5d={_style_preview['large_cap_chg']:+.2f}% 小盘5d={_style_preview['small_cap_chg']:+.2f}% 差={_style_preview['spread']:+.2f}%")
+
+    # V10.1 Top4: 结构性行情检测 —— 指数横盘+高分化时自动降仓
+    _structural_info = {"structural": False, "dispersion": 0, "position_adj": 1.0, "detail": "未启用"}
+    if getattr(config, 'STRUCTURAL_MARKET_ENABLED', True):
+        _structural_info = _detect_structural_market(data_dict, regime_info)
+        if _structural_info["structural"]:
+            logger.info(f"  ⚠ 结构性行情: σ={_structural_info['dispersion']:.1f}% → 仓位×{_structural_info['position_adj']:.2f}")
+
     # V5.2: 动态输出数量 —— 根据市场状态调整输出上限
     if max_stocks is None:
         if market_state == "up":
@@ -2478,6 +2854,11 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
         else:
             max_stocks = screener_cfg.get("total_max", 10)
         logger.info(f"  动态输出上限: {max_stocks}只 (market_state={market_state})")
+    # V10.1 Top4: 结构性行情仓位调整（高分化时减少输出数量）
+    if _structural_info.get("structural", False):
+        _pos_adj = _structural_info.get("position_adj", 1.0)
+        max_stocks = max(3, int(max_stocks * _pos_adj))
+        logger.info(f"  结构性行情调整: 输出上限{int(max_stocks / _pos_adj)}×{_pos_adj:.2f}={max_stocks}只")
     max_per_sector = min(
         screener_cfg.get("max_stocks_per_sector", 3),
         screener_cfg.get("max_stocks_per_sector_max", 5)
@@ -2599,13 +2980,13 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
         logger.warning(f"  [预热] RPS缓存加载失败(不影响主流程): {_e}")
     try:
         for _pc in list(_scorable.keys())[:5]:
-            _get_capital_flow_bonus(_pc)
+            _get_capital_flow_factor(_pc)
         logger.info("  [预热] 资金流缓存已预热")
     except Exception as _e:
         logger.warning(f"  [预热] 资金流缓存预热失败(不影响主流程): {_e}")
     try:
         for _pc in list(_scorable.keys())[:5]:
-            _get_sector_rotation_adj(_pc)
+            _get_sector_rotation_factor(_pc)
     except Exception:
         pass
     
@@ -2852,6 +3233,7 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
                 "rps_rank": cand["rps_rank"],
             }, market_info)
             buy_plan["sector_group"] = sector_group
+            buy_plan["financial_summary"] = cand.get("financial_summary", "")  # V10.2: 财报摘要传递
             if buy_plan.get("plan_degraded"):
                 # 2026-08-13: 买点计划出口降级（倒挂/零仓位/盈亏比不足等）→
                 # 仅观察、不占用行业配额、不进入买点落盘（save_buy_alert_levels 只收录推荐且非观察）
@@ -2993,6 +3375,8 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
 
     return {
         "market_info": market_info,
+        "style_info": _style_preview,  # V10.1 Top3: 市场风格检测结果
+        "structural_info": _structural_info,  # V10.1 Top4: 结构性行情检测结果
         "sector_analysis": sector_result,
         "sector_quotas": sector_quotas,
         "stock_pool": stock_pool,
@@ -3775,6 +4159,13 @@ def generate_screener_report_html(result: dict) -> str:
             score = stock["factor_score"]
             score_class = "score-high" if score >= 70 else ("score-mid" if score >= 55 else "score-low")
             signal_html = "".join(f'<span class="signal-tag{" signal-star" if "★" in sig else ""}">{sig}</span>' for sig in stock.get("signals", []))
+            # V10.2: 财报摘要展示
+            _fr_text = stock.get("financial_summary", "")
+            if _fr_text and _fr_text not in ("财报数据不足", "财报中性", "财报表现一般", "未启用", ""):
+                _fr_color = "#52C41A" if "优秀" in _fr_text or "良好" in _fr_text else ("#FF4D4F" if "预警" in _fr_text else "#FA8C16")
+                _fr_html = f'<span style="font-size:10px;color:{_fr_color};margin-left:6px">📊 {_fr_text}</span>'
+            else:
+                _fr_html = ""
             html += f"""
                 <tr>
                     <td>{i}</td>
@@ -3793,6 +4184,7 @@ def generate_screener_report_html(result: dict) -> str:
                     <td colspan="11" style="padding:3px 8px;background:#fafafa;text-align:left;border-bottom:1px solid #e8e8e8">
                         <span style="font-size:11px;color:#666">因子: </span>{_factor_bar(stock['factor_detail'])}
                         <span style="font-size:10px;color:#999;margin-left:6px">RPS前{stock.get('rps_rank',0):.0f}% | {stock.get('factor_reason','')}</span>
+                        {_fr_html}
                     </td>
                 </tr>
                 <tr>

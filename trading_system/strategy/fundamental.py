@@ -439,16 +439,115 @@ class FundamentalAnalyzer:
         """
         输出兼容选股引擎FUNDAMENTAL_DATA格式的数据
         
-        返回: {"eps_growth_q": xx, "eps_growth_3y": xx, "has_institution": bool}
+        V10.2: 扩展输出字段，从3字段→10+字段，供财报深度分析使用
+        向后兼容: 原有 eps_growth_q/eps_growth_3y/has_institution 字段不变
+        
+        返回:
+            {
+                "eps_growth_q": float,      # 单季度净利润增速(%)
+                "eps_growth_3y": float,     # 3年复合增速(%)
+                "has_institution": bool,    # 机构资金流入
+                "roe": float|None,          # ROE(%)
+                "gross_margin": float|None, # 毛利率(%)
+                "debt_ratio": float|None,   # 资产负债率(%)
+                "revenue_growth": float|None, # 营收同比增速(%)
+                "net_profit_growth": float|None, # 净利润同比增速(%)
+                "pe_ttm": float|None,       # 滚动市盈率
+                "pb": float|None,           # 市净率
+                "pe_percentile": float|None, # PE历史分位数(0-100)
+            }
         """
         fin = self.get_financial_indicators(code)
         flow = self.get_capital_flow(code)
 
         return {
+            # 现有字段（向后兼容）
             "eps_growth_q": fin.get("net_profit_growth", 0) or 0,
             "eps_growth_3y": fin.get("revenue_growth", 0) or 0,  # 近似
             "has_institution": flow.get("signal") == "inflow",
+            # V10.2 新增字段（财报深度分析用）
+            "roe": fin.get("roe"),
+            "gross_margin": fin.get("gross_margin"),
+            "debt_ratio": fin.get("debt_ratio"),
+            "revenue_growth": fin.get("revenue_growth"),
+            "net_profit_growth": fin.get("net_profit_growth"),
+            "pe_ttm": fin.get("pe_ttm"),
+            "pb": fin.get("pb"),
+            "pe_percentile": fin.get("pe_percentile"),
         }
+
+    def get_financial_history(self, code: str) -> dict:
+        """
+        V10.2 新增: 获取多季度财务指标历史序列
+        
+        用于财报深度分析中的趋势判断（营收加速/毛利率变化/ROE稳定性）
+        
+        返回:
+            {
+                "roe_history": [float],           # 近N期ROE列表
+                "margin_history": [float],        # 近N期毛利率列表
+                "revenue_growth_history": [float], # 近N期营收增速列表
+                "profit_growth_history": [float],  # 近N期利润增速列表
+                "debt_ratio_history": [float],    # 近N期负债率列表
+                "periods": int,                   # 实际获取的期数
+                "source": str,                    # 数据来源
+            }
+        """
+        # 检查缓存
+        cached = self._get_from_cache(code, "financial_history")
+        if cached:
+            return cached
+        
+        default_result = {
+            "roe_history": [],
+            "margin_history": [],
+            "revenue_growth_history": [],
+            "profit_growth_history": [],
+            "debt_ratio_history": [],
+            "periods": 0,
+            "source": "none",
+        }
+        
+        if not HAS_AKSHARE:
+            return default_result
+        
+        try:
+            symbol = self._to_akshare_symbol(code)
+            df = ak.stock_financial_analysis_indicator(symbol=symbol, start_year="2023")
+            if df is None or df.empty:
+                return default_result
+            
+            # 提取多季度历史序列（akshare返回中文列名）
+            col_map = {
+                "净资产收益率(%)": "roe_history",
+                "销售毛利率(%)": "margin_history",
+                "主营业务收入增长率(%)": "revenue_growth_history",
+                "净利润增长率(%)": "profit_growth_history",
+                "资产负债率(%)": "debt_ratio_history",
+            }
+            
+            result = {"source": "akshare"}
+            for cn_col, en_key in col_map.items():
+                history = []
+                if cn_col in df.columns:
+                    for val in df[cn_col]:
+                        if pd.notna(val):
+                            try:
+                                history.append(round(float(val), 2))
+                            except (ValueError, TypeError):
+                                pass
+                result[en_key] = history
+            
+            result["periods"] = max(len(result.get(k, [])) for k in col_map.values())
+            
+            # 存入缓存
+            result["update_date"] = self.today
+            self._save_to_cache(code, "financial_history", result)
+            return result
+            
+        except Exception as e:
+            logger.debug(f"[基本面] {code}财务历史序列获取失败: {e}")
+            return default_result
 
     # ============================================================
     # 五、缓存管理

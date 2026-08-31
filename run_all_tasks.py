@@ -146,7 +146,8 @@ def task_8_alert_engine():
 
     holdings_data = {}
     try:
-        with open(config.HOLDINGS_FILE, "r", encoding="utf-8") as f:
+        # FIX(2026-08-24): 统一委托config.get_holdings_file()（新旧路径兼容）
+        with open(config.get_holdings_file(), "r", encoding="utf-8") as f:
             holdings_data = json.load(f)
     except Exception:
         pass

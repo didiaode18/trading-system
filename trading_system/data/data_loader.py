@@ -3,6 +3,8 @@
 ===========================
 - 主数据源：baostock（证券宝，免费稳定）
 - 备用数据源：akshare（东方财富）
+- 第三数据源：腾讯日K API（web.ifzq.gtimg.cn）
+- 兜底：本地 SQLite 数据库
 - 支持每日增量更新，保存到本地 SQLite 数据库
 - 失败自动重试3次，每次间隔2秒
 - 股票池从 config.py 读取
@@ -12,6 +14,8 @@ import sqlite3
 import time
 import datetime
 import logging
+import json as _json
+import urllib.request
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -248,6 +252,67 @@ def fetch_stock_daily_akshare(code: str, start_date: str = None,
 
 
 # ============================================================
+# 腾讯日K API（第三数据源）
+# ============================================================
+
+def fetch_stock_daily_tencent(code: str, start_date: str = None,
+                               end_date: str = None) -> pd.DataFrame:
+    """
+    腾讯日K线 API（第三数据源）
+    接口: http://web.ifzq.gtimg.cn/appstock/app/fqkline/get
+    返回前复权日K，最多返回约320根K线
+    """
+    # 腾讯格式转换: 600xxx/51xxxx -> sh, 00xxxx/30xxxx/00xxxx -> sz
+    if code.startswith(('6', '5', '9')):
+        tc_code = f"sh{code}"
+    else:
+        tc_code = f"sz{code}"
+    
+    url = (f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+           f"param={tc_code},day,,,320,qfq")
+    
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        req.add_header("Referer", "http://finance.qq.com")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            content = resp.read().decode("utf-8", errors="ignore")
+        
+        data = _json.loads(content)
+        # 解析腾讯日K格式: data -> data -> {tc_code} -> day/qfqday -> [[date, open, close, high, low, volume], ...]
+        stock_data = data.get("data", {}).get(tc_code, {})
+        klines = stock_data.get("qfqday") or stock_data.get("day") or []
+        
+        if not klines:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(klines)
+        # 腾讯返回5-7列: [date, open, close, high, low, volume?, amount?]
+        col_map = {0: "date", 1: "open", 2: "close", 3: "high", 4: "low", 5: "volume", 6: "amount"}
+        df = df.rename(columns=col_map)
+        if "volume" not in df.columns:
+            df["volume"] = 0
+        if "amount" not in df.columns:
+            df["amount"] = 0.0
+        
+        for col in ["open", "close", "high", "low", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=["close"])
+        
+        # 日期过滤
+        if start_date:
+            sd = start_date.replace("-", "")[:8]
+            df = df[df["date"] >= f"{sd[:4]}-{sd[4:6]}-{sd[6:8]}"]
+        if end_date:
+            ed = end_date.replace("-", "")[:8]
+            df = df[df["date"] <= f"{ed[:4]}-{ed[4:6]}-{ed[6:8]}"]
+        
+        return df.reset_index(drop=True)
+    except Exception as e:
+        raise RuntimeError(f"腾讯日K失败[{code}]: {e}")
+
+
+# ============================================================
 # 统一获取接口（自动切换数据源）
 # ============================================================
 
@@ -255,8 +320,9 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
                       retry_times: int = None, retry_interval: int = None) -> pd.DataFrame:
     """
     获取单只股票日线数据（带重试 + 自动切换数据源）
-    优先使用 baostock，失败后尝试 akshare，最后回退到本地数据库
+    优先使用 baostock，失败后尝试 akshare，再失败尝试腾讯日K，最后回退到本地数据库
     V6.0 P2-4: 新增本地数据库兜底，避免网络故障时完全无数据
+    V6.1(2026-08-27): 新增腾讯日K API作为第三数据源
     """
     if retry_times is None:
         retry_times = config.DATA_RETRY_TIMES
@@ -286,6 +352,16 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
             except Exception as e:
                 last_error = e
                 logger.warning(f"[{code}] akshare 第{attempt}次失败: {e}")
+
+        # 再试腾讯日K API（第三数据源）
+        try:
+            df = fetch_stock_daily_tencent(code, start_date, end_date)
+            if not df.empty:
+                logger.info(f"[{code}] baostock/akshare失败，已切换到腾讯日K")
+                return df
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[{code}] 腾讯日K 第{attempt}次失败: {e}")
 
         if attempt < retry_times:
             time.sleep(retry_interval)
@@ -600,6 +676,55 @@ def get_all_candidate_codes() -> list:
     # 过滤创业板(300)和科创板(688)，用户无交易权限
     codes = {c for c in codes if not c.startswith("300") and not c.startswith("688")}
     return sorted(codes)
+
+
+def check_data_freshness(max_stale_days: int = 3) -> dict:
+    """
+    检查K线数据新鲜度
+    返回: {
+        "ok": bool,           # 数据是否新鲜
+        "latest_date": str,   # 最新数据日期
+        "stale_days": int,    # 过时自然日数
+        "stale_codes": list,  # 过时标的列表
+        "total_codes": int,   # 总标的数
+    }
+    """
+    try:
+        conn = init_db()
+        cursor = conn.cursor()
+        # 获取所有有last_update记录的标的
+        cursor.execute("SELECT code, last_date FROM last_update ORDER BY last_date DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if not rows:
+            return {"ok": False, "latest_date": None, "stale_days": 999,
+                    "stale_codes": [], "total_codes": 0}
+        
+        today = datetime.date.today()
+        latest_overall = None
+        stale_codes = []
+        
+        for code, last_date_str in rows:
+            last_date = datetime.datetime.strptime(last_date_str, "%Y-%m-%d").date()
+            days_stale = (today - last_date).days
+            if days_stale > max_stale_days:
+                stale_codes.append((code, last_date_str, days_stale))
+            if latest_overall is None or last_date > latest_overall:
+                latest_overall = last_date
+        
+        stale_days = (today - latest_overall).days if latest_overall else 999
+        return {
+            "ok": len(stale_codes) == 0,
+            "latest_date": latest_overall.strftime("%Y-%m-%d") if latest_overall else None,
+            "stale_days": stale_days,
+            "stale_codes": stale_codes[:20],  # 最多返回20只
+            "total_codes": len(rows),
+        }
+    except Exception as e:
+        logger.error(f"数据新鲜度检查异常: {e}")
+        return {"ok": False, "latest_date": None, "stale_days": 999,
+                "stale_codes": [], "total_codes": 0}
 
 
 def _update_single_akshare(code: str) -> int:

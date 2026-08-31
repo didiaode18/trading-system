@@ -110,6 +110,9 @@ class IntradayMonitor:
         # V8.0: 监控级别状态（供scheduler变频使用）
         self.alert_level = "normal"  # normal / warning / emergency
         self._clear_count = 0        # 连续无异常计数
+        self._emergency_since = None  # V10.3: emergency开始时间（防锁定）
+        self._emergency_suppressed_until = None  # V10.3 FIX: 降级后抑制窗口（防乒乓回升）
+        self._code_last_alert_time = {}  # V10.3: {code: datetime} 标的级全局冷却
 
         # V7.2: 状态跟踪
         self.stop_loss_first_touch = {}  # {code: datetime} 首次触及止损时间
@@ -136,6 +139,22 @@ class IntradayMonitor:
         self._prev_gate_state = "pass"   # 上轮门控状态（用于检测 delay→pass 转换）
         self._queued_alert_keys = set()  # 被门控延迟的预警key（防止重复入队）
 
+        # V9.3: warning级预警邮件冷却与升级追踪
+        self._warning_email_cooldown = {}   # {code: datetime} warning级邮件冷却追踪
+        self._warning_count_window = {}     # {code: [(datetime, type)]} 滑动窗口（升级判定用）
+
+        # V9.3: 波动率突变检测冷却（每标的15分钟最多触发1次）
+        self._vol_alert_cooldown = {}       # {code: datetime} 波动率预警冷却
+
+        # V9.3: 多因子联合评分冷却（每标的30分钟最多触发1次）
+        self._fusion_alert_cooldown = {}    # {code: datetime} 联合评分预警冷却
+
+        # V9.3: 预警效果在线评估器（P1-⑥）
+        self._alert_evaluator = None  # 懒初始化，避免非交易时段无谓导入
+
+        # V10.0 P0-①: 预警参数自优化闭环（加载校准参数）
+        self._calibration = self._load_calibration_params()
+
         # V9.2: 跨日状态跟踪（进程不重启时检测日期变化自动清理日内状态）
         self._state_date = datetime.date.today().isoformat()
 
@@ -146,6 +165,25 @@ class IntradayMonitor:
 
         # FIX: 从持久化文件加载当日状态（盘中重启不重复报警/不重置缓冲计时）
         self._load_state()
+
+    # ============================================================
+    # V10.0 P0-①: 预警参数自优化闭环（加载校准参数）
+    # ============================================================
+
+    def _load_calibration_params(self) -> dict:
+        """加载预警校准参数（仅启动时调用一次，失败降级为空 dict）"""
+        try:
+            from strategy.alert_auto_calibrate import load_calibration
+            cal = load_calibration()
+            if cal:
+                mode = "观察" if cal.get("observation_mode") else "生效"
+                logger.info(f"[预警校准] 已加载（{mode}模式）| "
+                           f"阈值因子{len(cal.get('threshold_factors', {}))}种 | "
+                           f"更新于{cal.get('last_updated', '未知')}")
+            return cal
+        except Exception as e:
+            logger.debug(f"[预警校准] 加载失败（降级为空）: {e}")
+            return {}
 
     # ============================================================
     # 状态持久化（FIX: 参照alert_cooldown.json模式，失败仅debug不阻断）
@@ -299,6 +337,13 @@ class IntradayMonitor:
                 self._check_all()
             except Exception as e:
                 logger.error(f"[盘中监控] 检查异常: {e}")
+
+            # V9.3: 预警效果评估 — 每轮验证待验证的历史预警
+            if self._alert_evaluator is not None:
+                try:
+                    self._alert_evaluator.verify_pending()
+                except Exception:
+                    pass
 
             # V4.0(G8): 每轮扫描后写心跳文件，watchdog据此检测监控静默失效
             self._write_heartbeat("active")
@@ -728,9 +773,10 @@ class IntradayMonitor:
                 self.stop_loss_first_touch.pop(code, None)
                 self.stop_touch_prices.pop(code, None)
 
-            # ---- 检查2: 急跌预警 ----
+            # ---- 检查2: 急跌预警（V9.3: 自适应阈值）----
             change_pct = quote.get("change_pct", 0)
-            if change_pct and change_pct < self.RAPID_DROP_PCT * 100:
+            _rapid_drop_threshold = self._get_adaptive_rapid_drop_threshold(market_quote)
+            if change_pct and change_pct < _rapid_drop_threshold:
                 alert_key = f"{today}_{code}_rapid_drop_{int(change_pct)}"
                 if alert_key not in self.alerts_sent:
                     alert = {
@@ -884,6 +930,17 @@ class IntradayMonitor:
                 (datetime.datetime.now().strftime("%H:%M:%S"), current_price)
             )
 
+        # ---- 检查8.6: V9.3 波动率突变检测（P0级新增）----
+        # V10.3: 默认禁用（无实际参考价值），通过 VOLATILITY_REGIME_CONFIG.enabled 控制
+        _vol_cfg = getattr(config, 'VOLATILITY_REGIME_CONFIG', {})
+        if _vol_cfg.get('enabled', False):
+            for code in list(self.holdings.keys()):
+                if code == "000300":
+                    continue
+                name = self.holdings[code].get("name", code)
+                vol_alerts = self._check_volatility_regime(code, name, today)
+                alerts.extend(vol_alerts)
+
         # ---- 检查9: V9.0 开盘30分钟定性（P0-4）----
         phase_alerts = self._check_opening_phase(quotes, today)
         alerts.extend(phase_alerts)
@@ -928,6 +985,11 @@ class IntradayMonitor:
                     alert["_alert_key"] = alert_key
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
+
+        # ---- V9.3: 多因子联合评分（贝叶斯融合近似）----
+        # 同一标的同一轮触发≥2个不同类型warning → 信号共振 → 升级为critical
+        fusion_alerts = self._fuse_alerts(alerts, today)
+        alerts.extend(fusion_alerts)
 
         # ---- V8.0: 更新监控级别（供scheduler变频使用）----
         self._update_alert_level(quotes, market_quote)
@@ -1002,9 +1064,9 @@ class IntradayMonitor:
     def _send_alert(self, alert: dict):
         """发送预警通知
 
-        FIX: 禁用监控线程的独立钉钉推送，统一由scheduler的send_alert_email()
-        单通道发送（含冷却/合并/去重），避免同一预警通过两条独立通道重复推送。
-        监控线程仅保留日志记录 + 企业微信 + critical邮件 + 回调。
+        V9.3: 恢复钉钉推送（critical/emergency立即推送，warning复用邮件判定逻辑）。
+        通知策略: 钉钉(秒达) + 邮件(存档) 双通道冗余。
+        scheduler统一链路仍保留作为补发兜底（含30min冷却+同标的合并）。
 
         V9.1: 大盘门控 — delay状态下非 critical 预警入队列延迟发送。
         """
@@ -1027,25 +1089,75 @@ class IntradayMonitor:
 
         logger.warning(f"[盘中预警-{level.upper()}] {message}")
 
+        # V10.3: 标的级全局冷却（同一标的多类型预警合并，防轰炸）
+        # critical/emergency不受限制（风控信号不可延迟）
+        code = alert.get("code", "")
+        if code and level not in ("critical", "emergency"):
+            esc_cfg = getattr(config, 'INTRADAY_ESCALATION_CONFIG', {})
+            global_cd_min = esc_cfg.get("code_global_cooldown_min", 15)
+            last_time = self._code_last_alert_time.get(code)
+            if last_time is not None:
+                elapsed_min = (datetime.datetime.now() - last_time).total_seconds() / 60
+                if elapsed_min < global_cd_min:
+                    logger.info(f"[标的冷却] {code} {alert.get('type','')} 距上次预警仅{elapsed_min:.0f}分钟(<{global_cd_min}min)，合并跳过")
+                    return
+        # 记录本次预警时间（延迟到实际发送判定后，避免仅日志预警占用冷却槽位）
+        _code_cooldown_armed = False
+
         # 企业微信推送
         if config.WECHAT_WORK_WEBHOOK:
             self._send_wechat(message, level)
+            _code_cooldown_armed = True
 
-        # FIX: 钉钉推送已禁用 —— 统一由scheduler.send_alert_email()单通道发送
-        # 原独立钉钉推送与scheduler统一预警各自治冷却/去重，导致同一标的
-        # 短时间内收到两条内容相同的钉钉预警。禁用后监控线程的预警仍通过
-        # scheduler统一链路（含30分钟冷却+同标的合并）发送，不再重复。
-        # if config.DINGTALK_WEBHOOK:
-        #     self._send_dingtalk(message, level)
+        # V9.3: warning级通知判定（钉钉+邮件共用，只调用一次避免副作用重复）
+        # _should_send_warning_email 有副作用（滑动窗口记录），必须缓存结果
+        _warning_notify = False
+        if level in ("warning", "emergency"):
+            _warning_notify = self._should_send_warning_email(alert)
 
-        # 邮件推送（仅critical级别）
-        if level == "critical" and config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            self._send_email_alert(alert)
+        # V9.3: 恢复钉钉推送（双通道冗余 — 钉钉秒达 + 邮件存档）
+        # critical/emergency: 立即推送（风控信号不可延迟）
+        # warning: 复用邮件判定逻辑，仅应发邮件的warning同步推钉钉
+        # info: 不发钉钉（避免噪音）
+        if config.DINGTALK_WEBHOOK:
+            if level in ("critical", "emergency"):
+                self._send_dingtalk(message, level)
+                _code_cooldown_armed = True
+            elif _warning_notify:
+                self._send_dingtalk(message, level)
+                _code_cooldown_armed = True
+
+        # 邮件推送
+        if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
+            if level == "critical":
+                # critical 无冷却，立即发送
+                self._send_email_alert(alert)
+                _code_cooldown_armed = True
+            elif _warning_notify:
+                # 复用上方已判定的 _warning_notify 结果，避免重复调用
+                self._send_warning_email(alert)
+                _code_cooldown_armed = True
+
+        # FIX(2026-08-24): 仅在实际发出通知后才占用标的冷却槽位——
+        # 原实现无条件记录，导致仅日志类预警（如VWAP失守）占用槽位后，
+        # 15分钟内同标的的必发风控预警（急跌/梯度减仓）被误拦截（实测复现）
+        if code and _code_cooldown_armed:
+            self._code_last_alert_time[code] = datetime.datetime.now()
 
         # 回调函数
         for callback in self.alert_callbacks:
             try:
                 callback(alert)
+            except Exception:
+                pass
+
+        # V9.3: 预警效果在线评估记录（warning+级别）
+        if level in ("warning", "critical", "emergency"):
+            try:
+                if self._alert_evaluator is None:
+                    from monitor.alert_evaluator import AlertEvaluator
+                    self._alert_evaluator = AlertEvaluator()
+                self._alert_evaluator.record_alert(alert)
             except Exception:
                 pass
 
@@ -1071,18 +1183,29 @@ class IntradayMonitor:
         """钉钉机器人推送"""
         try:
             import urllib.request
+            # V10.3: 关键词安全模式 —— 消息体不含DINGTALK_KEYWORD时自动加前缀，
+            # 否则钉钉服务端拒收(errcode 310000)导致风控信号丢失（与wechat_notify一致）
+            content = f"[交易系统预警] {message}"
+            _kw = getattr(config, "DINGTALK_KEYWORD", "")
+            if _kw and _kw not in content:
+                content = f"[{_kw}] {content}"
             data = json.dumps({
                 "msgtype": "text",
-                "text": {"content": f"[交易系统预警] {message}"}
+                "text": {"content": content}
             }).encode("utf-8")
             req = urllib.request.Request(
                 config.DINGTALK_WEBHOOK,
                 data=data,
                 headers={"Content-Type": "application/json"}
             )
-            urllib.request.urlopen(req, timeout=10)
+            # V10.3: 检查响应体errcode（钉钉返回HTTP200但errcode非0=拒收）
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp_body = json.loads(resp.read().decode("utf-8"))
+            if resp_body.get("errcode", 0) != 0:
+                logger.warning(f"[盘中监控] 钉钉推送被拒: errcode={resp_body.get('errcode')} "
+                               f"errmsg={resp_body.get('errmsg', '')[:60]}")
         except Exception as e:
-            logger.debug(f"[盘中监控] 钉钉推送失败: {e}")
+            logger.warning(f"[盘中监控] 钉钉推送失败: {e}")
 
     def _send_email_alert(self, alert: dict):
         """邮件推送（紧急预警）"""
@@ -1106,6 +1229,126 @@ class IntradayMonitor:
             send_email(subject, html)
         except Exception as e:
             logger.debug(f"[盘中监控] 邮件推送失败: {e}")
+
+    # ============================================================
+    # V9.3: warning级预警邮件发送（含冷却+升级机制）
+    # ============================================================
+
+    # 必须发送 warning 邮件的预警类型
+    _WARNING_EMAIL_TYPES = {
+        "急跌预警",        # 急跌≥3%（含5%+严重档）
+        "梯度减仓",        # 任意档位
+        "深亏标的每日提醒",  # 深亏每日汇总
+        # V10.3: 波动率突变移出必发集（用户反馈无实际参考价值，且单日产生86条预警/40+封邮件）
+    }
+    # 条件性发送：已满足触发条件即发送
+    _WARNING_CONDITIONAL_TYPES = {
+        "抛压沉重",           # 外盘<40% 且 跌幅>3%
+        "被动跌破(大盘联动)",  # 被动跌破
+    }
+    # 仅日志不邮件的类型
+    _WARNING_LOG_ONLY_TYPES = {
+        "托盘撤退", "VWAP失守", "振幅异常",
+        "疑似洗盘", "V反保护", "假突破确认(洗盘)",
+        "均值回归暂缓止损", "止损Buffer中", "止损解除(收回)",
+        "开盘定性",
+        "波动率突变",      # V10.3: 降为仅日志（即使重新启用检测也不发邮件/钉钉）
+    }
+
+    def _should_send_warning_email(self, alert: dict) -> bool:
+        """V9.3: 判断 warning 级预警是否应发送邮件（含冷却+升级机制）
+
+        规则:
+          - 仅日志类型（托盘撤退/VWAP首次跌破等）不发邮件
+          - 必发类型（急跌≥3%/梯度减仓/深亏）立即发送
+          - 条件类型（抛压沉重/被动跌破）立即发送
+          - 冷却: 同标的30分钟（抛压/VWAP 60分钟）只发一次
+          - 升级: 30分钟内同标的累计≥3条warning → 升级为critical放行
+        """
+        code = alert.get("code", "")
+        alert_type = alert.get("type", "")
+        now = datetime.datetime.now()
+
+        # ① 仅日志类型不发邮件
+        if alert_type in self._WARNING_LOG_ONLY_TYPES:
+            return False
+
+        # ② 冷却检查（warning 默认 30 分钟，抛压/被动跌破 60 分钟）
+        cooldown_min = 60 if alert_type in ("抛压沉重", "被动跌破(大盘联动)") else 30
+        # V10.0 P0-①: 应用校准冷却因子
+        if self._calibration and not self._calibration.get("observation_mode", True):
+            cd_factor = self._calibration.get("cooldown_factors", {}).get(alert_type, 1.0)
+            cooldown_min = int(cooldown_min * cd_factor)
+        last_send = self._warning_email_cooldown.get(code)
+        if last_send and (now - last_send).total_seconds() < cooldown_min * 60:
+            # 冷却期内：记录到滑动窗口用于升级判定
+            self._warning_count_window.setdefault(code, []).append(
+                (now, alert_type)
+            )
+            # 升级判定：30分钟内同标的 ≥3 条 warning → 升级 critical
+            window = self._warning_count_window.get(code, [])
+            recent = [t for t in window
+                      if (now - t[0]).total_seconds() < 30 * 60]
+            if len(recent) >= 3:
+                logger.warning(f"[预警升级] {code} 30分钟内{len(recent)}条warning"
+                              f"→升级为critical")
+                self._warning_count_window[code] = []  # 重置
+                return True  # 升级后放行
+            return False  # 冷却中，不发送
+
+        # ③ 按类型判定
+        if alert_type in self._WARNING_EMAIL_TYPES:
+            return True
+        if alert_type in self._WARNING_CONDITIONAL_TYPES:
+            return True  # 已满足触发条件
+
+        # ④ 未知类型默认不发（安全侧）
+        return False
+
+    def _send_warning_email(self, alert: dict):
+        """V9.3: warning 级预警邮件发送（含冷却登记 + 滑动窗口清理）"""
+        code = alert.get("code", "")
+        now = datetime.datetime.now()
+        try:
+            from notify.email_notify import send_email
+            name = alert.get("name", "")
+            alert_type = alert.get("type", "")
+            message = alert.get("message", "")
+
+            # 汇总滑动窗口中的历史 warning（如有）
+            window = self._warning_count_window.get(code, [])
+            recent = [t for t in window if (now - t[0]).total_seconds() < 60 * 60]
+            history_lines = ""
+            if recent:
+                history_lines = ("<p style='color:#FF8C00;font-size:13px'>"
+                                 "📋 近1小时预警记录:</p><ul>")
+                for t, typ in recent:
+                    history_lines += f"<li>{t.strftime('%H:%M')} {typ}</li>"
+                history_lines += "</ul>"
+
+            subject = (f"[盘中预警] {alert_type} - "
+                       f"{name}({code}) {now.strftime('%H:%M')}")
+            html = f"""
+            <div style="font-family:Microsoft YaHei;padding:20px">
+                <h2 style="color:#FF8C00">⚠️ {alert_type}</h2>
+                <p style="font-size:16px">{message}</p>
+                {history_lines}
+                <table style="border-collapse:collapse;margin:15px 0">
+                    <tr><td style="padding:5px 15px;border:1px solid #eee"><b>股票</b></td>
+                        <td style="padding:5px 15px;border:1px solid #eee">{name} ({code})</td></tr>
+                    <tr><td style="padding:5px 15px;border:1px solid #eee"><b>时间</b></td>
+                        <td style="padding:5px 15px;border:1px solid #eee">{now.strftime('%H:%M:%S')}</td></tr>
+                </table>
+                <p style="color:#999;font-size:12px">此邮件由盘中监控系统自动发送 | warning级预警</p>
+            </div>"""
+            send_email(subject, html)
+            # 登记冷却
+            self._warning_email_cooldown[code] = now
+            # 清理滑动窗口
+            self._warning_count_window[code] = []
+            logger.info(f"[warning邮件] 已发送: {name}({code}) {alert_type}")
+        except Exception as e:
+            logger.debug(f"[warning邮件] 发送失败: {e}")
 
     def add_alert_callback(self, callback: Callable):
         """添加预警回调函数"""
@@ -1342,29 +1585,36 @@ class IntradayMonitor:
             reduce_shares = int(shares * 0.5 / 100) * 100
             if reduce_shares < 100:
                 reduce_shares = min(shares, 100)
-            alert = {
-                "level": "emergency",
-                "type": "盘中放量暴跌-紧急减仓",
-                "code": code,
-                "name": name,
-                "current_price": current_price,
-                "change_pct": change_pct,
-                "reduce_shares": reduce_shares,
-                # 批2-S3: 结构化标记；预警上下文无现成止损价，取现价×0.97作为参考价
-                "is_stop_signal": True,
-                "stop_price": round(current_price * 0.97, 2),
-                "message": f"⚡ {name}({code}) 盘中放量暴跌{change_pct:.1f}%！"
-                          f"量比{volume/avg_volume:.1f}倍 | "
-                          f"不等收盘，建议立即减仓{reduce_shares}股(50%)",
-                "time": datetime.datetime.now().strftime("%H:%M:%S"),
-            }
-            alerts.append(alert)
-            self.alerts_sent.add(crash_key)
-            self._send_alert(alert)
-            if self.gradient_cfg.get("generate_condition_order", True):
-                self._generate_reduce_condition_order(
-                    code, name, current_price, reduce_shares, "盘中放量暴跌紧急减仓"
-                )
+            # FIX(2026-08-24): 暴跌减仓同样受cum_reduce封顶——同日三档梯度已全仓时不再重复发单，
+            # 否则条件单合计超持仓（实测：6000股生成9000股卖单）
+            reduce_shares = min(reduce_shares, shares - cum_reduce)
+            if reduce_shares <= 0:
+                logger.info(f"[梯度减仓] {code} 暴跌减仓跳过：梯度已减仓{cum_reduce}股，无可减仓位")
+            else:
+                cum_reduce += reduce_shares
+                alert = {
+                    "level": "emergency",
+                    "type": "盘中放量暴跌-紧急减仓",
+                    "code": code,
+                    "name": name,
+                    "current_price": current_price,
+                    "change_pct": change_pct,
+                    "reduce_shares": reduce_shares,
+                    # 批2-S3: 结构化标记；预警上下文无现成止损价，取现价×0.97作为参考价
+                    "is_stop_signal": True,
+                    "stop_price": round(current_price * 0.97, 2),
+                    "message": f"⚡ {name}({code}) 盘中放量暴跌{change_pct:.1f}%！"
+                              f"量比{volume/avg_volume:.1f}倍 | "
+                              f"不等收盘，建议立即减仓{reduce_shares}股(50%)",
+                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                }
+                alerts.append(alert)
+                self.alerts_sent.add(crash_key)
+                self._send_alert(alert)
+                if self.gradient_cfg.get("generate_condition_order", True):
+                    self._generate_reduce_condition_order(
+                        code, name, current_price, reduce_shares, "盘中放量暴跌紧急减仓"
+                    )
 
         return alerts
 
@@ -1607,6 +1857,46 @@ class IntradayMonitor:
             return cfg.get("default_buffer_minutes", 8)
 
     # ============================================================
+    # V9.3: 自适应阈值引擎（P1-⑦ 波动率 regime 条件）
+    # ============================================================
+
+    def _get_adaptive_rapid_drop_threshold(self, market_quote: dict) -> float:
+        """V9.3: 根据大盘波动率 regime 动态调整急跌阈值
+
+        原理: 高波动环境下频繁触发急跌预警会产生大量误报，
+              低波动环境下收紧阈值可提前捕捉风险。
+
+        规则:
+          - 高波动（大盘振幅>2% 或 跌幅>2%）: 放宽到 -4.0%
+          - 低波动（大盘振幅<0.5% 且 跌幅<0.5%）: 收紧到 -2.5%
+          - 正常: 保持 -3.0%
+
+        返回: 急跌阈值（负数，如 -3.0 表示跌3%）
+        """
+        if not market_quote:
+            return self.RAPID_DROP_PCT * 100  # 默认 -3.0
+
+        mkt_amplitude = abs(market_quote.get("change_pct", 0))
+        mkt_change = market_quote.get("change_pct", 0)
+
+        # 高波动 regime: 大盘大跌或振幅极大
+        if mkt_change < -2.0 or mkt_amplitude > 2.0:
+            base_threshold = -4.0
+        # 低波动 regime: 大盘平稳
+        elif mkt_amplitude < 0.5 and abs(mkt_change) < 0.5:
+            base_threshold = -2.5
+        # 正常波动
+        else:
+            base_threshold = self.RAPID_DROP_PCT * 100  # -3.0
+
+        # V10.0 P0-①: 应用校准因子（仅观察期外生效）
+        if self._calibration and not self._calibration.get("observation_mode", True):
+            factor = self._calibration.get("threshold_factors", {}).get("急跌预警", 1.0)
+            base_threshold *= factor
+
+        return base_threshold
+
+    # ============================================================
     # V9.1: 大盘门控机制（方案4: 大盘急跌时延迟/压制个股预警）
     # ============================================================
 
@@ -1744,12 +2034,18 @@ class IntradayMonitor:
             current_price = quote.get("price", 0)
             stop_loss = holding.get("stop_loss", 0)
 
-            # 紧急: 跌>5% 或 触及止损
+            # 紧急: 跌>5% 或 触及止损（新恶化跌>5%不受降级抑制窗口限制）
             if change_pct < emerg_triggers.get("holding_drop_pct", -5.0):
                 is_emergency = True
             if stop_loss > 0 and current_price > 0 and current_price <= stop_loss:
                 if emerg_triggers.get("stop_loss_touched", True):
-                    is_emergency = True
+                    # FIX(2026-08-24): 降级抑制窗口内，仅止损价停滞不再回升emergency（防乒乓），
+                    # 仅跌>5%/大盘暴跌等新恶化能突破抑制（风控不丢）
+                    if (self._emergency_suppressed_until is not None
+                            and datetime.datetime.now() < self._emergency_suppressed_until):
+                        is_warning = True  # 降为warning级关注，不停止监控
+                    else:
+                        is_emergency = True
 
             # 预警: 跌>3% 或 距止损<2%
             if change_pct < warn_triggers.get("holding_drop_pct", -3.0):
@@ -1761,16 +2057,48 @@ class IntradayMonitor:
 
         # 更新状态
         if is_emergency:
+            # V10.3 FIX: 从状态文件恢复alert_level=emergency时_emergency_since为None，
+            # 会导致变频降级保护永远不触发，此处补设起始时间
+            if self.alert_level != "emergency" or self._emergency_since is None:
+                self._emergency_since = datetime.datetime.now()
             self.alert_level = "emergency"
             self._clear_count = 0
+            self._emergency_suppressed_until = None  # FIX: 新恶化突破抑制，清除窗口
         elif is_warning:
             self.alert_level = "warning"
             self._clear_count = 0
+            self._emergency_since = None
         else:
             self._clear_count += 1
             downgrade_n = esc_cfg.get("downgrade_after_clear", 3)
             if self._clear_count >= downgrade_n:
                 self.alert_level = "normal"
+            self._emergency_since = None
+
+        # V10.3: 紧急级别最大持续时长保护（防止因止损价持续低于而锁定emergency）
+        if self.alert_level == "emergency" and self._emergency_since is not None:
+            max_dur = esc_cfg.get("emergency_max_duration_min", 20)
+            elapsed = (datetime.datetime.now() - self._emergency_since).total_seconds() / 60
+            if elapsed > max_dur:
+                # 检查是否有新的恶化（价格进一步下跌>2%）
+                has_new_deterioration = False
+                for code, holding in self.holdings.items():
+                    if code not in quotes:
+                        continue
+                    quote = quotes[code]
+                    change_pct = quote.get("change_pct", 0)
+                    if change_pct < esc_cfg.get("emergency_triggers", {}).get("holding_drop_pct", -5.0):
+                        has_new_deterioration = True
+                        break
+                if not has_new_deterioration:
+                    logger.info(f"[变频降级] emergency持续{elapsed:.0f}分钟且无新恶化，自动降为warning")
+                    self.alert_level = "warning"
+                    # FIX(2026-08-24): 设抑制窗口——否则下轮扫描止损价仍低于又会升回emergency，
+                    # 降级只生效一个周期（实测乒乓效应）。窗口内仅跌>5%/大盘暴跌可突破。
+                    _suppress_min = esc_cfg.get("emergency_suppress_after_downgrade_min", 30)
+                    self._emergency_suppressed_until = datetime.datetime.now() + \
+                        datetime.timedelta(minutes=_suppress_min)
+                    self._emergency_since = None
 
     def get_alert_level(self) -> str:
         """获取当前监控级别（供scheduler读取）"""
@@ -2182,6 +2510,195 @@ class IntradayMonitor:
                         self._send_alert(alert)
 
         return alerts
+
+    # ============================================================
+    # V9.3: 波动率突变检测（基于分时价格序列的实现波动率 RV）
+    # ============================================================
+
+    def _check_volatility_regime(self, code: str, name: str, today: str) -> list:
+        """V9.3: 波动率突变检测
+
+        原理: 用 price_history 中的分时价格序列计算短期/长期实现波动率( RV)，
+        当短期RV突破长期均值+2σ时，说明市场从“低波”切换到“高波”regime，
+        需立即预警。
+
+        参数:
+          - 短期窗口: 20个价格点（10秒轮询≈3-7分钟）
+          - 长期窗口: 60个价格点（10秒轮询≈10-20分钟）
+          - 触发阈值: 短期RV > 长期均值 + 2倍标准差
+          - 冷却: 同标的15分钟
+        """
+        alerts = []
+        prices_raw = self.price_history.get(code, [])
+        if len(prices_raw) < 30:  # 至少需要30个数据点（≈5分钟）
+            return alerts
+
+        # 冷却检查
+        now = datetime.datetime.now()
+        last_vol_alert = self._vol_alert_cooldown.get(code)
+        if last_vol_alert and (now - last_vol_alert).total_seconds() < 15 * 60:
+            return alerts
+
+        # 提取价格序列
+        prices = [p for _, p in prices_raw[-120:]]  # 取最近120个点
+        if len(prices) < 30:
+            return alerts
+
+        # 计算收益率序列
+        returns = []
+        for i in range(1, len(prices)):
+            if prices[i - 1] > 0:
+                returns.append((prices[i] - prices[i - 1]) / prices[i - 1])
+        if len(returns) < 20:
+            return alerts
+
+        # 短期RV: 最近20个收益率的标准差 × √252（年化）
+        import math
+        short_window = min(20, len(returns))
+        short_returns = returns[-short_window:]
+        short_mean = sum(short_returns) / len(short_returns)
+        short_var = sum((r - short_mean) ** 2 for r in short_returns) / max(len(short_returns) - 1, 1)
+        short_rv = math.sqrt(short_var) * math.sqrt(252 * 24 * 6)  # 年化（10秒频率≈每天24*6*60=8640个）
+
+        # 长期RV均值和标准差: 用滑动窗口计算
+        long_window = min(60, len(returns))
+        if long_window < 40:
+            return alerts
+
+        # 将长期数据分成多个20点的滑动窗口，计算每个窗口的RV
+        rv_samples = []
+        step = 5  # 滑动步长
+        for start in range(0, long_window - short_window + 1, step):
+            window_returns = returns[-(long_window) + start: -(long_window) + start + short_window]
+            if len(window_returns) < short_window:
+                continue
+            w_mean = sum(window_returns) / len(window_returns)
+            w_var = sum((r - w_mean) ** 2 for r in window_returns) / max(len(window_returns) - 1, 1)
+            rv_samples.append(math.sqrt(w_var))
+
+        if len(rv_samples) < 3:
+            return alerts
+
+        # 长期RV均值和标准差
+        rv_mean = sum(rv_samples) / len(rv_samples)
+        rv_var = sum((r - rv_mean) ** 2 for r in rv_samples) / max(len(rv_samples) - 1, 1)
+        rv_std = math.sqrt(rv_var)
+
+        # 短期RV（未年化）与长期比较
+        short_rv_raw = math.sqrt(short_var)
+        threshold = rv_mean + 2 * rv_std
+
+        if short_rv_raw > threshold and rv_std > 0:
+            # 波动率突变！
+            z_score = (short_rv_raw - rv_mean) / rv_std if rv_std > 0 else 0
+            current_price = prices[-1]
+            alert_key = f"{today}_vol_regime_{code}_{int(now.timestamp() / 900)}"
+            if alert_key not in self.alerts_sent:
+                alert = {
+                    "level": "warning",
+                    "type": "波动率突变",
+                    "code": code,
+                    "name": name,
+                    "current_price": current_price,
+                    "message": (f"📊 {name}({code}) 波动率突变！"
+                               f"短期RV={short_rv_raw*100:.2f}% > "
+                               f"长期均值+2σ={threshold*100:.2f}% "
+                               f"(Z={z_score:.1f})，"
+                               f"市场可能进入高波regime，注意风控"),
+                    "time": now.strftime("%H:%M:%S"),
+                }
+                alerts.append(alert)
+                alert["_alert_key"] = alert_key
+                self.alerts_sent.add(alert_key)
+                self._vol_alert_cooldown[code] = now
+                self._send_alert(alert)
+
+        return alerts
+
+    # ============================================================
+    # V9.3: 多因子联合评分（贝叶斯融合近似）
+    # ============================================================
+
+    def _fuse_alerts(self, alerts: list, today: str) -> list:
+        """V9.3: 多因子联合评分 — 同一标的同一轮触发多个warning时升级为critical
+
+        原理: 当多个独立信号同时触发同一标的时，联合后验概率显著高于单一信号。
+        近似贝叶斯融合: 2个独立warning联合 → P(风险) ≈ 1-(1-p1)*(1-p2) >> p1
+
+        规则:
+          - 同一标的同一轮 ≥2个不同类型 warning → 联合评分+15/个
+          - ≥3个不同类型 → 联合评分+30
+          - 联合评分 ≥30 → 生成 critical 级“多信号共振”预警
+          - 已有 critical 的标的不重复升级
+          - 冷却: 同标的30分钟
+        """
+        fusion_alerts = []
+        now = datetime.datetime.now()
+
+        # 按标的分组本轮 warning 级预警（排除已critical的）
+        code_warnings = {}  # {code: [alert_types]}
+        code_has_critical = set()
+        for a in alerts:
+            code = a.get("code", "")
+            level = a.get("level", "info")
+            alert_type = a.get("type", "")
+            if not code or not alert_type:
+                continue
+            if level in ("critical", "emergency"):
+                code_has_critical.add(code)
+            elif level == "warning":
+                code_warnings.setdefault(code, []).append(alert_type)
+
+        for code, types in code_warnings.items():
+            # 已有 critical 的标的不重复升级
+            if code in code_has_critical:
+                continue
+
+            # 去重统计不同类型数量
+            unique_types = list(set(types))
+            n_types = len(unique_types)
+
+            if n_types < 2:
+                continue
+
+            # 计算联合评分
+            if n_types >= 3:
+                score = 30 + (n_types - 3) * 10  # 3个=30, 4个=40, ...
+            else:
+                score = 15  # 2个=15
+
+            if score < 30:
+                continue  # 不足30分不升级
+
+            # 冷却检查
+            last_fusion = self._fusion_alert_cooldown.get(code)
+            if last_fusion and (now - last_fusion).total_seconds() < 30 * 60:
+                continue
+
+            # 获取标的名称
+            name = self.holdings.get(code, {}).get("name", code)
+
+            # 生成“多信号共振”预警
+            alert_key = f"{today}_fusion_{code}_{int(now.timestamp() / 1800)}"
+            if alert_key not in self.alerts_sent:
+                type_str = "/".join(unique_types[:4])  # 最多显示4个
+                alert = {
+                    "level": "critical",
+                    "type": "多信号共振",
+                    "code": code,
+                    "name": name,
+                    "message": (f"🚨 {name}({code}) 多信号共振！"
+                               f"本轮触发{n_types}类warning[{type_str}]，"
+                               f"联合评分{score}分，风险极高，建议立即评估减仓"),
+                    "time": now.strftime("%H:%M:%S"),
+                }
+                fusion_alerts.append(alert)
+                alert["_alert_key"] = alert_key
+                self.alerts_sent.add(alert_key)
+                self._fusion_alert_cooldown[code] = now
+                self._send_alert(alert)
+
+        return fusion_alerts
 
     @staticmethod
     def _calc_elapsed_minutes(now: datetime.datetime) -> float:

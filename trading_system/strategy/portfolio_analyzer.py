@@ -86,6 +86,23 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None, consensus_results:
             # 用现价替代成本，避免误判浮亏-88%触发深亏锁
             buy_price = current_price
 
+        # FIX(2026-08-25): 成本价交叉验证 —— 若holdings.json含券商pnl字段，
+        # 反推券商隐含成本 = current_price - pnl/shares，与buy_price比对。
+        # 偏差>1%时采用反推值，确保盈亏比例与券商口径一致。
+        _broker_pnl = holding.get("pnl")
+        if _broker_pnl is not None and shares > 0 and current_price > 0:
+            _implied_cost = current_price - _broker_pnl / shares
+            if _implied_cost > 0:
+                _cost_drift = abs(buy_price / _implied_cost - 1)
+                if _cost_drift > 0.005:  # 偏差>0.5%触发修正
+                    import logging
+                    logging.getLogger(__name__).info(
+                        f"[成本修正] {code}({holding.get('name','')}) "
+                        f"buy_price={buy_price:.3f}→{_implied_cost:.3f} "
+                        f"(偏差{_cost_drift*100:.1f}%，采用券商反推成本)"
+                    )
+                    buy_price = _implied_cost
+
         market_value = shares * current_price
         cost_value = shares * buy_price
         pnl = market_value - cost_value

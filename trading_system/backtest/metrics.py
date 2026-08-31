@@ -54,7 +54,7 @@ def calc_sharpe_ratio(daily_returns: pd.Series, risk_free_rate: float = 0.03) ->
         daily_returns: 日收益率序列
         risk_free_rate: 无风险利率（默认3%）
     """
-    if len(daily_returns) < 2 or daily_returns.std() == 0:
+    if len(daily_returns) < 2 or daily_returns.std() < 1e-12:
         return 0.0
     excess_return = daily_returns.mean() - risk_free_rate / 252
     return excess_return / daily_returns.std() * np.sqrt(252)
@@ -66,7 +66,7 @@ def calc_sortino_ratio(daily_returns: pd.Series, risk_free_rate: float = 0.03) -
         return 0.0
     excess_return = daily_returns.mean() - risk_free_rate / 252
     downside = daily_returns[daily_returns < 0]
-    if len(downside) == 0 or downside.std() == 0:
+    if len(downside) == 0 or downside.std() < 1e-12:
         return 0.0
     return excess_return / downside.std() * np.sqrt(252)
 

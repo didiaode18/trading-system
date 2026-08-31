@@ -35,6 +35,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+from utils.board_rules import get_limit_pct as _board_get_limit_pct
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,12 +44,20 @@ logger = logging.getLogger(__name__)
 # 一、交易环境参数（从 config 读取，禁止硬编码）
 # ============================================================
 
-COMMISSION = config.COMMISSION_RATE * 2 + config.STAMP_TAX_RATE  # 买卖合计(佣金双边+印花税单边) ≈ 0.0016
+COMMISSION = config.COMMISSION_RATE * 2 + config.STAMP_TAX_RATE + getattr(config, 'TRANSFER_FEE_RATE', 0.00001)  # 买卖合计(佣金双边+印花税单边+过户费双边) ≈ 0.00161
 SLIPPAGE_LEADER = 0.002  # 龙头股滑点 0.2%
 SLIPPAGE_FLEX = 0.005    # 弹性股滑点 0.5%
 RISK_PER_TRADE = 0.02    # 单笔风险2%本金
 TOTAL_CAPITAL = config.TOTAL_CAPITAL  # 总资金(从 config 读取)
-LIMIT_PCT = 0.095        # 涨跌停判定阈值（9.5%以上视为一字板）
+LIMIT_PCT = 0.095        # 涨跌停判定阈值（9.5%以上视为一字板，仅作为无code时的回退值）
+
+
+def _get_limit_pct_for_code(code: str) -> float:
+    """根据股票代码返回涨跌停幅度（主板10%/创业板20%/ST 5%/科创板20%）"""
+    try:
+        return _board_get_limit_pct(code)
+    except Exception:
+        return LIMIT_PCT
 
 # ============================================================
 # 二、测试标的池（20只，覆盖多行业）
@@ -171,22 +180,23 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # 五、真实环境回测引擎
 # ============================================================
 
-def is_limit_up(row) -> bool:
-    """判定是否一字涨停（无法买入）"""
+def is_limit_up(row, code: str = "") -> bool:
+    """判定是否一字涨停（无法买入）— 支持板块差异化"""
     if pd.isna(row["pct_change"]):
         return False
-    # 涨幅>9.5% 且 开盘=最高=最低=收盘（一字板）
-    if row["pct_change"] > LIMIT_PCT:
+    limit_pct = _get_limit_pct_for_code(code) if code else LIMIT_PCT
+    if row["pct_change"] > limit_pct:
         if abs(row["open"] - row["high"]) < 0.01 and abs(row["open"] - row["low"]) < 0.01:
             return True
     return False
 
 
-def is_limit_down(row) -> bool:
-    """判定是否一字跌停（无法卖出）"""
+def is_limit_down(row, code: str = "") -> bool:
+    """判定是否一字跌停（无法卖出）— 支持板块差异化"""
     if pd.isna(row["pct_change"]):
         return False
-    if row["pct_change"] < -LIMIT_PCT:
+    limit_pct = _get_limit_pct_for_code(code) if code else LIMIT_PCT
+    if row["pct_change"] < -limit_pct:
         if abs(row["open"] - row["high"]) < 0.01 and abs(row["open"] - row["low"]) < 0.01:
             return True
     return False
@@ -271,7 +281,7 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
             next_row = df.iloc[i + 1]
 
             # 检查T+1日是否一字涨停（无法买入）
-            if is_limit_up(next_row):
+            if is_limit_up(next_row, code=code):
                 continue
 
             # 实际买入价 = T+1开盘价 + 滑点
@@ -359,7 +369,7 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                 else:
                     next_row = df.iloc[i + 1]
                     # 检查T+1日是否一字跌停（无法卖出）
-                    if is_limit_down(next_row):
+                    if is_limit_down(next_row, code=code):
                         continue  # 卖不出去，继续持有
                     exec_price = next_row["open"] * (1 - slippage)
                     sell_date = next_row["date"]
@@ -387,10 +397,10 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                 })
                 in_position = False
 
-    # 回测结束仍持仓
+    # 回测结束仍持仓（收盘价平仓，不加滑点）
     if in_position:
         last_row = df.iloc[-1]
-        exec_price = last_row["close"] * (1 - slippage)
+        exec_price = last_row["close"]
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
         hold_days = len(df) - 1 - buy_index
@@ -753,9 +763,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             if i + 1 >= n:
                 continue
 
-            # 一字涨停判定（内联化，避免创建Series）
+            # 一字涨停判定（内联化，板块差异化）
             next_pct = pct_change_arr[i + 1]
-            if not np.isnan(next_pct) and next_pct > LIMIT_PCT:
+            _limit_pct = _get_limit_pct_for_code(code)
+            if not np.isnan(next_pct) and next_pct > _limit_pct:
                 if abs(open_arr[i+1] - high_arr[i+1]) < 0.01 and abs(open_arr[i+1] - low_arr[i+1]) < 0.01:
                     continue  # 一字涨停无法买入
 
@@ -902,9 +913,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     exec_price = close * (1 - slippage)
                     sell_date = date
                 else:
-                    # 一字跌停判定（内联化）
+                    # 一字跌停判定（内联化，板块差异化）
                     next_pct = pct_change_arr[i + 1]
-                    if not np.isnan(next_pct) and next_pct < -LIMIT_PCT:
+                    _limit_pct = _get_limit_pct_for_code(code)
+                    if not np.isnan(next_pct) and next_pct < -_limit_pct:
                         if abs(open_arr[i+1] - high_arr[i+1]) < 0.01 and abs(open_arr[i+1] - low_arr[i+1]) < 0.01:
                             continue  # 一字跌停无法卖出
                     exec_price = open_arr[i + 1] * (1 - slippage)
@@ -957,9 +969,9 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     position_shares = 0
                     last_sell_bar_idx = i  # V6.1: 记录卖出bar索引
 
-    # 回测结束仍持仓
+    # 回测结束仍持仓（收盘价平仓，不加滑点）
     if in_position and position_shares > 0:
-        exec_price = close_arr[-1] * (1 - slippage)
+        exec_price = close_arr[-1]
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
         hold_days = n - 1 - buy_index

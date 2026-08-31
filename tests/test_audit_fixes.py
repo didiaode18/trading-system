@@ -67,9 +67,11 @@ class TestLoadHoldingsFilter:
             "002415": {"名称": "海康威视", "shares": 500, "buy_price": 25.0},
             "000858": {"名称": "五粮液", "shares": None, "buy_price": 120.0},
         }
-        (tmp_path / "holdings.json").write_text(
-            json.dumps(holdings, ensure_ascii=False), encoding='utf-8')
-        monkeypatch.setattr(rd, "BASE_DIR", str(tmp_path))
+        hfile = tmp_path / "holdings.json"
+        hfile.write_text(json.dumps(holdings, ensure_ascii=False), encoding='utf-8')
+        # FIX(2026-08-24): load_holdings已重构为config.get_holdings_file()统一路径，
+        # 原monkeypatch rd.BASE_DIR失效，改打config路径函数
+        monkeypatch.setattr(rd.config, "get_holdings_file", lambda: str(hfile))
 
         result = rd.load_holdings()
         codes = {h["code"] for h in result}
@@ -79,7 +81,8 @@ class TestLoadHoldingsFilter:
     def test_missing_file_fallback(self, tmp_path, monkeypatch):
         """holdings.json 不存在时降级到 config.STOCK_POOL（不抛异常）"""
         import report_dispatcher as rd
-        monkeypatch.setattr(rd, "BASE_DIR", str(tmp_path))
+        monkeypatch.setattr(rd.config, "get_holdings_file",
+                            lambda: str(tmp_path / "not_exist.json"))
         result = rd.load_holdings()
         assert isinstance(result, list)
 

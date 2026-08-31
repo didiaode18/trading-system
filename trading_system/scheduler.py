@@ -259,6 +259,25 @@ def run_daily_task():
 
         logger.info(f"[{today}] 盘后分析完成: {buy_count}个买入信号, {sell_count}个卖出信号")
 
+        # ---- FIX(2026-08-27): 数据新鲜度检查 + 告警 ----
+        try:
+            from data.data_loader import check_data_freshness
+            _fresh = check_data_freshness(max_stale_days=3)
+            if not _fresh["ok"]:
+                _stale_n = len(_fresh["stale_codes"])
+                logger.warning(f"[数据告警] K线数据过时! 最新={_fresh['latest_date']}, "
+                               f"落后{_fresh['stale_days']}天, {_stale_n}/{_fresh['total_codes']}只标的超时")
+                # 尝试自动补拉取
+                from data.data_loader import init_db, batch_update_all
+                logger.info("[数据告警] 尝试自动补拉取...")
+                _conn = init_db()
+                _retry = batch_update_all(_conn, full_pool=True)
+                _conn.close()
+                _retry_ok = sum(1 for v in _retry.values() if v >= 0)
+                logger.info(f"[数据告警] 补拉完成: {_retry_ok}/{len(_retry)}只成功")
+        except Exception as _fresh_e:
+            logger.warning(f"[数据告警] 新鲜度检查/补拉异常: {_fresh_e}")
+
         # ---- ML预测 + 记录（不影响主流程）----
         try:
             _run_daily_ml_prediction(signals)
@@ -351,6 +370,40 @@ def _send_report_failure_alert(today, reason: str):
         logger.info(f"[{today}] 已发送报告失败告警邮件")
     except Exception as _ae:
         logger.error(f"[{today}] 报告失败告警邮件发送失败: {_ae}")
+
+
+# ============================================================
+# V10.0 P0-③: 交易行为长期追踪+纪律评分
+# ============================================================
+
+def _update_behavior_tracker():
+    """V10.0 P0-③: 盘后更新交易行为画像（从 trades_today.json 提取当日指标）"""
+    import json as _json
+    trades_path = os.path.join(PROJECT_ROOT, "trades_today.json")
+    if not os.path.exists(trades_path):
+        logger.debug("[行为追踪] trades_today.json 不存在，跳过")
+        return
+
+    try:
+        with open(trades_path, 'r', encoding='utf-8') as f:
+            data = _json.load(f)
+        trades = [t for t in data.get("trades", []) if t.get("status", "已成") == "已成"]
+        if not trades:
+            logger.debug("[行为追踪] 当日无成交，跳过")
+            return
+
+        from execution.trade_behavior import analyze_trade_behavior
+        from execution.behavior_tracker import update_from_daily
+
+        total_capital = getattr(config, 'TOTAL_CAPITAL', 1_000_000)
+        daily_result = analyze_trade_behavior(trades, total_capital, data.get("date", ""))
+        update_from_daily(daily_result)
+
+        logger.info(f"[行为追踪] 已更新: {daily_result['total_trades']}笔/"
+                   f"换手{daily_result['turnover']:.0%}/"
+                   f"浪费{daily_result['total_waste']:,.0f}元")
+    except Exception as e:
+        logger.warning(f"[行为追踪] 更新失败: {e}")
 
 
 def run_holdings_report_task():
@@ -450,6 +503,12 @@ def run_holdings_report_task():
     except Exception as e:
         logger.warning(f"[{today}] 买点信号结算异常: {e}")
 
+    # V10.0 P0-③: 交易行为长期追踪+纪律评分（盘后自动更新）
+    try:
+        _update_behavior_tracker()
+    except Exception as e:
+        logger.warning(f"[{today}] 行为追踪更新异常: {e}")
+
 
 def run_signal_settle_task():
     """V1.3: 买点信号结算独立任务（15:35注册）
@@ -497,7 +556,25 @@ def _cache_market_regime_state():
             logger.info("  [MarketRegime] 基准数据不足，跳过缓存")
             return
 
-        result = detector.detect(benchmark_df)
+        # FIX(2026-08-28) P1: 将 market_pulse 涨跌家数传入 regime 检测，
+        # breadth_score 使用真实涨跌家数而非指数代理，提高市场宽度判断精度
+        extra_data = None
+        try:
+            from strategy.market_pulse import get_pulse_summary
+            _ps = get_pulse_summary()
+            if _ps.get("up") is not None and _ps.get("down") is not None:
+                extra_data = {
+                    "advance_count": _ps["up"],
+                    "decline_count": _ps["down"],
+                }
+                # P2: 数据质量告警日志
+                if _ps.get("warnings"):
+                    for _w in _ps["warnings"]:
+                        logger.warning(f"  [MarketPulse] 数据质量告警: {_w}")
+        except Exception as _mpe:
+            logger.debug(f"  [MarketRegime] market_pulse数据获取失败，使用指数代理: {_mpe}")
+
+        result = detector.detect(benchmark_df, extra_data=extra_data)
 
         # FIX: detector返回的dict中可能含numpy类型(bool_/int64/float64)，
         # 标准json.dump无法序列化导致"Object of type bool_ is not JSON serializable"，
@@ -554,6 +631,26 @@ def _cache_market_regime_state():
             logger.warning(f"  [MarketRegime] 历史序列追加失败(不影响当日缓存): {_he}")
 
         logger.info(f"  [MarketRegime] {result.get('detail', '')} → 已缓存")
+
+        # FIX(2026-08-28) P2: 日级情绪趋势突变告警
+        # 与前一日regime状态对比，状态跳变(如BULL→BEAR)或分数剧变(>0.8)时告警
+        try:
+            if len(history) >= 2:
+                _prev = history[-2]  # 前一日条目(当日刚追加的在[-1])
+                _curr_state = result.get("state", "RANGE")
+                _prev_state = _prev.get("state", "RANGE")
+                _curr_ws = result.get("weighted_score", 0) or 0
+                _prev_ws = _prev.get("weighted_score", 0) or 0
+                _state_flip = _curr_state != _prev_state
+                _score_delta = abs(_curr_ws - _prev_ws)
+                if _state_flip and _score_delta > 0.3:
+                    logger.warning(
+                        f"  [Regime突变告警] 状态跳变: "
+                        f"{_prev_state}→{_curr_state}，"
+                        f"加权分变化{_score_delta:.2f}"
+                        f"（前日{_prev_ws:.2f}→今日{_curr_ws:.2f}）")
+        except Exception:
+            pass  # 告警失败不影响主流程
 
     except Exception as e:
         logger.warning(f"  [MarketRegime] 检测失败: {e}")
@@ -1671,6 +1768,33 @@ def _check_ml_accuracy_alert(monitor=None):
 
 
 # ============================================================
+# V10.0 P0-①: 预警参数自优化闭环（每周六 11:30）
+# ============================================================
+
+def _run_weekly_alert_calibration():
+    """[周度] 预警参数自优化校准 - 每周六 11:30 自动执行"""
+    today = datetime.date.today()
+    if today.weekday() != 5:  # 只周六运行
+        return
+    logger.info(f"[{today}] 开始预警参数自优化校准...")
+    try:
+        from strategy.alert_auto_calibrate import calibrate
+        result = calibrate()
+        status = result.get("status", "ok")
+        if status == "skip":
+            logger.info(f"[{today}] 预警校准跳过: {result.get('reason', '')}")
+        else:
+            mode = "观察" if result.get("observation_mode") else "生效"
+            logger.info(
+                f"[{today}] 预警校准完成（{mode}模式）| "
+                f"已验证{result.get('verified_records', 0)}条 | "
+                f"调整{len(result.get('by_type', {}))}种类型"
+            )
+    except Exception as e:
+        logger.error(f"[{today}] 预警校准失败: {e}", exc_info=True)
+
+
+# ============================================================
 # 二-3、IC监控与自适应权重
 # ============================================================
 
@@ -2234,6 +2358,9 @@ def _run_monthly_strategy_analysis():
 _monitor_thread = None
 _monitor_instance = None
 
+# V9.3: monitor 回调中继的预警缓冲（线程安全: list.append 是原子操作）
+_monitor_relayed_alerts = []
+
 # S5: 监控线程未就绪诊断邮件防重标记（当日只发一次，值为YYYY-MM-DD）
 _monitor_diag_mail_date = None
 
@@ -2754,7 +2881,9 @@ def run_unified_intraday_alert():
                                          ALERT_CONFIG, is_opportunity_alert)  # V3.4: 导入机会型判断
         holdings_data = {}
         try:
-            with open(config.HOLDINGS_FILE, "r", encoding="utf-8") as f:
+            # FIX(2026-08-24): 统一委托config.get_holdings_file()（新旧路径兼容），
+            # 与持仓数据加载函数复用规范保持一致，避免双文件不同步时读错源
+            with open(config.get_holdings_file(), "r", encoding="utf-8") as f:
                 holdings_data = _json.load(f)
         except Exception:
             pass
@@ -2806,6 +2935,43 @@ def run_unified_intraday_alert():
                     urgent_alerts.extend(critical)
     except Exception as e:
         logger.warning(f"  [深度预警] 异常: {e}")
+
+    # ---- 源1.5: monitor回调中继预警（V9.3新增）----
+    # 监控线程检测到 warning+ 级预警后通过回调写入缓冲，
+    # 统一扫描时消费并合入 urgent_alerts 进入邮件/钉钉链路。
+    try:
+        if _monitor_relayed_alerts:
+            relayed = list(_monitor_relayed_alerts)
+            _monitor_relayed_alerts.clear()
+            _relay_count = 0
+            for ra in relayed:
+                _code = ra.get("code", "")
+                # 冷却过滤（复用统一冷却字典）
+                last_time = _alert_cooldown.get(_code)
+                if last_time and (now - last_time).total_seconds() < _cooldown_minutes_for(
+                        _alert_cooldown_level.get(_code, "")) * 60:
+                    # 级别升级豁免: 新预警级别高于已记录级别时放行
+                    _new_rank = LEVEL_RANK.get(ra.get("level", "warning"), 1)
+                    _old_rank = LEVEL_RANK.get(_alert_cooldown_level.get(_code, ""), -1)
+                    if _new_rank > _old_rank:
+                        pass  # 升级豁免，放行
+                    else:
+                        continue  # 冷却中，跳过
+                urgent_alerts.append({
+                    "level": ra.get("level", "warning"),
+                    "name": ra.get("name", ""),
+                    "code": _code,
+                    "urgency_score": 60 if ra.get("level") == "warning" else 80,
+                    "msg": ra.get("message", ""),
+                    "rule_name": f"监控中继-{ra.get('type', '')}",
+                    "icon": "⚡",
+                })
+                _relay_count += 1
+            if _relay_count > 0:
+                logger.info(f"  [监控中继] 消费{len(relayed)}条monitor预警"
+                           f"(入链路: {_relay_count}条)")
+    except Exception as _e:
+        logger.debug(f"  [监控中继] 异常(不阻断): {_e}")
 
     # ---- 源5: 选股买点到价提醒（V4.4已迁出）----
     # 买点检测已解耦到独立快路径 _gated_buy_point_check（固定3分钟频率，
@@ -3246,7 +3412,7 @@ def start_intraday_monitor():
             pos["stop_loss"] = pos["buy_price"] * (1 - config.INITIAL_STOP_LOSS_PCT)
 
     monitor_cfg = getattr(config, 'MONITOR_CONFIG', {})
-    poll_interval = monitor_cfg.get('poll_interval', 30)
+    poll_interval = monitor_cfg.get('poll_interval', 10)  # V9.3: 默认30→10秒
 
     from strategy.intraday_monitor import IntradayMonitor
     _monitor_instance = IntradayMonitor(holdings, poll_interval=poll_interval)
@@ -3258,6 +3424,19 @@ def start_intraday_monitor():
 
     _monitor_thread = threading.Thread(target=_run_monitor, daemon=True, name="IntradayMonitor")
     _monitor_thread.start()
+
+    # V9.3: 注册监控线程预警回调 → 中继到统一预警链路（补发 warning 级）
+    def _forward_alert(alert):
+        """监控线程预警回调 → 转发到 _monitor_relayed_alerts 缓冲"""
+        try:
+            level = alert.get("level", "info")
+            code = alert.get("code", "")
+            if level in ("warning", "critical", "emergency") and code:
+                _monitor_relayed_alerts.append(alert)
+        except Exception:
+            pass
+    _monitor_instance.add_alert_callback(_forward_alert)
+
     logger.info(f"[盘中监控] 已启动 (09:30-15:00, {len(holdings)}只持仓)")
 
     # V6.0: 启动ACK回调服务器(守护线程，处理钉钉按钮点击回调)
@@ -3420,6 +3599,9 @@ def start_scheduler():
     # 每周六 11:00 ML模型训练（周策略报告之后）
     schedule.every().saturday.at("11:00").do(_run_weekly_ml_training)
 
+    # V10.0 P0-①: 每周六 11:30 预警参数自优化校准
+    schedule.every().saturday.at("11:30").do(_run_weekly_alert_calibration)
+
     # 每周日 10:00 股票池更新提醒
     schedule.every().sunday.at("10:00").do(run_weekly_task)
 
@@ -3443,6 +3625,7 @@ def start_scheduler():
     logger.info(f"  条件单: 每个交易日 19:00")
     logger.info(f"  周策略报告: 每周六 10:00")
     logger.info(f"  ML模型训练: 每周六 11:00")
+    logger.info(f"  预警参数校准: 每周六 11:30")
     logger.info(f"  周日提醒: 每周日 10:00")
     logger.info(f"  Walk-Forward验证: 每月1日 09:00")
     logger.info(f"  策略综合分析: 每月1日 10:00 (开关:{'开' if getattr(config, 'STRATEGY_ANALYSIS_MONTHLY_ENABLED', False) else '关/观察模式'})")
@@ -3593,6 +3776,7 @@ SCHEDULED_TASKS = [
     ("TradingSystem_HoldingsReport",  "16:15", "--run-holdings-report",  "综合分析报告(技术面+条件单)"),
     ("TradingSystem_Weekly",          "10:00", "--run-weekly",           "周六周策略报告"),
     ("TradingSystem_MLTraining",      "11:00", "--run-ml-training",      "周六ML模型训练"),
+    ("TradingSystem_AlertCalibrate",  "11:30", "--run-alert-calibrate",   "周六预警参数校准"),
     ("TradingSystem_WalkForward",     "09:00", "--run-walk-forward",     "月度Walk-Forward验证(每月1日)"),
     ("TradingSystem_SelfHeal",        "09:31", "--self-heal",            "P0调度器自愈(心跳检测+自动拉起)"),
 ]
@@ -3673,6 +3857,8 @@ def main():
                         help="运行周度仓位分析")
     parser.add_argument("--run-ml-training", action="store_true",
                         help="运行 ML模型训练")
+    parser.add_argument("--run-alert-calibrate", action="store_true",
+                        help="运行 预警参数校准")
     parser.add_argument("--run-walk-forward", action="store_true",
                         help="运行 Walk-Forward滚动窗口验证")
     parser.add_argument("--run-intraday-alert", action="store_true",
@@ -3722,6 +3908,7 @@ def main():
             'run_screener': run_morning_screener,
             'run_weekly': run_weekly_portfolio,
             'run_ml_training': _run_weekly_ml_training,
+            'run_alert_calibrate': _run_weekly_alert_calibration,
             'run_intraday_alert': run_intraday_alert_task,
             'run_intraday_decision': run_intraday_decision_task,
             'run_zt_gene': run_zt_gene_task,

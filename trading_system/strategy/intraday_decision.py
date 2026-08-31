@@ -57,7 +57,10 @@ try:
 except ImportError:
     HAS_AKSHARE = False
 
-from ..data.realtime import fetch_realtime_batch, fetch_index_realtime
+try:
+    from data.realtime import fetch_realtime_batch, fetch_index_realtime
+except (ImportError, ValueError):
+    from ..data.realtime import fetch_realtime_batch, fetch_index_realtime
 
 
 # ============================================================

@@ -206,6 +206,10 @@ SECTOR_CANDIDATES = {
             "688256": {"名称": "寒武纪",   "细分": "AI芯片", "类型": "弹性"},
             "688041": {"名称": "海光信息", "细分": "CPU芯片", "类型": "龙头"},
             "603986": {"名称": "兆易创新", "细分": "存储芯片", "类型": "龙头"},
+            "002049": {"名称": "紫光国微", "细分": "芯片设计", "类型": "龙头"},
+            "603501": {"名称": "韦尔股份", "细分": "CIS芯片", "类型": "龙头"},
+            "688012": {"名称": "中微公司", "细分": "刻蚀设备", "类型": "弹性"},
+            "002409": {"名称": "雅克科技", "细分": "半导体材料", "类型": "弹性"},
         }
     },
     "信创": {
@@ -920,6 +924,7 @@ WEEKLY_LOSS_LIMIT = 0.08         # 单周亏损>=8%: 全仓降至3成以下，�
 # --- 交易成本参数（回测必扣）---
 COMMISSION_RATE = 0.0003         # 佣金万3（买卖双边）
 STAMP_TAX_RATE = 0.001           # 印花税千1（卖出单边）
+TRANSFER_FEE_RATE = 0.00001      # 过户费十万分之一（买卖双边）
 MIN_COMMISSION = 5.0             # 最低佣金5元
 
 # 行情强度判定（用于动态调整总仓位）
@@ -1200,7 +1205,7 @@ STRATEGY_CONFIG = {
 # 十五、盘中监控配置（V3.0新增）
 # ============================================================
 MONITOR_CONFIG = {
-    "poll_interval": 30,              # 轮询间隔(秒)，30秒刷新一次
+    "poll_interval": 10,              # 轮询间隔(秒)，10秒刷新一次（V9.3: 30→10，预警发现延迟降低3倍）
     "rapid_drop_pct": -0.03,          # 急跌预警阈值(-3%)
     "market_drop_pct": -0.015,        # 大盘急跌阈值(-1.5%)
     "amplitude_alert_pct": 0.08,      # 振幅预警(8%)
@@ -1272,6 +1277,13 @@ INTRADAY_ESCALATION_CONFIG = {
     },
     # 降级条件（连续N次扫描无异常则降回正常）
     "downgrade_after_clear": 3,    # 连续3次无异常 → 降回正常频率
+    # V10.3: 紧急级别最大持续时长（防止因止损价持续低于而锁定emergency）
+    "emergency_max_duration_min": 20,  # emergency持续超过N分钟 → 自动降为warning
+    # FIX(2026-08-24): 降级后抑制窗口（防乒乓回升）——窗口内仅止损价停滞不再升emergency，
+    # 跌>5%/大盘暴跌等新恶化可突破（风控不丢）
+    "emergency_suppress_after_downgrade_min": 30,
+    # V10.3: 标的级全局冷却（同一标的多类型预警合并，防轰炸）
+    "code_global_cooldown_min": 15,   # 同一标的任意预警触发后，N分钟内不再发其他类型（critical/emergency除外）
 }
 
 # ============================================================
@@ -1467,8 +1479,8 @@ ORDERBOOK_CONFIG = {
     "heavy_sell_outer_ratio": 0.35,     # 外盘占比<35% + 跌>2% → 抛压沉重(真跌)
     "strong_buy_outer_ratio": 0.65,     # 外盘占比>65% + 价格平/微跌 → 资金承接(洗盘)
     "ask_pressure_ratio": 5.0,          # 卖一量 > 买一量×5 → 压盘吸筹
-    "bid_withdraw_pct": 0.20,           # 买一量比上轮<20% → 托盘撤退
-    "order_ratio_bearish": -0.30,       # 委比<-30% → 卖压偏重
+    "bid_withdraw_pct": 0.15,           # V10.3: 买一量比上轮<15% → 托盘撤退(原20%过于敏感，今日5只同时触发)
+    "order_ratio_bearish": -0.40,       # V10.3: 委比<-40% → 卖压偏重(原-30%过于敏感)
     "order_ratio_bullish": 0.30,        # 委比>30% → 买压偏重
 }
 
@@ -1506,6 +1518,15 @@ VOL_RATIO_CONFIG = {
     "stagnation_change_pct": 1.0,       # 量比>3 + 涨幅<1% → 放量滞涨(出货)
     "bottom_volume_pct": 3.0,           # 量比>3 + 低位 → 底部放量(关注)
     "high_level_profit_pct": 5.0,       # 浮盈>5%时放量滞涨 → 出货嫌疑
+}
+
+# --- V9.3: 波动率突变检测（V10.3: 默认禁用，无实际参考价值）---
+VOLATILITY_REGIME_CONFIG = {
+    "enabled": False,                   # 总开关（False=跳过检测，不产生预警）
+    "rv_lookback_days": 20,             # 长期RV回看天数
+    "rv_short_window": 5,               # 短期RV窗口(分钟)
+    "z_score_threshold": 2.0,           # Z分数阈值
+    "cooldown_min": 15,                 # 同标的冷却时间
 }
 
 # --- P1-2: K线形态识别（V10.0: 扩展为完整形态引擎参数）---
@@ -1655,8 +1676,21 @@ M_FACTOR_FLEXIBLE_ENABLED = True       # V6.0 P0-1: M因子柔性化启用（dow
 M_FACTOR_DOWN_POSITION_LIMIT = 0.15    # V6.0 P0-1: down状态下最大新建仓比例（15%轻仓试探）
 BUY_SCORE_BREADTH_ADJUST_ENABLED = True  # V6.0 P0-2: 买入线随breadth动态下调启用
 CAI_MULTI_PROXY_ENABLED = True         # V6.0 P1-1: CAI多代理指标启用（动量+波动率+换手率综合代理替代固定中性分）
+SCREENER_DATA_STALE_THRESHOLD = 4      # V6.1(2026-08-27): 选股引擎数据过时阈值（自然日），超过则拒绝运行并提示更新
 V_FACTOR_ENABLED = True                # V6.0 P1-2: 估值因子V_估值启用（PE/PB百分位反向打分）
 V_FACTOR_WEIGHT = 5                    # V6.0 P1-2: 估值因子满分（5分，辅助因子不主导）
+VALUATION_GATE_ENABLED = True          # V10.1 Top1: 估值安全闸门启用（PE百分位过高直接拦截，防止高估值陷阱）
+VALUATION_GATE_PE_PCT_MAX = 80         # V10.1 Top1: PE百分位上限（>80%拦截，即历史最贵的20%不选）
+STYLE_ROTATION_THRESHOLD = 1.0         # V10.1 Top3: 风格轮动阈值（大盘-小盘5d涨幅差>1%判定为大盘风格）
+STYLE_ROTATION_ENABLED = True          # V10.1 Top3: 风格轮动检测启用（动态调整CANSLIM因子权重）
+STRUCTURAL_DISPERSION_THRESHOLD = 4.0  # V10.1 Top4: 结构性行情分化度阈值（个股5d收益σ>4%视为高分化）
+STRUCTURAL_INDEX_THRESHOLD = 3.0       # V10.1 Top4: 结构性行情指数横盘阈值（沪深300 5d涨跌<3%视为横盘）
+STRUCTURAL_MARKET_ENABLED = True       # V10.1 Top4: 结构性行情检测启用（高分化+横盘→自动降仓）
+SECTOR_CYCLE_ENABLED = True            # V10.1 Top5: 行业景气度因子启用（基于ETF轮动判定行业周期阶段，±3分调整）
+MOAT_INDICATOR_ENABLED = True          # V10.1 Top6: 护城河代理指标启用（ROE稳定+毛利率+行业地位→0-3分加分）
+FINANCIAL_REPORT_ENABLED = True        # V10.2: 财报深度分析启用（营收趋势/利润质量/ROE杜邦/负债结构→-2~+4分）
+FINANCIAL_REPORT_MAX_BONUS = 4         # V10.2: 财报分析最大加分（优秀财报+4）
+FINANCIAL_REPORT_PENALTY = -2          # V10.2: 财报分析最大减分（财报地雷杀伤力，非对称设计）
 IC_IR_WEIGHT_ENABLED = True            # V6.0 P1-3: IC_IR动态加权启用（IC/|IC|比率替代固定权重）
 ATR_ADAPTIVE_STOP_LOG_ONLY = True      # ATR梯度档位（True=仅日志对比ATR建议值，不改变触发）
 SECTOR_CHANGE_PCT_ENABLED = False      # 板块涨跌注入（影响洗盘/真跌判定，先双算日志观察）

@@ -39,6 +39,10 @@ try:
     from ..attribution.trade_log import TradeLog
 except ImportError:
     from attribution.trade_log import TradeLog
+try:
+    from ..utils.board_rules import get_limit_pct as _board_get_limit_pct
+except ImportError:
+    from utils.board_rules import get_limit_pct as _board_get_limit_pct
 
 logger = logging.getLogger(__name__)
 
@@ -315,8 +319,15 @@ class BacktestEngineV2:
                     except Exception:
                         pass
                 else:
-                    # 跌停无法卖出：按跌停价估值，记录为末日未平仓
-                    limit_down_price = round(bar["pre_close"] * 0.9, 2) if bar.get("pre_close", 0) > 0 else bar["close"]
+                    # 跌停无法卖出：按跌停价估值，记录为末日未平仓（板块差异化）
+                    if bar.get("pre_close", 0) > 0:
+                        try:
+                            limit_pct = _board_get_limit_pct(code)
+                        except Exception:
+                            limit_pct = 0.10
+                        limit_down_price = round(bar["pre_close"] * (1 - limit_pct), 2)
+                    else:
+                        limit_down_price = bar["close"]
                     self.order_log.append({
                         "date": final_date, "code": code, "action": "sell",
                         "shares": pos.shares, "price": limit_down_price,

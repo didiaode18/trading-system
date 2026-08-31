@@ -99,6 +99,7 @@ class Fill:
     total_cost: float     # 总费用（含手续费）
     date: str
     reason: str = ""
+    transfer_fee: float = 0.0  # 过户费
 
 
 # ============================================================
@@ -124,6 +125,7 @@ class SimBroker:
         self.fills: list[Fill] = []
         self.total_commission = 0.0
         self.total_stamp_tax = 0.0
+        self.total_transfer_fee = 0.0
 
     def reset(self):
         """重置状态"""
@@ -132,6 +134,7 @@ class SimBroker:
         self.fills = []
         self.total_commission = 0.0
         self.total_stamp_tax = 0.0
+        self.total_transfer_fee = 0.0
 
     # ----------------------------------------------------------
     # 价格计算
@@ -172,6 +175,10 @@ class SimBroker:
         if direction == "sell":
             return amount * self.cost_config.stamp_tax_rate
         return 0.0
+
+    def _calc_transfer_fee(self, amount: float) -> float:
+        """计算过户费（买卖双向）"""
+        return amount * self.cost_config.transfer_fee_rate
 
     # ----------------------------------------------------------
     # 涨跌停检查
@@ -236,21 +243,24 @@ class SimBroker:
         # 计算费用
         amount = exec_price * target
         commission = self._calc_commission(amount)
-        total_cost = amount + commission
+        transfer_fee = self._calc_transfer_fee(amount)
+        total_cost = amount + commission + transfer_fee
 
         if total_cost > self.cash:
             # 再减少股数
-            target = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate + 0.001)))
+            target = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate + self.cost_config.transfer_fee_rate + 0.001)))
             target = (target // 100) * 100
             if target <= 0:
                 return None
             amount = exec_price * target
             commission = self._calc_commission(amount)
-            total_cost = amount + commission
+            transfer_fee = self._calc_transfer_fee(amount)
+            total_cost = amount + commission + transfer_fee
 
         # 扣款
         self.cash -= total_cost
         self.total_commission += commission
+        self.total_transfer_fee += transfer_fee
 
         # 更新持仓
         if order.code in self.positions:
@@ -282,6 +292,7 @@ class SimBroker:
             total_cost=round(total_cost, 2),
             date=order.date,
             reason=order.reason,
+            transfer_fee=round(transfer_fee, 4),
         )
         self.fills.append(fill)
         return fill
@@ -335,12 +346,14 @@ class SimBroker:
         amount = exec_price * sell_shares
         commission = self._calc_commission(amount)
         stamp_tax = self._calc_stamp_tax(amount, "sell")
-        total_cost = commission + stamp_tax
+        transfer_fee = self._calc_transfer_fee(amount)
+        total_cost = commission + stamp_tax + transfer_fee
 
         # 入账
         self.cash += amount - total_cost
         self.total_commission += commission
         self.total_stamp_tax += stamp_tax
+        self.total_transfer_fee += transfer_fee
 
         # 计算盈亏
         pnl = (exec_price - pos.avg_cost) * sell_shares - total_cost
@@ -361,6 +374,7 @@ class SimBroker:
             total_cost=round(total_cost, 2),
             date=order.date,
             reason=order.reason,
+            transfer_fee=round(transfer_fee, 4),
         )
         self.fills.append(fill)
         return fill
@@ -417,4 +431,4 @@ class SimBroker:
     @property
     def total_cost_paid(self) -> float:
         """总交易成本"""
-        return self.total_commission + self.total_stamp_tax
+        return self.total_commission + self.total_stamp_tax + self.total_transfer_fee

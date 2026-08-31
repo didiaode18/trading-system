@@ -1388,8 +1388,10 @@ def run_canslim():
         adaptive_min_score = _min_score_weak
         mode_desc = f"↔️ 震荡市 | 适度放宽（min_score={_min_score_weak}）"
     else:  # down
-        adaptive_min_score = _min_score_strong  # 保持高分门槛，但标记为观察模式
-        mode_desc = "📉 下跌市 | 严格模式（仅观察，不建议买入）"
+        # FIX(2026-08-27): 下跌市应使用弱势买入线(28分)，而非强势线(45分)
+        # 原逻辑down市与up市共用_min_score_strong导致V6.0 breadth动态下调被完全覆盖
+        adaptive_min_score = _min_score_weak  # 28分，与V6.0 P0-2 breadth下调可叠加
+        mode_desc = f"📉 下跌市 | 观察模式（min_score={_min_score_weak}，V6.0 breadth下调可叠加）"
 
     print(f"[选股] 大盘状态: {mode_desc}")
     print(f"[选股] {market_detail}")
