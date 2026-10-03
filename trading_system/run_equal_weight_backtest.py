@@ -4,6 +4,13 @@
 ====================
 基于V5.1回测引擎（backtest_stock_v5），验证策略在10只代表性个股上的独立表现。
 
+>>> ⚠️ 口径声明：本脚本结果仅供示意，不得作为业绩证据 <<<
+三个方法学硬伤：
+  1. 事后人工指定10只牛股（后视偏差/幸存者偏差）
+  2. 用已实现盈亏累加权益，忽略持仓浮亏（回撤被严重低估）
+  3. 独立资金桶，无真实组合约束
+正确业绩应由 PIT 全市场动态选股回测（改造A）产出。
+
 回测方案:
   - 总资金: 100万元
   - 分配方式: 等权分配，每只股票10万元
@@ -392,6 +399,8 @@ tr:nth-child(even) {{ background: #f8f9fa; }}
 .footer {{ text-align: center; color: #999; font-size: 11px; margin-top: 15px; padding-top: 10px; border-top: 1px solid #eee; }}
 .highlight {{ background: #fef9e7; border: 2px solid #f39c12; border-radius: 8px; padding: 15px; margin: 15px 0; }}
 .highlight h3 {{ margin: 0 0 10px; color: #d35400; }}
+.bias-warning {{ background: #fdedec; border: 2px solid #e74c3c; border-radius: 8px; padding: 15px; margin: 15px 0; }}
+.bias-warning h3 {{ margin: 0 0 10px; color: #c0392b; }}
 </style>
 </head>
 <body>
@@ -401,6 +410,19 @@ tr:nth-child(even) {{ background: #f8f9fa; }}
         <div class="sub">回测区间: {START_DATE} ~ {END_DATE} | 总资金: {TOTAL_CAPITAL_PORTFOLIO:,.0f}元 | 每只: {CAPITAL_PER_STOCK:,.0f}元 × 10只 | 生成: {today} {now}</div>
     </div>
     <div class="content">
+
+        <!-- ⚠️ 口径声明 -->
+        <div class="bias-warning">
+            <h3>⚠️ 口径声明：本报告仅供示意，不得作为业绩证据</h3>
+            <ul style="font-size:13px;line-height:1.8;margin:0;padding-left:20px">
+                <li><b>幸存者偏差/后视偏差</b>：10只标的为事后人工指定，非实时选股</li>
+                <li><b>回撤低估</b>：用已实现盈亏累加权益，忽略持仓浮亏</li>
+                <li><b>无真实组合约束</b>：独立资金桶，非统一资金管理</li>
+            </ul>
+            <p style="font-size:13px;margin-top:10px;color:#555">
+                正确业绩应由 <b>PIT 全市场动态选股回测</b>产出。
+            </p>
+        </div>
 
         <!-- 1. 组合整体表现 -->
         <div class="panel" style="border: 2px solid #27ae60;">

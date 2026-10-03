@@ -152,6 +152,29 @@ def init_db(db_path: str = None) -> sqlite3.Connection:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_last_update_code ON last_update(code)")
     except sqlite3.OperationalError:
         pass  # 索引已存在
+    # V10.5 改造A: PIT全市场股票基础信息表（含上市/退市日期，消除幸存者偏差）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_basic (
+            code          TEXT PRIMARY KEY,
+            name          TEXT,
+            board         TEXT,
+            ipo_date      TEXT,
+            out_date      TEXT,
+            status        TEXT,
+            industry_sw   TEXT,
+            industry_em   TEXT,
+            update_date   TEXT
+        )
+    """)
+    # V10.5 改造A: ST戴帽/摘帽时变状态表（PIT化）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_status_history (
+            code        TEXT,
+            date        TEXT,
+            status_tag  TEXT,
+            PRIMARY KEY (code, date)
+        )
+    """)
     conn.commit()
     return conn
 

@@ -175,15 +175,15 @@ class SimBroker:
 
     def __init__(self, initial_capital: float, cost_config: CostConfig = None,
                  match_mode: MatchMode = MatchMode.REALISTIC,
-                 match_price: str = "signal_price"):
+                 match_price: str = "next_open"):
         """
         参数:
             initial_capital: 初始资金
             cost_config: 交易成本配置
             match_mode: 撮合模式（REALISTIC / SIGNAL）
             match_price: 撮合价来源
-                "signal_price" = 使用信号价（默认，向后兼容）
-                "next_open" = 使用次日开盘价
+                "next_open" = 使用次日开盘价（V10.5默认，消除隐性前视）
+                "signal_price" = 使用信号价（向后兼容，不得作为默认）
                 "next_vwap" = 使用次日VWAP
         """
         self.initial_capital = initial_capital
@@ -442,7 +442,8 @@ class SimBroker:
             return None
 
         # 计算可买股数（100股整数倍）
-        max_shares = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate)))
+        # V10.5 OPT-01: 分母一次性纳入佣金+过户费，减少二次兆底重算
+        max_shares = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate + self.cost_config.transfer_fee_rate)))
         max_shares = (max_shares // 100) * 100
         target = min(target, max_shares)
 

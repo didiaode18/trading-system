@@ -32,7 +32,7 @@ class SimulatorBroker:
 
     def __init__(self, initial_capital: float, cost_config: CostConfig = None,
                  match_mode: MatchMode = MatchMode.REALISTIC,
-                 match_price: str = "signal_price", on_fill=None):
+                 match_price: str = "next_open", on_fill=None):
         """
         参数:
             initial_capital: 初始资金

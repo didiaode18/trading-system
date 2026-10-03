@@ -235,8 +235,6 @@ def analyze_deep(trades: list) -> dict:
     
     # 5. 卖出原因详细分析
     analysis["sell_types"] = {}
-    for st, data in stats["sell_stats"].items() if "sell_stats" in dir() else []:
-        pass
     
     sell_type_trades = defaultdict(list)
     for t in trades:

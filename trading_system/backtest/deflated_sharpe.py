@@ -37,7 +37,8 @@ class DeflatedSharpe:
     """Deflated Sharpe Ratio 计算器"""
 
     def evaluate(self, observed_sharpe: float, n_trials: int,
-                 returns: np.ndarray = None, track_record_length: int = None) -> dict:
+                 returns: np.ndarray = None, track_record_length: int = None,
+                 sr_std: float = None) -> dict:
         """
         计算Deflated Sharpe Ratio
         
@@ -46,6 +47,10 @@ class DeflatedSharpe:
             n_trials: 测试了多少组参数/策略（多重检验次数）
             returns: 收益率序列（用于计算偏度和峰度）
             track_record_length: 回测天数（默认从returns推断）
+            sr_std: 年化夏普跨试验标准差（Bailey & López de Prado）。
+                    默认0.5（经验值），保守压测可取1.0。
+                    V10.5修复: 旧版从价格波动推导sr_std口径完全错误，
+                    导致N=75时expected_max_sharpe=24.95（荒谬值）。
         
         返回:
             {
@@ -58,35 +63,34 @@ class DeflatedSharpe:
                 "interpretation": str,
             }
         """
+        # V10.5 BUG-06修复: sr_std 使用跨试验标准差（默认0.5），
+        # 不再从单条收益序列的价格波动推导（口径完全错误）。
+        if sr_std is None:
+            sr_std = getattr(config, 'DSR_SR_STD', 0.5)
+
         if returns is not None:
             T = len(returns)
             skew = float(stats.skew(returns))
             kurt = float(stats.kurtosis(returns, fisher=True))  # 超额峰度
-            # FIX(G3): sr_std 保护——日收益 mean 接近 0 时 sr_std 会爆炸，
-            # cap 到 10.0 避免预期最大夏普尺度失真。
-            mean_ret = float(np.mean(returns))
-            sr_std = min(
-                np.std(returns) / max(abs(mean_ret), 1e-8),
-                10.0
-            ) if T > 1 else 1.0
         else:
             T = track_record_length or 252
             skew = 0.0
             kurt = 0.0
-            sr_std = 1.0
 
         # ---- 1. 计算预期最大Sharpe（Euler-Mascheroni近似）----
-        # E[max(SR)] ≈ sqrt(2*log(N)) - (log(π) + log(log(N))) / (2*sqrt(2*log(N)))
+        # E[max(SR)] ≈ E[max Z] × σ_SR
+        # E[max Z] 是 N 个标准正态的极值期望（N=75 时约 2.43）
         if n_trials <= 1:
             expected_max_sr = 0.0
         else:
             log_n = np.log(n_trials)
-            expected_max_sr = (
+            # E[max Z] 的极值期望近似
+            emax_z = (
                 np.sqrt(2 * log_n) -
                 (np.log(np.pi) + np.log(log_n)) / (2 * np.sqrt(2 * log_n))
             )
-            # 调整为年化（假设日度Sharpe × sqrt(252)）
-            expected_max_sr *= sr_std  # 缩放到与observed_sharpe同尺度
+            # V10.5: 直接乘以跨试验标准差 σ_SR（年化尺度）
+            expected_max_sr = emax_z * sr_std
 
         # ---- 2. Sharpe的标准误 ----
         # SE(SR) = sqrt((1 + 0.5*SR^2 - skew*SR + (kurt/4)*SR^2) / T)
@@ -105,8 +109,11 @@ class DeflatedSharpe:
         # p值（原假设：SR <= E[max(SR)]）
         p_value = 1 - dsr
 
-        # Sharpe折扣率
-        haircut = 1 - (expected_max_sr / observed_sharpe) if observed_sharpe > 0 else 0
+        # V10.5: Sharpe折扣率，observed≤0时haircut置1（无折扣意义）
+        if observed_sharpe > 0 and expected_max_sr > 0:
+            haircut = 1 - (expected_max_sr / observed_sharpe)
+        else:
+            haircut = 1.0
         haircut = max(0, min(1, haircut))
 
         # 显著性判定

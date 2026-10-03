@@ -1565,7 +1565,7 @@ PAPER_TRADING_CONFIG = {
     "nav_deviation_threshold": 0.02,    # 模拟盘vs回测净值日偏差绝对值均值阈值 2%
     "reject_deviation_threshold": 0.05, # 偏差持续过大→建议淘汰阈值 5%
     "initial_capital": 0,               # 模拟盘初始资金（0=沿用 TOTAL_CAPITAL）
-    "match_price": "signal_price",      # 撮合价：signal_price/next_open/next_vwap
+    "match_price": "next_open",          # 撮合价：next_open(默认)/signal_price/next_vwap
     "daily_advance_time": "16:30",      # 盘后推进所有 paper 策略一个交易日的时间
     "auto_promote_live": False,         # 禁止自动转实盘，毕业仅生成建议由人工确认
 }
@@ -1573,6 +1573,12 @@ PAPER_TRADING_CONFIG = {
 # ============================================================
 # Brinson归因 + 夏普分解（V9.0 任务B，attribution/brinson.py · sharpe_decompose.py）
 # ============================================================
+
+# V10.5: Deflated Sharpe Ratio 参数（BUG-06修复）
+# sr_std: 年化夏普跨试验标准差（Bailey & López de Prado）
+#   默认0.5（经验值），保守压测可取1.0
+#   N=75时: σ=0.5 → SR_0≈1.21; σ=1.0 → SR_0≈2.43
+DSR_SR_STD = 0.5
 ATTRIBUTION_CONFIG = {
     "enabled": True,                    # 周报是否展示Brinson/夏普分解区块
     "benchmark": "000300",              # 基准指数（沪深300）

@@ -35,6 +35,26 @@ logger = logging.getLogger(__name__)
 # 一、基础工具函数
 # ============================================================
 
+# V10.5: _vol_adj 提升为模块级函数（原为 _detect_single_candle 局部函数，
+# 双根/三根K线形态方法无法访问，导致 NameError）
+def _vol_adj(vr):
+    """量能置信度调整值（基于量比 vol_ratio）
+    量比缺失(NaN/None)时返回0，不崩。
+    """
+    if vr is None or (isinstance(vr, float) and np.isnan(vr)):
+        return 0.0
+    try:
+        vr = float(vr)
+    except (ValueError, TypeError):
+        return 0.0
+    if vr > 2.0:
+        return 0.15
+    elif vr > 1.3:
+        return 0.10
+    elif vr < 0.8:
+        return -0.10
+    return 0.0
+
 def _body(o, c):
     """实体长度（绝对值）"""
     return abs(c - o)
@@ -227,13 +247,6 @@ class CandlestickPatternEngine:
 
         min_body = self.cfg.get("min_body_ratio", 0.3)
         long_shadow = self.cfg.get("long_shadow_ratio", 2.0)
-
-        # V10.1: 量能配合分级（替代简单加成，减少噪音）
-        def _vol_adj(vr):
-            if vr > 2.0: return 0.15
-            elif vr > 1.3: return 0.10
-            elif vr < 0.8: return -0.10
-            return 0.0
 
         # 1. 锤子线（底部反转看涨）
         if (trend in ("downtrend", "sideways") and

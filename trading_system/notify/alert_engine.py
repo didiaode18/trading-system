@@ -1475,6 +1475,8 @@ def _generate_action(alert: dict, holdings_info: dict) -> str:
         return "建议分批止盈锁定利润，剩余持仓上移止损"
     elif atype in ("systemic_risk", "systemic_risk_intraday"):
         # V27: 大盘系统性风险
+        # BUG-03修复: 显式从alert取消息字段，避免NameError
+        msg = alert.get("message", "") or alert.get("msg", "") or ""
         if "强制减仓" in msg or "硬止损(>2.5%)" in (alert.get("rule_name", "") if isinstance(alert, dict) else ""):
             return "🔴 大盘急跌超2.5%! 建议立即减仓至30%以下，优先卖出浮亏最大标的"
         elif "准备减仓" in msg or "硬止损(>1.5%)" in (alert.get("rule_name", "") if isinstance(alert, dict) else ""):

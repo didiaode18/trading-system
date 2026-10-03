@@ -62,7 +62,7 @@ class PaperTradingEngine:
     def __init__(self, strategy_name: str, strategy_fn, data_dict: dict,
                  config: dict = None, start_date: str = None,
                  initial_capital: float = None, tracker: PaperTracker = None,
-                 cost_config: CostConfig = None, match_price: str = "signal_price"):
+                 cost_config: CostConfig = None, match_price: str = "next_open"):
         """
         参数:
             strategy_name: 策略名（命名空间）
@@ -73,7 +73,7 @@ class PaperTradingEngine:
             initial_capital: 初始资金（None 时按 config/全局推导）
             tracker:       净值台账（None=默认库）
             cost_config:   交易成本（None=回测默认，费率与回测一致）
-            match_price:   撮合价来源（signal_price/next_open/next_vwap）
+            match_price:   撮合价来源（next_open/signal_price/next_vwap）
         """
         self.strategy_name = strategy_name
         self.strategy_fn = strategy_fn
@@ -213,7 +213,7 @@ PAPER_STRATEGIES = {}
 def register_paper_strategy(name: str, strategy_fn, data_dict: dict = None,
                             data_loader=None, start_date: str = None,
                             initial_capital: float = None, cost_config=None,
-                            match_price: str = "signal_price", config: dict = None):
+                            match_price: str = "next_open", config: dict = None):
     """注册一个 paper 策略实例（回测通过后调用）。
 
     data_dict 与 data_loader 二选一：data_loader() 返回 {code: DataFrame}，
@@ -247,7 +247,7 @@ def build_engine(name: str, tracker: PaperTracker = None,
         strategy_name=name, strategy_fn=reg["strategy_fn"], data_dict=data_dict,
         config=cfg, start_date=reg.get("start_date"),
         initial_capital=reg.get("initial_capital"), tracker=tracker,
-        cost_config=reg.get("cost_config"), match_price=reg.get("match_price", "signal_price"))
+        cost_config=reg.get("cost_config"), match_price=reg.get("match_price", "next_open"))
 
 
 def advance_all(end_date: str = None, tracker: PaperTracker = None,

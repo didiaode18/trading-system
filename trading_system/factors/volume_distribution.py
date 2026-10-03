@@ -49,9 +49,9 @@ def calc_volume_distribution_daily(df: pd.DataFrame, window: int = 20) -> pd.Ser
     for i in range(window + 4, n):
         # 1. 成交量分布熵
         vol_window = volume[i-window:i]
-        vol_sum = np.sum(vol_windows)
+        vol_sum = np.sum(vol_window)
         if vol_sum > 0:
-            p = vol_windows / vol_sum
+            p = vol_window / vol_sum
             p = p[p > 0]  # 去除零值
             entropy = -np.sum(p * np.log(p + 1e-10))
         else:
