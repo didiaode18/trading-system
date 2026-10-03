@@ -1,5 +1,5 @@
 """
-高胜率A股交易操作系统（V3.0 全面升级版）- 全局配置文件
+高胜率A股交易操作系统 - 全局配置文件
 =====================================================
 所有可调参数、股票池、风控阈值均在此处集中管理
 修改任何参数只需编辑本文件，无需改动策略逻辑代码
@@ -81,6 +81,70 @@ NEAR_FULL_POSITION = 0.80        # 仓位>=80%时只允许减仓不允许新开�
 # 四处硬编码15%/20%且口径不一，同一持仓两份报告结论打架，统一由此处管理）
 MAX_SINGLE_STOCK_RATIO = 0.15    # 个股单只最大仓位15%
 MAX_SINGLE_ETF_RATIO = 0.20      # ETF单只最大仓位20%
+MAX_SINGLE_BOND_RATIO = 0.10     # 可转债单只最大仓位10%
+
+# V8.1: ETF分类策略参数（行业ETF/宽基ETF/主题ETF差异化配置）
+ETF_STRATEGY_PARAMS = {
+    "行业ETF": {
+        "momentum_weight": 40,     # 动量权重↑ (行业趋势性强)
+        "ma_weight": 25,
+        "volume_weight": 15,
+        "heat_weight": 15,
+        "risk_weight": 5,
+        "stop_loss_pct": 0.08,     # 止损8% (波动适中)
+        "atr_multiplier": 2.5,     # ATR止损乘数
+        "hold_period_days": 10,    # 建议持有周期
+    },
+    "宽基ETF": {
+        "momentum_weight": 20,     # 动量权重↓ (均值回归性强)
+        "ma_weight": 20,
+        "volume_weight": 10,
+        "heat_weight": 10,
+        "risk_weight": 10,
+        "mean_reversion_weight": 30,  # 均值回归权重↑
+        "stop_loss_pct": 0.12,     # 止损12% (波动低可放宽)
+        "atr_multiplier": 3.0,     # ATR止损乘数放宽
+        "hold_period_days": 20,
+    },
+    "主题ETF": {
+        "momentum_weight": 35,
+        "ma_weight": 25,
+        "volume_weight": 15,
+        "heat_weight": 20,         # 主题受板块热度影响更大
+        "risk_weight": 5,
+        "stop_loss_pct": 0.10,
+        "atr_multiplier": 2.5,
+        "hold_period_days": 15,
+    },
+}
+
+# ETF分类规则（代码前缀→类型映射）
+ETF_TYPE_MAP = {
+    # 宽基ETF
+    "510": "宽基ETF",   # 沪深300/中证500/综指等
+    "563": "宽基ETF",   # 中证系列
+    "560": "宽基ETF",   # 宽基系列
+    # 行业ETF
+    "562": "行业ETF",   # 半导体/材料等行业
+    "512": "行业ETF",   # 证券/银行/军工等行业
+    "515": "行业ETF",   # 科技/消费等行业
+    # 主题ETF
+    "159": "主题ETF",   # 创业板/主题系列
+    "513": "主题ETF",   # 跨境/主题系列
+    "588": "主题ETF",   # 科创板系列
+}
+
+def get_etf_type(code: str) -> str:
+    """V8.2: 根据代码前缀返回ETF类型，非ETF返回空字符串
+    注意: 优先使用utils.instrument.is_etf()判定，此处保留供兼容"""
+    # V8.2: 使用精确ETF前缀，避免将可转债误判为ETF
+    from utils.instrument import ETF_PREFIXES
+    if not any(code.startswith(p) for p in ETF_PREFIXES):
+        return ""
+    for prefix, etf_type in ETF_TYPE_MAP.items():
+        if code.startswith(prefix):
+            return etf_type
+    return "行业ETF"  # 默认归类为行业ETF
 
 # 个股硬性筛选标准
 MIN_DAILY_AMOUNT = 5e8           # 日均成交额下限（5亿元，V2.3降低避免中小盘龙头被误杀）
@@ -587,6 +651,41 @@ SECTOR_CANDIDATES = {
     },
 }
 
+# ============================================================
+# 二'、回测扩展标的池（Phase 2: 从 SECTOR_CANDIDATES 中选取高流动性标的补充回测宇宙）
+# 不影响实盘 STOCK_POOL，仅 master_backtest.py 使用。
+# 选取原则：各行业龙头/大市值、历史数据充分、趋势特征明显。
+# ============================================================
+BACKTEST_EXTRA_POOL = {
+    # 科技AI
+    "002230": {"名称": "科大讯飞", "赛道": "人工智能", "类型": "龙头"},
+    "002371": {"名称": "北方华创", "赛道": "半导体芯片", "类型": "龙头"},
+    "603019": {"名称": "中科曙光", "赛道": "算力", "类型": "龙头"},
+    "300308": {"名称": "中际旭创", "赛道": "光模块", "类型": "龙头"},
+    # 机器人
+    "300124": {"名称": "汇川技术", "赛道": "机器人", "类型": "龙头"},
+    # 商业航天/军工
+    "600760": {"名称": "中航沈飞", "赛道": "商业航天", "类型": "龙头"},
+    # 新能源
+    "300750": {"名称": "宁德时代", "赛道": "锂电池", "类型": "龙头"},
+    "002594": {"名称": "比亚迪",   "赛道": "新能源汽车", "类型": "龙头"},
+    "601012": {"名称": "隆基绿能", "赛道": "光伏", "类型": "龙头"},
+    # 周期资源
+    "601899": {"名称": "紫金矿业", "赛道": "黄金概念", "类型": "龙头"},
+    "600519": {"名称": "贵州茅台", "赛道": "白酒", "类型": "龙头"},
+    # 医药
+    "600276": {"名称": "恒瑞医药", "赛道": "创新药", "类型": "龙头"},
+    # 消费
+    "000858": {"名称": "五粮液",   "赛道": "白酒", "类型": "龙头"},
+    # 储能/风电
+    "300274": {"名称": "阳光电源", "赛道": "光伏逆变器", "类型": "龙头"},
+    "600438": {"名称": "通威股份", "赛道": "光伏", "类型": "龙头"},
+    # 稀土
+    "600111": {"名称": "北方稀土", "赛道": "稀土永磁", "类型": "龙头"},
+    # 医疗器械
+    "300760": {"名称": "迈瑞医疗", "赛道": "医疗器械", "类型": "龙头"},
+}
+
 # 选股引擎配置
 SCREENER_CONFIG = {
     "max_stocks_per_sector": 3,     # 每个行业最多入选3只
@@ -626,7 +725,7 @@ SCREENER_CONFIG = {
     "ml_predict_bonus_max": 3,        # ML预测加分上限（上涨概率>0.7时+3分）
     "ml_predict_threshold": 0.70,     # ML上涨概率确认阈值
     # V5.2: 盘中重新评分时点
-    "intraday_rescore_times": ["10:00", "14:00"],  # 盘中关键时点触发重新评分
+    "intraday_rescore_times": ["14:00"],  # V23优化: 10:00评分不被09:25消费，移除
 }
 
 # FIX: 调仓评分阈值单一来源（GAP=评分差门槛, SELL=卖出阈值, BUY=买入阈值）
@@ -702,7 +801,7 @@ BUY_POINT_ALERT_ENABLED = True       # 买点到价提醒总开关
 BUY_POINT_ALERT_EMAIL_FALLBACK = True  # 微信/钉钉渠道未配置或失败时邮件兜底(DINGTALK_ONLY=True时此开关无效)
 # V4.4: 买点比价独立快路径（与统一预警解耦，固定频率轻量比价，只拉买点标的+大盘行情）
 BUY_POINT_FAST_CHECK_ENABLED = True  # 买点快路径开关（False=回退到统一预警内检测）
-BUY_POINT_FAST_INTERVAL_MIN = 3      # 快路径轮询间隔(分钟)
+BUY_POINT_FAST_INTERVAL_MIN = 8      # 快路径轮询间隔(分钟) — V23优化: 5→8min，实际到价触发日均<1次，减少37.5%无效API调用
 # V4.4: 买点数据静默失效检查（每交易日09:40校验levels生效日，失效发告警邮件）
 BUY_LEVELS_CHECK_ENABLED = True
 
@@ -805,6 +904,11 @@ BOLL_PERIOD = 20                 # 布林带周期
 BOLL_STD = 2                     # 布林带标准差倍数
 ATR_PERIOD = 14                  # ATR周期
 
+# FIX P2-#10: 止损触发口径开关（trend_strategy.check_sell_signal 使用）
+#   "low"   ：盘中最低价 <= 止损线 → 触发（默认，与 backtest_real / intraday_monitor 一致）
+#   "close" ：仅收盘价 <= 止损线 → 触发（旧口径，保守）
+STOP_LOSS_TRIGGER_MODE = "low"
+
 # ============================================================
 # 四、买点参数
 # ============================================================
@@ -824,6 +928,15 @@ MIN_SIGNAL_QUALITY_LIVE = 62     # P0-2: 实盘信号质量硬门槛（回测55�
 # V6.1: 信号质量分市场环境（回测50万验证: 57.2%胜率/盈亏比1.00，提高门槛过滤低质量信号）
 MIN_SIGNAL_QUALITY_BEAR = 75     # V6.2: 熊市门槛70→75（回测熊市命中率仅33.2%，提高拦截）
 MIN_SIGNAL_QUALITY_NON_BEAR = 65 # V6.1: 非熊市从60提升至65（预期减少15%假信号，胜率+2-3%）
+# V5.2: 三档差异化信号质量门槛
+MIN_SIGNAL_QUALITY_BULL = 70     # V5.2: 牛市门槛70（减少假信号，但不过严）
+
+# V7(A2): 多因子信号增强权重（0=关闭，v5引擎通过config读取，v6引擎通过params传入）
+FACTOR_WEIGHT_SMF = 0.0          # 聪明钱因子权重（建议值: 8~12）
+FACTOR_WEIGHT_REVERSAL = 0.0     # 反转因子权重（建议值: 5~8）
+FACTOR_WEIGHT_LOW_VOL = 0.0      # 低波动因子权重（建议值: 3~5）
+FACTOR_MAX_BONUS = 20            # 因子加分上限
+MIN_SIGNAL_QUALITY_RANGE = 60    # V5.2: 震荡门槛60（保持宽松）
 
 # V6.2: 买点下跌趋势过滤（回测假信号率23.1%，加强过滤）
 BUY_SIGNAL_MA60_SLOPE_FILTER = True   # MA60下行时不买（下降趋势中回踩大概率破位）
@@ -837,11 +950,11 @@ SECOND_BATCH_RATIO = 0.50        # V5.1: 第二批加仓比例（50%，与首批
 MIN_PROFIT_TO_ADD = 0.03         # 浮盈>=3%才允许加第二批
 
 # ============================================================
-# 六、止损参数（V6.0优化版 - 基于网格搜索最优参数）
+# 六、止损参数（V10统一版 - 先设默认，RISK_UNIFIED_CONFIG定义后覆盖）
 # ============================================================
-# 优化结论: 10%止损比8%更优（减少被洗出，给交易更多呼吸空间）
-INITIAL_STOP_LOSS_PCT = 0.10     # 初始止损幅度（买入价下方10%）
-INITIAL_STOP_LOSS_LOW = 0.10     # 稳健龙头止损下限（V6.0: 8%→10%）
+# [P0-#1修复] 止损参数统一引用RISK_UNIFIED_CONFIG，消除多处独立定义的矛盾
+INITIAL_STOP_LOSS_PCT = 0.10  # 默认值，RISK_UNIFIED_CONFIG定义后自动覆盖
+INITIAL_STOP_LOSS_LOW = INITIAL_STOP_LOSS_PCT  # 稳健龙头止损与主止损对齐
 
 # 移动止损档位（浮盈 -> 止损上移到的位置）
 # V6.0优化: 保本线从5%降至3%（更早保护本金），锁定从+2%降至+1%
@@ -867,23 +980,27 @@ MACD_DEATH_CROSS_ENABLED = False  # 关闭MACD死叉卖出（假信号太多）
 TREND_BREAK_ENABLED = False       # 关闭趋势破位卖出（40笔全亏，假破位严重）
 
 # V6.1: 同股信号最小间隔（避免同一股票短期内重复开仓）
-MIN_SIGNAL_INTERVAL_DAYS = 3      # 同一只股票两次买入信号至少间隔3个交易日
+MIN_SIGNAL_INTERVAL_DAYS = 7      # V5.2: 同一只股票两次买入信号至少间隔7个交易日（原3天，减少频繁交易）
+
+# V5.2: 回测个股黑名单（回测诊断用，实盘不受影响）
+# 基于三年回测诊断：胜率<20%且交易>=4笔的标的
+BACKTEST_BLACKLIST = {"600519", "600989", "001979", "603345", "600887"}  # 贵州茅台/宝丰能源/招商南油/安井食品/伊利股份
 
 # ============================================================
 # 七、止盈参数（双轨制）V6.1优化版
 # ============================================================
-# V6.1优化: 阶梯第1档从10%提高到12%（回测盈亏比1.00→目标1.20+，让盈利单充分奔跑）
+# V7.0优化: 阶梯第1档从12%提高到18%（回测验证：组合方案夏普0.60/收益+50%/回撤28%）
 # 第一轨：阶梯目标止盈
 LADDER_SELL_LEVELS = [
     # (浮盈阈值, 卖出比例)
-    (0.12, 1/3),                   # 浮盈12%: 卖出1/3（V6.1: 10%→12%，提升盈亏比）
+    (0.18, 1/4),                   # 浮盈18%: 卖出1/4（V7.0: 12%→18%, 1/3→1/4，CANSLIM目标20%+让利润奔跑）
     (0.25, 1/3),                   # 浮盈25%: 再卖出1/3（V6.1: 20%→25%，让大牛股跑更远）
 ]
 
-# V6.2: 盘中止盈提醒阈值（与阶梯止盈对齐，回测10%/20%提醒过早，超半数继续上涨）
+# V7.0: 盘中止盈提醒阈值（与阶梯止盈对齐，第一档18%前3%提醒，第二档25%同步）
 PROFIT_ALERT_LEVELS = [
-    0.15,                          # 第一止盈提醒: 浮盈15%（V6.2: 10%→15%）
-    0.25,                          # 第二止盈提醒: 浮盈25%（V6.2: 20%→25%）
+    0.15,                          # 第一止盈提醒: 浮盈15%（接近18%阶梯止盈线）
+    0.25,                          # 第二止盈提醒: 浮盈25%（与第二阶梯同步）
 ]
 
 # 第二轨：回落止盈（按股票类型区分）
@@ -940,11 +1057,11 @@ MARKET_WEAK_MAX = 0.30           # 弱势行情最大仓位30%
 # 合并 RiskGate(V2.0) 与 risk_check(V3.0) 两套系统，取更保守值
 RISK_UNIFIED_CONFIG = {
     # --- 持仓与仓位 ---
-    "max_holdings": 7,                # 持仓数量硬限制（7只最优，已验证）
+    "max_holdings": MAX_HOLDINGS,     # [P1-#4修复] 统一引用全局MAX_HOLDINGS(8)
     "max_single_position": 0.25,      # 单只最大仓位25%（ETF 20%/个股15%的保守上限）
     "etf_max_ratio": 0.20,            # 单只ETF仓位上限20%
     "stock_max_ratio": 0.15,          # 单只个股仓位上限15%
-    "flexible_max_ratio": 0.08,       # 弹性标的单只上限8%
+    "flexible_max_ratio": FLEXIBLE_STOCK_MAX_RATIO,  # [P1-#6修复] 统一引用全局配置(0.15)
     "sector_max_ratio": 0.40,         # 单一赛道仓位上限40%
     "min_cash_ratio": 0.10,           # 最低现金保留10%
 
@@ -1000,6 +1117,10 @@ RISK_UNIFIED_CONFIG = {
     ],
 }
 
+# [P0-#1修复] RISK_UNIFIED_CONFIG定义完成，覆盖止损参数默认值
+INITIAL_STOP_LOSS_PCT = RISK_UNIFIED_CONFIG["initial_stop_loss_pct"]
+INITIAL_STOP_LOSS_LOW = INITIAL_STOP_LOSS_PCT
+
 # ============================================================
 # 八''、策略失效检测器配置（V6.1: 从类内部提取到config，便于调优）
 # ============================================================
@@ -1022,11 +1143,14 @@ SFD_CONFIG = {
 WF_CONFIG = {
     "train_days": 200,                # V6.1: 训练窗口150→200天（覆盖完整牛熊周期）
     "test_days": 60,                  # V6.1: 验证窗口40→60天（增加统计显著性）
-    "max_windows": 10,                # 最多10个窗口（控制运行时间）
+    "max_windows": 20,                # FIX(G2): 10→20个窗口，覆盖约80%数据（原10窗口仅覆盖40%）
     "param_grid": {
-        "initial_stop_loss": [0.06, 0.08],  # 2个止损值
-        "min_signal_quality": [60, 65, 70], # 3个质量门槛
-    },  # 共2×3=6组合（原6组合已足够，保持）
+        "initial_stop_loss": [0.05, 0.06, 0.07, 0.08],  # V7: 2→4值
+        "min_signal_quality": [55, 60, 65, 70, 75],      # V7: 3→5值
+        "drawdown_leader": [0.05, 0.06, 0.07, 0.08],     # V7: 新增4值
+        "vol_shrink_ratio": [0.60, 0.70, 0.80],           # V7: 新增3值
+    },  # V7: 6组合→4×5×4×3=240组合（WF会采样 grid_max_trials 个）
+    "grid_max_trials": 80,  # V7: 240组合中采样80个（平衡计算时间与搜索质量）
 }
 
 # ============================================================
@@ -1043,20 +1167,21 @@ import os as _os
 PROJECT_ROOT = _os.path.dirname(_os.path.abspath(__file__))
 DATA_DIR = _os.path.join(PROJECT_ROOT, "data")
 DB_PATH = _os.path.join(DATA_DIR, "stock_db.db")
+DATA_FETCH_WORKERS = 10            # 数据拉取并行线程数（batch_update_all 默认）
 LOG_DIR = _os.path.join(PROJECT_ROOT, "logs")
 OUTPUT_DIR = _os.path.join(PROJECT_ROOT, "output")
 
-# 持仓文件路径（优先项目内，兼容旧路径）
-HOLDINGS_FILE = _os.path.join(PROJECT_ROOT, "holdings.json")
-_HOLDINGS_FILE_LEGACY = _os.path.join(_os.path.dirname(PROJECT_ROOT), "holdings.json")
+# 持仓文件路径（优先根目录用户可见文件，消除双副本不一致风险）
+HOLDINGS_FILE = _os.path.join(_os.path.dirname(PROJECT_ROOT), "holdings.json")
+_HOLDINGS_FILE_LEGACY = _os.path.join(PROJECT_ROOT, "holdings.json")
 
 def get_holdings_file() -> str:
-    """获取持仓文件路径（优先新路径，兼容旧路径）"""
+    """获取持仓文件路径（优先根目录权威路径，兼容旧路径）"""
     if _os.path.exists(HOLDINGS_FILE):
         return HOLDINGS_FILE
     if _os.path.exists(_HOLDINGS_FILE_LEGACY):
         return _HOLDINGS_FILE_LEGACY
-    return HOLDINGS_FILE  # 默认新路径（用于创建）
+    return HOLDINGS_FILE  # 默认根目录路径（用于创建）
 
 
 def load_holdings(validated: bool = True) -> dict:
@@ -1133,10 +1258,48 @@ ALERT_DINGTALK_MIN_LEVEL = "high"  # 钉钉推送最低级别门槛: "critical"/
 # 竞价预警: critical级是否补发钉钉
 AUCTION_ALERT_DINGTALK = True
 
-# V6.0: 预警确认(ACK)机制 —— 用户点击"已处理"后当日静默同标的同规则预警
-ALERT_ACK_ENABLED = True            # ACK机制总开关
-ALERT_ACK_CALLBACK_URL = "http://192.168.88.101:9876/ack/"  # 回调服务器URL前缀(钉钉按钮点击目标, 用局域网IP让手机可访问)
-ALERT_ACK_SERVER_PORT = 9876        # 回调服务器监听端口
+# V26: 自动静默机制 —— 同标的同规则当日仅提醒一次，条件恶化时自动再提醒
+ALERT_AUTO_SILENCE = True           # 自动静默开关
+ALERT_WORSEN_THRESHOLD = 15         # 恶化放行阈值: urgency提升>=此值才允许再提醒
+
+# ============================================================
+# V27: 大盘系统性风险提前预警（2026-09-11 实施）
+# 解决: M因子/MarketRegime判定"下降趋势"滞后10+日的问题
+# 三层防线: L1加速信号(领先5日) → L2盘中硬止损(零延迟) → L3宽度收窄(领先3日)
+# ============================================================
+# L1: MA斜率加速度检测（M因子增强）
+SYSTEMIC_RISK_MA_ACCEL_ENABLED = True      # MA20斜率加速度检测开关
+SYSTEMIC_RISK_MA_ACCEL_WINDOW = 5          # 斜率回望窗口（日）
+SYSTEMIC_RISK_MA_ACCEL_THRESHOLD = -0.05   # 加速度阈值（斜率5日变化<此值→预警）
+
+# L2: 盘中大盘跌幅硬止损触发器
+SYSTEMIC_RISK_INTRADAY_ENABLED = True      # 盘中大盘跌幅监控开关
+SYSTEMIC_RISK_INTRADAY_WARNING_PCT = -1.5  # 🟠准备减仓: 沪深300日内跌幅超此值
+SYSTEMIC_RISK_INTRADAY_CRITICAL_PCT = -2.5 # 🔴强制减仓: 沪深300日内跌幅超此值
+
+# L3: 市场宽度收窄速率检测
+SYSTEMIC_RISK_BREADTH_ENABLED = True       # 宽度收窄速率检测开关
+SYSTEMIC_RISK_BREADTH_DROP_THRESHOLD = 15  # 5日内宽度下降超此百分点→预警
+SYSTEMIC_RISK_BREADTH_LOW_THRESHOLD = 30   # 宽度低于此值+仍在下降→准备减仓
+
+# L4: 资金流外流检测
+SYSTEMIC_RISK_FUND_FLOW_ENABLED = True     # 资金流外流检测开关
+SYSTEMIC_RISK_FUND_FLOW_DAYS = 3           # 连续N日北向净流出→预警
+SYSTEMIC_RISK_FUND_FLOW_THRESHOLD = -50    # 单日北向净流出阈值（亿元）
+SYSTEMIC_RISK_MARGIN_DROP_THRESHOLD = -3.0 # 融资余额周降超此百分比→预警
+
+# V27.1 改进参数（回测后调优 2026-09-11）
+SYSTEMIC_RISK_L1_CONSECUTIVE_DAYS = 2    # L1连续N天score>=2才升级ready（降误报）
+SYSTEMIC_RISK_VOL_WARM_THRESHOLD = 1.2   # L5波动率warm阈值（原1.5→1.2）
+SYSTEMIC_RISK_VOL_READY_THRESHOLD = 1.8  # L5波动率ready阈值（原2.0→1.8）
+SYSTEMIC_RISK_MFACTOR_BOOST = True       # M因子状态联动增强（M=down时信号升级）
+
+# 分级预警输出
+SYSTEMIC_RISK_LEVELS = {
+    "warm":   {"emoji": "🟡", "label": "风险升温", "action": "日志+邮件提醒"},
+    "ready":  {"emoji": "🟠", "label": "准备减仓", "action": "钉钉+邮件+生成减仓条件单"},
+    "force":  {"emoji": "🔴", "label": "强制减仓", "action": "紧急钉钉+邮件+立即减仓条件单"},
+}
 
 # ============================================================
 # 十二、邮件通知配置（QQ邮箱SMTP）
@@ -1209,7 +1372,7 @@ MONITOR_CONFIG = {
     "rapid_drop_pct": -0.03,          # 急跌预警阈值(-3%)
     "market_drop_pct": -0.015,        # 大盘急跌阈值(-1.5%)
     "amplitude_alert_pct": 0.08,      # 振幅预警(8%)
-    "profit_alert_levels": [0.08, 0.20],  # 止盈提醒档位
+    "profit_alert_levels": [0.15, 0.25],  # 止盈提醒档位（V7.0: 与PROFIT_ALERT_LEVELS对齐）
 }
 
 # ============================================================
@@ -1231,9 +1394,11 @@ ANTI_WASH_CONFIG = {
 GRADIENT_REDUCE_CONFIG = {
     # 梯度减仓阈值（浮亏比例 → 建议减仓比例）
     "levels": [
-        {"loss_pct": -0.05, "reduce_ratio": 1/3, "level": "warning",  "label": "浮亏5%减仓1/3"},
-        {"loss_pct": -0.08, "reduce_ratio": 1/2, "level": "critical", "label": "浮亏8%减仓1/2"},
-        {"loss_pct": -0.10, "reduce_ratio": 1.0, "level": "emergency","label": "浮亏10%清仓"},
+        # FIX(2026-09-28): 首档从"warning"升级为"high"，确保通过钉钉分级路由(ALERT_DINGTALK_MIN_LEVEL=high)
+        # 梯度减仓首档是浮亏加速的最早预警信号，需在钉钉秒达
+        {"loss_pct": -0.09, "reduce_ratio": 1/3, "level": "high",     "label": "浮亏9%减仓1/3"},
+        {"loss_pct": -0.12, "reduce_ratio": 1/2, "level": "critical", "label": "浮亏12%减仓1/2"},
+        {"loss_pct": -0.15, "reduce_ratio": 1.0, "level": "emergency","label": "浮亏15%清仓"},
     ],
     # FIX(2026-08-12): 深亏模式 —— 浮亏≤threshold时不再走三档清仓轰炸，
     # 合并为每日1条汇总提醒且不生成条件单；holdings.json设"ack_deep_loss":true可完全豁免
@@ -1242,7 +1407,7 @@ GRADIENT_REDUCE_CONFIG = {
     "consecutive_decline_days": 3,       # 连续N日下跌
     "consecutive_decline_total": -0.05,  # 累计跌幅超此值 → 触发减仓1/3
     # 单日放量暴跌（不等收盘，盘中直接触发）
-    "intraday_crash_pct": -0.05,         # 盘中跌超5%
+    "intraday_crash_pct": -0.05,         # 盘中跌超5%（保持敏感，暴跌仍需及时响应）
     "intraday_crash_vol_ratio": 2.0,     # 且量>均量2倍 → 立即减仓1/2
     # 条件单生成
     "generate_condition_order": True,    # 是否自动生成东方财富条件单
@@ -1261,7 +1426,7 @@ ALERT_EMAIL_ASYNC = True
 
 INTRADAY_ESCALATION_CONFIG = {
     # 三级监控频率
-    "normal_interval_min": 10,     # 正常状态: 10分钟/次
+    "normal_interval_min": 15,     # 正常状态: 15分钟/次 — V22优化: 10→15min，减少40%无效info级预警
     "warning_interval_min": 3,     # 预警状态: 3分钟/次
     "emergency_interval_min": 1,   # 紧急状态: 1分钟/次
     # 升级条件（满足任一即升级）
@@ -1339,7 +1504,7 @@ BACKTEST_CONFIG = {
     "initial_capital": TOTAL_CAPITAL,   # 回测初始资金
     "buy_slippage": 0.001,              # 买入滑点 0.1%
     "sell_slippage": 0.001,             # 卖出滑点 0.1%
-    "commission_rate": 0.00025,         # 佣金万2.5
+    "commission_rate": COMMISSION_RATE,     # [P1-#3修复] 统一引用全局佣金费率(万3)
     "stamp_tax_rate": 0.001,            # 印花税千1
     "benchmark": "000300",              # 基准指数
     "walk_forward_train": 60,           # Walk-Forward训练窗口
@@ -1390,12 +1555,98 @@ DISCIPLINE_CONFIG = {
 # 二十一、模拟盘配置（V8.0新增）
 # ============================================================
 PAPER_TRADING_CONFIG = {
-    # V9.3: 模拟盘功能尚未实现，此配置为预留。
-    # 当enabled=True时，dashboard/app.py将显示模拟盘入口。
-    "enabled": False,                   # 是否启用模拟盘（功能未实现，保持False）
-    "graduation_days": 20,              # 毕业所需天数
-    "min_sharpe": 1.0,                  # 毕业最低夏普
-    "max_drawdown": 0.10,               # 毕业最大回撤
+    # V9.3 → 模拟盘引擎已实现（paper_trading/ 模块）。
+    # 铁律：回测通过的策略必须在模拟盘"毕业"后才允许进入实盘。
+    # 默认观察模式（enabled=False）：开启后仅记录净值与毕业建议，绝不触发真实下单。
+    "enabled": False,                   # 是否启用模拟盘（默认关闭，人工确认后开启）
+    "graduation_days": 20,              # 毕业所需最少交易日
+    "min_sharpe": 1.0,                  # 毕业最低夏普（>）
+    "max_drawdown": 0.10,               # 毕业最大回撤（<）
+    "nav_deviation_threshold": 0.02,    # 模拟盘vs回测净值日偏差绝对值均值阈值 2%
+    "reject_deviation_threshold": 0.05, # 偏差持续过大→建议淘汰阈值 5%
+    "initial_capital": 0,               # 模拟盘初始资金（0=沿用 TOTAL_CAPITAL）
+    "match_price": "signal_price",      # 撮合价：signal_price/next_open/next_vwap
+    "daily_advance_time": "16:30",      # 盘后推进所有 paper 策略一个交易日的时间
+    "auto_promote_live": False,         # 禁止自动转实盘，毕业仅生成建议由人工确认
+}
+
+# ============================================================
+# Brinson归因 + 夏普分解（V9.0 任务B，attribution/brinson.py · sharpe_decompose.py）
+# ============================================================
+ATTRIBUTION_CONFIG = {
+    "enabled": True,                    # 周报是否展示Brinson/夏普分解区块
+    "benchmark": "000300",              # 基准指数（沪深300）
+    "check_tolerance": 0.001,           # Brinson三项合计 vs 实际超额收益允许误差 0.1pct
+    "risk_free_rate": 0.03,             # 夏普/信息比率年化无风险利率
+    "min_observations": 10,             # 夏普分解最少样本（不足静默降级）
+}
+
+# ============================================================
+# 最全历史回测流水线（full-history-backtest skill）
+# scripts/master_backtest.py 编排 13 个 Stage + 七道准入门。
+# 全部阈值可在此覆盖；未实现的新增 Stage 自动 skipped，不阻断流水线。
+# ============================================================
+MASTER_BACKTEST_CONFIG = {
+    "enabled": True,
+    "seed": 42,                         # 固定随机种子，保证结果可复现
+    "risk_free_rate": 0.03,
+    # --- quick 模式样本控制（目标 < 1 分钟）---
+    "quick": {
+        "max_codes": 8,                 # 最多标的数
+        "tail_days": 400,               # 每只标的只取最近 N 根K线
+        "mc_simulations": 200,
+        "wf_max_windows": 3,
+        "grid_max_trials": 12,
+    },
+    "full": {
+        "mc_simulations": 1000,
+        "wf_max_windows": 20,             # FIX(G2): 与 WF_CONFIG 对齐，20窗口
+        "grid_max_trials": 120,            # V7: 75→120，容纳 WF 扩展网格采样
+    },
+    # --- Stage 3 全池引擎回测（进程内有界采样：控 30min 预算、规避 run() 邮件副作用）---
+    "stage3": {
+        "max_codes": 10,                # 采样标的数（优先 STOCK_POOL）；全池×3年×MC 达小时级
+        "window_days": 200,             # 回测窗口（交易日），取采样标的公共日期尾部 N 根
+    },
+    # --- Stage 5 参数网格（V7: 扩展至4参数，含 vol_shrink_ratio）---
+    "param_grid": {
+        "initial_stop_loss": [0.04, 0.05, 0.06, 0.07, 0.08],
+        "min_signal_quality": [55, 60, 65, 70, 75],
+        "drawdown_leader": [0.05, 0.06, 0.07],
+        "vol_shrink_ratio": [0.60, 0.70, 0.80],  # V7: 新增缩量阈值
+    },
+    # --- Stage 9 多基准（DB 无对应指数时静默降级并标注 missing）---
+    "benchmarks": {
+        "000300": "沪深300",
+        "000905": "中证500",
+        "000852": "中证1000",
+        "932000": "中证2000",
+        "399006": "创业板指",
+    },
+    # --- Stage 12 因子分层 ---
+    "factor_layer": {
+        "n_groups": 5,                  # 按月分 5 组
+        "forward_days": 20,             # 前瞻收益窗口
+        "rebalance_freq": 20,           # 调仓频率（交易日，约每月）
+        "factors": ["mom_20d", "mom_60d", "ma20_bias", "vol_ratio", "turnover_rate"],
+    },
+    # --- 七道准入门阈值（默认值，SKILL.md 表格）---
+    "gates": {
+        "G2_oos_sharpe_min": 0.8,       # Walk-Forward 样本外平均夏普 >
+        "G3_dsr_min": 0.95,             # Deflated Sharpe >
+        "G3_pbo_max": 0.5,              # PBO <（若实现）
+        "G4_cost_degradation_max": 0.30,# 成本×2 后夏普退化 <
+        "G5_plateau_degradation_max": 0.15,  # 高原：邻域退化 <
+        "G5_isolated_degradation": 0.30,     # 孤点：邻域退化 >
+        "G7_return_diff_max": 0.03,     # 双引擎总收益差 <
+        "G7_sharpe_diff_max": 0.3,      # 双引擎夏普差 <
+    },
+    # --- Stage 13 存档 / 基线 diff ---
+    "archive_file": "backtest_runs.jsonl",
+    "baseline_diff": {
+        "sharpe_threshold": 0.3,        # 夏普变化超此值标红
+        "annual_threshold": 0.05,       # 年化变化超此值标红
+    },
 }
 
 # ============================================================
@@ -1446,6 +1697,9 @@ CAOPAN_CONFIG = {
     "max_risk_atr_mult": 2.0,          # 最大风险不超过2倍ATR（防止止损太远）
     "rr_position_scale": True,         # 盈亏比联动仓位
 
+    # --- 多周期共振（周线趋势判定）---
+    "weekly_ma_period": 50,            # 周线MA周期（50日≈10周，用于check_weekly_trend）
+
     # --- 回测参数 ---
     "backtest_years": 3,
     "backtest_commission": 0.0003,
@@ -1467,6 +1721,7 @@ CAOPAN_CONFIG = {
 # --- P0-1: VWAP均价线监控 ---
 VWAP_CONFIG = {
     "enabled": True,
+    "quiet_minutes": 30,                  # V25: 开盘静默期15→30分钟（P1-1修复，开盘30min内VWAP不稳定）
     "bearish_deviation_pct": -0.015,   # 价格低于VWAP 1.5% → 空头控盘预警
     "bearish_persist_cycles": 3,        # 连续N个轮询周期低于VWAP → 确认走弱
     "bullish_deviation_pct": 0.03,      # 价格高于VWAP 3% → 超买偏离提示
@@ -1605,6 +1860,14 @@ INTRADAY_PATTERN_CONFIG = {
     "v_reversal_bounce_pct": 0.02,      # V反: 5分钟反弹>2%
 }
 
+# --- V10.1: VWAP偏离检测 ---
+VWAP_DEVIATION_CONFIG = {
+    "enabled": True,
+    "high_deviation": 0.02,             # 偏离>2%: VWAP偏离过高(价格虚高)
+    "low_deviation": -0.02,             # 偏离<-2%: VWAP偏离过低(价格虚低)
+    "min_data_points": 20,              # 最少20个分时数据点
+}
+
 # --- P2-4: 缺口分析 ---
 GAP_CONFIG = {
     "enabled": True,
@@ -1692,13 +1955,46 @@ FINANCIAL_REPORT_ENABLED = True        # V10.2: 财报深度分析启用（营�
 FINANCIAL_REPORT_MAX_BONUS = 4         # V10.2: 财报分析最大加分（优秀财报+4）
 FINANCIAL_REPORT_PENALTY = -2          # V10.2: 财报分析最大减分（财报地雷杀伤力，非对称设计）
 IC_IR_WEIGHT_ENABLED = True            # V6.0 P1-3: IC_IR动态加权启用（IC/|IC|比率替代固定权重）
-ATR_ADAPTIVE_STOP_LOG_ONLY = True      # ATR梯度档位（True=仅日志对比ATR建议值，不改变触发）
+ATR_ADAPTIVE_STOP_LOG_ONLY = False     # V26: ATR梯度档位生效（False=高波动股自动放宽至ATR建议值，诊断确认固定档对002491等过紧）
 SECTOR_CHANGE_PCT_ENABLED = False      # 板块涨跌注入（影响洗盘/真跌判定，先双算日志观察）
 CAI_NEUTRAL_PROXY_ENABLED = True       # V5.1: CAI中性分代理启用（无基本面数据时固定10分，消除动量伪装）
 CORRELATION_PENALTY_ENABLED = False    # 相关性卖出惩罚（报告展示原因，不改排序）
 SCAN_TOTAL_MAX = 200                   # V5.2: 动态扫描候选上限（V5.1=100，扩展至200覆盖更多赛道）
 PORTFOLIO_RISK_ACTIONS_ENABLED = True  # 持仓报告"组合风控行动项"区块
 CAPITAL_PLANNER_ENABLED = True         # 持仓报告"资金仓位智能规划"板块（资金仪表盘/调仓清单/买点可行性/禁买联动）
+
+
+# ============================================================
+# 证据分级研究配置（research/ 模块）
+# 把投研纪律工程化：事实/推断/假设三级标注、事件催化剂双分级、传闻隔离
+# 默认观察模式：仅在报告追加样板区块，不改变任何买卖阈值与策略逻辑
+# ============================================================
+EVIDENCE_GRADING_CONFIG = {
+    "enabled": True,             # 是否启用证据分级样板区块
+    "observe_only": True,        # 观察模式：只展示分级，不拦截现有报告结论
+    "embed_in_report": True,     # 是否在盘后报告嵌入样板区块
+    "isolate_rumor": True,       # L3 传闻强制隔离到"市场雷达"区，禁止买卖建议
+    "block_concept_only": True,  # C 类概念公司禁止进入推荐/选股结果
+    "min_event_level": 2,        # 进入报告正文的最低事件证据等级（<=L2）
+}
+
+
+# ============================================================
+# 成交回报 + 账实对账配置（execution/ 模块）
+# 铁律：一切持仓与盈亏以券商真实成交流水为准，本地估算仅作参考
+# 默认观察模式：只告警与生成修正建议，不自动写回 holdings.json
+# ============================================================
+RECONCILE_CONFIG = {
+    "enabled": True,               # 是否启用成交回报与账实对账
+    "register_callback": True,     # connect 成功后注册 FillCallback
+    "sync_on_connect": True,       # 连接后主动拉取当日委托/成交兜底
+    "daily_reconcile_time": "15:35",  # 盘后对账任务触发时间
+    "notify_on_diff": True,        # 账实不一致时通过现有 notify 通道告警
+    "auto_fix_holdings": False,    # 初期禁止自动改 holdings，仅生成建议由人工确认
+    "buy_slippage_threshold": 0.003,   # 买入滑点超标阈值 +0.3%
+    "sell_slippage_threshold": -0.003, # 卖出滑点超标阈值 -0.3%
+    "asset_tolerance_pct": 0.005,      # 资金/成本对账容差 0.5%
+}
 
 
 # ============================================================

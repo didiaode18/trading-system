@@ -46,9 +46,25 @@ except ImportError:
 _RELEASE_SUMMARY_FAIL_CACHE = {"date": None}
 _RELEASE_QUEUE_CACHE = {}
 
+# V11 P0-1: 回购数据进程级缓存 —— 原实现每只股票调用 ak.stock_repurchase_em()
+# 拉取全市场数据(数千条)，111只候选=111次全量API调用，耗时~2000秒。
+# 修复: 按日缓存全量DataFrame，循环内直接查表，API调用从111次→1次。
+_REPURCHASE_CACHE = {"date": None, "df": None}
+
+# V11 P0-3: 财报披露日期进程级缓存 —— 原实现每只股票调用 ak.stock_report_disclosure()
+# 查询单股披露日期，111只候选=111次API调用，耗时~333秒。
+# 修复: 按(代码,日期)缓存，每只股票最多调用1次。
+_EARNINGS_DISCLOSURE_CACHE = {}  # {code: {"date": "YYYY-MM-DD", "disclosure_date": date|None}}
+
 
 class EventCalendar:
-    """事件日历管理器"""
+    """
+    事件日历管理器
+
+    职责:
+      管理财经事件日历（财报发布、经济数据、政策会议等），
+      在事件窗口期内调整选股/交易策略（如财报前回避、政策期降仓）。
+    """
 
     def __init__(self, cache_dir: str = None):
         self.cache_dir = cache_dir or os.path.join(
@@ -199,44 +215,60 @@ class EventCalendar:
         return None
 
     def _check_unlock(self, code: str, days_ahead: int) -> dict:
-        """检查限售股解禁"""
+        """检查限售股解禁
+        
+        V11 P0-2: 复用 _fetch_stock_release_queue() 的按日缓存机制，
+        替代原实现直接调用 ak.stock_restricted_release_queue_em()（无缓存，111次API调用）。
+        """
         today = datetime.date.today()
         
-        if HAS_AKSHARE:
-            try:
-                # 尝试获取解禁日历
-                df = ak.stock_restricted_release_queue_em(symbol=code)
-                if df is not None and not df.empty:
-                    for _, row in df.iterrows():
-                        unlock_date = pd.to_datetime(row.get("解禁时间", "")).date()
-                        days_until = (unlock_date - today).days
-                        if 0 <= days_until <= days_ahead:
-                            ratio = float(row.get("解禁占总股本比例", 0) or 0)
-                            return {
-                                "type": "unlock",
-                                "type_cn": "限售股解禁",
-                                "date": unlock_date.isoformat(),
-                                "days_until": days_until,
-                                "ratio": ratio,
-                                "impact": f"解禁比例{ratio:.1f}%，抛压预期",
-                                "severity": "high" if ratio > 5 else "medium",
-                            }
-            except Exception:
-                pass
+        try:
+            # V11 P0-2: 使用已有的带缓存的个股解禁队列接口
+            events = self._fetch_stock_release_queue(code, days_ahead=days_ahead)
+            for evt in events:
+                try:
+                    unlock_date = datetime.date.fromisoformat(evt["release_date"])
+                    days_until = (unlock_date - today).days
+                    if 0 <= days_until <= days_ahead:
+                        ratio = evt.get("release_market_value_ratio", 0)
+                        return {
+                            "type": "unlock",
+                            "type_cn": "限售股解禁",
+                            "date": unlock_date.isoformat(),
+                            "days_until": days_until,
+                            "ratio": ratio,
+                            "impact": f"解禁比例{ratio:.1f}%，抛压预期",
+                            "severity": "high" if ratio > 5 else "medium",
+                        }
+                except Exception:
+                    continue
+        except Exception:
+            pass
         
         return None
 
     def _check_positive_events(self, code: str, days_ahead: int) -> list:
-        """检查正面事件（回购/增持/激励）"""
+        """检查正面事件（回购/增持/激励）
+        
+        V11 P0-1: 回购数据改为进程级缓存，首次调用时拉取全市场数据并缓存，
+        后续调用直接查缓存。API调用从 N次(每只股票) → 1次(当日首次)。
+        """
         events = []
         today = datetime.date.today()
+        today_str = today.isoformat()
         
         if not HAS_AKSHARE:
             return events
         
         try:
-            # 回购
-            df = ak.stock_repurchase_em()
+            # V11 P0-1: 检查/刷新全市场回购缓存（当日仅首次调用API）
+            if _REPURCHASE_CACHE["date"] != today_str:
+                _REPURCHASE_CACHE["df"] = ak.stock_repurchase_em()
+                _REPURCHASE_CACHE["date"] = today_str
+                _df = _REPURCHASE_CACHE['df']
+                logger.info(f"[事件日历] 回购数据已缓存({len(_df) if _df is not None else 0}条)")
+            
+            df = _REPURCHASE_CACHE["df"]
             if df is not None and not df.empty:
                 stock_rows = df[df["代码"] == code]
                 for _, row in stock_rows.iterrows():
@@ -245,7 +277,7 @@ class EventCalendar:
                         events.append({
                             "type": "buyback",
                             "type_cn": "回购实施中",
-                            "date": today.isoformat(),
+                            "date": today_str,
                             "days_until": 0,
                             "impact": "公司回购中，正面信号",
                             "severity": "positive",
@@ -272,23 +304,39 @@ class EventCalendar:
         return None
 
     def _get_earnings_date_akshare(self, code: str):
-        """从akshare获取具体财报披露日期"""
+        """从akshare获取具体财报披露日期
+        
+        V11 P0-3: 按(代码,日期)缓存，每只股票当日最多调用1次API。
+        原实现无缓存，111只候选=111次API调用。
+        """
+        today = datetime.date.today()
+        today_str = today.isoformat()
+        
+        # 检查缓存
+        cached = _EARNINGS_DISCLOSURE_CACHE.get(code)
+        if cached and cached.get("date") == today_str:
+            return cached.get("disclosure_date")
+        
+        result = None
         try:
             df = ak.stock_report_disclosure(symbol=code)
             if df is not None and not df.empty:
                 # 取最近一次未披露的
-                today = datetime.date.today()
                 for _, row in df.iterrows():
                     date_str = str(row.get("预计披露时间", ""))
                     try:
                         disc_date = datetime.date.fromisoformat(date_str[:10])
                         if disc_date >= today:
-                            return disc_date
+                            result = disc_date
+                            break
                     except (ValueError, TypeError):
                         continue
         except Exception:
             pass
-        return None
+        
+        # 写入缓存（含空结果，避免失败重复调用）
+        _EARNINGS_DISCLOSURE_CACHE[code] = {"date": today_str, "disclosure_date": result}
+        return result
 
     # ============================================================
     # 限售解禁预警（扩展）

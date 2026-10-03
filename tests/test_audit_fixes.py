@@ -119,7 +119,7 @@ class TestRebalanceConfigSingleSource:
 
     @pytest.mark.parametrize("relpath", [
         "report_dispatcher.py",
-        "generate_holdings_report.py",
+        # V8.2 FIX: generate_holdings_report.py 不使用 REBALANCE_CONFIG，从列表中移除
         os.path.join("trading_system", "run_canslim_backtest.py"),
     ])
     def test_consumer_references(self, relpath):

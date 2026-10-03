@@ -121,6 +121,10 @@ trading_system/output/trade_logs/
 .aicoding-chat-workspace
 
 # === 临时调试与一次性脚本（根目录） ===
+# 注意: 以下规则覆盖所有 _ 前缀的临时文件
+_*.py
+_*.log
+_*.txt
 _v50_*.py
 _v50_*.txt
 _v44_*.py
@@ -136,8 +140,12 @@ scripts/_*.ps1
 # QMT 运行日志
 qmt_*.log
 
-# === output/ 临时产物 ===
-output/*.py
+# 根目录散落的日志
+_run_*.log
+verify_report_run.log
+auto_scheduler.log
+
+# === output/ 临时产物（保留 .py 源文件跟踪）===
 output/*.txt
 output/*.json
 output/*.ps1
@@ -178,3 +186,14 @@ trading_system/output/*.py
 
 # === 根目录临时持仓备份 ===
 holdings_backup_*.json
+holdings.json_backup_*.json
+trading_system/holdings.json_backup_*.json
+
+# === 数据备份文件（异常膨胀防护） ===
+trading_system/data/*_backup_*
+
+# === 独立子项目 ===
+horse_race_sim/
+
+# === pytest缓存 ===
+.pytest_cache/

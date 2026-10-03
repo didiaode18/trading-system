@@ -20,6 +20,7 @@ import time
 import pandas as pd
 import numpy as np
 from typing import Callable, Optional
+from multiprocessing import Pool, cpu_count
 
 import sys
 import os
@@ -170,6 +171,12 @@ class BacktestEngineV2:
         """
         if strategy_fn is None:
             strategy_fn = default_strategy
+
+        # FIX P1-3: 入参鲁棒性校验——空数据/零资金/负价格
+        if not data_dict:
+            return {"error": "data_dict 为空，无回测数据"}
+        if self.initial_capital <= 0:
+            return {"error": f"初始资金异常: {self.initial_capital}"}
 
         # 初始化
         self.broker = SimBroker(self.initial_capital, self.cost_config)
@@ -397,10 +404,13 @@ class BacktestEngineV2:
         return report
 
     def _calc_trade_pnl(self, trades_df: pd.DataFrame) -> pd.DataFrame:
-        """计算每笔交易的盈亏"""
-        # 按股票分组，匹配买卖
+        """计算每笔交易的盈亏（FIFO 分批匹配）
+        
+        FIX P1-1: 支持分批卖出匹配——买入记录保留剩余股数，
+        卖出不一次性弹出整条买入记录，而是按 FIFO 逐笔消耗。
+        """
         pnl_records = []
-        buy_records = {}  # {code: [buy_info]}
+        buy_records = {}  # {code: [{buy_date, buy_price, remaining_shares}]}
 
         for _, row in trades_df.iterrows():
             code = row["code"]
@@ -410,27 +420,39 @@ class BacktestEngineV2:
                 buy_records[code].append({
                     "buy_date": row["date"],
                     "buy_price": row["price"],
-                    "buy_shares": row["shares"],
+                    "remaining_shares": row["shares"],
                 })
             elif row["action"] == "sell":
-                if code in buy_records and buy_records[code]:
-                    buy_info = buy_records[code].pop(0)
-                    pnl = (row["price"] - buy_info["buy_price"]) * row["shares"]
-                    pnl_pct = (row["price"] - buy_info["buy_price"]) / buy_info["buy_price"]
-                    hold_days = (datetime.datetime.strptime(row["date"], "%Y-%m-%d") -
+                sell_shares_remaining = row["shares"]
+                sell_price = row["price"]
+                sell_date = row["date"]
+
+                while sell_shares_remaining > 0 and code in buy_records and buy_records[code]:
+                    buy_info = buy_records[code][0]
+                    matched_shares = min(sell_shares_remaining, buy_info["remaining_shares"])
+
+                    pnl = (sell_price - buy_info["buy_price"]) * matched_shares
+                    pnl_pct = (sell_price - buy_info["buy_price"]) / buy_info["buy_price"] if buy_info["buy_price"] > 0 else 0
+                    hold_days = (datetime.datetime.strptime(sell_date, "%Y-%m-%d") -
                                 datetime.datetime.strptime(buy_info["buy_date"], "%Y-%m-%d")).days
                     pnl_records.append({
                         "code": code,
                         "buy_date": buy_info["buy_date"],
-                        "sell_date": row["date"],
+                        "sell_date": sell_date,
                         "buy_price": buy_info["buy_price"],
-                        "sell_price": row["price"],
-                        "shares": row["shares"],
+                        "sell_price": sell_price,
+                        "shares": matched_shares,
                         "pnl": round(pnl, 2),
                         "pnl_pct": round(pnl_pct, 4),
                         "hold_days": hold_days,
                         "reason": row.get("reason", ""),
                     })
+
+                    # 消耗买入记录
+                    buy_info["remaining_shares"] -= matched_shares
+                    sell_shares_remaining -= matched_shares
+                    if buy_info["remaining_shares"] <= 0:
+                        buy_records[code].pop(0)
 
         if pnl_records:
             return pd.DataFrame(pnl_records)
@@ -546,6 +568,80 @@ def run_backtest_v2(stock_codes: list = None, data_dict: dict = None,
     report = engine.run(data_dict, strategy_fn, start_date, end_date,
                         benchmark_code, auto_monte_carlo, mc_simulations)
     return report
+
+
+# ============================================================
+# 批量并行回测（多进程）
+# ============================================================
+
+def _run_single_backtest(args):
+    """单只回测工作函数（供多进程调用）"""
+    code, data_dict, initial_capital, start_date, end_date, benchmark_code = args
+    try:
+        single_data = {code: data_dict[code]}
+        if benchmark_code and benchmark_code in data_dict:
+            single_data[benchmark_code] = data_dict[benchmark_code]
+        engine = BacktestEngineV2(initial_capital)
+        report = engine.run(
+            single_data, None, start_date, end_date,
+            benchmark_code, auto_monte_carlo=False,
+        )
+        report["_code"] = code
+        return report
+    except Exception as e:
+        return {"_code": code, "error": str(e)}
+
+
+def run_backtest_batch(stock_codes: list = None, data_dict: dict = None,
+                       initial_capital: float = None,
+                       start_date: str = None, end_date: str = None,
+                       benchmark_code: str = "000300",
+                       max_workers: int = None) -> list:
+    """
+    批量并行回测：每只股票独立回测，多进程加速
+
+    参数:
+        stock_codes: 股票代码列表
+        data_dict: {code: DataFrame}
+        initial_capital: 每只股票的初始资金
+        start_date / end_date: 回测日期范围
+        benchmark_code: 基准指数代码
+        max_workers: 并行进程数（默认=CPU核心数）
+
+    返回:
+        [{code, report}, ...] 每只股票的绩效报告列表
+    """
+    if stock_codes is None:
+        stock_codes = list(config.STOCK_POOL.keys())
+    if max_workers is None:
+        max_workers = min(cpu_count(), len(stock_codes))
+
+    logger.info(f"批量回测: {len(stock_codes)}只股票, 并行度={max_workers}")
+    t0 = time.time()
+
+    # 构建任务参数
+    tasks = [
+        (code, data_dict, initial_capital, start_date, end_date, benchmark_code)
+        for code in stock_codes
+        if code in data_dict
+    ]
+
+    if not tasks:
+        logger.warning("无有效回测任务")
+        return []
+
+    # 单只股票直接串行，避免多进程开销
+    if len(tasks) == 1 or max_workers <= 1:
+        results = [_run_single_backtest(t) for t in tasks]
+    else:
+        with Pool(processes=max_workers) as pool:
+            results = pool.map(_run_single_backtest, tasks)
+
+    elapsed = time.time() - t0
+    ok_count = sum(1 for r in results if "error" not in r)
+    logger.info(f"批量回测完成: {ok_count}/{len(results)}只成功, 耗时{elapsed:.1f}秒")
+
+    return results
 
 
 # ============================================================

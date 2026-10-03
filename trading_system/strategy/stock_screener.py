@@ -72,6 +72,9 @@ _OVERNIGHT_CACHE = None
 _ML_PREDICTOR = None
 _ML_INIT_DONE = False
 
+# V11 P0-5: EventCalendar实例缓存（避免评分循环内每只股票重新实例化）
+_EVENT_CALENDAR_INSTANCE = None
+
 # V10.1 Top3: 市场风格缓存（每次选股运行计算一次）
 _STYLE_CACHE = {"style": "neutral", "large_cap_chg": 0, "small_cap_chg": 0, "computed": False}
 
@@ -283,265 +286,9 @@ def _load_fundamental_data(stock_codes: list) -> dict:
 
 # ============================================================
 # 一、大盘方向判断（M因子）
+# P1-2拆分: 已提取到 strategy/market_analysis.py，此处重新导出保持向后兼容
 # ============================================================
-
-def check_market_direction(data_dict: dict) -> dict:
-    """
-    M因子：判断大盘方向，决定是否适合做多
-    
-    判断标准（000300沪深300）:
-    - 收盘价 > MA20 > MA60 → 上升趋势（可操作）
-    - 收盘价 > MA20 但 MA20 < MA60 → 震荡（谨慎操作）
-    - 收盘价 < MA20 → 下降趋势（不建议买入）
-    
-    返回:
-        {
-            "market_state": "up" / "neutral" / "down",
-            "can_buy": bool,
-            "position_limit_ratio": float,  # 建议仓位上限
-            "detail": str
-        }
-    """
-    index_df = data_dict.get("000300")
-    if index_df is None or len(index_df) < 60:
-        logger.warning("[M因子] 无沪深300数据，默认中性")
-        return {
-            "market_state": "neutral",
-            "can_buy": True,
-            "position_limit_ratio": 0.5,
-            "detail": "无指数数据，默认半仓操作",
-            # V4.0(G12): 数据源降级标记，报告输出前汇总展示
-            "degraded_reason": "无沪深300指数数据，大盘状态默认中性、建议仓位默认半仓，结论可靠性降低"
-        }
-
-    latest = index_df.iloc[-1]
-    close = latest["close"]
-    ma20 = latest.get("ma20", 0)
-    ma60 = latest.get("ma60", 0)
-
-    if pd.isna(ma20) or pd.isna(ma60):
-        return {
-            "market_state": "neutral",
-            "can_buy": True,
-            "position_limit_ratio": 0.5,
-            "detail": "均线数据不足，默认半仓操作",
-            # FIX: 补齐降级标记（与无数据分支对齐），使报告警示区可统一汇总展示
-            "degraded_reason": "沪深300均线数据不足，大盘状态默认中性、建议仓位默认半仓，结论可靠性降低"
-        }
-
-    # 20日涨跌幅
-    change_20d = (close / index_df["close"].iloc[-20] - 1) * 100 if len(index_df) >= 20 else 0
-    # MA20斜率（近5日）
-    # FIX: 除零/NaN防护（数据异常时分母可能为0或NaN，导致斜率为NaN干扰后续比较）
-    ma20_slope = 0.0
-    if len(index_df) >= 26:
-        _ma20_base = index_df["ma20"].iloc[-6]
-        if _ma20_base > 0 and not pd.isna(_ma20_base):
-            ma20_slope = (ma20 - _ma20_base) / _ma20_base * 100
-
-    if close > ma20 > ma60 and ma20_slope > 0:
-        state = "up"
-        can_buy = True
-        limit = 1.0
-        detail = f"上升趋势（沪深300在MA20/MA60上方，MA20斜率{ma20_slope:+.2f}%）→ 满仓操作"
-    elif close > ma20:
-        state = "neutral"
-        can_buy = True
-        limit = 0.5
-        # FIX: 原文案硬编码“MA20<MA60”，但MA20>MA60且斜率<=0也会落入本分支，文案会误导
-        detail = f"震荡偏强（沪深300在MA20上方但MA20未持续向上，MA20斜率{ma20_slope:+.2f}%）→ 半仓操作"
-    elif close > ma60:
-        state = "neutral"
-        can_buy = True
-        limit = 0.3
-        detail = f"震荡偏弱（沪深300在MA60上方但跌破MA20）→ 轻仓操作"
-    else:
-        state = "down"
-        # V6.0 P0-1: M因子柔性化 —— down状态允许轻仓15%而非完全禁止
-        # 诊断: 原逻辑can_buy=False导致弱势市完全无法开仓，即使有优质标的也被埋没
-        _flex_enabled = getattr(config, 'M_FACTOR_FLEXIBLE_ENABLED', True)
-        _down_limit = getattr(config, 'M_FACTOR_DOWN_POSITION_LIMIT', 0.15)
-        if _flex_enabled:
-            can_buy = True  # 允许轻仓买入
-            limit = _down_limit  # 但限制15%仓位
-            detail = f"下降趋势（沪深300跌破MA20和MA60）→ V6.0柔性化: 允许轻仓{_down_limit:.0%}试探"
-        else:
-            can_buy = False
-            limit = 0.0
-            detail = f"下降趋势（沪深300跌破MA20和MA60）→ 不建议买入"
-    
-    # V6.0 P0-1: 市场环境硬过滤柔性化 —— MA20<MA60且收盘<MA20时允许轻仓而非完全禁止
-    # 原逻辑: can_buy=False完全禁止 → 新逻辑: 限制仓位至_down_limit
-    if ma20 < ma60 and close < ma20:
-        _flex_enabled = getattr(config, 'M_FACTOR_FLEXIBLE_ENABLED', True)
-        _down_limit = getattr(config, 'M_FACTOR_DOWN_POSITION_LIMIT', 0.15)
-        if _flex_enabled:
-            can_buy = True
-            limit = _down_limit
-            state = "down"
-            detail += f" | V6.0 P0-1: MA20<MA60且收盘<MA20，轻仓{_down_limit:.0%}操作"
-        else:
-            can_buy = False
-            limit = 0.0
-            state = "down"
-            detail += " | P1-2: MA20<MA60且收盘<MA20，禁止新开仓"
-
-    # V5.1: 市场宽度（breadth）—— 为regime detection提供前置数据
-    above_ma20_count = 0
-    total_count = 0
-    # 注: 此处仅计算指数本身的MA20关系，个股breadth在detect_market_regime中计算
-    breadth = 50.0  # 默认中性
-
-    logger.info(f"[M因子] 大盘状态: {state} | {detail}")
-
-    return {
-        "market_state": state,
-        "can_buy": can_buy,
-        "position_limit_ratio": limit,
-        "detail": detail,
-        "index_close": round(close, 2),
-        "index_ma20": round(ma20, 2),
-        "index_ma60": round(ma60, 2),
-        "change_20d": round(change_20d, 2),
-        "market_breadth": round(breadth, 1),  # V5.1: 宽度指标（后续由detect_market_regime填充）
-    }
-
-
-def detect_market_regime(data_dict: dict, market_info: dict) -> dict:
-    """
-    V5.1: 市场regime检测 —— 基于市场宽度(breadth)判断当前适合趋势跟踪还是均值回归
-    
-    原理: IC数据显示所有技术因子IC同步衰减→市场从趋势模式切换到回归模式。
-    直接观测因子IC有20天延迟，而市场宽度可以实时反映。
-    
-    判定标准:
-    - breadth > 55% → trend_following（趋势跟踪有效，N/L因子加权）
-    - breadth < 45% → mean_reversion（均值回归有效，MR/W因子加权）
-    - 45-55%      → mixed（标准权重，不调整）
-    
-    返回:
-        {
-            "regime": "trend_following" / "mean_reversion" / "mixed",
-            "breadth": float,  # 0-100, 个股在MA20上方的比例
-            "detail": str
-        }
-    """
-    above_ma20 = 0
-    total = 0
-    
-    for code, df in data_dict.items():
-        if code == "000300":
-            continue
-        # 与选股引擎保持一致的过滤规则
-        if code.startswith(("300", "688", "588", "159")):
-            continue
-        if len(df) < 25:
-            continue
-        
-        ma20_val = df["close"].rolling(20).mean().iloc[-1]
-        close_val = df["close"].iloc[-1]
-        
-        if not pd.isna(ma20_val) and ma20_val > 0:
-            total += 1
-            if close_val > ma20_val:
-                above_ma20 += 1
-    
-    breadth = (above_ma20 / total * 100) if total > 0 else 50.0
-    
-    if breadth > 55:
-        regime = "trend_following"
-        detail = f"趋势模式(宽度{breadth:.0f}%>55%，{above_ma20}/{total}只在MA20上方) → 动量/龙头因子加权"
-    elif breadth < 45:
-        regime = "mean_reversion"
-        detail = f"回归模式(宽度{breadth:.0f}%<45%，仅{above_ma20}/{total}只在MA20上方) → 均值回归/周线因子加权"
-    else:
-        regime = "mixed"
-        detail = f"混合模式(宽度{breadth:.0f}%，{above_ma20}/{total}只在MA20上方) → 标准权重"
-    
-    logger.info(f"[Regime检测] {detail}")
-    
-    # 回填market_info的breadth字段
-    market_info["market_breadth"] = round(breadth, 1)
-    
-    return {
-        "regime": regime,
-        "breadth": round(breadth, 1),
-        "above_ma20_count": above_ma20,
-        "total_count": total,
-        "detail": detail,
-    }
-
-
-def _detect_structural_market(data_dict: dict, regime_info: dict) -> dict:
-    """
-    V10.1 Top4: 结构性行情检测
-    
-    原理: 计算全市场个股5日收益的标准差(分化度)。
-    高分化 + 混合regime = 结构性行情（指数横盘但板块极端分化）。
-    
-    结构性行情特征:
-    - 指数涨跌幅 < 2%（横盘）
-    - 个股收益标准差 > 阈值（板块分化严重）
-    - 强势板块少数集中，弱势板块普跌
-    
-    返回:
-        {
-            "structural": bool,       # 是否为结构性行情
-            "dispersion": float,      # 分化度(个股5d收益标准差)
-            "position_adj": float,    # 仓位调整系数(0.8-1.0)
-            "detail": str
-        }
-    """
-    returns_5d = []
-    
-    for code, df in data_dict.items():
-        if code == "000300" or len(df) < 6:
-            continue
-        if code.startswith(("300", "688", "588", "159")):
-            continue
-        chg_5d = (df["close"].iloc[-1] / df["close"].iloc[-6] - 1) * 100
-        returns_5d.append(chg_5d)
-    
-    if len(returns_5d) < 10:
-        return {"structural": False, "dispersion": 0, "position_adj": 1.0, "detail": "数据不足"}
-    
-    dispersion = np.std(returns_5d)
-    
-    # 指数涨跌幅（用000300代理）
-    index_chg = 0
-    if "000300" in data_dict and len(data_dict["000300"]) >= 6:
-        idx_df = data_dict["000300"]
-        index_chg = abs(idx_df["close"].iloc[-1] / idx_df["close"].iloc[-6] - 1) * 100
-    
-    breadth = regime_info.get("breadth", 50)
-    
-    # 结构性行情判定: 指数横盘(<3%) + 高分化(σ>4%) + 混合regime
-    STRUCTURAL_DISPERSION_THRESHOLD = getattr(config, 'STRUCTURAL_DISPERSION_THRESHOLD', 4.0)
-    STRUCTURAL_INDEX_THRESHOLD = getattr(config, 'STRUCTURAL_INDEX_THRESHOLD', 3.0)
-    
-    is_structural = (
-        index_chg < STRUCTURAL_INDEX_THRESHOLD and
-        dispersion > STRUCTURAL_DISPERSION_THRESHOLD and
-        regime_info.get("regime") == "mixed"
-    )
-    
-    # 仓位调整: 结构性行情下降低10-20%仓位（分化越大仓位越低）
-    if is_structural:
-        # 分化度越高，仓位越低: σ=4%→0.9, σ=6%→0.85, σ=8%→0.8
-        position_adj = max(0.8, min(0.95, 1.0 - (dispersion - STRUCTURAL_DISPERSION_THRESHOLD) * 0.025))
-        detail = f"结构性行情: 指数横盘({index_chg:.1f}%) + 高分化(σ={dispersion:.1f}%) → 仓位×{position_adj:.2f}"
-    else:
-        position_adj = 1.0
-        detail = f"非结构性: 指数{'横盘' if index_chg < 3 else '趋势'}({index_chg:.1f}%) 分化σ={dispersion:.1f}%"
-    
-    logger.info(f"[结构性行情] {detail}")
-    
-    return {
-        "structural": is_structural,
-        "dispersion": round(dispersion, 2),
-        "position_adj": round(position_adj, 2),
-        "detail": detail,
-    }
+from strategy.market_analysis import check_market_direction, detect_market_regime, _detect_structural_market
 
 
 # ============================================================
@@ -724,9 +471,12 @@ def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
         
         # V5.1: 弱势模式通过条件：weak_score >= WEAK_SCORE_THRESHOLD(默认40)
         _weak_threshold = getattr(config, 'WEAK_SCORE_THRESHOLD', 40)
-        if weak_score < _weak_threshold:
+        # V7.0: ETF弱势模式降低门槛（ETF波动小，弱评分天然偏低）
+        from utils.instrument import is_etf as _is_etf_fn
+        _etf_threshold = 25 if _is_etf_fn(code) else _weak_threshold
+        if weak_score < _etf_threshold:
             result["pass"] = False
-            result["reason"] = f"弱势评分{weak_score}分不足{_weak_threshold}分，相对强度太弱"
+            result["reason"] = f"弱势评分{weak_score}分不足{_etf_threshold}分，相对强度太弱"
             return result
         
         result["reason"] = f"弱势模式通过(评分{weak_score})"
@@ -835,8 +585,10 @@ def hard_filter(df: pd.DataFrame, code: str, market_state: str = "up") -> dict:
 # 赛道评分/强弱判定/领涨股/预计Top5；不改变个股评分、买入推荐、观察池与涨停基因/动量通道）
 # - 688: 科创板（用户无交易权限）
 # - 8/4: 北交所（83/87/88/43 开头），920: 北交所新代码段
-# - 588/159: ETF基金（非个股，不参与板块统计）
-SECTOR_RANK_EXCLUDE_PREFIXES = ("688", "8", "4", "920", "588", "159")
+# V9.2: ETF(588/159等)不再屏蔽，改为单独作为“板块”参与排名（用ETF名称作为板块名）
+SECTOR_RANK_EXCLUDE_PREFIXES = ("688", "8", "4", "920")
+# V9.2: ETF前缀（单独统计，每个ETF作为独立“板块”参与排名）
+ETF_SECTOR_PREFIXES = ("588", "159", "510", "512", "513", "515", "516", "518", "560", "562")
 
 
 def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback: int = 20) -> dict:
@@ -866,19 +618,24 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
                                         "leader": None})
 
     _rank_excluded_count = 0  # V4.2: 板块排名屏蔽统计（日志与HTML同源）
+    _etf_included_count = 0  # V9.2: ETF参与板块排名统计
     for code, df in data_dict.items():
         if code == "000300":
             continue
         # 过滤创业板(300)
         if code.startswith("300"):
             continue
-        # V4.2: 板块排名屏蔽科创板(688)与北交所(8/4/920开头)及ETF(588/159)，
-        # 排除规则基于代码前缀/交易所归属，日志汇总与HTML展示同源
+        # V4.2: 板块排名屏蔽科创板(688)与北交所(8/4/920开头)
         if code.startswith(SECTOR_RANK_EXCLUDE_PREFIXES):
             _rank_excluded_count += 1
             continue
         info = config.get_stock_info(code)
-        sector = info.get("赛道", "其他")
+        # V9.2: ETF单独作为“板块”参与排名（用ETF名称作为板块名）
+        if code.startswith(ETF_SECTOR_PREFIXES):
+            sector = info.get("名称", code)  # 用ETF名称作为板块名
+            _etf_included_count += 1
+        else:
+            sector = info.get("赛道", "其他")
         if len(df) < lookback + 5:
             continue
 
@@ -929,7 +686,9 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
 
     sectors = []
     if _rank_excluded_count:
-        logger.info(f"[板块排名] 屏蔽科创板/北交所/ETF标的{_rank_excluded_count}只，不参与板块统计与展示")
+        logger.info(f"[板块排名] 屏蔽科创板/北交所标的{_rank_excluded_count}只，不参与板块统计")
+    if _etf_included_count:
+        logger.info(f"[板块排名] ETF单独参与板块排名{_etf_included_count}只")
     ma60_ratio_threshold = getattr(config, 'SECTOR_MA60_ABOVE_RATIO', 0.60)
     
     for sector, data in sector_data.items():
@@ -956,6 +715,10 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
         ma_slope_norm = max(0, min(100, (avg_ma20_slope / max(abs(avg_ma20_slope), 0.01) * 50 + 50))) if avg_ma20_slope != 0 else 50
         trend_score = (ma20_score * 0.40 + ma60_score * 0.30 + ma_slope_norm * 0.30) * 0.50 + change_score * 0.30 + accel_score * 0.20
 
+        # === V9.2: 5日动量子项（捕捉短期爆发，让近期启动的板块快速反映在评分中）===
+        # 5日涨幅归一化: -10%~+10% → 0~100分
+        momentum_5d_score = max(0, min(100, (avg_recent + 10) / 20 * 100))
+
         # === 爆发力得分（涨停家数 + 龙头溢价）===
         limit_up_count = data.get("limit_up_count", 0)
         sector_total = data["total"]
@@ -965,8 +728,9 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
         leader_premium = max(0, min(100, (leader_change - avg_change + 10) / 20 * 100))
         burst_score = limit_up_ratio * 0.60 + leader_premium * 0.40
 
-        # === 综合评分（趋势60% + 爆发力40%）===
-        total_score = trend_score * 0.60 + burst_score * 0.40
+        # === 综合评分（趋势45% + 5日动量25% + 爆发力30%）===
+        # V9.2: 提升5日动量权重到25%，让短期爆发的板块能快速上升排名
+        total_score = trend_score * 0.45 + momentum_5d_score * 0.25 + burst_score * 0.30
 
         # 5日涨幅（供下游拥挤度惩罚使用）
         avg_change_5d = np.mean(data["recent_changes"]) if data["recent_changes"] else 0
@@ -979,6 +743,7 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
             "score": round(total_score, 1),
             "change_20d": round(avg_change, 2),
             "change_5d": round(avg_change_5d, 2),
+            "momentum_5d_score": round(momentum_5d_score, 1),  # V9.2: 5日动量子分
             "acceleration": round(acceleration, 2),
             "ma20_ratio": round(ma20_ratio, 2),
             "ma60_ratio": round(ma60_ratio, 2),
@@ -1044,6 +809,9 @@ def filter_strong_sectors(data_dict: dict, fund_flow_data: dict = None, lookback
             json.dump({"sector_scores": _rot_scores, "strong": strong, "weak": weak,
                        # V3.4: 只加不改——新增板块20日涨跌幅与领涨股，原有键名/语义保持不变
                        "sector_change_20d": {s["sector"]: s["change_20d"] for s in sectors},
+                       # V9.2: 新增5日动量子分与5日涨幅，供板块景气雷达“近期爆发”标签使用
+                       "sector_momentum_5d": {s["sector"]: s.get("momentum_5d_score", 0) for s in sectors},
+                       "sector_change_5d": {s["sector"]: s.get("change_5d", 0) for s in sectors},
                        "sector_leaders": {s["sector"]: s["leader"] for s in sectors if s.get("leader")},
                        "sector_prediction": {s["sector"]: s.get("prediction_score", 0) for s in sectors},
                        "sector_drivers": {s["sector"]: s.get("prediction_drivers", []) for s in sectors},
@@ -1124,6 +892,59 @@ def _reset_style_cache():
     """重置风格缓存（每次选股运行时调用）"""
     global _STYLE_CACHE
     _STYLE_CACHE = {"style": "neutral", "large_cap_chg": 0, "small_cap_chg": 0, "computed": False}
+
+
+# ============================================================
+# V7.0 P0: ETF拆分自动复权
+# ============================================================
+
+def _adjust_etf_split(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """检测并修正ETF基金拆分/合并导致的价格断层
+
+    原理: ETF拆分(如1:3)会导致前复权价格与后复权价格不可比，
+    使得60日高点、涨幅等指标严重失真。本函数检测相邻交易日价格
+    跳跃>50%的异常事件，将历史价格统一调整为最新价格口径。
+
+    触发条件:
+      - ETF品种 (由instrument.is_etf判定)
+      - 相邻日close比值 > 1.5 或 < 0.67
+      - 排除前60日(IPO初期数据不稳定)
+    """
+    from utils.instrument import is_etf as _is_etf_fn
+    if not _is_etf_fn(code):
+        return df
+    if len(df) < 61:
+        return df
+    try:
+        split_idx = None
+        split_ratio = 1.0
+        for i in range(60, len(df)):
+            prev_c = df["close"].iloc[i - 1]
+            curr_c = df["close"].iloc[i]
+            if prev_c <= 0 or curr_c <= 0:
+                continue
+            ratio = curr_c / prev_c
+            if ratio > 1.5:
+                split_idx = i
+                split_ratio = curr_c / prev_c
+                break
+            elif ratio < 0.67:
+                split_idx = i
+                split_ratio = curr_c / prev_c
+                break
+        if split_idx is None:
+            return df
+        df_adj = df.copy()
+        # split_ratio < 1 表示正向拆分(价格缩小)，> 1 表示反向合并(价格放大)
+        # 将历史价格乘以 split_ratio 使其与最新价格口径一致
+        for col in ['open', 'close', 'high', 'low']:
+            df_adj.loc[df.index[:split_idx], col] *= split_ratio
+        logger.info(f"[ETF复权] {code} 检测到拆分事件(日{df['date'].iloc[split_idx]},"
+                    f"比例{split_ratio:.3f})，已前复权{split_idx}条K线")
+        return df_adj
+    except Exception as e:
+        logger.warning(f"[ETF复权] {code} 复权失败: {e}")
+        return df
 
 
 # ============================================================
@@ -1209,52 +1030,51 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
             n_score += 8  # 已突破新高
         factors["N_新事物"] = min(n_score, 20)
 
-    # ---- S因子：供给需求/量价配合（V3.2: 满分从20降至10）----
-    # V3.2回测诊断: S因子IC=-0.28%(整体), 牛市-1.43%, 占总分20%权重无效
-    # 修复: ①满分压缩至10 ②"缩量回踩"降权(牛市反向) ③"放量突破"升权
+    # ---- S因子：盈利加速度代理（V9.0重构）----
+    # V5.1诊断: 旧S因子(纯量价) IC≈0，区分度丧失
+    # V9.0重构: 用“机构累积买入代理”+“盈利动量代理”替代纯量价信号
+    # 核心思想: 持续的量价配合比单日放量更有预测力
     s_score = 0
     vol = latest["volume"]
     vol_ma20 = df["volume"].iloc[-20:].mean()
     vol_ratio = vol / vol_ma20 if vol_ma20 > 0 else 1
-
-    # ★ 放量突破（V3.2升权: 回测显示放量突破是唯一正向信号）
-    high_60d_for_breakout = df["high"].iloc[-60:].max() if len(df) >= 60 else current_price
-    is_near_high = current_price >= high_60d_for_breakout * 0.98
-    if vol_ratio > 1.5 and current_price > prev["close"] and is_near_high:
-        s_score += 4   # V5.1: 放量突破60日新高（满分5体系下核心信号4分）
-        signals.append("★放量突破新高")
-        logger.info(f"  [买点] {code} 放量突破: vol_ratio={vol_ratio:.2f} price={current_price:.2f} high60={high_60d_for_breakout:.2f}")
-    elif vol_ratio > 1.5 and current_price > prev["close"]:
-        s_score += 2   # V5.1: 放量上涨但未突破新高
-        signals.append("放量上涨")
-    elif vol_ratio > 1.2 and current_price > prev["close"]:
-        s_score += 1   # V5.1: 温和放量
-
-    # 缩量回踩MA20（V3.2降权: 牛市中“缩量回踩”常意味无人问津而非蓄势）
-    if "ma20" in df.columns and not pd.isna(latest.get("ma20", None)):
-        ma20_val = latest["ma20"]
-        dist_to_ma20 = (current_price - ma20_val) / ma20_val
-        day_low = latest.get("low", current_price)
-        is_shrink = vol_ratio < 0.7
-        touch_ma20 = day_low <= ma20_val * 1.01
-        hold_above_ma20 = current_price > ma20_val
-        is_pullback = -0.03 <= dist_to_ma20 <= 0.02
-
-        if is_shrink and touch_ma20 and hold_above_ma20:
-            s_score += 3   # V3.2: 从20降至3（缩量回踩在牛市反向，仅保留微弱加分）
-            signals.append("缩量回踩MA20")
-        elif is_shrink and is_pullback and hold_above_ma20:
-            s_score += 2   # V3.2: 从16降至2
-        elif is_pullback and hold_above_ma20:
-            s_score += 1   # V3.2: 从12降至1
-
-    # 下跌缩量（健康的量价关系，保留微弱加分）
-    if current_price < prev["close"] and vol_ratio < 0.7:
-        s_score += 1
-        signals.append("下跌缩量")
-
-    factors["S_供需"] = min(s_score, 5)  # V5.1: 上限从10压缩到5（IC≈0，仅保留放量突破信号）
-    # V2.8回测优化: 弱势市场下S因子打折（V5.1: 上限5分下不再打折，已足够小）
+    
+    # ① 机构累积买入代理（3分）: 近20日上涨日成交量/下跌日成交量
+    if len(df) >= 20:
+        recent_20 = df.iloc[-20:]
+        up_vol = recent_20[recent_20["close"] > recent_20["close"].shift(1)]["volume"].sum()
+        down_vol = recent_20[recent_20["close"] < recent_20["close"].shift(1)]["volume"].sum()
+        if down_vol > 0:
+            accumulation_ratio = up_vol / down_vol
+            if accumulation_ratio > 2.0:
+                s_score += 3
+                signals.append(f"机构累积买入(量比{accumulation_ratio:.1f})")
+            elif accumulation_ratio > 1.5:
+                s_score += 2
+                signals.append(f"资金净流入(量比{accumulation_ratio:.1f})")
+            elif accumulation_ratio > 1.2:
+                s_score += 1
+        # 下跌缩量也是健康信号
+        elif up_vol > 0:
+            s_score += 1
+    
+    # ② 盈利动量代理（2分）: 价格趋势一致性（上涨天数占比+涨幅加速）
+    if len(df) >= 20:
+        recent_20 = df.iloc[-20:]
+        up_days = (recent_20["close"] > recent_20["close"].shift(1)).sum()
+        up_ratio = up_days / 20
+        # 近5日涨幅 vs 近20日涨幅的加速度
+        chg_5d = (current_price / df["close"].iloc[-6] - 1) * 100 if len(df) >= 6 else 0
+        chg_20d = (current_price / df["close"].iloc[-21] - 1) * 100 if len(df) >= 21 else 0
+        # 加速度: 近期涨幅占比>40%且总涨幅>5% = 盈利加速
+        if chg_20d > 5 and chg_5d / chg_20d > 0.4:
+            s_score += 2
+            signals.append("盈利加速(近期动量增强)")
+        elif chg_20d > 0 and up_ratio > 0.6:
+            s_score += 1
+            signals.append(f"趋势一致(上涨占比{up_ratio:.0%})")
+    
+    factors["S_供需"] = min(s_score, 5)  # V9.0: 上限5分，但底层逻辑从纯量价升级为机构行为+盈利动量
 
     # V3.2: 换手率修正（知识库规则: 3-10%健康, >15%过度换手扣分）
     try:
@@ -1628,10 +1448,14 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
 
     # ---- V3.2: 事件日历调整（财报/解禁/回购）----
     # 财报前5天减分，解禁前10天减分，回购/股权激励加分
+    # V11 P0-5: EventCalendar 使用模块级缓存，避免每只股票重新实例化+读取JSON
     event_adj = 0
     try:
-        from strategy.event_calendar import EventCalendar
-        _evt_cal = EventCalendar()
+        global _EVENT_CALENDAR_INSTANCE
+        if _EVENT_CALENDAR_INSTANCE is None:
+            from strategy.event_calendar import EventCalendar
+            _EVENT_CALENDAR_INSTANCE = EventCalendar()
+        _evt_cal = _EVENT_CALENDAR_INSTANCE
         _evt_risk = _evt_cal.check_event_risk(code, days_ahead=10)
         if _evt_risk.get("block_buy"):
             event_adj = -10  # 高风险事件（财报/解禁）
@@ -1682,13 +1506,13 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
 
     # ---- V10.0 P1-③: ML独立因子 M_ML (0-5分) ----
     # 将ML概率映射为CANSLIM独立因子，受IC降权管控
+    # V11 P0-4: 复用模块级 ML 预测器单例，避免每只股票重新创建实例+从磁盘加载模型
     ml_score = 2  # 默认中性
     ml_available = False
     try:
-        from ml.predictor import MLPredictor
-        ml_predictor = MLPredictor()
-        if ml_predictor.load_model("xgb_daily"):
-            ml_result = ml_predictor.predict_score(df)
+        _ml_pred = _get_ml_predictor()
+        if _ml_pred is not None and _ml_pred.model is not None:
+            ml_result = _ml_pred.predict_score(df)
             ml_available = ml_result.get("available", False)
             if ml_available:
                 ml_score = ml_result["score"]
@@ -1750,8 +1574,13 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         except Exception as _e:
             logger.debug(f"[财报] {code} 财报分析异常: {_e}")
 
+    # V8.2: 评分异常检测
+    _total = round(total, 1)
+    if _total < 5 and _total > 0:
+        logger.warning(f"[评分异常] {code} CANSLIM评分{_total}分极低，可能存在数据异常或模型失效")
+
     return {
-        "total_score": round(total, 1),
+        "total_score": _total,
         "factors": {k: round(v, 1) for k, v in factors.items()},
         "signals": signals,
         "reason": _canslim_reason(factors, signals),
@@ -1759,6 +1588,281 @@ def canslim_score(df: pd.DataFrame, code: str, all_dfs: dict = None, market_stat
         "change_60d": round(change_60d, 2),
         "prediction": prediction,
         "financial_summary": _fr_summary,  # V10.2: 财报分析摘要
+    }
+
+
+# ============================================================
+# V7.0 P1: ETF专用评分模型（动量+均线+量能+板块热度+波动控制）
+# ============================================================
+
+def etf_score(df: pd.DataFrame, code: str, market_state: str = "up",
+              sector_heat_data: dict = None) -> dict:
+    """ETF专用多因子评分 V8.1（0-100分）
+
+    V7.0初始版→V8.1升级:
+      - 接入ETF分类参数(行业/宽基/主题差异化权重)
+      - 新增均值回归因子(宽基ETF专属)
+      - 新增份额变动因子(ETF独有资金流向信号)
+      - 动态权重归一化确保总分=100
+
+    因子体系(100分, 权重随ETF类型动态调整):
+      M_动量: 20日/5日/60日涨幅加权
+      MA_均线: 价格vs MA20/MA60排列
+      VOL_量能: 量价配合
+      HEAT_板块: 所在板块热度
+      RISK_波动: 波动率控制
+      MR_回归: 均值回归信号(宽基ETF专属)
+      FLOW_份额: ETF份额变动趋势
+    """
+    if len(df) < 60:
+        return {"total_score": 0, "factors": {}, "signals": [], "reason": "数据不足"}
+
+    current_price = df["close"].iloc[-1]
+    factors = {}
+    signals = []
+
+    # V8.1: 加载ETF分类参数
+    _etf_type = config.get_etf_type(code)
+    _etf_params = config.ETF_STRATEGY_PARAMS.get(_etf_type, config.ETF_STRATEGY_PARAMS.get("行业ETF", {}))
+    _w_momentum = _etf_params.get("momentum_weight", 35)
+    _w_ma = _etf_params.get("ma_weight", 25)
+    _w_vol = _etf_params.get("volume_weight", 15)
+    _w_heat = _etf_params.get("heat_weight", 15)
+    _w_risk = _etf_params.get("risk_weight", 10)
+    _w_mr = _etf_params.get("mean_reversion_weight", 0)
+
+    # 计算原始60日涨幅(供返回使用)
+    chg_60d = (current_price / df["close"].iloc[-60] - 1) * 100 if len(df) >= 60 else 0
+
+    # ---- M_动量因子 ----
+    chg_20d = (current_price / df["close"].iloc[-20] - 1) * 100 if len(df) >= 20 else 0
+    chg_5d = (current_price / df["close"].iloc[-5] - 1) * 100 if len(df) >= 5 else 0
+
+    m_raw = 15  # 中性基准
+    if chg_20d > 10: m_raw += 12
+    elif chg_20d > 5: m_raw += 8
+    elif chg_20d > 0: m_raw += 4
+    elif chg_20d > -5: m_raw -= 2
+    else: m_raw -= 8
+
+    if chg_5d > 5: m_raw += 5
+    elif chg_5d > 2: m_raw += 3
+    elif chg_5d > 0: m_raw += 1
+
+    if chg_60d > 15: m_raw += 3
+    elif chg_60d > 5: m_raw += 2
+    elif chg_60d < -10: m_raw -= 3
+
+    m_score = max(0, min(35, m_raw))
+    if m_raw >= 20:
+        signals.append(f"动量强势(20d{chg_20d:+.1f}%/5d{chg_5d:+.1f}%)")
+
+    # ---- MA_均线排列因子 ----
+    ma_raw = 10
+    ma20_val = df["close"].rolling(20).mean().iloc[-1] if len(df) >= 20 else None
+    ma60_val = df["close"].rolling(60).mean().iloc[-1] if len(df) >= 60 else None
+
+    if ma20_val and not pd.isna(ma20_val):
+        dist_ma20 = (current_price - ma20_val) / ma20_val * 100
+        if dist_ma20 > 3:
+            ma_raw += 8
+            signals.append(f"站上MA20上方{dist_ma20:.1f}%")
+        elif dist_ma20 > 0: ma_raw += 5
+        elif dist_ma20 > -3: ma_raw += 2
+        else:
+            ma_raw -= 5
+            signals.append(f"跌破MA20下方{abs(dist_ma20):.1f}%")
+
+        ma20_slope = df["close"].rolling(20).mean().diff(5).iloc[-1]
+        if not pd.isna(ma20_slope):
+            if ma20_slope > 0: ma_raw += 5
+            elif ma20_slope < -0.01: ma_raw -= 3
+
+    if ma60_val and not pd.isna(ma60_val):
+        if current_price > ma60_val:
+            ma_raw += 4
+            signals.append("中期趋势向上(>MA60)")
+        else:
+            ma_raw -= 3
+
+    ma_score = max(0, min(25, ma_raw))
+
+    # ---- VOL_量能因子 ----
+    vol_raw = 5
+    vol = df["volume"].iloc[-1]
+    vol_ma20 = df["volume"].iloc[-20:].mean() if len(df) >= 20 else df["volume"].mean()
+    vol_ratio = vol / vol_ma20 if vol_ma20 > 0 else 1
+
+    if vol_ratio > 1.5 and current_price > df["close"].iloc[-2]:
+        vol_raw += 8
+        signals.append(f"放量上涨(量比{vol_ratio:.1f})")
+    elif vol_ratio > 1.2 and current_price > df["close"].iloc[-2]: vol_raw += 5
+    elif vol_ratio > 1.0: vol_raw += 2
+    elif vol_ratio < 0.5: vol_raw -= 2
+
+    vol_score = max(0, min(15, vol_raw))
+
+    # ---- HEAT_板块热度因子 ----
+    heat_raw = 5
+    if sector_heat_data:
+        stock_info = config.get_stock_info(code)
+        sector = stock_info.get("赛道", "其他")
+        heat_info = sector_heat_data.get(sector, {})
+        heat_rank = heat_info.get("rank", 0)
+        heat_chg = heat_info.get("avg_chg", 0)
+
+        if heat_rank > 0:
+            if heat_rank <= 3:
+                heat_raw += 10
+                signals.append(f"★热门板块{sector}(Top{heat_rank},{heat_chg:+.1f}%)")
+            elif heat_rank <= 5:
+                heat_raw += 6
+                signals.append(f"板块较热{sector}(Top{heat_rank})")
+            elif heat_rank <= 10: heat_raw += 2
+            else: heat_raw -= 3
+
+    heat_score = max(0, min(15, heat_raw))
+
+    # ---- RISK_波动控制因子 ----
+    risk_raw = 5
+    if len(df) >= 20:
+        vol_std = df["close"].pct_change().iloc[-20:].std() * 100
+        if not pd.isna(vol_std):
+            if vol_std < 1.5: risk_raw += 5
+            elif vol_std < 3: risk_raw += 2
+            elif vol_std > 5: risk_raw -= 3
+
+    risk_score = max(0, min(10, risk_raw))
+
+    # ---- MR_均值回归因子（宽基ETF专属）----
+    mr_score = 0
+    if _w_mr > 0 and len(df) >= 20:
+        mr_raw = 10  # 中性
+        try:
+            # RSI(14)
+            _delta = df["close"].diff()
+            _gain = _delta.apply(lambda x: max(x, 0)).rolling(14).mean()
+            _loss = _delta.apply(lambda x: abs(min(x, 0))).rolling(14).mean()
+            _rsi = (_gain / (_loss + 1e-10) * 100).iloc[-1]
+
+            # 布林带位置
+            _bb_mid = df["close"].rolling(20).mean().iloc[-1]
+            _bb_std = df["close"].rolling(20).std().iloc[-1]
+            _bb_lower = _bb_mid - 2 * _bb_std if not pd.isna(_bb_std) else _bb_mid
+            _bb_upper = _bb_mid + 2 * _bb_std if not pd.isna(_bb_std) else _bb_mid
+            _bb_pos = (current_price - _bb_lower) / (_bb_upper - _bb_lower + 1e-10)
+
+            if not pd.isna(_rsi):
+                if _rsi < 25: mr_raw += 10; signals.append(f"RSI超卖{_rsi:.0f}(均值回归机会)")
+                elif _rsi < 35: mr_raw += 6
+                elif _rsi < 45: mr_raw += 2
+                elif _rsi > 75: mr_raw -= 5; signals.append(f"RSI超买{_rsi:.0f}")
+                elif _rsi > 65: mr_raw -= 2
+
+            if not pd.isna(_bb_pos):
+                if _bb_pos < 0.1: mr_raw += 8; signals.append("触及布林下轨")
+                elif _bb_pos < 0.3: mr_raw += 4
+                elif _bb_pos > 0.9: mr_raw -= 5
+                elif _bb_pos > 0.7: mr_raw -= 2
+
+            # 偏离MA20程度（负偏离越大=回归机会越大）
+            if ma20_val and not pd.isna(ma20_val):
+                _dist = (current_price - ma20_val) / ma20_val * 100
+                if _dist < -5: mr_raw += 6
+                elif _dist < -2: mr_raw += 3
+                elif _dist > 5: mr_raw -= 3
+        except Exception:
+            pass
+
+        mr_score = max(0, min(25, mr_raw))
+
+    # ---- FLOW_份额变动因子（ETF独有资金流信号）----
+    flow_score = 0
+    try:
+        # 使用成交量变化代理份额变动趋势
+        # （真实份额数据需外部接口，此处用成交量趋势作为代理）
+        if len(df) >= 20:
+            _vol_5d = df["volume"].iloc[-5:].mean()
+            _vol_20d = df["volume"].iloc[-20:].mean()
+            _vol_trend = (_vol_5d / _vol_20d - 1) * 100 if _vol_20d > 0 else 0
+
+            if _vol_trend > 30 and current_price > df["close"].iloc[-5]:
+                flow_score = 8  # 放量上涨=资金流入
+                signals.append(f"资金流入信号(量趋势{_vol_trend:+.0f}%)")
+            elif _vol_trend > 10:
+                flow_score = 4
+            elif _vol_trend < -30 and current_price < df["close"].iloc[-5]:
+                flow_score = -3  # 放量下跌=资金撤离
+                signals.append(f"资金撤离信号(量趋势{_vol_trend:+.0f}%)")
+    except Exception:
+        pass
+
+    # ---- 动态权重归一化 ----
+    # 将各因子的原始分(0~满分)按配置权重缩放，确保总分=100
+    _total_weight = _w_momentum + _w_ma + _w_vol + _w_heat + _w_risk + _w_mr
+    if _total_weight <= 0:
+        _total_weight = 100
+    # 各因子归一化到[0,1]再乘以权重
+    factors["M_动量"] = round(m_score / 35 * _w_momentum, 1)
+    factors["MA_均线"] = round(ma_score / 25 * _w_ma, 1)
+    factors["VOL_量能"] = round(vol_score / 15 * _w_vol, 1)
+    factors["HEAT_板块"] = round(heat_score / 15 * _w_heat, 1)
+    factors["RISK_波动"] = round(risk_score / 10 * _w_risk, 1)
+    if _w_mr > 0:
+        factors["MR_回归"] = round(mr_score / 25 * _w_mr, 1)
+    if flow_score != 0:
+        factors["FLOW_份额"] = round(flow_score, 1)
+
+    # ---- RS_相对强弱因子（V8.1: ETF相对全市场的超额收益）----
+    # 使用全市场RPS缓存计算ETF的相对排名
+    _rs_bonus = 0
+    try:
+        _market_changes = _load_market_rps()
+        if _market_changes and len(_market_changes) > 100:
+            _chg_20d_abs = (current_price / df["close"].iloc[-20] - 1) * 100 if len(df) >= 20 else 0
+            _rank = sum(1 for x in _market_changes if x <= _chg_20d_abs)
+            _rps_pct = _rank / len(_market_changes)
+            if _rps_pct >= 0.8:
+                _rs_bonus = 5
+                signals.append(f"相对强势(RPS前{int(_rps_pct*100)}%)")
+            elif _rps_pct >= 0.6:
+                _rs_bonus = 2
+            elif _rps_pct < 0.2:
+                _rs_bonus = -3
+                signals.append(f"相对弱势(RPS后{int((1-_rps_pct)*100)}%)")
+    except Exception:
+        pass
+
+    total = sum(factors.values()) + _rs_bonus
+    total = max(0, min(100, round(total, 1)))
+
+    reason_parts = []
+    if _etf_type:
+        reason_parts.append(_etf_type)
+    if factors.get("M_动量", 0) >= _w_momentum * 0.7:
+        reason_parts.append("动量强势")
+    if factors.get("MA_均线", 0) >= _w_ma * 0.7:
+        reason_parts.append("均线多头")
+    if factors.get("HEAT_板块", 0) >= _w_heat * 0.8:
+        reason_parts.append("板块热门")
+    if factors.get("MR_回归", 0) >= _w_mr * 0.7:
+        reason_parts.append("超卖回归")
+    reason = "/".join(reason_parts) if reason_parts else "ETF综合评分"
+
+    # V8.2: 评分异常检测
+    if total < 5 and total > 0:
+        logger.warning(f"[评分异常] {code} ETF评分{total}分极低，可能存在数据异常或模型失效")
+
+    return {
+        "total_score": total,
+        "factors": {k: round(v, 1) for k, v in factors.items()},
+        "signals": signals,
+        "reason": reason,
+        "rps_rank": 0,
+        "change_60d": round(chg_60d, 2),
+        "etf_type": _etf_type,
+        "prediction": {},
+        "financial_summary": "",
     }
 
 
@@ -2380,12 +2484,19 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
         _degrade_reasons.append(f"三档买点重排后仍非单调(agg={aggressive_buy}/mod={moderate_buy}/con={conservative_buy})")
 
     # ---- 止损价 ----
-    # 1. 10%固定止损（底线）
-    # FIX P2: 止损基准从current_price改为moderate_buy（与文档"买入价×90%"一致）
-    fixed_stop = round(moderate_buy * 0.90, 2)
+    # V8.2: ETF使用分类止损参数（宽基ETF放宽至12%/行业ETF 8%/主题ETF 10%）
+    from utils.instrument import is_etf as _is_etf_fn, get_etf_subtype
+    _is_etf = _is_etf_fn(code)
+    _etf_type = get_etf_subtype(code) if _is_etf else ""
+    _etf_params = config.ETF_STRATEGY_PARAMS.get(_etf_type, {}) if _is_etf else {}
+    _stop_pct = _etf_params.get("stop_loss_pct", 0.10)  # ETF用分类参数，个股默认10%
+    _atr_mult = _etf_params.get("atr_multiplier", 2.0 if stock_type == "龙头" else 2.5)
 
-    # 2. ATR自适应止损
-    atr_multiplier = 2.0 if stock_type == "龙头" else 2.5
+    # 1. 固定止损（底线）
+    fixed_stop = round(moderate_buy * (1 - _stop_pct), 2)
+
+    # 2. ATR自适应止损（V8.1: ETF使用差异化乘数）
+    atr_multiplier = _atr_mult
     atr_stop = round(current_price - atr_multiplier * atr, 2)
 
     # 3. 技术支撑止损
@@ -2653,7 +2764,7 @@ def allocate_sector_quotas(sector_result: dict, total_max: int = 10) -> dict:
 
 def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
                          fund_flow_data: dict, is_weak_market: bool,
-                         news_risk: dict) -> dict:
+                         news_risk: dict, sector_heat_data: dict = None) -> dict:
     """V5.2: 单只股票评分工作函数（线程安全，无共享可变状态）
     
     返回:
@@ -2677,6 +2788,9 @@ def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
             result["fate"] = {"sector": sector_name, "fate": "新闻风控过滤", "score": 0, "detail": nr.get("name", "")}
             return result
 
+    # V7.0 P0: ETF拆分自动复权（修正历史K线，使60日高/涨幅等指标可比）
+    df = _adjust_etf_split(df, code)
+    
     # 硬性筛选
     hf_result = hard_filter(df, code, market_state)
     if not hf_result["pass"]:
@@ -2702,8 +2816,29 @@ def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
         result["fate"] = {"sector": sector_name, "fate": "估值闸门拦截", "score": 0, "detail": vg_result["reason"]}
         return result
 
-    # CANSLIM多因子打分
-    factor_result = canslim_score(df, code, None, market_state=market_state, regime_info=regime_info)
+    # V8.2: ETF使用专用评分模型（CANSLIM框架不适合ETF品种）
+    from utils.instrument import is_etf as _is_etf_fn
+    _is_etf = _is_etf_fn(code)
+    if _is_etf:
+        factor_result = etf_score(df, code, market_state=market_state,
+                                  sector_heat_data=sector_heat_data)
+    else:
+        # CANSLIM多因子打分
+        factor_result = canslim_score(df, code, None, market_state=market_state, regime_info=regime_info)
+
+    # V7.0 P2: 板块热度加分（ETF/个股通用）
+    if sector_heat_data and not _is_etf:
+        _heat_info = sector_heat_data.get(sector_name, {})
+        _heat_rank = _heat_info.get("rank", 0)
+        if _heat_rank <= 3:
+            _heat_bonus = 3
+            factor_result["total_score"] = min(100, factor_result["total_score"] + _heat_bonus)
+            factor_result["factors"]["板块热度"] = _heat_bonus
+            factor_result["signals"].append(f"热门板块+{_heat_bonus}(Top{_heat_rank})")
+        elif _heat_rank <= 5:
+            _heat_bonus = 1
+            factor_result["total_score"] = min(100, factor_result["total_score"] + _heat_bonus)
+            factor_result["factors"]["板块热度"] = _heat_bonus
 
     # 资金异动加分
     ff_info = fund_flow_data.get(code)
@@ -2768,6 +2903,7 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     
     # FIX(2026-08-27): 数据新鲜度守卫 —— K线数据过时超过阈值时拒绝运行，避免基于陈旧数据输出误导性结果
     # FIX(2026-08-31): 当最新数据为今日但少数动态候选K线滞后时，降级为警告+跳过过时标的，而非拦截整个选股
+    # FIX(2026-09-28): 自然日→交易日转换，避免周末/节假日导致误拦截（如周四→周一=4自然日但仅1交易日）
     _DATA_STALE_THRESHOLD = getattr(config, 'SCREENER_DATA_STALE_THRESHOLD', 4)
     try:
         from data.data_loader import check_data_freshness
@@ -2777,10 +2913,23 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
             _latest = _freshness["latest_date"] or "未知"
             _days = _freshness["stale_days"]
             _total = _freshness.get("total_codes", 0)
-            # 降级策略: 最新数据为今日(或昨日)且过时标的占比<30%时，仅警告+跳过
+            # V22: 自然日→交易日换算（排除周末，节假日暂不处理）
+            try:
+                import datetime as _dt
+                _latest_dt = _dt.datetime.strptime(_latest, "%Y-%m-%d").date()
+                _today_dt = _dt.date.today()
+                _trading_stale = 0
+                _d = _latest_dt + _dt.timedelta(days=1)
+                while _d <= _today_dt:
+                    if _d.weekday() < 5:  # 周一~周五
+                        _trading_stale += 1
+                    _d += _dt.timedelta(days=1)
+            except Exception:
+                _trading_stale = _days  # 换算失败时回退自然日
+            # 降级策略: 过时交易日<=阈值 且 过时标的占比<30%时，仅警告+跳过
             _stale_ratio = _stale_n / max(_total, 1)
-            if _days <= 1 and _stale_ratio < 0.3:
-                logger.warning(f"[选股引擎] 数据部分过时(降级运行): 最新={_latest}, {_stale_n}/{_total}只过时({_stale_ratio:.0%}), 将跳过过时标的")
+            if _trading_stale <= _DATA_STALE_THRESHOLD and _stale_ratio < 0.3:
+                logger.warning(f"[选股引擎] 数据部分过时(降级运行): 最新={_latest}, 落后{_trading_stale}个交易日(自然日{_days}), {_stale_n}/{_total}只过时({_stale_ratio:.0%}), 将跳过过时标的")
                 if _stale_n > 0:
                     _examples = [f"{c}({d})" for c, d, _ in _freshness["stale_codes"][:5]]
                     logger.warning(f"[选股引擎] 过时标的示例: {', '.join(_examples)}")
@@ -2789,7 +2938,7 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
                 for _sc in _stale_code_set:
                     data_dict.pop(_sc, None)
             else:
-                logger.error(f"[选股引擎] 数据已过时! 最新={_latest}, 落后{_days}天, {_stale_n}只标的超时")
+                logger.error(f"[选股引擎] 数据已过时! 最新={_latest}, 落后{_trading_stale}个交易日(自然日{_days}), {_stale_n}只标的超时")
                 logger.error(f"[选股引擎] 请先执行数据更新: python main.py 或 batch_update_all()")
                 if _stale_n > 0:
                     _examples = [f"{c}({d})" for c, d, _ in _freshness["stale_codes"][:5]]
@@ -2799,7 +2948,7 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
                     "buy_recommend_count": 0, "watch_only_count": 0,
                     "error": "data_stale", "staleness_days": _days,
                     "latest_data_date": _latest,
-                    "msg": f"K线数据已过时{_days}天(最新={_latest})，请先执行数据更新",
+                    "msg": f"K线数据已过时{_trading_stale}个交易日(最新={_latest})，请先执行数据更新",
                 }
     except Exception as _fresh_err:
         logger.warning(f"[选股引擎] 数据新鲜度检查异常(继续运行): {_fresh_err}")
@@ -2990,6 +3139,24 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
     except Exception:
         pass
     
+    # V7.0 P2: 计算板块热度（从data_dict扫描近5日板块动量排名）
+    _sector_heat_data = {}
+    try:
+        _sector_chg = {}
+        for _sh_code, _sh_df in _scorable.items():
+            if len(_sh_df) >= 6:
+                _sh_chg = (_sh_df["close"].iloc[-1] / _sh_df["close"].iloc[-6] - 1) * 100
+                _sh_sec = config.get_stock_info(_sh_code).get("赛道", "其他")
+                _sector_chg.setdefault(_sh_sec, []).append(_sh_chg)
+        _sec_avg = {s: sum(cs)/len(cs) for s, cs in _sector_chg.items() if len(cs) >= 3}
+        _sec_sorted = sorted(_sec_avg.items(), key=lambda x: x[1], reverse=True)
+        _sector_heat_data = {s: {"avg_chg": c, "rank": i+1, "count": len(_sector_chg[s])}
+                             for i, (s, c) in enumerate(_sec_sorted)}
+        if _sec_sorted:
+            logger.info(f"  [板块热度] Top3: {', '.join(f'{s}({c:+.1f}%)' for s,c in _sec_sorted[:3])}")
+    except Exception as _e:
+        logger.warning(f"  [板块热度] 计算失败: {_e}")
+
     # 阶段2: 主线程顺序评分（FIX-P0: 替代ThreadPoolExecutor，避免V8多线程崩溃）
     # V9.2: 评分循环中保持心跳写入，防止 scheduler_daemon 因心跳超时误杀进程
     _HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -3007,7 +3174,8 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
         try:
             _wr = _score_stock_worker(
                 _code, _df, market_state, regime_info,
-                fund_flow_data, _is_weak_market, news_risk
+                fund_flow_data, _is_weak_market, news_risk,
+                sector_heat_data=_sector_heat_data
             )
             _worker_results.append(_wr)
         except Exception as e:

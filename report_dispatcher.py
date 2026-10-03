@@ -52,7 +52,7 @@ import pandas as pd
 import config
 from notify.email_notify import send_email
 from data.realtime import fetch_realtime_batch
-from data.data_loader import fetch_stock_daily_baostock, _bs_logout
+from data.data_loader import fetch_stock_daily_baostock, fetch_stock_daily, _bs_logout
 
 # FIX: 模块级today/now/weekday_cn原在导入时固化，长驻进程跨天取值会过期，
 # 改为函数按需取当前值，各run_*入口处一次性取值，保证同一报告内取值一致
@@ -1099,6 +1099,31 @@ def run_evening():
 # 第三层：周策略报告（周六10:00）— 占位，后续SearchReplace补充
 # ============================================================
 
+def _weekly_brinson_benchmark(sectors: list) -> tuple:
+    """
+    周报Brinson基准数据：沪深300近5交易日收益（复用baostock数据层）
+
+    基准行业权重采用观察口径：组合覆盖行业等权、行业收益统一用沪深300
+    周收益（无申万二级行业数据时的诚实简化，配置效应解读为行业偏离）。
+    数据不足时返回 ({}, {}) → Brinson区块静默隐藏，禁止编造基准。
+    """
+    if not sectors:
+        return {}, {}
+    try:
+        start = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        df = fetch_stock_daily_baostock("000300", start_date=start)
+        _bs_logout()
+        if df is None or len(df) < 5:
+            return {}, {}
+        week_ret = float(df["close"].iloc[-1] / df["close"].iloc[-5] - 1)
+        n = len(sectors)
+        bm_weights = {s: 1.0 / n for s in sectors}
+        bm_returns = {s: week_ret for s in sectors}
+        return bm_weights, bm_returns
+    except Exception:
+        return {}, {}
+
+
 def run_weekly():
     """
     第三层：周策略报告
@@ -1202,6 +1227,57 @@ def run_weekly():
             html += f'<tr><td><b>{sector}</b></td><td class="{chg_class}">{avg:+.2f}%</td><td>{trend}</td></tr>'
         html += '</table>'
 
+    # ②b Brinson归因 + 夏普分解（V9.0，数据不足静默降级）
+    try:
+        from attribution.brinson import (
+            brinson_attribution, build_sector_maps, render_brinson_section_html)
+        from attribution.sharpe_decompose import (
+            decompose_sharpe, render_sharpe_decompose_html)
+
+        holdings_map = {}
+        try:
+            with open(os.path.join(BASE_DIR, 'holdings.json'), 'r', encoding='utf-8') as fj:
+                holdings_map = json.load(fj)
+        except Exception:
+            holdings_map = {}
+        weekly_chg_map = {w["code"]: w["chg"] for w in weekly_changes}
+        pw, pr, _, _ = build_sector_maps(holdings_map, weekly_chg_map,
+                                         benchmark_sector_weights={"x": 1},
+                                         benchmark_sector_returns={"x": 0})
+        if pw:
+            bm_w, bm_r = _weekly_brinson_benchmark(list(pw.keys()))
+            if bm_w:
+                brinson_html = render_brinson_section_html(
+                    brinson_attribution(pw, bm_w, pr, bm_r))
+                if brinson_html:
+                    html += '<h2>②b 归因分析</h2>' + brinson_html
+
+        # 夏普分解：持仓等权日收益序列 vs 沪深300日收益（样本不足自动降级隐藏）
+        ret_frames = {}
+        for code, s in shared.items():
+            df = s["df"]
+            if df is not None and len(df) >= 12 and "date" in df.columns:
+                ret_frames[code] = df.set_index("date")["close"].pct_change()
+        bench_df = None
+        if ret_frames:
+            try:
+                _start = (datetime.date.today() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+                bench_df = fetch_stock_daily_baostock("000300", start_date=_start)
+                _bs_logout()
+            except Exception:
+                bench_df = None
+        if ret_frames and bench_df is not None and len(bench_df) >= 12:
+            strat_ret = pd.concat(ret_frames, axis=1).mean(axis=1).dropna()
+            bench_ret = bench_df.set_index("date")["close"].pct_change().dropna()
+            sharpe_html = render_sharpe_decompose_html(
+                decompose_sharpe(strat_ret, bench_ret))
+            if sharpe_html:
+                if '②b' not in html:
+                    html += '<h2>②b 归因分析</h2>'
+                html += sharpe_html
+    except Exception as _e:
+        print(f"[周报] Brinson/夏普分解区块降级: {_e}")
+
     # ③ 仓位再平衡建议
     html += '<h2>③ 仓位再平衡建议</h2>'
     if position_data:
@@ -1263,7 +1339,7 @@ def run_weekly():
 # CANSLIM独立选股报告（手动/定时共用入口）
 # ============================================================
 
-def run_canslim():
+def run_canslim(send_email_flag=True):
     """
     CANSLIM独立选股报告（手动触发 + 09:25定时触发共用此入口）
 
@@ -1271,6 +1347,10 @@ def run_canslim():
     - 上涨市: min_score=45，正常模式
     - 震荡市: min_score=35，适度放宽
     - 下跌市: 仅输出观察建议，标注"建议空仓等待"
+
+    Args:
+        send_email_flag: V23优化(P0-3) 是否发送邮件，默认True。
+                         盘中重新评分(14:00)调用时传False，仅更新缓存不发邮件。
 
     输出完整性:
     - CANSLIM综合评分(N/S/L/CAI/P五因子) ✓
@@ -1349,12 +1429,12 @@ def run_canslim():
     print(f"[选股] 候选股票池: {len(all_codes)}只 "
           f"(静态{static_count} + 观察池{pool_new} + 动态{scan_new} + 指数1)")
 
-    # 批量拉取数据
+    # 批量拉取数据（V22: 改用fetch_stock_daily全链路兜底，baostock不可用时自动切腾讯API）
     start = (datetime.date.today() - datetime.timedelta(days=300)).strftime("%Y-%m-%d")
     data_dict = {}
     for code in all_codes:
         try:
-            df = fetch_stock_daily_baostock(code, start_date=start)
+            df = fetch_stock_daily(code, start_date=start)
             if df is not None and not df.empty and len(df) >= 60:
                 df["ma5"] = df["close"].rolling(5).mean()
                 df["ma10"] = df["close"].rolling(10).mean()
@@ -1441,17 +1521,18 @@ def run_canslim():
             f"回调至MA20附近是较好的介入时机。"
         )
 
-    # 发送邮件（有入选标的 → 完整报告；无入选 → 简报）
-    if result['qualified_count'] > 0:
-        success = send_screener_email(result)
-        if success:
-            print(f"[选股] 📧 选股报告邮件已发送（{result['qualified_count']}只入选）")
+    # 发送邮件（V23优化: send_email_flag=False时跳过，仅更新缓存/状态文件）
+    if send_email_flag:
+        if result['qualified_count'] > 0:
+            success = send_screener_email(result)
+            if success:
+                print(f"[选股] 📧 选股报告邮件已发送（{result['qualified_count']}只入选）")
+            else:
+                print(f"[选股] ⚠️ 选股报告邮件发送失败")
         else:
-            print(f"[选股] ⚠️ 选股报告邮件发送失败")
-    else:
-        # 无入选标的：发送"本期无推荐"简报
-        reason = "大盘下跌，建议空仓等待" if market_state == "down" else "候选池均不达标（评分/趋势/盈亏比未通过）"
-        brief_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{COMMON_CSS}</style></head><body>
+            # 无入选标的：发送"本期无推荐"简报
+            reason = "大盘下跌，建议空仓等待" if market_state == "down" else "候选池均不达标（评分/趋势/盈亏比未通过）"
+            brief_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{COMMON_CSS}</style></head><body>
 <div class="container">
 <div class="header"><h1>📝 CANSLIM选股简报</h1>
 <div class="sub">{today} {weekday_cn} | 本期无推荐标的</div></div>
@@ -1463,9 +1544,11 @@ def run_canslim():
 <p style="font-size:13px;line-height:1.8">{result.get('_market_commentary', '')}</p>
 <div class="footer">CANSLIM选股报告 | {today} {now} | 三层分时报告体系·独立选股</div>
 </div></div></body></html>"""
-        brief_subject = f"[CANSLIM选股] {today} | 本期无推荐 | {reason}"
-        brief_ok = send_email(brief_subject, brief_html)
-        print(f"[选股] 📧 无推荐简报{'已发送' if brief_ok else '发送失败'}")
+            brief_subject = f"[CANSLIM选股] {today} | 本期无推荐 | {reason}"
+            brief_ok = send_email(brief_subject, brief_html)
+            print(f"[选股] 📧 无推荐简报{'已发送' if brief_ok else '发送失败'}")
+    else:
+        print(f"[选股] 静默模式: 跳过邮件发送（{result['qualified_count']}只入选）")
 
     return result
 

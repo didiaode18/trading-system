@@ -38,7 +38,20 @@ logger = logging.getLogger(__name__)
 
 
 class VolTargetManager:
-    """波动率目标仓位管理器"""
+    """
+    波动率目标仓位管理器
+
+    职责:
+      基于组合波动率目标动态调整总仓位。当市场波动率升高时自动降低仓位，
+      波动率降低时允许更高仓位，保持组合风险暴露恒定。
+
+    核心公式:
+      目标仓位比例 = 目标波动率 / 预测波动率 × 基准仓位
+      实际仓位 = min(目标仓位, 硬上限) × 信号置信度
+
+    输出:
+      scale (float): 仓位缩放因子（<1降仓, >1可加仓, =1正常）
+    """
 
     def __init__(self, target_vol: float = 0.15, lookback: int = 20,
                  ewma_lambda: float = 0.94, max_scale: float = 1.3,

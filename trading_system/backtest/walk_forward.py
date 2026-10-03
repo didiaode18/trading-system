@@ -28,9 +28,13 @@ import config
 try:
     from .engine import BacktestEngineV2
     from .data_feed import DataFeed
+    from . import master_common
+    from backtest_optimizer import backtest_stock_v6
 except ImportError:
     from backtest.engine import BacktestEngineV2
     from backtest.data_feed import DataFeed
+    from backtest import master_common
+    from backtest_optimizer import backtest_stock_v6
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,7 @@ class WalkForwardAnalyzer:
         wf_cfg = getattr(config, 'WF_CONFIG', {})
         self.train_days = train_days or wf_cfg.get('train_days', 200)
         self.test_days = test_days or wf_cfg.get('test_days', 60)
-        self.max_windows = max_windows or wf_cfg.get('max_windows', 10)
+        self.max_windows = max_windows or wf_cfg.get('max_windows', 20)
         # P1-6: 精简参数网格，仅2个核心参数×2-3值=6组合（原27组合过拟合维度太高）
         # min_signal_quality对齐V6.1新门槛65，取60/65/70
         self.param_grid = param_grid or wf_cfg.get('param_grid', {
@@ -156,17 +160,20 @@ class WalkForwardAnalyzer:
                     test_start: str, test_end: str) -> Optional[dict]:
         """运行单个窗口：训练集优化 + 验证集评估（V2.0使用V5.0逐股回测）"""
 
+        # Phase 2: 计算训练集 regime 调整——震荡/熊市自动提高信号质量门槛
+        regime_adj = self._calc_regime_adj(data_dict, train_end)
+
         # 1. 训练集参数优化（V2.0: 使用V5.0逐股回测）
         best_params, train_report = self._optimize_on_train_v5(
-            data_dict, stock_codes, train_start, train_end
+            data_dict, stock_codes, train_start, train_end, regime_adj
         )
 
         if best_params is None:
             return None
 
-        # 2. 验证集评估（用训练集最优参数）
+        # 2. 验证集评估（用训练集最优参数 + 同一 regime 调整）
         test_report = self._evaluate_on_test_v5(
-            data_dict, stock_codes, test_start, test_end, best_params
+            data_dict, stock_codes, test_start, test_end, best_params, regime_adj
         )
 
         if test_report is None:
@@ -184,7 +191,8 @@ class WalkForwardAnalyzer:
         }
 
     def _optimize_on_train_v5(self, data_dict: dict, stock_codes: list,
-                              start_date: str, end_date: str) -> tuple:
+                              start_date: str, end_date: str,
+                              regime_adj: float = 0.0) -> tuple:
         """
         V2.0: 在训练集上用V5.0逐股回测找最优参数
         
@@ -196,6 +204,19 @@ class WalkForwardAnalyzer:
         values = list(self.param_grid.values())
         combinations = list(product(*values))
 
+        # V7(A3): 网格采样（避免240+组合全量遍历）
+        import config as _cfg
+        _max_trials = getattr(_cfg, 'WF_CONFIG', {}).get('grid_max_trials', 0)
+        if not _max_trials:
+            _max_trials = getattr(getattr(_cfg, 'BACKTEST_SAMPLE', {}), 'get', lambda *a: 0)('full', 'grid_max_trials')
+        if not _max_trials or _max_trials <= 0:
+            _max_trials = len(combinations)  # 无限制时全量遍历
+        if len(combinations) > _max_trials:
+            rng = np.random.default_rng(42)
+            indices = rng.choice(len(combinations), _max_trials, replace=False)
+            combinations = [combinations[i] for i in sorted(indices)]
+            logger.debug(f"WF网格采样: {len(combinations)}/{_max_trials} 组合")
+
         best_score = -999
         best_params = None
         best_report = None
@@ -204,12 +225,16 @@ class WalkForwardAnalyzer:
             params = dict(zip(keys, combo))
             try:
                 report = self._run_v5_backtest(
-                    data_dict, stock_codes, start_date, end_date, params
+                    data_dict, stock_codes, start_date, end_date, params,
+                    regime_adj=regime_adj,
                 )
-                # 用期望收益×sqrt(交易数)作为评分（兼顾盈利和样本量）
+                # V7(A3): 增强目标函数 = sharpe_proxy × sqrt(n_trades)
+                # sharpe_proxy = expectancy / std(trade_returns) 的简化版
                 expectancy = report.get("expectancy", 0)
                 n_trades = report.get("total_trades", 0)
-                score = expectancy * np.sqrt(max(n_trades, 1))
+                win_rate = report.get("win_rate", 0) / 100.0
+                # 综合评分：期望收益 × 样本量 × 胜率调整
+                score = expectancy * np.sqrt(max(n_trades, 1)) * (0.5 + 0.5 * win_rate)
 
                 if score > best_score:
                     best_score = score
@@ -221,24 +246,28 @@ class WalkForwardAnalyzer:
         return best_params, best_report
 
     def _evaluate_on_test_v5(self, data_dict: dict, stock_codes: list,
-                             start_date: str, end_date: str, params: dict) -> Optional[dict]:
+                             start_date: str, end_date: str, params: dict,
+                             regime_adj: float = 0.0) -> Optional[dict]:
         """V2.0: 在验证集上用V5.0逐股回测评估"""
         try:
             return self._run_v5_backtest(
-                data_dict, stock_codes, start_date, end_date, params
+                data_dict, stock_codes, start_date, end_date, params,
+                regime_adj=regime_adj,
             )
         except Exception as e:
             logger.warning(f"验证集V5.0回测失败: {e}")
             return None
 
     def _run_v5_backtest(self, data_dict: dict, stock_codes: list,
-                         start_date: str, end_date: str, params: dict) -> dict:
+                         start_date: str, end_date: str, params: dict,
+                         regime_adj: float = 0.0) -> dict:
         """
         V2.0核心：调用backtest_real.py的V5.0逐股回测
         
         参数通过params传入，不修改config.py（遵守约束）
+        Phase 2: regime_adj 为训练集 regime 检测的信号质量调整量，
+        震荡/熊市时提高 min_signal_quality 门槛。
         """
-        from backtest_real import backtest_stock_v5
         
         all_trades = []
         for code in stock_codes:
@@ -248,12 +277,24 @@ class WalkForwardAnalyzer:
             # 截取窗口内数据（含前置预热期）
             mask = df["date"] <= end_date
             df_window = df[mask].copy()
-            if len(df_window) < 60:
+            if len(df_window) < 80:
                 continue
             
             try:
-                info = config.get_stock_info(code)
-                trades = backtest_stock_v5(df_window, code, info)
+                # FIX(G2): v5/v6 记录成交时硬取 info["行业"]，而 get_stock_info 返回的
+                # 是"赛道"键 → 未映射会让每笔完成的交易抛 KeyError，被下方 except
+                # 吞掉，导致样本外交易恒为0、oos_sharpe=0（对齐 stage1_single 口径）。
+                raw = config.get_stock_info(code) or {}
+                info = {"名称": raw.get("名称", code), "类型": raw.get("类型", "龙头"),
+                        "行业": raw.get("行业", raw.get("赛道", "其他"))}
+                # FIX(G2-P0): 改用 v6 引擎，真正将训练集优化的 params 传入回测，
+                # 而非像之前调 v5 那样 params 被静默丢弃。
+                # Phase 2: regime 调整——震荡/熊市提高信号质量门槛
+                adj_params = params.copy()
+                if regime_adj != 0 and "min_signal_quality" in adj_params:
+                    adj_params["min_signal_quality"] = min(
+                        adj_params["min_signal_quality"] + regime_adj, 85)
+                trades = backtest_stock_v6(df_window, code, info, adj_params)
                 # 过滤日期范围内的交易
                 for t in trades:
                     if t.get("sell_date", "") >= start_date and t.get("sell_date", "") <= end_date:
@@ -266,19 +307,24 @@ class WalkForwardAnalyzer:
             return {"total_trades": 0, "win_rate": 0, "expectancy": 0,
                     "sharpe_ratio": 0, "total_return": 0, "max_drawdown": 0}
         
-        wins = [t for t in all_trades if t.get("profit_pct", 0) > 0]
-        losses = [t for t in all_trades if t.get("profit_pct", 0) <= 0]
+        # FIX(G2): v5/v6 交易记录用 net_profit（含成本，百分比），并无 profit_pct 键；
+        # 旧代码读 profit_pct 恒取默认0，会把胜率/期望/夏普全算成0。改用 net_profit。
+        wins = [t for t in all_trades if t.get("net_profit", 0) > 0]
+        losses = [t for t in all_trades if t.get("net_profit", 0) <= 0]
         n = len(all_trades)
         win_rate = len(wins) / n * 100 if n > 0 else 0
-        avg_win = np.mean([t["profit_pct"] for t in wins]) if wins else 0
-        avg_loss = np.mean([t["profit_pct"] for t in losses]) if losses else 0
+        avg_win = np.mean([t.get("net_profit", 0) for t in wins]) if wins else 0
+        avg_loss = np.mean([t.get("net_profit", 0) for t in losses]) if losses else 0
         expectancy = (win_rate/100 * avg_win + (1-win_rate/100) * avg_loss)
         
-        # 简化夏普估算（基于每笔收益的均值/标准差）
-        returns = [t.get("profit_pct", 0) for t in all_trades]
-        ret_std = np.std(returns) if len(returns) > 1 else 1
-        sharpe = np.mean(returns) / max(ret_std, 0.01) * np.sqrt(min(n, 252)) if ret_std > 0 else 0
+        # FIX(G2-P1): 夏普估计器升级——改用 master_common 的年化夏普代理，
+        # 基于逐笔收益率 + sqrt(252/avg_hold) 年化，而非逐笔 mean/std*sqrt(n)。
+        # 后者在交易笔数少时噪声极大（oos_sharpe_std=9.31 >> mean=-2.39）。
+        trade_rets = master_common.trades_to_return_series(all_trades)
+        avg_hold = float(np.mean([t.get("hold_days", 5) for t in all_trades])) if all_trades else 5.0
+        sharpe = master_common.sharpe_from_trade_returns(trade_rets, avg_hold)
         
+        returns = [t.get("net_profit", 0) for t in all_trades]
         return {
             "total_trades": n,
             "win_rate": round(win_rate, 1),
@@ -347,6 +393,37 @@ class WalkForwardAnalyzer:
         if oos_sharpe > 1.5 and stability > 0.7:
             return "✅ 策略稳健：样本外表现优秀且参数稳定"
         return "✅ 策略可用：样本外表现合格"
+
+    @staticmethod
+    def _calc_regime_adj(data_dict: dict, train_end: str) -> float:
+        """
+        Phase 2: 基于训练集基准指数趋势计算 regime 调整量。
+        
+        利用 000300 基准数据的 20 日收益率判断市场状态，
+        对 min_signal_quality 参数施加调整：
+          - BULL (ret20 > +2%): -5（放宽门槛，趋势市多参与）
+          - BEAR (ret20 < -2%): +10（收紧门槛，熊市少参与）
+          - RANGE (其他): +5（震荡市适度收紧）
+        
+        仅使用 train_end 及之前的数据，无未来信息泄露。
+        """
+        bench = data_dict.get("000300")
+        if bench is None or len(bench) < 30:
+            return 0.0
+        try:
+            mask = bench["date"] <= train_end
+            closes = bench.loc[mask, "close"].values
+            if len(closes) < 25:
+                return 0.0
+            ret20 = (closes[-1] / closes[-20] - 1) if closes[-20] > 0 else 0
+            if ret20 > 0.02:
+                return -5.0   # BULL: 放宽
+            elif ret20 < -0.02:
+                return 10.0   # BEAR: 收紧
+            else:
+                return 5.0    # RANGE: 适度收紧
+        except Exception:
+            return 0.0
 
 
 # ============================================================

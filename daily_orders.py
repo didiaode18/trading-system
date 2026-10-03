@@ -144,19 +144,22 @@ def compute_indicators(df):
 # ============================================================
 # 条件单生成逻辑 V3（增强版：分档止损+互斥+去重+价格校验日志）
 # ============================================================
-def generate_condition_orders(holding, df, realtime_price):
+def generate_condition_orders(holding, df, realtime_price, _playbook=None):
     """
-    为单只持仓生成次日条件单（V3增强版）
+    为单只持仓生成次日条件单（V3增强版 + V10 regime-aware）
 
     规则:
       - 趋势≤ 2级(空头): 仅生成1张清仓单(现价×97%，14:50触发)，不重复生成止损单
-      - 浮亏状态(现价<成本): 止损价 = 现价 × 92%
-      - 浮盈<5%: 初始止损 = 成本×90%，若≥现价则改为现价×95%
+      - 浮亏状态(现价<成本): 止损价 = 现价 × (1-stop_loss_pct)
+      - 浮盈<5%: 初始止损 = 成本×(1-stop_loss_pct)
       - 浮盈5%-15%: 保本止损 = 成本×102%
       - 浮盈>15%: 移动止盈 = 阶段高点×95%
       - 止损/清仓单: 14:50尾盘确认
       - 止盈单: 盘中实时触发
       - 去重: 同标的不得出现2张方向相同、触发价相近(差距<2%)的卖出单
+
+    V10参数:
+      _playbook: RegimePlaybook实例，提供regime-aware止损幅度。None时使用默认STOP_LOSS_PCT。
     """
     orders = []
     code = holding["code"]
@@ -172,6 +175,12 @@ def generate_condition_orders(holding, df, realtime_price):
         ma20 = price
     if pd.isna(ma60):
         ma60 = price
+
+    # V10: regime-aware止损幅度（playbook提供时动态调整）
+    if _playbook is not None:
+        _regime_stop = _playbook.risk_rules().get("stop_loss_pct", STOP_LOSS_PCT)
+    else:
+        _regime_stop = STOP_LOSS_PCT
 
     # 判断趋势方向
     is_bullish = price > ma20 and ma20 > ma60
@@ -247,22 +256,22 @@ def generate_condition_orders(holding, df, realtime_price):
         stop_note = f"已回本持仓，保护性止损=现价{price:.3f}×85%"
     elif pnl_pct < 0:
         # FIX B3: 浮亏状态优先使用holdings.json预设止损价，消除多处硬编码不一致
-        # FIX P2: 止损线只升不降（Ratchet原则）—— 硬止损 = 成本×90% 为绝对底线
-        hard_floor = round(cost * (1 - STOP_LOSS_PCT), 3)  # 原始硬止损（成本×90%）
+        # FIX P2: 止损线只升不降（Ratchet原则）—— 硬止损 = 成本×(1-stop) 为绝对底线
+        hard_floor = round(cost * (1 - _regime_stop), 3)  # V10: regime-aware止损幅度
         preset_stop = holding.get("stop_loss", 0)
         if preset_stop > 0 and preset_stop < price:
             stop_price = round(max(preset_stop, hard_floor), 3)  # 不低于硬止损底线
             stop_type = "预设止损"
             stop_note = f"浮亏{pnl_pct:.1f}%，预设止损{preset_stop:.3f}，硬止损底线{hard_floor:.3f}，取高者"
         else:
-            stop_price = hard_floor  # FIX P2: 浮亏时直接使用硬止损，不再用price×90%下移
+            stop_price = hard_floor  # FIX P2: 浮亏时直接使用硬止损
             stop_type = "硬止损"
-            stop_note = f"浮亏{pnl_pct:.1f}%，硬止损=成本{cost:.3f}×{1-STOP_LOSS_PCT:.0%}={hard_floor:.3f}(止损线只升不降)"
+            stop_note = f"浮亏{pnl_pct:.1f}%，硬止损=成本{cost:.3f}×{1-_regime_stop:.0%}={hard_floor:.3f}(止损线只升不降)"
     elif pnl_pct < 5:
-        # 浮盈<5%: 初始止损 = 成本×90%
-        stop_price = round(cost * 0.9, 3)
+        # 浮盈<5%: 初始止损 = 成本×(1-stop)
+        stop_price = round(cost * (1 - _regime_stop), 3)
         stop_type = "初始止损"
-        stop_note = f"浮盈{pnl_pct:.1f}%<5%，初始止损=成本{cost:.3f}×90%"
+        stop_note = f"浮盈{pnl_pct:.1f}%<5%，初始止损=成本{cost:.3f}×{1-_regime_stop:.0%}"
         # 止损价不能高于现价
         if stop_price >= price:
             stop_price = round(price * 0.95, 3)
@@ -394,10 +403,12 @@ def _log_price_check(code, name, order_type, trigger_price, current_price):
 # ============================================================
 # 持仓健康度巡检（四级分类 + 处置方案）
 # ============================================================
-def health_inspection(holdings_with_price, all_data):
+def health_inspection(holdings_with_price, all_data, _playbook=None):
     """
     持仓风险四级巡检，返回按紧急程度排序的结果
     等级: 危险 > 预警 > 关注 > 健康
+
+    V10.1: 传入_playbook实现regime-aware仓位上限
     """
     gate = UnifiedRiskEngine(total_capital=TOTAL_CAPITAL)  # FIX B4: 统一风控引擎
     # 构建 UnifiedRiskEngine 需要的 holdings dict
@@ -418,7 +429,7 @@ def health_inspection(holdings_with_price, all_data):
             "ma20": ma20,
             "ma60": ma60,
         }
-    results = gate.inspect_holdings(holdings_dict)
+    results = gate.inspect_holdings(holdings_dict, _playbook=_playbook)
 
     # 为危险/预警级标的生成具体调仓方案
     for r in results:
@@ -473,9 +484,9 @@ def health_inspection(holdings_with_price, all_data):
 # ============================================================
 # 纪律锁
 # ============================================================
-def generate_discipline_lock():
-    """生成今日操作纪律（禁止事项）"""
-    return [
+def generate_discipline_lock(_playbook=None):
+    """生成今日操作纪律（禁止事项）+ V10 regime附加纪律"""
+    base = [
         f"🚫 明日最多交易{MAX_DAILY_TRADES}笔，超过即锁仓不动",
         "🚫 禁止在盘中临时决定买入/卖出，所有操作必须在前一晚通过条件单设定",
         "🚫 禁止越跌越补（单只当日最多补仓1次，且必须通过条件单触发）",
@@ -484,6 +495,10 @@ def generate_discipline_lock():
         "✅ 唯一允许的手动操作：条件单触发后确认成交",
         "✅ 如果手痒想操作：先等10分钟，问自己'这是系统信号还是情绪？'",
     ]
+    # V10: regime附加纪律
+    if _playbook is not None:
+        base.extend(_playbook.discipline_extra())
+    return base
 
 
 # ============================================================
@@ -493,6 +508,20 @@ print("=" * 60)
 print(f"  每日条件单生成器 V1.0 | {today} {now}")
 print(f"  目标: 生成{tomorrow}操作计划，消除盘中人为干预")
 print("=" * 60)
+
+# V10: 加载RegimePlaybook（regime-aware条件单）
+_playbook = None
+try:
+    from trading_system.strategy.regime_playbook import RegimePlaybook
+    from trading_system.strategy.market_regime import detect_market_regime
+    _regime_result = detect_market_regime()
+    _playbook = RegimePlaybook(_regime_result)
+    print(f"\n[Regime] V10 市场状态={_playbook.state}，置信度={_playbook.confidence:.0%}，"
+          f"行动模式={_playbook.action_mode_cn()}")
+    print(f"  止损幅度={_playbook.risk_rules()['stop_loss_pct']:.0%}，"
+          f"仓位上限={_playbook.position_limits()['max_total']:.0%}")
+except Exception as _e:
+    print(f"\n[Regime] V10 playbook加载失败，使用默认配置: {_e}")
 
 # 1. 获取实时行情
 codes = [h["code"] for h in holdings_list]
@@ -534,7 +563,7 @@ for h in holdings_list:
 
 # 4. 持仓健康度巡检（四级分类）
 print(f"\n[巡检] 持仓健康度四级分类...")
-health_results = health_inspection(holdings_with_price, all_data)
+health_results = health_inspection(holdings_with_price, all_data, _playbook=_playbook)
 for r in health_results:
     icon = {"危险": "🔴", "预警": "🟠", "关注": "🟡", "健康": "🟢"}.get(r["level"], "⚪")
     print(f"  {icon} {r['name']}({r['code']}): {r['level']} | 浮盈{r['pnl_pct']:+.1f}% | {r['action']}")
@@ -542,6 +571,19 @@ for r in health_results:
         print(f"     ⚠️ 仓位{r['position_ratio']:.1f}%超标，建议减仓{r['reduce_shares']}股")
 
 # 5. 生成条件单
+# FIX P0-D: 熔断状态约束——检查是否处于熔断状态，熔断时禁止生成加仓/买入类条件单
+_circuit_breaker_active = False
+try:
+    from trading_system.risk.risk_control import UnifiedRiskEngine
+    _risk_engine = UnifiedRiskEngine()
+    _risk_status = _risk_engine.check_all()
+    if _risk_status.get("circuit_breaker_triggered", False):
+        _circuit_breaker_active = True
+        _triggered_levels = [k for k, v in _risk_status.get("levels", {}).items() if v.get("triggered")]
+        print(f"\n[风控] ⛔ 熔断状态生效: {', '.join(_triggered_levels)}，禁止生成加仓/买入类条件单")
+except Exception as _e:
+    print(f"\n[风控] 熔断检查失败: {_e}，继续正常生成")
+
 print(f"\n[条件单] 生成次日操作计划...")
 all_orders = []
 for h in holdings_list:
@@ -551,12 +593,191 @@ for h in holdings_list:
         continue
     if code in all_data:
         rt_price = quotes.get(code, {}).get("price", 0)
-        orders = generate_condition_orders(h, all_data[code], rt_price)
-        all_orders.extend(orders)
-        print(f"  {h['名称']}: {len(orders)}条条件单")
+        orders = generate_condition_orders(h, all_data[code], rt_price, _playbook=_playbook)
+        # FIX P0-D: 熔断时过滤掉买入类条件单
+        if _circuit_breaker_active:
+            _filtered = [o for o in orders if o.get("方向") != "买入"]
+            all_orders.extend(_filtered)
+            _buy_count = len(orders) - len(_filtered)
+            if _buy_count > 0:
+                print(f"  {h['名称']}: {len(_filtered)}条条件单(已过滤{_buy_count}条买入类)")
+            else:
+                print(f"  {h['名称']}: {len(_filtered)}条条件单")
+        else:
+            all_orders.extend(orders)
+            print(f"  {h['名称']}: {len(orders)}条条件单")
+
+# 5.1 V9.0(P0-4): 仓位硬约束 — 单只持仓>MAX_SINGLE_POSITION自动生成减仓条件单
+_position_orders = []
+_existing_sell_codes = {o["证券代码"] for o in all_orders if o.get("方向") == "卖出"}
+for r in health_results:
+    if r.get("reduce_plan") and r["reduce_plan"]["total_reduce"] > 0:
+        rp = r["reduce_plan"]
+        code = r["code"]
+        if code in _existing_sell_codes:
+            continue  # 已有卖出单，不重复生成
+        _position_orders.append({
+            "类型": f"仓位硬约束减仓(>{MAX_SINGLE_POSITION*100:.0f}%)",
+            "优先级": "★★★必挂",
+            "证券代码": code,
+            "证券名称": r["name"],
+            "方向": "卖出",
+            "触发价": rp["batch1"]["price"],
+            "触发时间": "09:30开盘",
+            "数量": rp["batch1"]["shares"],
+            "有效期": "3个交易日",
+            "说明": f"仓位{r['position_ratio']:.1f}%超限(>{MAX_SINGLE_POSITION*100:.0f}%)，减仓{rp['batch1']['shares']}股至{rp['target_ratio']:.1f}%",
+        })
+if _position_orders:
+    all_orders.extend(_position_orders)
+    print(f"\n[仓位约束] ✅ 自动生成{len(_position_orders)}条减仓条件单(单只>{MAX_SINGLE_POSITION*100:.0f}%)")
+    for po in _position_orders:
+        print(f"  {po['证券名称']}: 减仓{po['数量']}股@{po['触发价']:.3f}")
+
+# 5.2 V10(P0-C): ActionPlanner集成 —— 生成调仓建议清单
+try:
+    from trading_system.strategy.action_planner import ActionPlanner
+    # 构建持仓字典（ActionPlanner需要的格式）
+    _holdings_dict = {}
+    for h in holdings_list:
+        _holdings_dict[h["code"]] = {
+            "name": h["名称"],
+            "shares": h["数量"],
+            "buy_price": h.get("成本价", 0),
+            "sector": h.get("赛道", ""),
+            "market_value": h.get("市值", 0),
+        }
+    # 板块景气数据（如果有）
+    _sector_result = {}
+    try:
+        from trading_system.strategy.sector_flow import SectorMonitor
+        _sector_mon = SectorMonitor()
+        _sector_result = _sector_mon.analyze() or {}
+    except Exception:
+        pass
+
+    _planner = ActionPlanner(
+        regime_result=_regime_result if '_regime_result' in dir() else {},
+        sector_result=_sector_result,
+        holdings=_holdings_dict,
+        all_data=all_data,
+        total_capital=TOTAL_CAPITAL,
+    )
+    _action_plan = _planner.generate_action_plan()
+    _reduce_list = _action_plan.get("reduce_list", [])
+    _add_list = _action_plan.get("add_list", [])
+    _switch_list = _action_plan.get("switch_list", [])
+
+    if _reduce_list or _add_list or _switch_list:
+        print(f"\n[ActionPlanner] ✅ 调仓建议: 减仓{_reduce_list}只 / 加仓{_add_list}只 / 换仓{_switch_list}对")
+        for r in _reduce_list[:3]:
+            print(f"  ⬇️ 减仓: {r.get('name', r.get('code'))} | {r.get('reason', '')}")
+        for a in _add_list[:3]:
+            print(f"  ⬆️ 加仓: {a.get('name', a.get('code'))} | {a.get('reason', '')}")
+        for s in _switch_list[:2]:
+            print(f"  🔄 换仓: {s.get('sell_name')}→{s.get('buy_name')} | {s.get('reason', '')}")
+except ImportError:
+    print(f"\n[ActionPlanner] 模块未找到，跳过调仓建议")
+except Exception as _e:
+    print(f"\n[ActionPlanner] 调仓建议生成失败: {_e}")
 
 # 6. 纪律锁
-discipline = generate_discipline_lock()
+discipline = generate_discipline_lock(_playbook=_playbook)
+
+# V10: BEAR模式非防御板块持仓自动减仓建议单
+if _playbook is not None and _playbook.state == "BEAR":
+    _bear_reduce_count = 0
+    for h in holdings_with_price:
+        if h["数量"] <= 0:
+            continue
+        _sector = h.get("赛道", "")
+        if not _playbook.is_defensive_sector(_sector):
+            _reduce_qty = max(h["数量"] // 2 // 100 * 100, 100)
+            _reduce_qty = min(_reduce_qty, h["数量"])
+            all_orders.append({
+                "类型": "板块弱势减仓(BEAR模式)",
+                "优先级": "★★建议",
+                "证券代码": h["code"],
+                "证券名称": h["名称"],
+                "方向": "卖出",
+                "触发价": round(h["price"] * 0.998, 3),
+                "触发时间": "14:50",
+                "数量": _reduce_qty,
+                "有效期": "3个交易日",
+                "说明": f"熊市模式，{_sector}板块非防御型，建议减仓{_reduce_qty}股，转防御板块或现金",
+            })
+            _bear_reduce_count += 1
+    if _bear_reduce_count:
+        print(f"\n[BEAR模式] ✅ 自动生成{_bear_reduce_count}条非防御板块减仓建议单")
+
+# 5.2 V10(Phase3): 板块弱势持仓识别 —— 持仓所在板块排名后30%时标注板块弱势警示
+_sector_rank_map = {}  # {sector_name: rank_pct} 板块排名百分位(0=最强, 1=最弱)
+try:
+    from trading_system.strategy.sector_flow import SectorMonitor, get_stock_sector_map
+    _sm = SectorMonitor()
+    _sm_data = {}
+    _sm_info = {}
+    _sector_map = get_stock_sector_map()
+    for h in holdings_with_price:
+        _c = h["code"]
+        if _c in all_data and all_data[_c] is not None and len(all_data[_c]) >= 20:
+            _sm_data[_c] = all_data[_c]
+            _sm_info[_c] = {"name": h.get("名称", _c)}
+    if _sm_data:
+        _sm_result = _sm.analyze(_sm_data, _sm_info)
+        _ranked = _sm_result.get("ranked", [])
+        _n_ranked = len(_ranked)
+        if _n_ranked > 0:
+            for _idx, _m in enumerate(_ranked):
+                _sector_rank_map[_m["sector"]] = _idx / max(_n_ranked - 1, 1)
+            _weak_threshold = 0.7  # 后30%为弱势
+            _weak_holdings = []
+            for h in holdings_with_price:
+                if h["数量"] <= 0:
+                    continue
+                _sec = _sector_map.get(h["code"], h.get("赛道", "其他"))
+                _rank_pct = _sector_rank_map.get(_sec, 0.5)
+                if _rank_pct >= _weak_threshold:
+                    _weak_holdings.append({
+                        "code": h["code"], "name": h["名称"],
+                        "sector": _sec, "rank_pct": _rank_pct,
+                    })
+            if _weak_holdings:
+                print(f"\n[板块弱势] ⚠️ {len(_weak_holdings)}只持仓所在板块排名后30%:")
+                for wh in _weak_holdings:
+                    print(f"  ⚠️ {wh['name']}({wh['code']}) 板块={wh['sector']} 排名后{100-wh['rank_pct']*100:.0f}%")
+                # 为板块弱势持仓的现有条件单追加板块弱势警示标注
+                _sector_weak_codes = {wh["code"] for wh in _weak_holdings}
+                for order in all_orders:
+                    if order.get("证券代码") in _sector_weak_codes and order.get("方向") == "卖出":
+                        order["说明"] += " | ⚠️板块弱势(排名后30%)"
+                # 对没有现有卖出单的板块弱势持仓，生成提示性减仓建议
+                _existing_sell = {o["证券代码"] for o in all_orders if o.get("方向") == "卖出"}
+                for wh in _weak_holdings:
+                    if wh["code"] not in _existing_sell:
+                        _h = next((h for h in holdings_with_price if h["code"] == wh["code"]), None)
+                        if _h and _h["数量"] > 0:
+                            _reduce_qty = max(_h["数量"] // 3 // 100 * 100, 100)
+                            _reduce_qty = min(_reduce_qty, _h["数量"])
+                            all_orders.append({
+                                "类型": "板块弱势减仓提示",
+                                "优先级": "★★建议",
+                                "证券代码": wh["code"],
+                                "证券名称": wh["name"],
+                                "方向": "卖出",
+                                "触发价": round(_h["price"] * 0.998, 3),
+                                "触发时间": "14:50",
+                                "数量": _reduce_qty,
+                                "有效期": "3个交易日",
+                                "说明": f"板块{wh['sector']}排名后{(1-wh['rank_pct'])*100:.0f}%，建议减仓{_reduce_qty}股(约1/3)，关注板块轮动方向",
+                            })
+                print(f"  板块弱势减仓建议单: {len([o for o in all_orders if o.get('类型')=='板块弱势减仓提示'])}条")
+        else:
+            print(f"\n[板块弱势] 板块排名数据为空，跳过")
+    else:
+        print(f"\n[板块弱势] K线数据不足，跳过")
+except Exception as _swe:
+    print(f"\n[板块弱势] 板块弱势持仓识别异常(不影响其他条件单): {_swe}")
 
 # 5.5 V4.0(G6): 组合风控再平衡actions并入条件单闭环
 # （解决"组合风控只会算不会做"：卖出类动作转条件单进QMT，买入类仅建议不自动转单）
@@ -612,6 +833,60 @@ try:
             print(f"\n[组合风控] 再平衡动作: 卖出类已转条件单{rebalance_converted}条{_buy_note}")
 except Exception as e:
     print(f"\n[组合风控] 再平衡动作并入异常(不影响基础条件单): {e}")
+
+# 5.6 V9.0(P1-1): 风险平价再平衡 — 激活position/risk_parity.py接入生产链路
+_risk_parity_orders = []
+try:
+    from position.risk_parity import risk_parity_weights
+    from position.rebalance import RebalanceTrigger
+    # 计算当前权重
+    _total_mv = sum(h["市值"] for h in holdings_with_price if h["市值"] > 0)
+    _current_weights = {}
+    _vols = {}
+    for h in holdings_with_price:
+        if h["市值"] > 0 and _total_mv > 0:
+            _current_weights[h["code"]] = h["市值"] / _total_mv
+            # 用近20日波动率近似
+            _df = all_data.get(h["code"])
+            if _df is not None and len(_df) >= 20:
+                _ret = _df["close"].pct_change().tail(20)
+                _vols[h["code"]] = float(_ret.std() * (252 ** 0.5))
+    if _vols and _current_weights:
+        _target_weights = risk_parity_weights(_vols, max_weight=MAX_SINGLE_POSITION)
+        _trigger = RebalanceTrigger(threshold=0.05)
+        if _trigger.should_rebalance(_current_weights, _target_weights):
+            _rp_orders = _trigger.calc_rebalance_orders(
+                _current_weights, _target_weights, _total_mv,
+                {h["code"]: h["price"] for h in holdings_with_price}
+            )
+            _rp_sell_codes = {o["证券代码"] for o in all_orders if o.get("方向") == "卖出"}
+            for ro in _rp_orders:
+                if ro["action"] == "sell" and ro["code"] not in _rp_sell_codes:
+                    _h = next((h for h in holdings_with_price if h["code"] == ro["code"]), None)
+                    if _h and _h["price"] > 0:
+                        _risk_parity_orders.append({
+                            "类型": "风险平价再平衡",
+                            "优先级": "★★建议",
+                            "证券代码": ro["code"],
+                            "证券名称": _h["名称"],
+                            "方向": "卖出",
+                            "触发价": round(_h["price"] * 0.995, 3),
+                            "触发时间": "盘中实时",
+                            "数量": ro["shares"],
+                            "有效期": "3个交易日",
+                            "说明": f"风险平价: 当前{ro.get('drift',0)*100:+.1f}%偏离，减仓{ro['shares']}股",
+                        })
+            if _risk_parity_orders:
+                all_orders.extend(_risk_parity_orders)
+                print(f"\n[风险平价] ✅ 生成{len(_risk_parity_orders)}条再平衡条件单")
+                for rpo in _risk_parity_orders:
+                    print(f"  {rpo['证券名称']}: 减仓{rpo['数量']}股@{rpo['触发价']:.3f}")
+            else:
+                print(f"\n[风险平价] 目标权重偏离已触发，但卖出单已存在，不重复生成")
+        else:
+            print(f"\n[风险平价] 当前权重偏离在阈值内，无需再平衡")
+except Exception as e:
+    print(f"\n[风险平价] 再平衡计算异常(不影响其他条件单): {e}")
 
 # 6.5 V4.0(G4): 条件单下单前风控硬校验（三级仓位上限+现金底线）
 _positions_snapshot = {

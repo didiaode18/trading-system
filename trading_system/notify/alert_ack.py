@@ -61,16 +61,20 @@ _ACK_STATE_FILE = os.path.join(_DATA_DIR, "alert_ack_state.json")
 # ============================================================
 
 def _load_state() -> dict:
-    """读取ACK状态文件，失败返回空结构"""
+    """读取状态文件，失败返回空结构；自动迁移旧格式ack_records→delivered_records"""
     try:
         if os.path.exists(_ACK_STATE_FILE):
             with open(_ACK_STATE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                # V26: 迁移旧格式 ack_records → delivered_records
+                if "ack_records" in data and "delivered_records" not in data:
+                    data["delivered_records"] = data.pop("ack_records", {})
+                data.pop("pending_tokens", None)  # V26: 令牌机制已废弃
                 return data
     except Exception as e:
-        logger.warning(f"ACK状态读取失败: {e}")
-    return {"date": "", "ack_records": {}, "pending_tokens": {}}
+        logger.warning(f"状态读取失败: {e}")
+    return {"date": "", "delivered_records": {}}
 
 
 def _save_state(state: dict) -> None:
@@ -95,8 +99,7 @@ def _get_today_state() -> dict:
         # 新交易日自动重置
         state = {
             "date": today,
-            "ack_records": {},
-            "pending_tokens": {},
+            "delivered_records": {},
         }
         _save_state(state)
     return state
@@ -106,43 +109,48 @@ def _get_today_state() -> dict:
 # 核心查询接口
 # ============================================================
 
-def is_silenced(code: str, rule: str, level: str, urgency_score: float) -> bool:
-    """判断预警是否已被确认静默
+def is_delivered(code: str, rule: str, level: str, urgency_score: float) -> bool:
+    """V26: 判断预警是否已发送过（自动静默）
 
-    返回True表示该预警应被静默(不发送)。
-    条件恶化(urgency更高或新规则)时返回False(允许重新触发)。
+    返回True表示该预警当日已提醒过，应被静默。
+    条件恶化(urgency提升>=15分或新规则)时返回False(允许再提醒一次)。
     """
     try:
         state = _get_today_state()
-        ack_records = state.get("ack_records", {})
+        delivered = state.get("delivered_records", {})
 
-        # 查找该标的的确认记录
-        ack = ack_records.get(code)
-        if not ack:
+        rec = delivered.get(code)
+        if not rec:
             return False
 
-        # 同规则已确认 → 静默
-        if ack.get("rule") == rule:
-            return not _is_worsened(ack, urgency_score, rule)
+        # 同规则已提醒过 → 静默
+        if rec.get("rule") == rule:
+            return not _is_worsened(rec, urgency_score, rule)
 
-        # 不同规则 → 检查是否升级
-        # 新规则视为条件恶化，不静默
+        # 不同规则 → 视为恶化，不静默
         return False
     except Exception as e:
-        logger.warning(f"ACK静默检查失败: {e}")
+        logger.warning(f"静默检查失败: {e}")
         return False
 
 
-def _is_worsened(ack: dict, new_urgency: float, new_rule: str) -> bool:
-    """判断条件是否恶化：紧急度更高 或 触发了新的更严重规则"""
-    old_urgency = ack.get("urgency_score", 0)
-    old_rule = ack.get("rule", "")
+# V26: 向后兼容别名
+is_silenced = is_delivered
 
-    # 紧急度升级
-    if new_urgency > old_urgency:
+
+def _is_worsened(delivered: dict, new_urgency: float, new_rule: str) -> bool:
+    """判断条件是否恶化：紧急度提升>=15分 或 触发了新的更严重规则
+
+    V26: 新增urgency差值阈值(15分)，避免微小波动触发重复推送
+    """
+    old_urgency = delivered.get("urgency_score", 0)
+    old_rule = delivered.get("rule", "")
+
+    # V26: 紧急度提升需>=15分才算恶化(避免85→88的微小波动触发再提醒)
+    if new_urgency - old_urgency >= 15:
         return True
 
-    # 新规则(不同于已确认规则)视为恶化
+    # 新规则(不同于已提醒规则)视为恶化
     if new_rule != old_rule:
         return True
 
@@ -150,36 +158,73 @@ def _is_worsened(ack: dict, new_urgency: float, new_rule: str) -> bool:
 
 
 def get_ack_record(code: str) -> dict:
-    """获取标的的当前确认记录，无记录返回空dict"""
+    """获取标的今日记录，无记录返回空dict"""
     try:
         state = _get_today_state()
-        return state.get("ack_records", {}).get(code, {})
+        return state.get("delivered_records", {}).get(code, {})
     except Exception:
         return {}
+
+
+# ============================================================
+# V8.3: 跨周期方向记忆查询
+# ============================================================
+
+_BUY_KW = ("回调加仓", "加仓机会", "可以加仓", "突破加仓")
+_SELL_KW = ("紧急卖出", "建议减仓", "止损", "清仓", "跌破", "暴跌", "趋势降级")
+
+
+def get_last_signal_direction(code: str) -> dict:
+    """V8.3: 查询该标的最近一次已推送信号的方向
+
+    返回:
+        {"direction": "buy"/"sell"/"none", "rule": str, "time": str, "urgency": float}
+    """
+    try:
+        rec = get_ack_record(code)
+        if not rec:
+            return {"direction": "none", "rule": "", "time": "", "urgency": 0}
+        rule = rec.get("rule", "")
+        # 判断方向
+        is_buy = any(k in rule for k in _BUY_KW)
+        is_sell = any(k in rule for k in _SELL_KW)
+        if is_sell:
+            direction = "sell"
+        elif is_buy:
+            direction = "buy"
+        else:
+            direction = "none"
+        return {
+            "direction": direction,
+            "rule": rule,
+            "time": rec.get("ack_time", ""),
+            "urgency": rec.get("urgency_score", 0),
+        }
+    except Exception:
+        return {"direction": "none", "rule": "", "time": "", "urgency": 0}
 
 
 # ============================================================
 # 确认操作
 # ============================================================
 
-def record_ack(code: str, rule: str, level: str, urgency_score: float,
-               suggested_qty: int = 0) -> bool:
-    """记录用户确认操作
+def record_delivery(code: str, rule: str, level: str, urgency_score: float,
+                    suggested_qty: int = 0) -> bool:
+    """V26: 记录预警已发送（自动静默，无需用户确认）
 
-    参数:
-        code: 标的代码
-        rule: 触发规则名
-        level: 预警级别
-        urgency_score: 紧急度分数
-        suggested_qty: 建议操作数量(股)
-
-    返回: 是否成功记录
+    发送成功后自动调用，登记该标的+规则当日已提醒。
+    后续同标的同规则预警将被静默，除非条件恶化。
     """
     try:
         state = _get_today_state()
-        ack_records = state.setdefault("ack_records", {})
+        delivered = state.setdefault("delivered_records", {})
 
-        ack_records[code] = {
+        # 如果已有记录且urgency更高，不覆盖（保留最高基准用于恶化判断）
+        existing = delivered.get(code)
+        if existing and existing.get("urgency_score", 0) > urgency_score:
+            return True  # 已有更高urgency记录，无需更新
+
+        delivered[code] = {
             "rule": rule,
             "level": level,
             "ack_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -189,11 +234,15 @@ def record_ack(code: str, rule: str, level: str, urgency_score: float,
         }
 
         _save_state(state)
-        logger.info(f"  [ACK] ✅ 用户已确认: {code} {rule} 紧急度{urgency_score}")
+        logger.info(f"  [静默登记] {code} {rule} 紧急度{urgency_score} (当日已提醒)")
         return True
     except Exception as e:
-        logger.warning(f"ACK记录失败: {e}")
+        logger.warning(f"发送登记失败: {e}")
         return False
+
+
+# V26: 向后兼容别名
+record_ack = record_delivery
 
 
 # ============================================================
@@ -352,15 +401,14 @@ def cleanup_expired_tokens() -> None:
 # ============================================================
 
 def get_ack_summary(code: str) -> str:
-    """获取标的今日确认摘要，无记录返回空字符串"""
+    """获取标的今日提醒摘要"""
     try:
-        ack = get_ack_record(code)
-        if not ack:
+        rec = get_ack_record(code)
+        if not rec:
             return ""
-        ack_time = ack.get("ack_time", "")
-        rule = ack.get("rule", "")
-        qty = ack.get("ack_qty", 0)
-        return f"已确认 {ack_time} | {rule} | 已处理{qty}股"
+        ack_time = rec.get("ack_time", "")
+        rule = rec.get("rule", "")
+        return f"已提醒 {ack_time} | {rule}"
     except Exception:
         return ""
 
@@ -424,14 +472,11 @@ def build_action_card_md(alerts: list, header_title: str,
 
 def build_action_card_payload(alerts: list, header_title: str,
                               now_str: str, today_str: str,
-                              confirm_url_base: str) -> dict:
-    """构建钉钉ActionCard完整payload
+                              confirm_url_base: str = "") -> dict:
+    """构建钉钉ActionCard payload
 
-    参数:
-        alerts: 预警列表
-        header_title: 标题
-        now_str/today_str: 时间字符串
-        confirm_url_base: 确认回调URL前缀(如 http://192.168.88.101:9876/ack/)
+    V26: 移除确认按钮（自动静默模式，无需用户确认）
+    confirm_url_base参数保留但不再使用（向后兼容）
 
     返回: 可直接json.dumps发送的payload dict
     """
@@ -440,55 +485,25 @@ def build_action_card_payload(alerts: list, header_title: str,
     except ImportError:
         from trading_system.notify.wechat_notify import _ensure_keyword
 
-    # 构建确认按钮
-    buttons = []
-    for a in alerts[:3]:
-        code = a.get("code", "")
-        rule = a.get("rule", a.get("rule_name", ""))
-        level = a.get("level", "info")
-        urgency = a.get("urgency_score", 0)
-        token = generate_token(code, rule, level, urgency)
-        if token:
-            buttons.append({
-                "title": f"✅ {a.get('name', code)}已处理",
-                "actionURL": f"{confirm_url_base}{token}"
-            })
-
     # Markdown内容
     md_text = build_action_card_md(alerts, header_title, now_str, today_str)
 
-    # 追加确认指引
-    if buttons:
-        md_text += "\n\n---\n\n> 👆 处理完毕后请点击下方按钮确认，当日不再重复推送"
-    else:
-        md_text += ("\n\n---\n\n> 💡 命令行确认: python -m trading_system.notify.alert_ack "
-                    "confirm <code> <rule>")
+    # V26: 移除确认按钮提示，改为自动静默提示
+    md_text += "\n\n---\n\n> \U0001f4e2 同标的同规则当日仅提醒一次，条件恶化时自动再提醒"
 
     # 关键词安全
     md_text = _ensure_keyword(md_text)
-    title = _ensure_keyword(header_title)  # 返回带关键词前缀的标题字符串
+    title = _ensure_keyword(header_title)
 
-    if buttons:
-        # 多按钮ActionCard
-        payload = {
-            "msgtype": "actionCard",
-            "actionCard": {
-                "title": title,
-                "text": md_text,
-                "btnOrientation": "0",
-                "btns": buttons,
-            }
+    # V26: 无按钮ActionCard（singleTitle仅展示，无实际链接）
+    payload = {
+        "msgtype": "actionCard",
+        "actionCard": {
+            "title": title,
+            "text": md_text,
+            "singleTitle": "\U0001f4cb 查看详情",
+            "singleURL": "",
         }
-    else:
-        # 单按钮ActionCard
-        payload = {
-            "msgtype": "actionCard",
-            "actionCard": {
-                "title": title,
-                "text": md_text,
-                "singleTitle": "✅ 全部已处理",
-                "singleURL": f"{confirm_url_base}all",
-            }
-        }
+    }
 
     return payload

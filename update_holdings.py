@@ -50,12 +50,12 @@ import config
 def get_holdings_paths():
     """获取所有需要同步的holdings.json路径"""
     paths = []
-    # 主路径: trading_system/holdings.json
-    primary = os.path.join(TRADING_SYSTEM_DIR, "holdings.json")
+    # 主路径: 根目录 holdings.json（用户可见的权威路径）
+    primary = os.path.join(SCRIPT_DIR, "holdings.json")
     paths.append(primary)
-    # 根目录路径: holdings.json（兼容旧脚本）
-    legacy = os.path.join(SCRIPT_DIR, "holdings.json")
-    if legacy != primary:
+    # 兼容路径: trading_system/holdings.json（逐步废弃）
+    legacy = os.path.join(TRADING_SYSTEM_DIR, "holdings.json")
+    if legacy != primary and os.path.exists(legacy):
         paths.append(legacy)
     return paths
 
@@ -71,6 +71,17 @@ def load_current_holdings():
 
 def save_holdings(holdings: dict):
     """保存holdings.json到所有路径（原子写 + 异常降级，防止进程中断导致文件截断）"""
+    # [P0-#2修复] 保存前自动清理shares=0的已清仓记录，防止持仓文件无限膨胀
+    zero_codes = [c for c, h in holdings.items() if h.get("shares", 0) <= 0]
+    if zero_codes:
+        for c in zero_codes:
+            del holdings[c]
+        print(f"  🧹 已清理 {len(zero_codes)} 只已清仓记录 (shares=0)")
+    # [P0-#2修复] MAX_HOLDINGS 上限检查
+    max_h = getattr(config, 'MAX_HOLDINGS', 8)
+    active_count = sum(1 for h in holdings.values() if h.get("shares", 0) > 0)
+    if active_count > max_h:
+        print(f"  ⚠️ 持仓数{active_count}超过MAX_HOLDINGS={max_h}上限，请检查是否异常！")
     paths = get_holdings_paths()
     ok_count = 0
     for path in paths:

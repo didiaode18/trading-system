@@ -22,11 +22,19 @@ import logging
 import numpy as np
 import pandas as pd
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
 class AntiManipulationAnalyzer:
-    """主力行为识别与反操控分析"""
+    """
+    主力行为识别与反操控分析器
+
+    职责:
+      识别主力操盘行为（拉抬/打压/洗盘/出货），
+      提供反操控建议（避免追高/抄底被套）。
+    """
 
     def __init__(self):
         # 检测参数
@@ -106,6 +114,21 @@ class AntiManipulationAnalyzer:
             score += 15  # 诱空=看多信号
             details.append(bear_detail)
 
+        # ---- 4.5 V10.1: 诱多/诱空早期征兆检测(前瞻性预警) ----
+        # W4修复: 提前计算压盘吸筹，传给 _detect_early_trap_warning 避免重复计算
+        accum_result = self.detect_accumulation_anomaly(df)
+        early_warning = self._detect_early_trap_warning(df, accum_result=accum_result)
+        if early_warning.get("early_bull_trap"):
+            result["early_bull_trap"] = True
+            result["early_bull_trap_detail"] = early_warning["early_bull_trap_detail"]
+            score -= 8  # 早期诱多也是看空信号(但弱于确认型)
+            details.append(f"早期诱多: {early_warning['early_bull_trap_detail']}")
+        if early_warning.get("early_bear_trap"):
+            result["early_bear_trap"] = True
+            result["early_bear_trap_detail"] = early_warning["early_bear_trap_detail"]
+            score += 8  # 早期诱空也是看多信号
+            details.append(f"早期诱空: {early_warning['early_bear_trap_detail']}")
+
         # ---- 5. 异常波动检测 ----
         abnormal_score, abn_detail = self._detect_abnormal_volatility(df)
         score += abnormal_score
@@ -119,7 +142,7 @@ class AntiManipulationAnalyzer:
             details.append(pat_detail)
 
         # ---- 7. 大单净流入异常检测（压盘吸筹） ----
-        accum_result = self.detect_accumulation_anomaly(df)
+        # W4修复: accum_result 已在 4.5 步骤计算，直接复用
         if accum_result.get("is_accumulation"):
             score += 15  # 压盘吸筹 → 洗盘概率增加15分
             details.append(accum_result["description"])
@@ -421,6 +444,105 @@ class AntiManipulationAnalyzer:
                     return True, "低位放量长下影(诱空吸筹)"
 
         return False, ""
+
+    # ============================================================
+    # V10.1: 诱多/诱空早期征兆检测(前瞻性预警)
+    # ============================================================
+
+    def _detect_early_trap_warning(self, df: pd.DataFrame, accum_result: dict = None) -> dict:
+        """诱多/诱空早期征兆检测 —— 在陷阱确认前发出预警
+
+        诱多早期征兆(3个领先指标):
+          1. 试探性拉升: 上影线>实体*3 + 收盘<=(high+low)/2
+          2. 量价背离: 连续3日价涨量缩
+          3. 资金衰退: 主力流入连续3日递减
+
+        诱空早期征兆(3个领先指标):
+          1. 恐慌测试: 下影线>实体*3 + 收盘>=(high+low)/2
+          2. 缩量假跌: 连续3日价跌量缩(卖压衰竭)
+          3. 承接增强: 低位出现大买单(压盘吸筹)
+
+        返回: {"early_bull_trap": bool, "early_bull_trap_detail": str,
+               "early_bear_trap": bool, "early_bear_trap_detail": str}
+        """
+        result = {
+            "early_bull_trap": False, "early_bull_trap_detail": "",
+            "early_bear_trap": False, "early_bear_trap_detail": "",
+        }
+
+        if len(df) < 10:
+            return result
+
+        latest = df.iloc[-1]
+        close = df["close"].values
+        volume = df["volume"].values
+
+        # ==== 诱多早期征兆 ====
+        bull_signals = 0
+        bull_reasons = []
+
+        # 征兆1: 试探性拉升(上影线>实体*3 + 收盘偏下)
+        body = abs(latest["close"] - latest["open"])
+        upper_shadow = latest["high"] - max(latest["close"], latest["open"])
+        mid_price = (latest["high"] + latest["low"]) / 2
+        if body > 0 and upper_shadow > body * 3 and latest["close"] < mid_price:
+            bull_signals += 40
+            bull_reasons.append("试探性拉升(长上影+收低)")
+
+        # 征兆2: 连续3日价涨量缩
+        if len(close) >= 4 and len(volume) >= 4:
+            price_rising_vol_shrinking = True
+            for i in range(-3, 0):
+                if close[i] <= close[i - 1] or volume[i] >= volume[i - 1]:
+                    price_rising_vol_shrinking = False
+                    break
+            if price_rising_vol_shrinking:
+                bull_signals += 35
+                bull_reasons.append("连续3日价涨量缩(动能衰退)")
+
+        # 征兆3: 主力流入连续3日递减(用main_flow列如果存在)
+        if "main_flow" in df.columns and len(df) >= 4:
+            main_flows = df["main_flow"].tail(3).values
+            if main_flows[0] > main_flows[1] > main_flows[2]:
+                bull_signals += 25
+                bull_reasons.append("主力流入连续3日递减")
+
+        if bull_signals >= 65:
+            result["early_bull_trap"] = True
+            result["early_bull_trap_detail"] = "+".join(bull_reasons)
+
+        # ==== 诱空早期征兆 ====
+        bear_signals = 0
+        bear_reasons = []
+
+        # 征兆1: 恐慌测试(下影线>实体*3 + 收盘偏上)
+        lower_shadow = min(latest["open"], latest["close"]) - latest["low"]
+        if body > 0 and lower_shadow > body * 3 and latest["close"] > mid_price:
+            bear_signals += 40
+            bear_reasons.append("恐慌测试(长下影+收高)")
+
+        # 征兆2: 连续3日价跌量缩(卖压衰竭)
+        if len(close) >= 4 and len(volume) >= 4:
+            price_falling_vol_shrinking = True
+            for i in range(-3, 0):
+                if close[i] >= close[i - 1] or volume[i] >= volume[i - 1]:
+                    price_falling_vol_shrinking = False
+                    break
+            if price_falling_vol_shrinking:
+                bear_signals += 35
+                bear_reasons.append("连续3日价跌量缩(卖压衰竭)")
+
+        # 征兆3: 低位压盘吸筹(W4修复: 复用父级传入的 accum_result，避免重复计算)
+        accum = accum_result if accum_result is not None else self.detect_accumulation_anomaly(df)
+        if accum.get("is_accumulation"):
+            bear_signals += 25
+            bear_reasons.append(f"低位压盘吸筹({accum['days']}天)")
+
+        if bear_signals >= 65:
+            result["early_bear_trap"] = True
+            result["early_bear_trap_detail"] = "+".join(bear_reasons)
+
+        return result
 
     # ============================================================
     # 异常波动检测

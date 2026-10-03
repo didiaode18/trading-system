@@ -33,6 +33,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # 行业ETF映射表（覆盖主要赛道）
+# FIX P1-C: 扩展ETF映射，覆盖持仓中的主要板块
 SECTOR_ETF_MAP = {
     "芯片半导体": {"etf": "159599", "name": "芯片指数"},
     "新能源": {"etf": "516160", "name": "新能源ETF"},
@@ -44,6 +45,16 @@ SECTOR_ETF_MAP = {
     "白酒": {"etf": "512690", "name": "酒ETF"},
     "有色金属": {"etf": "512400", "name": "有色ETF"},
     "人工智能": {"etf": "515070", "name": "人工智能"},
+    # P1-C 新增: 覆盖当前持仓板块
+    "能源化工": {"etf": "516980", "name": "化工ETF"},
+    "能源": {"etf": "159930", "name": "能源ETF"},
+    "电力公用": {"etf": "159611", "name": "电力ETF"},
+    "乳制品": {"etf": "159928", "name": "消费ETF"},
+    "CRO/CDMO": {"etf": "512010", "name": "医药ETF"},
+    "食品饮料": {"etf": "515170", "name": "食品ETF"},
+    "半导体材料": {"etf": "159599", "name": "芯片指数"},
+    "光通信": {"etf": "515880", "name": "通信ETF"},
+    "宽基ETF": {"etf": "510300", "name": "沪深300"},
 }
 
 # 轮动参数
@@ -104,6 +115,12 @@ class SectorRotationStrategy:
             vol_20 = vol.tail(20).mean()
             vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1.0
 
+            # FIX P1-B: 板块加速度指标——近5日动量 vs 近20日动量
+            # 加速度>0表示板块在加速上涨，<0表示动量衰减（追高风险）
+            _mom_5d = (close.iloc[-1] / close.iloc[-min(5, len(close))] - 1) * 100
+            _mom_20d = momentum  # 已在上方计算
+            _acceleration = _mom_5d - (_mom_20d / 4)  # 5日动量 vs 20日平均动量
+
             results.append({
                 "sector": sector,
                 "etf": etf_code,
@@ -112,6 +129,7 @@ class SectorRotationStrategy:
                 "trend": trend,
                 "vol_ratio": round(vol_ratio, 2),
                 "close": round(close.iloc[-1], 4),
+                "acceleration": round(_acceleration, 2),  # P1-B 新增字段
             })
 
         # 按动量降序排列

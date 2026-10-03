@@ -1,6 +1,11 @@
-# 操盘密码 V9.0 系统设计知识库
+# 操盘密码 V10.0 系统设计知识库
 
-> 版本: V9.0+V6.0 | 最后同步日期: 2026-08-31 | 对应代码版本: 操盘密码 V9.0 + CANSLIM选股V6.0 | 基于代码实际实现编写
+> 版本: V10.0+V6.0 | 最后同步日期: 2026-09-21 | 对应代码版本: 操盘密码 V10.0 + CANSLIM选股V6.0 | 基于代码实际实现编写
+> 2026-09-21: P0-A状态防抖 + P0-D熔断约束 + P0-C ActionPlanner集成 + P1-A极端应急 + P1-G仓位对齐 + P2-A宽度改进
+> P1-4: intraday_monitor 拆分出 intraday_patterns + market_gate 模块
+> P1-3: quant/factors 因子计算统一委托给 factors/quant_factors（单一数据源）
+> P1-5: generate_holdings_report.py 迁移至 output/
+> P1-7: system_test* 统一迁移为 pytest 格式 test_system_integration.py
 
 ---
 
@@ -44,7 +49,7 @@
 | 10 | monitor/ | 盘中实时监控 | intraday_monitor.py | data(realtime) | notify |
 | 11 | attribution/ | 绩效归因 | alpha_beta.py, barra.py | backtest | 报告 |
 | 12 | notify/ | 通知推送 | email_notify.py, wechat_notify.py, alert_ledger.py | 所有模块 | 用户 |
-| 13 | output/ | 报告区块与组合监控 | weekly_review.py, portfolio_monitor.py, live_divergence.py | attribution, factors, data | 邮件报告 |
+| 13 | output/ | 报告生成与邮件发送 | condition_sheet.py, daily_digest.py, eastmoney_orders.py, morning_brief.py | attribution, factors, data | 邮件报告 |
 
 > [NOTE] 早期规划中的 paper_trading/（模拟交易）层尚未建目录落地，当前实际落地为 12 个模块层 + output/ 报告层；模拟验证能力由回测层（backtest/）承担。
 
@@ -758,7 +763,7 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 
 | 编号 | 能力 | 说明 |
 |------|------|------|
-| P1 | 周报基准收益修复 | 修复 weekly_review `benchmark_return: 0 # TODO`，改从本地DB取沪深300近5日；取不到时显示"暂无"而非误导性0 |
+| P1 | ~~周报基准收益修复~~ | ~~已移除 weekly_review 模块（2026-09-15），日报已覆盖周度回顾内容~~ |
 | P2 | CAPM/择时归因 | 实盘净值 vs 沪深300对齐后调用 attribution/alpha_beta（含T-M择时）；样本<20时标注"样本偏少结论仅供参考" |
 | P3 | 滑点归因区块 | execution/slippage_section.py；校准建议只展示"待人工确认"，绝不调用apply_backtest_adjustment自动写回 |
 | P4 | Deflated Sharpe进月度Walk-Forward邮件 | DSR>0.95才认为夏普显著（多重检验校正） |

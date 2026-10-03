@@ -132,7 +132,9 @@ def get_ma5_trend(codes: list) -> dict:
 
     for code in codes:
         try:
-            if code.startswith("5") or code.startswith("1"):
+            # V8.2: 统一品种判定
+            from utils.instrument import is_etf
+            if is_etf(code):
                 df = ak.fund_etf_hist_em(symbol=code, period="daily",
                                          start_date=start_date, end_date=end_date,
                                          adjust="qfq")

@@ -151,10 +151,10 @@ def load_data_from_db(stock_codes=None, days=750):
 
     for code in stock_codes:
         try:
-            query = f"""SELECT date, open, close, high, low, volume 
-                       FROM daily_kline WHERE code='{code}' 
-                       ORDER BY date DESC LIMIT {days}"""
-            df = pd.read_sql(query, conn)
+            query = """SELECT date, open, close, high, low, volume
+                       FROM daily_kline WHERE code=? 
+                       ORDER BY date DESC LIMIT ?"""
+            df = pd.read_sql(query, conn, params=[code, days])
             if df is not None and not df.empty and len(df) > 60:
                 df = df.sort_values("date").reset_index(drop=True)
                 for col in ["open", "close", "high", "low", "volume"]:
@@ -168,10 +168,10 @@ def load_data_from_db(stock_codes=None, days=750):
 
     # 加载基准
     try:
-        query = f"""SELECT date, open, close, high, low, volume 
+        query = """SELECT date, open, close, high, low, volume
                    FROM daily_kline WHERE code='000300' 
-                   ORDER BY date DESC LIMIT {days}"""
-        bench = pd.read_sql(query, conn)
+                   ORDER BY date DESC LIMIT ?"""
+        bench = pd.read_sql(query, conn, params=[days])
         if bench is not None and not bench.empty:
             bench = bench.sort_values("date").reset_index(drop=True)
             for col in ["open", "close", "high", "low", "volume"]:

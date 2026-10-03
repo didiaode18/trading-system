@@ -83,6 +83,54 @@ def _enabled() -> bool:
     return bool(getattr(config, "BUY_POINT_ALERT_ENABLED", True))
 
 
+def _get_sector_status(sector_name: str) -> str:
+    """
+    V9.1(P1-1): 获取板块景气状态标签
+
+    读取 sector_rotation_cache.json，返回板块景气描述文本。
+    任何异常返回空字符串（不影响推送）。
+
+    Returns:
+        "半导体·🔥加速上涨(动量82分)" 或 "乳制品·❄️震荡(动量45分)" 等
+    """
+    if not sector_name:
+        return ""
+    try:
+        _rot_path = os.path.join(_DATA_DIR, "sector_rotation_cache.json")
+        if not os.path.exists(_rot_path):
+            return ""
+        with open(_rot_path, "r", encoding="utf-8") as f:
+            _rot = json.load(f)
+        # 校验新鲜度（24小时）
+        _updated = _rot.get("updated", "")
+        if _updated:
+            try:
+                _ts = datetime.datetime.fromisoformat(str(_updated))
+                if (datetime.datetime.now() - _ts).total_seconds() > 24 * 3600:
+                    return ""
+            except Exception:
+                pass
+        _scores = _rot.get("sector_scores", {})
+        _strong = set(_rot.get("strong", []))
+        _weak = set(_rot.get("weak", []))
+        _score = _scores.get(sector_name)
+        if _score is None:
+            return ""
+        if sector_name in _strong:
+            _status = "🔥加速上涨"
+        elif sector_name in _weak:
+            _status = "❄️弱势流出"
+        elif _score >= 70:
+            _status = "📈偏强上升"
+        elif _score <= 35:
+            _status = "📉偏弱震荡"
+        else:
+            _status = "⚖️中性震荡"
+        return f"{sector_name}·{_status}(动量{_score:.0f}分)"
+    except Exception:
+        return ""
+
+
 def _load_json(path: str) -> dict:
     try:
         if os.path.exists(path):
@@ -154,6 +202,7 @@ def save_buy_alert_levels(result: dict) -> int:
                     "code": str(item.get("code", "")),
                     "name": item.get("name", ""),
                     "sector_group": item.get("sector_group", ""),
+                    "sector_status": _get_sector_status(item.get("sector_group", "")),
                     "factor_score": item.get("factor_score", 0),
                     "aggressive_buy": float(item.get("aggressive_buy") or 0),
                     "moderate_buy": moderate,
@@ -270,10 +319,12 @@ def merge_intraday_picks(candidates: list) -> int:
             if _added_today + added >= _max_per_day or len(levels) >= _max_levels:
                 break
             _first_shares = max(100, int(20000 // price // 100) * 100)
+            _sec_name = cand.get("sector", cand.get("sector_group", ""))
             levels.append({
                 "code": code,
                 "name": cand.get("name", ""),
-                "sector_group": cand.get("sector", cand.get("sector_group", "")),
+                "sector_group": _sec_name,
+                "sector_status": _get_sector_status(_sec_name),
                 "factor_score": 0,
                 "aggressive_buy": round(price * 0.99, 2),
                 "moderate_buy": round(price * 0.97, 2),
@@ -345,13 +396,19 @@ def check_levels_validity() -> dict:
 
 
 def _market_gate() -> tuple:
-    """大盘环境四档闸门（上证/沪深300取较差者）
+    """大盘环境四档闸门（上证/沪深300取较差者）+ V24情绪维度硬阻断
 
     返回 (level, label, emoji, pct_sh, pct_300):
       L0正常(>-0.5%) 正常执行 | L1走弱 买点降级仅池内龙头
-      L2整体走跌(≤-1.5%) 暂停全部推送 | L3系统性风险(≤-2.5%) 禁止买入
+      L2整体走跌(≤-1.0%) 暂停全部推送 | L3系统性风险(≤-2.5%) 禁止买入
+    V24新增: 情绪≤30分(恐慌) → 强制L2阻断; 策略熔断(breaker) → 强制L2阻断
     行情异常时降级为L0并记日志，不误杀也不阻断调用方。
     """
+    # ---- V24: 情绪维度硬阻断（恐慌市不推送买入，修复"一边减仓一边推买点"矛盾）----
+    _gate_extra = _market_gate_sentiment_override()
+    if _gate_extra is not None:
+        return _gate_extra
+
     try:
         from data.realtime import fetch_index_realtime
         sh = fetch_index_realtime("000001") or {}
@@ -384,6 +441,46 @@ def _market_gate() -> tuple:
     if worst <= GATE_L1_WEAK:
         return 1, "大盘走弱", "🟡", pct_sh, pct_300
     return 0, "正常", "🟢", pct_sh, pct_300
+
+
+def _market_gate_sentiment_override() -> tuple | None:
+    """V24: 情绪+策略熔断硬阻断（返回None表示不覆盖，走原指数闸门）
+
+    检查两个独立维度:
+      1. 市场情绪温度 ≤ 30分(恐慌) → 强制L2阻断
+      2. 策略失效检测器处于breaker状态 → 强制L2阻断
+    任一触发则返回L2级闸门元组，全部异常静默降级返回None(不影响原逻辑)。
+    """
+    # 1. 情绪温度检查
+    try:
+        from strategy.market_pulse import get_pulse_summary
+        summary = get_pulse_summary()
+        temp = summary.get("temperature")
+        level_label = summary.get("level", "")
+        if temp is not None and temp <= 40:
+            logger.warning(
+                f"[买点提醒] V24情绪闸门: 情绪{temp}分({level_label})≤40，"
+                f"强制阻断全部买点推送"
+            )
+            return (2, f"情绪恐慌({temp}分)", "🧊", 0.0, 0.0)
+    except Exception as e:
+        logger.debug(f"[买点提醒] 情绪闸门检查异常(降级不影响): {e}")
+
+    # 2. 策略熔断检查
+    try:
+        from risk.risk_control import StrategyFailureDetector
+        sfd = StrategyFailureDetector()
+        status = sfd.get_status()
+        if status.get("current_level") == "breaker":
+            logger.warning(
+                f"[买点提醒] V24策略熔断闸门: 策略失效检测器处于breaker状态，"
+                f"强制阻断全部买点推送"
+            )
+            return (2, "策略熔断(breaker)", "⚰️", 0.0, 0.0)
+    except Exception as e:
+        logger.debug(f"[买点提醒] 策略熔断闸门检查异常(降级不影响): {e}")
+
+    return None
 
 
 def _load_buy_block(today_str: str) -> set:
@@ -483,8 +580,11 @@ def _quote_is_fresh(quote: dict, today_str: str) -> bool:
 
 def _max_position_ratio(code: str) -> float:
     """单只仓位上限比例: ETF→20%，池内龙头→15%，其余弹性标的→8%"""
-    if str(code).startswith("5") or str(code).startswith("1"):
-        return float(getattr(config, "MAX_SINGLE_ETF_RATIO", 0.20))
+    # V8.2: 统一使用instrument模块查询品种仓位上限
+    from utils.instrument import get_max_single_position
+    _inst_max = get_max_single_position(code)
+    if _inst_max != float(getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15)):
+        return _inst_max  # ETF/可转债有专属上限
     pool_info = getattr(config, "STOCK_POOL", {}).get(str(code), {})
     if pool_info.get("类型") == "龙头":
         return float(getattr(config, "LEADER_STOCK_MAX_RATIO", 0.15))
@@ -510,6 +610,8 @@ def _build_push_text(lv: dict, tier_label: str, tier_price: float,
     """
     code, name = lv.get("code", ""), lv.get("name", lv.get("code", ""))
     sector = lv.get("sector_group", "")
+    # V9.1(P1-1): 板块景气状态标签
+    sector_status = lv.get("sector_status", "") or _get_sector_status(sector)
     stop = lv.get("stop_loss", 0)
     stop_str = f"{stop:.2f}" if stop > 0 else "-"
     shares = lv.get("first_shares", 0)
@@ -596,10 +698,17 @@ def _build_push_text(lv: dict, tier_label: str, tier_price: float,
         banner += f"### ⚠️ 指数行情缺失，按走弱降级处理\n\n---\n\n"
     
     # 主体卡片
+    # V9.1(P1-1): 赛道展示升级为“板块名·景气状态”
+    _sector_display = sector_status if sector_status else sector
+    _sector_weak_warn = ""
+    if sector_status and ("❄️" in sector_status or "📉" in sector_status):
+        _sector_weak_warn = ("\n\n⚠️ **板块弱势提醒**: 所在板块景气度偏低，"
+                             "买入需更严格止损纪律，建议仅限首仓\n\n")
     content = (
         f"{banner}"
         f"### 🎯 {name} ({code})\n\n"
-        f"**赛道**: {sector} | **评分**: {lv.get('factor_score', '-')} | **环境**: {env_str or '🟢 正常'}\n\n"
+        f"**赛道**: {_sector_display} | **评分**: {lv.get('factor_score', '-')} | **环境**: {env_str or '🟢 正常'}\n\n"
+        f"{_sector_weak_warn}"
         f"---\n\n"
         f"#### 📊 触发详情\n\n"
         f"**现价**: {price:.2f} ≤ **{tier_label}买点**: {tier_price:.2f}{trigger_note}{source_note}\n\n"
@@ -660,14 +769,12 @@ def _push_alert(title: str, content: str, alert_meta: dict = None):
 
     # ---- 钉钉/企微推送 ----
     try:
-        # V6.0: ACK开启 + 有alert_meta → ActionCard(含确认按钮)
+        # V26: 自动静默模式 —— ActionCard无按钮，发送后自动登记静默
         _ack_ok = False
-        if alert_meta and getattr(config, "ALERT_ACK_ENABLED", True):
+        if alert_meta and getattr(config, "ALERT_AUTO_SILENCE", True):
             try:
                 from notify.alert_ack import build_action_card_payload
                 from notify.wechat_notify import send_dingtalk_action_card
-                _confirm_base = getattr(config, "ALERT_ACK_CALLBACK_URL",
-                                        "http://192.168.88.101:9876/ack/")
                 _now_str = datetime.datetime.now().strftime("%H:%M")
                 _today_str2 = datetime.date.today().strftime("%Y-%m-%d")
                 # 构造单条预警的alerts列表(复用ACK模块的ActionCard构建)
@@ -685,12 +792,18 @@ def _push_alert(title: str, content: str, alert_meta: dict = None):
                     "extra_rules": [],
                 }]
                 _header = f"[股票] 🎯 买点到价提醒 ({alert_meta.get('name', '')})"
+                # V26: 无按钮ActionCard
                 _payload = build_action_card_payload(
-                    _bp_alerts, _header, _now_str, _today_str2, _confirm_base)
+                    _bp_alerts, _header, _now_str, _today_str2)
                 _ack_ok = send_dingtalk_action_card(_payload)
                 if _ack_ok:
                     channel_ok = True
-                    logger.info(f"[买点提醒] ActionCard发送成功(含ACK按钮): "
+                    # V26: 发送成功后自动登记静默
+                    from notify.alert_ack import record_delivery
+                    record_delivery(alert_meta.get("code", ""),
+                                    f"买点到价-{alert_meta.get('tier', '')}",
+                                    "high", 80)
+                    logger.info(f"[买点提醒] ActionCard发送成功: "
                                 f"{alert_meta.get('code', '')} "
                                 f"{alert_meta.get('tier', '')}")
             except Exception as _ack_e:
@@ -952,15 +1065,15 @@ def check_buy_point_alerts(skip_codes=None) -> list:
                     "is_holding": code in held_map,
                     "held_shares": int(held_map.get(code, 0)),
                 }
-                # V6.0: ACK静默检查 —— 用户已确认的同标的同档位买点当日不再推送
+                # V26: 自动静默检查 —— 同标的同档位当日已提醒则不再推送
                 try:
-                    from notify.alert_ack import is_silenced as _bp_silenced
-                    if _bp_silenced(code, f"买点到价-{hit_label}", "high", 80):
-                        logger.info(f"  [买点提醒] ACK静默: {code} {hit_label}档 "
-                                    f"(用户已确认，当日不再推送)")
+                    from notify.alert_ack import is_delivered as _bp_delivered
+                    if _bp_delivered(code, f"买点到价-{hit_label}", "high", 80):
+                        logger.info(f"  [买点提醒] 自动静默: {code} {hit_label}档 "
+                                    f"(当日已提醒，不再推送)")
                         continue
                 except Exception as _bp_e:
-                    logger.debug(f"[买点提醒] ACK静默检查异常(不阻断): {_bp_e}")
+                    logger.debug(f"[买点提醒] 静默检查异常(不阻断): {_bp_e}")
                 # H2修复: 先推送，仅成功后才登记去重；失败记失败计数允许下轮重试
                 alert["pushed"] = _push_alert(title, content, alert_meta=alert)
                 triggered.append(alert)

@@ -1,19 +1,26 @@
 """
-大盘状态智能识别模块 V1.0
+大盘状态智能识别模块 V1.1
 ==========================
 使用多维度特征+隐马尔可夫模型(HMM)思想识别市场状态，
 比简单MA20/MA60判断更准确
+
+V1.1 新增:
+  - 量能极值检测: “地量见地价”信号，极致缩量时修正BEAR误判
+  - 量价背离检测: 价格新低但成交量不创新低 → 卖压衰竭
+  - 底部概率评分: 综合多维度量化底部临近概率
+  - 逆向仓位层: 底部信号强烈时提升仓位下限
 
 核心方法:
   1. 多特征融合判定（趋势+波动率+量能+ breadth）
   2. 基于HMM思想的三状态模型（牛市/震荡/熊市）
   3. 状态转换概率矩阵（预判下一步走势）
   4. 自适应仓位建议（根据状态动态调整）
+  5. V1.1: 底部逆向修正（地量信号→仓位下限保护）
 
 特征维度:
   - 趋势特征: MA20/MA60关系、指数斜率
   - 波动率特征: ATR变化、振幅
-  - 量能特征: 成交量趋势、量价关系
+  - 量能特征: 成交量趋势、量价关系、**量能极值分位数**
   - 市场宽度: 涨跌比、涨停/跌停家数
   - 情绪特征: 换手率、融资余额变化
 
@@ -44,9 +51,37 @@ logger = logging.getLogger(__name__)
 
 
 class MarketRegimeDetector:
-    """大盘状态检测器"""
+    """
+    大盘状态智能识别器
 
-    def __init__(self):
+    职责:
+      通过多维度特征融合（趋势/波动率/量能/动量/宽度）识别当前市场状态，
+      输出 BULL/RANGE/BEAR 三态判定 + 置信度 + 仓位建议 + 状态转换概率。
+
+    核心输入:
+      benchmark_df: 沪深300指数日线DataFrame（需含 close/high/low/volume 列）
+      extra_data: 可选，涨跌家数等辅助数据
+
+    核心输出 (detect() 返回 dict):
+      state: BULL/RANGE/BEAR
+      confidence: 置信度 (0-1)
+      position_advice: 仓位建议（max/min/strategy）
+      transition: 状态转换概率
+      scores: 各维度得分明细
+      bottom_probability: 底部概率（V1.1）
+
+    关键依赖:
+      - config.MARKET_REGIME_CONFIG（各评分权重/阈值）
+      - data/regime_state.json（防抖持久化，P0-A）
+      - systemic_risk 模块（detect_with_systemic 融合系统性风险）
+
+    V10 增强:
+      - P0-A: 状态防抖（状态切换需连续2天确认）
+      - P1-A: 极端行情应急（单日跌幅>3%或波动率≤-0.8强制BEAR）
+      - P2-A: 宽度代理改进（涨跌幅加权替代简单计数）
+    """
+
+    def __init__(self, enable_debounce: bool = True):
         # 状态定义
         self.STATES = {"BULL": "牛市/强势", "RANGE": "震荡/平衡", "BEAR": "熊市/弱势"}
         # 各状态对应仓位建议
@@ -55,26 +90,74 @@ class MarketRegimeDetector:
             "RANGE": {"max_position": 0.60, "min_position": 0.30, "strategy": "高抛低吸+均值回归"},
             "BEAR": {"max_position": 0.30, "min_position": 0.00, "strategy": "防守为主+超跌反弹"},
         }
+        # V1.1: 量能极值状态标记（由 _calc_volume_score 设置，detect 读取）
+        self._extreme_low_volume = False      # 是否极致缩量
+        self._volume_exhaustion = False        # 是否“卖压衰竭”（下跌+极致缩量）
+        self._vol_percentile = 0.5            # 当前成交量在历史中的分位数
+
+        # FIX P0-A: 状态防抖持久化路径
+        self._enable_debounce = enable_debounce
+        self._state_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "regime_state.json"
+        )
+
+    def _load_prev_state(self) -> str:
+        """加载前一交易日regime状态（防抖用）"""
+        try:
+            if os.path.exists(self._state_file):
+                with open(self._state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return data.get("state")
+        except Exception:
+            pass
+        return None
+
+    def _save_prev_state(self, state: str):
+        """保存当前regime状态（防抖用）"""
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            with open(self._state_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "state": state,
+                    "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"[防抖] 保存状态失败: {e}")
+
+    def _save_pending_state(self, state: str):
+        """保存待确认状态（防抖用）"""
+        try:
+            pending_file = self._state_file.replace(".json", "_pending.json")
+            with open(pending_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "pending_state": state,
+                    "pending_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def detect(self, benchmark_df: pd.DataFrame, extra_data: dict = None) -> dict:
         """
-        检测当前大盘状态
-        
+        检测当前大盘状态（核心入口）
+
         参数:
-            benchmark_df: 基准指数(沪深300)日线数据
-            extra_data: 额外数据（涨跌家数等，可选）
-        
+            benchmark_df: 基准指数(沪深300)日线数据，需含 close/high/low/volume 列，至少60行
+            extra_data: 额外数据（涨跌家数等，可选），支持 advance_count/decline_count 字段
+
         返回:
-            {
-                "state": str,              # "BULL"/"RANGE"/"BEAR"
-                "state_cn": str,           # 中文描述
-                "confidence": float,       # 置信度(0-1)
-                "scores": {...},           # 各维度得分
-                "position_advice": {...},  # 仓位建议
-                "transition_prob": {...},  # 状态转换概率
-                "features": {...},         # 原始特征值
-                "detail": str
-            }
+            dict 包含:
+              state (str): BULL/RANGE/BEAR
+              confidence (float): 置信度 0-1
+              position_advice (dict): 仓位建议 {max_position, min_position, strategy}
+              transition (dict): 状态转换概率 {BULL: x, RANGE: y, BEAR: z}
+              scores (dict): 各维度得分 {trend, volatility, volume, momentum, breadth}
+              bottom_probability (float): 底部概率 0-100
+              detail (str): 人可读的判定说明
+              features (dict): 原始特征值
+
+        异常处理:
+            数据不足时降级为RANGE+0.5置信度，不抛异常
         """
         if benchmark_df is None or len(benchmark_df) < 60:
             return {
@@ -115,6 +198,68 @@ class MarketRegimeDetector:
             state = "RANGE"
             confidence = 0.6 + (0.3 - abs(weighted_score)) * 0.5
 
+        # FIX P1-A: 极端行情应急通道——波动率爆表或单日暴跌时强制BEAR
+        _crash_override = False
+        if len(benchmark_df) >= 2:
+            _daily_return = (benchmark_df["close"].iloc[-1] / benchmark_df["close"].iloc[-2] - 1)
+            _vol_check = self._calc_volatility_score(benchmark_df)
+            # 单日跌幅>3% 或 波动率得分=-0.8（恐慌）→ 强制BEAR
+            if _daily_return < -0.03 or _vol_check <= -0.8:
+                state = "BEAR"
+                confidence = max(confidence, 0.75)
+                _crash_override = True
+                logger.warning(
+                    f"[大盘状态] P1-A 极端行情应急: 强制BEAR | "
+                    f"日跌幅={_daily_return:.2%}, 波动率得分={_vol_check:.2f}"
+                )
+
+        # FIX P0-A: 状态防抖——状态切换需连续2天确认，避免单日噪声导致误切换
+        _prev_state = self._load_prev_state() if self._enable_debounce else None
+        _state_changed = (_prev_state is not None and state != _prev_state)
+        if _state_changed and not _crash_override:
+            # 状态发生变化，记录为“待确认”
+            self._save_pending_state(state)
+            # 使用前一状态作为当前输出（待确认期间不切换）
+            _confirmed = False
+        elif _state_changed and _crash_override:
+            # 极端行情下强制切换，跳过防抖
+            _confirmed = True
+        else:
+            # 状态未变，确认切换
+            _confirmed = True
+
+        if _confirmed:
+            self._save_prev_state(state)
+        else:
+            # 防抖生效，保持前一状态
+            if _prev_state and _prev_state != state:
+                logger.info(
+                    f"[大盘状态] P0-A 防抖生效: 新状态={state}待确认，"
+                    f"维持前一状态={_prev_state}"
+                )
+                state = _prev_state
+                # 重新计算仓位建议
+                confidence = max(confidence * 0.8, 0.4)  # 待确认时降低置信度
+
+        # V1.1: 底部信号检测 — 地量见地价 + 量价背离 + 卖压衰竭
+        bottom_prob = self._calc_bottom_probability(benchmark_df, scores)
+        vol_divergence = self._detect_volume_price_divergence(benchmark_df)
+
+        # V1.1 P0: 极致缩量时 BEAR→RANGE 降级
+        # 核心逻辑: 地量=抛压枯竭=底部临近，不应判定为熊市
+        _bear_downgraded = False
+        if state == "BEAR" and self._extreme_low_volume:
+            state = "RANGE"
+            _bear_downgraded = True
+            confidence = max(confidence, 0.55)  # 底部信号时提升置信下限
+            logger.warning(
+                f"[大盘状态] V1.1地量修正: BEAR→RANGE | "
+                f"vol分位数={self._vol_percentile:.0%}, "
+                f"卖压衰竭={self._volume_exhaustion}, "
+                f"量价背离={vol_divergence}, "
+                f"底部概率={bottom_prob:.0f}%"
+            )
+
         # 状态转换概率（简化版，基于历史统计）
         transition = self._estimate_transition(state, scores)
 
@@ -124,12 +269,38 @@ class MarketRegimeDetector:
         if confidence < 0.5:
             position_advice["max_position"] *= 0.8  # 不确定时降低仓位
 
+        # V1.1 P2: 底部逆向仓位层 — 底部概率高时提升仓位下限
+        if bottom_prob >= 70 and state in ("RANGE", "BEAR"):
+            _floor = 0.50  # 底部信号强烈时，仓位下限50%
+            if position_advice["max_position"] < _floor:
+                position_advice["max_position"] = _floor
+                position_advice["strategy"] = "底部逆向建仓"
+                position_advice["bottom_signal"] = True
+                logger.info(f"[大盘状态] V1.1底部逆向: 仓位下限提升至{_floor:.0%}")
+        elif bottom_prob >= 50 and state == "RANGE":
+            # 中等底部信号: 仓位下限提升至40%
+            _floor = 0.40
+            if position_advice["max_position"] < _floor:
+                position_advice["max_position"] = _floor
+                position_advice["strategy"] = "底部观望+试探建仓"
+                position_advice["bottom_signal"] = True
+
         # 特征原始值
         features = self._get_raw_features(benchmark_df)
 
         detail = (f"大盘状态: {self.STATES[state]} | 置信度{confidence:.0%} | "
                  f"综合得分{weighted_score:+.3f} | "
                  f"趋势{trend_score:+.2f} 量能{volume_score:+.2f} 动量{momentum_score:+.2f}")
+        if _crash_override:
+            detail += " | P1-A 极端行情应急(BEAR)"
+        if _bear_downgraded:
+            detail += " | V1.1地量修正(BEAR→RANGE)"
+        if _state_changed and not _crash_override:
+            detail += f" | P0-A 防抖待确认(原{_prev_state}→新{state}待确认)"
+        if bottom_prob >= 50:
+            detail += f" | 底部概率{bottom_prob:.0f}%"
+        if vol_divergence:
+            detail += " | 量价背离(卖压衰竭)"
 
         result = {
             "state": state,
@@ -141,10 +312,64 @@ class MarketRegimeDetector:
             "transition_prob": transition,
             "features": features,
             "detail": detail,
+            # V1.1 新增字段
+            "extreme_low_volume": self._extreme_low_volume,
+            "volume_exhaustion": self._volume_exhaustion,
+            "vol_percentile": round(self._vol_percentile, 3),
+            "bottom_probability": round(bottom_prob, 1),
+            "volume_price_divergence": vol_divergence,
+            "bear_downgraded": _bear_downgraded,
+            "crash_override": _crash_override,
+            "state_debounce": _state_changed and not _crash_override,
             "detect_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
 
         logger.info(f"[大盘状态] {detail}")
+        return result
+
+    def detect_with_systemic(self, benchmark_df: pd.DataFrame,
+                              extra_data: dict = None,
+                              breadth_now: float = 50.0,
+                              breadth_history: list = None) -> dict:
+        """V27: 增强版大盘状态检测，融合系统性风险提前预警
+
+        在原有detect()基础上增加:
+        - L3: 市场宽度收窄速率检测（领先3-5日）
+        - 宽度快速收窄时提前降低仓位建议
+
+        参数:
+            benchmark_df: 基准指数日线数据
+            extra_data: 额外数据（涨跌家数等）
+            breadth_now: 当前市场宽度（个股在MA20上方比例，0-100）
+            breadth_history: 近5日宽度历史 [day1, day2, ..., day5]
+        """
+        # 基础检测
+        result = self.detect(benchmark_df, extra_data)
+
+        # V27: 宽度收窄速率检测
+        try:
+            from strategy.systemic_risk import check_breadth_narrowing
+            breadth_result = check_breadth_narrowing(breadth_now, breadth_history)
+            result["breadth_check"] = breadth_result
+
+            if breadth_result.get("triggered"):
+                _b_level = breadth_result.get("level", "warm")
+                _b_detail = breadth_result.get("detail", "")
+                result["detail"] += f" | V27宽度预警({_b_level}): {_b_detail}"
+
+                # 宽度快速收窄时提前降低仓位建议
+                if _b_level == "ready":
+                    _cur_max = result["position_advice"].get("max_position", 0.6)
+                    result["position_advice"]["max_position"] = min(_cur_max, 0.3)
+                    result["detail"] += " → 仓位上限提前降至30%"
+                    logger.warning(f"[大盘状态] V27宽度收窄预警: 仓位上限降至30%")
+                elif _b_level == "warm" and result["state"] != "BEAR":
+                    _cur_max = result["position_advice"].get("max_position", 0.6)
+                    result["position_advice"]["max_position"] = min(_cur_max, 0.45)
+                    result["detail"] += " → 仓位上限降至45%"
+        except Exception as e:
+            logger.debug(f"[大盘状态] V27宽度检测异常(不影响主流程): {e}")
+
         return result
 
     # ============================================================
@@ -154,7 +379,13 @@ class MarketRegimeDetector:
     def _calc_trend_score(self, df: pd.DataFrame) -> float:
         """
         趋势得分 [-1, 1]
-        正=多头排列，负=空头排列
+
+        计算逻辑:
+          1. MA20 vs MA60 位置关系（多头/空头排列）
+          2. 当前价格相对MA20/MA60的位置
+          3. MA20斜率（5日变化率）
+
+        正分=多头排列（有利做多），负分=空头排列
         """
         close = df["close"].values
         if len(close) < 60:
@@ -193,8 +424,17 @@ class MarketRegimeDetector:
     def _calc_volatility_score(self, df: pd.DataFrame) -> float:
         """
         波动率得分 [-1, 1]
-        波动率收缩+价格稳定=正（有利做多）
-        波动率急剧放大=负（恐慌）
+
+        计算逻辑:
+          1. 近期(10日)波动率 vs 远期(20日)波动率
+          2. ATR变化率
+          3. MA20斜率贡献
+
+        波动率收缩+价格稳定 → 正分（有利做多）
+        波动率急剧放大 → 负分（恐慌信号）
+
+        特殊: 波动率得分同时被 P1-A 极端行情应急使用，
+              得分≤-0.8 且日跌幅>3% 时触发强制BEAR。
         """
         if len(df) < 30:
             return 0
@@ -229,6 +469,10 @@ class MarketRegimeDetector:
         量能得分 [-1, 1]
         上涨放量+下跌缩量=正（健康）
         下跌放量+上涨缩量=负（出货）
+
+        V1.1 新增:
+          - 成交量历史分位数计算（120日窗口）
+          - 极致缩量（分位数<10%）时“卖压衰竭”信号修正
         """
         if len(df) < 20:
             return 0
@@ -241,8 +485,36 @@ class MarketRegimeDetector:
         vol_20 = volume[-20:].mean()
         vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
 
+        # V1.1: 成交量历史分位数（120日窗口）
+        self._extreme_low_volume = False
+        self._volume_exhaustion = False
+        self._vol_percentile = 0.5
+
+        if len(volume) >= 60:
+            # 计算过去120日每天的5日均量，作为历史基准
+            _hist_vol = []
+            _lookback = min(120, len(volume) - 4)
+            for i in range(5, _lookback + 5):
+                _w = volume[-(i+4):-(i-1)] if i < len(volume) - 4 else None
+                if _w is not None and len(_w) == 5:
+                    _hist_vol.append(_w.mean())
+            if _hist_vol:
+                _hist_arr = np.array(_hist_vol)
+                self._vol_percentile = float(np.sum(_hist_arr <= vol_5) / len(_hist_arr))
+
+                # 极致缩量检测：分位数 < 10%
+                if self._vol_percentile < 0.10:
+                    self._extreme_low_volume = True
+                    price_change_5d = (close[-1] / close[-6] - 1) if len(close) >= 6 and close[-6] > 0 else 0
+                    if price_change_5d < 0:
+                        self._volume_exhaustion = True  # 下跌+极致缩量 = 卖压衰竭
+                    elif price_change_5d < 0.01:
+                        # V1.1 FIX: 极致缩量+价格停滞(微跌或横盘)也视为卖压衰竭
+                        # "地量见地价"不要求严格下跌，横盘缩量同样是底部信号
+                        self._volume_exhaustion = True
+
         # 量价关系
-        price_change_5d = (close[-1] / close[-6] - 1) if close[-6] > 0 else 0
+        price_change_5d = (close[-1] / close[-6] - 1) if len(close) >= 6 and close[-6] > 0 else 0
 
         score = 0
         if price_change_5d > 0 and vol_ratio > 1.2:
@@ -259,12 +531,30 @@ class MarketRegimeDetector:
         vol_trend = (volume[-5:].mean() - volume[-10:-5].mean()) / volume[-10:-5].mean() if volume[-10:-5].mean() > 0 else 0
         score += np.clip(vol_trend * 0.5, -0.3, 0.3)
 
+        # V1.1: 极致缩量修正
+        # “地量见地价” — 极致缩量+下跌 = 卖压衰竭，是底部信号而非弱势信号
+        if self._volume_exhaustion:
+            score = max(score, 0.3)  # 量能得分至少+0.3（强正面修正）
+            logger.info(f"[量能极值] 卖压衰竭信号: vol分位数={self._vol_percentile:.0%}, "
+                        f"5日跌幅={price_change_5d*100:.1f}% → 量能得分修正为{score:+.2f}")
+        elif self._extreme_low_volume:
+            # 极致缩量但非下跌（横盘缩量）→ 蓄势信号
+            score = max(score, 0.15)
+            # 取消量能趋势项的负面惩罚（缩量趋势不应再扣分）
+            score = max(score, -vol_trend * 0.5 + 0.15)
+
         return np.clip(score, -1, 1)
 
     def _calc_momentum_score(self, df: pd.DataFrame) -> float:
         """
         动量得分 [-1, 1]
-        基于RSI、MACD、涨跌幅
+
+        计算逻辑:
+          1. 5日/20日涨跌幅
+          2. RSI位置（超买/超卖）
+          3. MACD柱状图方向（动能趋势）
+
+        正分=上涨动量强劲，负分=下跌动量主导
         """
         if len(df) < 30:
             return 0
@@ -307,7 +597,13 @@ class MarketRegimeDetector:
     def _calc_breadth_score(self, df: pd.DataFrame, extra_data: dict = None) -> float:
         """
         市场宽度得分 [-1, 1]
-        如果有涨跌家数数据则使用，否则用指数特征代理
+
+        计算逻辑（V10 P2-A 改进）:
+          - 有涨跌家数数据时: 直接用涨跌比计算
+          - 无额外数据时: 使用指数近10日涨跌幅加权（替代原简单计数）
+            up_magnitude / (up_magnitude + down_magnitude) 作为宽度代理
+
+        正分=市场宽度扩散（多数标的上涨），负分=宽度收缩
         """
         if extra_data and "advance_count" in extra_data:
             adv = extra_data["advance_count"]
@@ -322,12 +618,140 @@ class MarketRegimeDetector:
             return 0
 
         close = df["close"].values
-        # 近10日中上涨天数
+        # FIX P2-A: 改进宽度代理——使用涨跌幅加权而非简单计数
+        # 上涨幅度大→宽度更扩散；下跌幅度大→宽度更收缩
         daily_changes = np.diff(close[-11:])
-        up_days = np.sum(daily_changes > 0)
-        ratio = up_days / 10
+        if len(daily_changes) == 0:
+            return 0
+        up_magnitude = np.sum(daily_changes[daily_changes > 0]) if np.any(daily_changes > 0) else 0
+        down_magnitude = abs(np.sum(daily_changes[daily_changes < 0])) if np.any(daily_changes < 0) else 0
+        total_mag = up_magnitude + down_magnitude
+        if total_mag > 0:
+            ratio = up_magnitude / total_mag
+        else:
+            ratio = 0.5
 
-        return np.clip((ratio - 0.5) * 3, -1, 1)
+        return np.clip((ratio - 0.5) * 4, -1, 1)  # 放大系数从3→4，提高敏感度
+
+    # ============================================================
+    # V1.1: 底部信号检测
+    # ============================================================
+
+    def _detect_volume_price_divergence(self, df: pd.DataFrame) -> bool:
+        """V1.1: 量价背离检测
+
+        经典底部信号: 价格创20日新低，但成交量未创20日新低
+        含义: 卖压减弱，底部临近
+
+        返回:
+            True = 检测到量价背离（卖压衰竭）
+        """
+        if len(df) < 20:
+            return False
+
+        try:
+            close = df["close"].values
+            volume = df["volume"].values
+
+            # 近5日价格最低点 vs 前15-20日最低点
+            _price_5d_low = close[-5:].min()
+            _price_prev_low = close[-20:-5].min()
+
+            # 近5日成交量均值 vs 前15-20日均量
+            _vol_5d = volume[-5:].mean()
+            _vol_prev = volume[-20:-5].mean()
+
+            # 价格新低但成交量不新低 → 量价背离
+            price_new_low = _price_5d_low < _price_prev_low
+            vol_not_new_low = _vol_5d >= _vol_prev * 0.8  # 成交量未显著放大
+
+            if price_new_low and vol_not_new_low:
+                logger.info(f"[量价背离] 价格新低({_price_5d_low:.2f}<{_price_prev_low:.2f}) "
+                            f"但量能维持({_vol_5d:.0f} vs {_vol_prev:.0f})")
+                return True
+        except Exception as e:
+            logger.debug(f"[量价背离] 检测异常: {e}")
+
+        return False
+
+    def _calc_bottom_probability(self, df: pd.DataFrame, scores: dict = None) -> float:
+        """V1.1: 底部概率评分 (0-100)
+
+        综合多维度信号量化底部临近概率:
+          1. 量能极值: vol分位数<10% → +25分
+          2. 卖压衰竭: 下跌+极致缩量 → +20分
+          3. 量价背离: 价格新低但量不新低 → +15分
+          4. RSI超卖: RSI<30 → +15分
+          5. 波动收缩: 波动率得分>0.3 → +10分
+          6. 连续缩量: 连续5日+缩量 → +15分
+
+        返回:
+            底部概率 (0-100)
+        """
+        prob = 0.0
+
+        # 1. 量能极值 (25分)
+        if self._vol_percentile < 0.05:
+            prob += 25
+        elif self._vol_percentile < 0.10:
+            prob += 20
+        elif self._vol_percentile < 0.15:
+            prob += 10
+        elif self._vol_percentile < 0.20:
+            prob += 5  # 偏低量能也给予少量加分
+
+        # 2. 卖压衰竭 (20分)
+        if self._volume_exhaustion:
+            prob += 20
+
+        # 3. 量价背离 (15分)
+        if self._detect_volume_price_divergence(df):
+            prob += 15
+
+        # 4. RSI超卖 (15分)
+        if "rsi" in df.columns:
+            rsi = df["rsi"].iloc[-1]
+            if pd.notna(rsi):
+                if rsi < 20:
+                    prob += 15
+                elif rsi < 30:
+                    prob += 10
+                elif rsi < 40:
+                    prob += 5
+
+        # 5. 波动收缩 (10分)
+        if scores and scores.get("volatility", 0) > 0.3:
+            prob += 10
+
+        # 6. 连续缩量/持续缩量 (15分)
+        # 用120日均量作为长期基准（避免被近期缩量污染）
+        if len(df) >= 60 and "volume" in df.columns:
+            try:
+                vol = df["volume"].values
+                _blen = min(len(vol), 120)
+                vol_long = vol[-_blen:].mean()
+                # 6a. 连续缩量天数
+                _consecutive_low = 0
+                for i in range(1, min(15, len(vol))):
+                    _d = len(vol) - i
+                    if _d >= 0 and vol[_d] < vol_long * 0.5:
+                        _consecutive_low += 1
+                    else:
+                        break
+                if _consecutive_low >= 5:
+                    prob += 15
+                elif _consecutive_low >= 3:
+                    prob += 8
+                # 6b. 近5日均量 vs 长期均量（持续缩量）
+                _vol_5 = vol[-5:].mean()
+                if vol_long > 0 and _vol_5 < vol_long * 0.35:
+                    prob += 10  # 近5日量不到长期均量的35%
+                elif vol_long > 0 and _vol_5 < vol_long * 0.5:
+                    prob += 5   # 近5日量不到长期均量的50%
+            except Exception:
+                pass
+
+        return min(100.0, prob)
 
     # ============================================================
     # 状态转换概率

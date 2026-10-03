@@ -44,7 +44,7 @@ PULSE_CACHE_FILE = os.path.join(_TS_DIR, "data", "market_pulse_cache.json")
 # 模块内默认参数（不修改 config.py）
 PULSE_CFG = {
     "amount_hot": 15000,        # 两市成交额(亿) ≥ 此值视为放量
-    "amount_cold": 7000,        # 两市成交额(亿) ≤ 此值视为缩量冰点
+    "amount_cold": 5000,        # 两市成交额(亿) ≤ 此值视为缩量冰点 (V28: 7000→5000, 适配当前量能下移 regime)
     "amount_stale_days": 4,     # 日K兜底源允许的交易日滞后上限(超过视为陈旧弃用)
     "limit_up_hot": 80,         # 涨停家数 ≥ 此值视为情绪火热
     "limit_down_panic": 30,     # 跌停家数 ≥ 此值视为恐慌
@@ -206,10 +206,30 @@ def _fetch_up_down_spot_em() -> dict:
             changes = pd.to_numeric(df[chg_col], errors="coerce").dropna()
             up = int((changes > 0).sum())
             down = int((changes < 0).sum())
-            # 涨停/跌停: 涨跌幅≥9.8%判定涨停，≤-9.8%判定跌停
-            # (兼容主板10%与科创/创业20%涨跌幅板差异)
-            limit_up = int((changes >= 9.8).sum())
-            limit_down = int((changes <= -9.8).sum())
+            # V10.4: 涨停/跌停判定区分板块（主板10% vs 创业板/科创板20%）
+            code_col = None
+            for c in df.columns:
+                if c == "代码":
+                    code_col = c
+                    break
+            limit_up = 0
+            limit_down = 0
+            if code_col is not None:
+                codes = df[code_col].astype(str)
+                # 创业板(300xxx) / 科创板(688xxx) → 20%涨跌停
+                is_20pct = codes.str.startswith(("300", "301", "688", "689"))
+                chg_20 = changes[is_20pct.reindex(changes.index, fill_value=False)]
+                chg_10 = changes[~is_20pct.reindex(changes.index, fill_value=True)]
+                # 主板 ≥9.8% 涨停, ≤-9.8% 跌停
+                limit_up += int((chg_10 >= 9.8).sum())
+                limit_down += int((chg_10 <= -9.8).sum())
+                # 创业板/科创板 ≥19.6% 涨停, ≤-19.6% 跌停
+                limit_up += int((chg_20 >= 19.6).sum())
+                limit_down += int((chg_20 <= -19.6).sum())
+            else:
+                # 无代码列时回退到旧逻辑（主板为主）
+                limit_up = int((changes >= 9.8).sum())
+                limit_down = int((changes <= -9.8).sum())
             return {"up": up, "down": down, "limit_up": limit_up, "limit_down": limit_down}
         except Exception as e:
             last_err = e

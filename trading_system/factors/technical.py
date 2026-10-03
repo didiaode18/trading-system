@@ -77,20 +77,24 @@ def macd_cross(df):
 # ============================================================
 
 def rsi_6(df):
-    """RSI(6)"""
+    """RSI(6) — Wilder EMA (V4.1 FIX: 原SMA改为ewm)"""
     delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(6).mean()
-    loss = (-delta.clip(upper=0)).rolling(6).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/6, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/6, adjust=False).mean()
+    # FIX P1-2: loss=0 时 RSI=100（全涨无跌），避免 NaN
     rs = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+    result = 100 - 100 / (1 + rs)
+    return result.fillna(100)  # loss=0 → RSI=100
 
 def rsi_14(df):
-    """RSI(14)"""
+    """RSI(14) — Wilder EMA (V4.1 FIX: 原SMA改为ewm)"""
     delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    # FIX P1-2: loss=0 时 RSI=100（全涨无跌），避免 NaN
     rs = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+    result = 100 - 100 / (1 + rs)
+    return result.fillna(100)  # loss=0 → RSI=100
 
 def rsi_divergence(df):
     """RSI背离: 价格新高但RSI未新高=-1(顶背离), 价格新低但RSI未新低=1(底背离)"""
@@ -117,7 +121,9 @@ def boll_position(df):
     upper = ma + 2 * std
     lower = ma - 2 * std
     width = upper - lower
-    return (df["close"] - lower) / width.replace(0, np.nan)
+    # FIX P1-2: std=0 时带宽=0，填0.5（中轨位置），避免 NaN 传播
+    result = (df["close"] - lower) / width.replace(0, np.nan)
+    return result.fillna(0.5)
 
 def boll_width(df):
     """布林带宽度（波动率代理）"""
@@ -141,16 +147,20 @@ def boll_breakout(df):
 # ============================================================
 
 def atr_14(df):
-    """ATR(14)"""
+    """ATR(14)
+    V10.5: warmup期NaN填0，防止NaN传播到下游因子组合
+    """
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(14).mean()
+    return tr.rolling(14).mean().fillna(0)
 
 def atr_ratio(df):
-    """ATR比率 = ATR/收盘价（标准化波动率）"""
-    return atr_14(df) / df["close"]
+    """ATR比率 = ATR/收盘价（标准化波动率）
+    V10.5: NaN填0（无波动时比率为0）
+    """
+    return (atr_14(df) / df["close"]).fillna(0)
 
 
 # ============================================================
@@ -161,8 +171,9 @@ def kdj_k(df):
     """KDJ K值"""
     low_9 = df["low"].rolling(9).min()
     high_9 = df["high"].rolling(9).max()
+    # FIX P1-2: high==low 时填50（中性值），避免 NaN 传播
     rsv = (df["close"] - low_9) / (high_9 - low_9).replace(0, np.nan) * 100
-    return rsv.ewm(com=2).mean()
+    return rsv.fillna(50).ewm(com=2).mean()
 
 def kdj_d(df):
     """KDJ D值"""
@@ -178,11 +189,13 @@ def kdj_j(df):
 # ============================================================
 
 def cci_14(df):
-    """CCI(14)"""
+    """CCI(14)
+    V10.5: md=0或warmup期NaN填0，防止NaN传播
+    """
     tp = (df["high"] + df["low"] + df["close"]) / 3
     ma_tp = tp.rolling(14).mean()
     md = tp.rolling(14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-    return (tp - ma_tp) / (0.015 * md.replace(0, np.nan))
+    return ((tp - ma_tp) / (0.015 * md.replace(0, np.nan))).fillna(0)
 
 
 # ============================================================

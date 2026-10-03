@@ -94,11 +94,25 @@ def _save_cache(cache: dict) -> None:
 
 
 def _is_cache_fresh(cache: dict, key: str) -> bool:
-    """检查缓存条目是否在 TTL 内"""
-    ts = cache.get(key, {}).get("timestamp")
+    """检查缓存条目是否在 TTL 内
+
+    FIX P2-#15: 尊重条目级 TTL——内部写入时会对负缓存（网络异常）写入短 TTL（15分钟），
+    而全局函数以前固定用 CACHE_TTL_SECONDS（6小时），导致外部调用方（如批量分析预检）
+    会把本应过期的负缓存误判为“新鲜”长达 5.75 小时，阻断重试。
+    现与内部 _fetch_daily_detail 保持一致：优先用条目自带 ttl 字段，其次才回退全局默认。
+    """
+    entry = cache.get(key, {})
+    if not isinstance(entry, dict):
+        return False
+    ts = entry.get("timestamp")
     if ts is None:
         return False
-    return (datetime.datetime.now().timestamp() - ts) < CACHE_TTL_SECONDS
+    ttl = entry.get("ttl") or CACHE_TTL_SECONDS
+    try:
+        ttl = float(ttl)
+    except (TypeError, ValueError):
+        ttl = CACHE_TTL_SECONDS
+    return (datetime.datetime.now().timestamp() - ts) < ttl
 
 
 def _normalize_stock_code(code: str) -> str:

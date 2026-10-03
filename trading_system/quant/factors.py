@@ -3,6 +3,9 @@
 ===============
 6个核心因子，等权合成，截面排名打分
 
+P1-3: 因子计算已统一委托给 factors/quant_factors.py（单一数据源），
+本模块仅保留 FactorEngine 的截面打分/选股/IC接口。
+
 因子列表:
 1. 动量因子: 20日收益率（正向，强者恒强）
 2. 换手率因子: 5日平均换手率（适中，非极端）
@@ -64,6 +67,8 @@ class FactorEngine:
         """
         计算单只股票在最新日期的所有因子值
 
+        P1-3: 委托给 factors/quant_factors.py（单一数据源），取序列末值。
+
         参数:
             df: 日线数据（至少60行），含 date/open/close/high/low/volume
 
@@ -73,109 +78,27 @@ class FactorEngine:
         if df is None or len(df) < 60:
             return None
 
-        close = df["close"].values
-        volume = df["volume"].values
-        n = len(close)
+        # P1-3: 统一委托给 factors/quant_factors.py，消除重复实现
+        from factors.quant_factors import (
+            calc_qe_momentum, calc_qe_turnover, calc_qe_volatility,
+            calc_qe_vol_price_div, calc_qe_ma_trend, calc_qe_breakout,
+            calc_qe_pullback,
+        )
 
-        factors = {}
+        def _last_val(series):
+            """取 Series 最后一个非 NaN 值，全 NaN 则返回 None"""
+            v = series.dropna()
+            return float(v.iloc[-1]) if len(v) > 0 else None
 
-        # 1. 动量因子: 20日收益率
-        if n >= 21:
-            factors["momentum"] = (close[-1] - close[-21]) / close[-21]
-        else:
-            factors["momentum"] = 0
-
-        # 2. 换手率因子: 5日平均成交量/20日平均成交量（用量比代理换手率）
-        if n >= 20:
-            vol_5 = np.mean(volume[-5:])
-            vol_20 = np.mean(volume[-20:])
-            factors["turnover"] = vol_5 / vol_20 if vol_20 > 0 else 1.0
-        else:
-            factors["turnover"] = 1.0
-
-        # 3. 波动率因子: 20日收益率标准差（越低越好）
-        if n >= 21:
-            returns = np.diff(close[-21:]) / close[-21:-1]
-            factors["volatility"] = np.std(returns)
-        else:
-            factors["volatility"] = 0.05
-
-        # 4. 量价背离: 近10天中"价涨量缩"的天数占比（越低越好）
-        if n >= 11:
-            div_count = 0
-            for i in range(-10, 0):
-                price_up = close[i] > close[i - 1]
-                vol_down = volume[i] < volume[i - 1]
-                if price_up and vol_down:
-                    div_count += 1
-            factors["vol_price_div"] = div_count / 10.0
-        else:
-            factors["vol_price_div"] = 0
-
-        # 5. 均线趋势: MA5>MA10>MA20 得分（0-3）
-        if n >= 20:
-            ma5 = np.mean(close[-5:])
-            ma10 = np.mean(close[-10:])
-            ma20 = np.mean(close[-20:])
-            score = 0
-            if close[-1] > ma5:
-                score += 1
-            if ma5 > ma10:
-                score += 1
-            if ma10 > ma20:
-                score += 1
-            factors["ma_trend"] = score / 3.0
-        else:
-            factors["ma_trend"] = 0
-
-        # 6. 突破因子: 当前价格距60日新高的距离（越近越好）
-        if n >= 60:
-            high_60 = np.max(close[-60:])
-            factors["breakout"] = close[-1] / high_60 if high_60 > 0 else 0
-        else:
-            factors["breakout"] = 0.5
-
-        # 7. 回调买入因子（V2增强）: 从近期高点回落5-10%且MA20仍向上+缩量企稳
-        # 得分越高 = 回调到位 + 趋势未破 + 缩量确认 = 好的买点
-        if n >= 20:
-            high_20 = np.max(close[-20:])
-            drawdown_from_high = (high_20 - close[-1]) / high_20 if high_20 > 0 else 0
-            ma20 = np.mean(close[-20:])
-            ma20_slope = (ma20 - np.mean(close[-25:-5])) / np.mean(close[-25:-5]) if n >= 25 else 0
-
-            # 回调得分: 回落5-10%得满分，<3%或>15%得0分
-            if 0.05 <= drawdown_from_high <= 0.10:
-                pullback_score = 1.0
-            elif 0.03 <= drawdown_from_high < 0.05:
-                pullback_score = 0.6
-            elif 0.10 < drawdown_from_high <= 0.15:
-                pullback_score = 0.5
-            else:
-                pullback_score = 0.0
-
-            # 趋势加分: MA20仍向上则保持高分，MA20走平/向下则打折
-            if ma20_slope > 0.01:
-                trend_bonus = 1.0
-            elif ma20_slope > -0.01:
-                trend_bonus = 0.6
-            else:
-                trend_bonus = 0.2
-
-            # 价格仍在MA20上方加分
-            above_ma20 = 1.0 if close[-1] > ma20 else 0.4
-
-            # V2新增: 缩量企稳确认（近2日量 < 5日均量×0.7）
-            if n >= 5:
-                vol_2 = np.mean(volume[-2:])
-                vol_5 = np.mean(volume[-5:])
-                vol_shrink_bonus = 1.0 if (vol_5 > 0 and vol_2 < vol_5 * 0.7) else 0.7
-            else:
-                vol_shrink_bonus = 0.7
-
-            factors["pullback"] = pullback_score * trend_bonus * above_ma20 * vol_shrink_bonus
-        else:
-            factors["pullback"] = 0
-
+        factors = {
+            "momentum":      _last_val(calc_qe_momentum(df))      or 0,
+            "turnover":      _last_val(calc_qe_turnover(df))      or 1.0,
+            "volatility":    _last_val(calc_qe_volatility(df))    or 0.05,
+            "vol_price_div": _last_val(calc_qe_vol_price_div(df)) or 0,
+            "ma_trend":      _last_val(calc_qe_ma_trend(df))      or 0,
+            "breakout":      _last_val(calc_qe_breakout(df))      or 0.5,
+            "pullback":      _last_val(calc_qe_pullback(df))      or 0,
+        }
         return factors
 
     # ============================================================

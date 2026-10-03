@@ -14,4 +14,18 @@ except ImportError:
     TradeLog = None
     calc_alpha_beta_attribution = None
 
-__all__ = ["BarraAttribution", "TradeLog", "calc_alpha_beta_attribution"]
+try:
+    from .brinson import brinson_attribution, build_sector_maps, render_brinson_section_html
+    from .sharpe_decompose import decompose_sharpe, render_sharpe_decompose_html
+except ImportError:
+    brinson_attribution = None
+    build_sector_maps = None
+    render_brinson_section_html = None
+    decompose_sharpe = None
+    render_sharpe_decompose_html = None
+
+__all__ = [
+    "BarraAttribution", "TradeLog", "calc_alpha_beta_attribution",
+    "brinson_attribution", "build_sector_maps", "render_brinson_section_html",
+    "decompose_sharpe", "render_sharpe_decompose_html",
+]

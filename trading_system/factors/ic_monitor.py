@@ -285,6 +285,78 @@ class ICMonitor:
             "top_minus_bottom": round(layer_returns[-1] - layer_returns[0], 4),
         }
 
+    def compute_all_factor_ic(self, precomputed: dict, date: str,
+                              forward_days: int = 5) -> dict:
+        """
+        V7.0 Phase0: 批量计算全因子截面IC
+
+        对FactorRegistry中所有已启用因子，计算该日截面IC并更新记录。
+
+        参数:
+            precomputed: {code: DataFrame} 预计算数据
+            date: 当前日期字符串
+            forward_days: 前瞻收益天数
+
+        返回:
+            {factor_name: ic_value} 当日IC字典
+        """
+        try:
+            from factors.registry import get_registry
+            registry = get_registry()
+        except ImportError:
+            logger.warning("[IC批量] FactorRegistry不可用")
+            return {}
+
+        # 收集截面因子值和前瞻收益
+        records = []
+        for code, df in precomputed.items():
+            if code == "000300" or code.startswith("588") or code.startswith("159"):
+                continue
+            mask = df["date"] <= date
+            if mask.sum() < 60:
+                continue
+            df_cut = df[mask]
+            future = df[~mask].head(forward_days)
+            if future.empty:
+                continue
+
+            # 前瞻收益
+            fwd_ret = (future.iloc[-1]["close"] - df_cut.iloc[-1]["close"]) / df_cut.iloc[-1]["close"]
+
+            # 计算所有因子
+            try:
+                factor_vals = registry.compute_all(df_cut)
+                if factor_vals.empty:
+                    continue
+                # 取最新一行
+                latest = factor_vals.iloc[-1]
+                latest["forward_return"] = fwd_ret
+                latest["code"] = code
+                records.append(latest)
+            except Exception:
+                continue
+
+        if len(records) < 30:
+            return {}
+
+        all_df = pd.DataFrame(records)
+        ic_results = {}
+
+        for name in registry.factors:
+            if name not in all_df.columns:
+                continue
+            factor_col = pd.to_numeric(all_df[name], errors="coerce")
+            ret_col = all_df["forward_return"]
+            valid = factor_col.notna() & ret_col.notna()
+            if valid.sum() < 10:
+                continue
+            ic, _ = stats.spearmanr(factor_col[valid], ret_col[valid])
+            if not np.isnan(ic):
+                ic_results[name] = round(ic, 6)
+                self.update(name, ic, date)
+
+        return ic_results
+
 
 # ============================================================
 # 模块级函数：IC快照落盘 与 待结算队列结算（批1-B公共模块）
@@ -619,3 +691,45 @@ def load_cohort_performance_stats(history_path: str = None) -> dict:
     except Exception as e:
         logger.warning(f"cohort胜率统计读取失败: {e}")
         return {"settled_cohorts": 0}
+
+
+# ============================================================
+# V9.0(P1-2): 因子权重自动降权接口
+# ============================================================
+def get_factor_weight_overrides(history_path: str = None) -> dict:
+    """
+    读取IC历史，返回因子权重乘数。
+    规则:
+      - 连续5日|IC|<0.02 → 降权50% (乘数0.5)
+      - 连续10日|IC|<0.02 → 禁用 (乘数0.0)
+      - 连续5日IC<0(负IC) → 降权50%
+    返回: {factor_name: weight_multiplier}  仅包含需要调整的因子
+    """
+    path = history_path or DEFAULT_IC_HISTORY_PATH
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            ic_data = json.load(f)
+        overrides = {}
+        for factor, records in ic_data.items():
+            if not isinstance(records, list) or len(records) < 5:
+                continue
+            recent = records[-10:]  # 最近10条
+            recent_5 = records[-5:]
+            # 规则1: 连续10日|IC|<0.02 → 禁用
+            if len(recent) >= 10 and all(abs(r.get("ic", 0)) < 0.02 for r in recent):
+                overrides[factor] = 0.0
+            # 规则2: 连续5日|IC|<0.02 → 降权50%
+            elif all(abs(r.get("ic", 0)) < 0.02 for r in recent_5):
+                overrides[factor] = 0.5
+            # 规则3: 连续5日IC<0 → 降权50%
+            elif all(r.get("ic", 0) < 0 for r in recent_5):
+                overrides[factor] = 0.5
+        if overrides:
+            logger.info(f"[因子降权] {len(overrides)}个因子被降权: "
+                        + ", ".join(f"{k}→{v}x" for k, v in overrides.items()))
+        return overrides
+    except Exception as e:
+        logger.debug(f"因子权重计算异常: {e}")
+        return {}

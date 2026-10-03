@@ -25,11 +25,18 @@ import json
 import datetime
 from collections import deque
 
-# ---- 费用参数（可按券商实际调整） ----
-COMMISSION_RATE = 0.00025    # 佣金 万2.5
-COMMISSION_MIN = 5.0         # 单笔最低佣金
-STAMP_TAX_RATE = 0.0005      # 印花税 万5（仅卖出股票，ETF免征）
-TRANSFER_FEE_RATE = 0.00001  # 过户费 万0.1（双边）
+# ---- 费用参数（统一引用config，避免硬编码不一致） ----
+try:
+    import config as _cfg
+    COMMISSION_RATE = getattr(_cfg, 'COMMISSION_RATE', 0.0003)
+    COMMISSION_MIN = getattr(_cfg, 'MIN_COMMISSION', 5.0)
+    STAMP_TAX_RATE = getattr(_cfg, 'STAMP_TAX_RATE', 0.001)
+    TRANSFER_FEE_RATE = getattr(_cfg, 'TRANSFER_FEE_RATE', 0.00001)
+except ImportError:
+    COMMISSION_RATE = 0.0003    # 佣金 万3
+    COMMISSION_MIN = 5.0        # 单笔最低佣金
+    STAMP_TAX_RATE = 0.001      # 印花税千1（仅卖出股票）
+    TRANSFER_FEE_RATE = 0.00001 # 过户费 万0.1（双边）
 
 # ---- 行为阈值 ----
 FREQUENCY_SEVERE = 20        # 成交笔数≥20 → 严重
@@ -41,9 +48,9 @@ QUICK_FLIP_MINUTES = 30      # 闪电翻转判定窗口
 
 
 def _is_etf(code: str) -> bool:
-    """ETF/LOF判定（免印花税品种）"""
-    code = str(code)
-    return code.startswith(('159', '16', '51', '56', '58', '501', '513', '518'))
+    """ETF判定（免印花税品种）— V8.2统一使用instrument模块"""
+    from utils.instrument import is_etf as _inst_is_etf
+    return _inst_is_etf(str(code))
 
 
 def _parse_time(t: str):

@@ -46,8 +46,11 @@ MINUTE_CACHE_DIR = os.path.join(
 class MinuteDataFeed:
     """分钟K线数据源
 
-    支持akshare分钟K线获取，带文件缓存（当日有效）。
+    支持akshare分钟K线获取，带文件缓存（V10.4: TTL=300秒刷新，盘中增量更新）。
     """
+
+    # V10.4: 缓存TTL从“当日有效”改为300秒，盘中每5分钟增量刷新
+    CACHE_TTL_SECONDS = 300
 
     def __init__(self, cache_dir: str = None):
         self.cache_dir = cache_dir or MINUTE_CACHE_DIR
@@ -64,7 +67,7 @@ class MinuteDataFeed:
             DataFrame with columns: [datetime, open, high, low, close, volume, amount]
             失败返回空DataFrame
         """
-        # 检查缓存（当日有效）
+        # V10.4: 检查缓存（TTL有效期内命中）
         cached = self._load_cache(code, period)
         if cached is not None:
             return cached
@@ -105,17 +108,24 @@ class MinuteDataFeed:
             return pd.DataFrame()
 
     def _cache_path(self, code: str, period: str) -> str:
-        today = datetime.date.today().strftime("%Y%m%d")
-        return os.path.join(self.cache_dir, f"{code}_{period}min_{today}.pkl")
+        # V10.4: 文件名不含日期，通过TTL控制刷新
+        return os.path.join(self.cache_dir, f"{code}_{period}min_cache.pkl")
 
     def _load_cache(self, code: str, period: str) -> pd.DataFrame:
+        """V10.4: 缓存加载带TTL校验，超期返回None触发重新拉取"""
         path = self._cache_path(code, period)
-        if os.path.exists(path):
-            try:
-                return pd.read_pickle(path)
-            except Exception:
-                pass
-        return None
+        if not os.path.exists(path):
+            return None
+        try:
+            # 检查文件修改时间是否在TTL内
+            mtime = os.path.getmtime(path)
+            age = datetime.datetime.now().timestamp() - mtime
+            if age > self.CACHE_TTL_SECONDS:
+                logger.debug(f"[分钟数据] {code} {period}min 缓存超期({age:.0f}s>{self.CACHE_TTL_SECONDS}s)，重新拉取")
+                return None
+            return pd.read_pickle(path)
+        except Exception:
+            return None
 
     def _save_cache(self, code: str, period: str, df: pd.DataFrame):
         path = self._cache_path(code, period)

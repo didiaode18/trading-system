@@ -659,6 +659,7 @@ def _identify_fund_pattern(df: pd.DataFrame) -> pd.Series:
     - mild_build: 温和建仓（连续3-5日小幅流入+股价缓涨）
     - surge: 放量拉升（单日大额流入+大涨）
     - fake: 对倒骗线（主力流入但股价滞涨+散户大幅流入）
+    - systemic_fake: V10.1 系统性诱多（连续3日对倒骗线）
     - normal: 正常
     """
     patterns = pd.Series("normal", index=df.index)
@@ -681,6 +682,13 @@ def _identify_fund_pattern(df: pd.DataFrame) -> pd.Series:
         # 对倒骗线: 主力流入但股价滞涨 + 散户大幅流入
         elif main > 0 and abs(price_chg) < 0.01 and retail > 0 and vol_ratio > 1.5:
             patterns.iloc[i] = "fake"
+
+    # V10.1: 连续对倒检测 —— 连续3日fake → 系统性诱多
+    for i in range(3, len(df)):
+        if (patterns.iloc[i] == "fake" and
+            patterns.iloc[i-1] == "fake" and
+            patterns.iloc[i-2] == "fake"):
+            patterns.iloc[i] = "systemic_fake"
 
     return patterns
 
@@ -856,6 +864,11 @@ class CaopanEngine:
         if df is None or len(df) < 60:
             return {"code": code, "name": name, "error": "数据不足(需≥60根K线)"}
 
+        # V8.2: ETF识别 — 统一使用instrument模块
+        from utils.instrument import is_etf, get_etf_subtype
+        _is_etf = is_etf(code)
+        _etf_type = get_etf_subtype(code) if _is_etf else ""
+
         # 1. 自适应生命线
         df = compute_adaptive_life_lines(df, self.params["life_line_fast"], self.params["life_line_slow"])
         # 2. 资金流
@@ -881,13 +894,19 @@ class CaopanEngine:
         # 6. 周线共振
         weekly = check_weekly_trend(df)
 
-        # 7. 筹码分布
-        from strategy.chip_distribution import ChipAnalyzer
-        chip_result = ChipAnalyzer().analyze(df, current_price=close)
+        # 7. 筹码分布（ETF跳过 — ETF无传统筹码概念）
+        if _is_etf:
+            chip_result = {"skipped": True, "reason": "ETF无传统筹码分布"}
+        else:
+            from strategy.chip_distribution import ChipAnalyzer
+            chip_result = ChipAnalyzer().analyze(df, current_price=close)
 
-        # 7.5 真实资金数据
-        from data.real_fund_data import RealFundData
-        fund_data = RealFundData().analyze(code, df)
+        # 7.5 真实资金数据（ETF跳过北向/机构分析，仅保留量价资金流）
+        if _is_etf:
+            fund_data = {"skipped": True, "reason": "ETF无北向/机构持仓数据"}
+        else:
+            from data.real_fund_data import RealFundData
+            fund_data = RealFundData().analyze(code, df)
 
         # 8. 综合操作建议
         action = self._generate_action_v2(latest, df, env, rr, weekly)
@@ -957,8 +976,10 @@ class CaopanEngine:
             "support_price": round(latest.get("support_ll", latest.get("ll_slow", 0)), 3),
             "resistance_price": round(latest.get("resistance_ll", latest.get("ll_fast", 0)), 3),
             "atr": round(latest.get("atr", 0), 3),
-            "chip": chip_result if "error" not in chip_result else None,
+            "chip": chip_result if (not _is_etf and "error" not in chip_result) else None,
             "fund_data": fund_data,
+            "is_etf": _is_etf,
+            "etf_type": _etf_type,
             "df_analyzed": df,
         }
 
@@ -1092,6 +1113,11 @@ class CaopanEngine:
         if pattern == "fake":
             return {"type": "hold", "desc": "警惕对倒骗线", "urgency": "warning",
                     "detail": "主力流入但股价滞涨+散户大幅流入，疑似对倒，禁止加仓"}
+
+        # V10.1: 系统性诱多(连续3日对倒)
+        if pattern == "systemic_fake":
+            return {"type": "reduce", "desc": "系统性诱多警告", "urgency": "critical",
+                    "detail": "连续3日对倒骗线，系统性诱多概率极高，建议减仓"}
 
         # D点信号
         if dk == "D" and not dk_filtered:

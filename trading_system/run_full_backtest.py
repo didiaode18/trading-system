@@ -53,8 +53,8 @@ logger = logging.getLogger("full_backtest")
 # 回测参数
 # ============================================================
 INITIAL_CAPITAL = 1_000_000  # 100万
-START_DATE = "2023-01-01"
-END_DATE = "2026-07-25"
+START_DATE = "2023-09-01"
+END_DATE = "2026-09-23"
 
 
 # ============================================================
@@ -127,34 +127,45 @@ def precompute_indicators(data_dict):
 # ============================================================
 
 def create_fast_strategy(precomputed_data):
-    """创建使用预计算数据的快速策略函数"""
+    """创建使用预计算数据的快速策略函数
+
+    FIX P1-#8: 原实现 `except Exception: pass` 静默吞没所有异常，导致某只标的信号
+    生成失败时回测无告警继续运行，用户误判为“该标的无交易机会”。现改为：
+      - 单只标的异常时记录 warning 日志并累加错误计数
+      - 同一标的连续失败 ≥ 10 次时抛 RuntimeError 中止回测，避免产出误导性结果
+      - 主流程结束时汇总错误统计，供报告生成引用
+    """
     from strategy.trend_strategy import generate_strategy_signal
     from strategy.position import calc_first_batch
     from backtest.broker import Order
-    
+
+    # FIX P1-#8: 错误计数器（跨日累积；函数对象属性在 def 之后挂载）
+    _error_counts = {}
+    _error_samples = {}  # {code: 最后一次异常信息}
+
     def fast_strategy(date: str, feed, broker) -> list:
         orders = []
-        
+
         for code in feed.stock_codes:
             if code not in precomputed_data:
                 continue
-            
+
             df_full = precomputed_data[code]
-            
+
             # 获取截止到当前日期的数据
             mask = df_full["date"] <= date
             df = df_full[mask].copy()
-            
+
             if len(df) < config.MA_MID:
                 continue
-            
+
             # 获取当前持仓
             holding = broker.get_holding_dict(code)
-            
+
             try:
                 # 生成信号
                 signal = generate_strategy_signal(df, holding)
-                
+
                 # 卖出信号
                 if signal.get("sell_signal") and holding:
                     bar = feed.get_bar(code, date)
@@ -168,13 +179,13 @@ def create_fast_strategy(precomputed_data):
                             date=date,
                             reason=signal.get("signal_reason", "策略卖出"),
                         ))
-                
+
                 # 买入信号
                 elif signal.get("buy_signal") and not holding:
                     bar = feed.get_bar(code, date)
                     buy_price = signal.get("buy_price") or (bar["close"] if bar else 0)
                     stop_loss = signal.get("stop_loss_initial", buy_price * 0.9)
-                    
+
                     if buy_price > 0:
                         stock_type = config.get_stock_info(code).get("类型", "龙头")
                         batch = calc_first_batch(buy_price, stop_loss, stock_type, broker.initial_capital)
@@ -188,15 +199,35 @@ def create_fast_strategy(precomputed_data):
                                 reason=signal.get("signal_reason", "策略买入"),
                             ))
             except Exception as e:
-                pass  # 静默处理单只股票异常
-        
+                # FIX P1-#8: 静默吞没改为计数告警 + 连续失败中止
+                _error_counts[code] = _error_counts.get(code, 0) + 1
+                _error_samples[code] = f"{type(e).__name__}: {e}"
+                if _error_counts[code] <= 3 or _error_counts[code] % 10 == 0:
+                    logger.warning(
+                        f"[回测异常] {date} {code} 信号生成失败"
+                        f"(第{_error_counts[code]}次): {type(e).__name__}: {e}"
+                    )
+                if _error_counts[code] >= 10:
+                    raise RuntimeError(
+                        f"{code} 信号连续失败{_error_counts[code]}次，回测中止。"
+                        f"最后错误: {_error_samples[code]}"
+                    )
+
         return orders
-    
+
+    # FIX P1-#8: 计数器挂在函数对象上，供 run_engine_backtest 汇总；
+    # 必须在 def fast_strategy 之后赋值，否则触发 UnboundLocalError。
+    fast_strategy.error_counts = _error_counts
+    fast_strategy.error_samples = _error_samples
     return fast_strategy
 
 
-def run_engine_backtest(data_dict, precomputed_data):
-    """运行事件驱动回测引擎V2 + 趋势跟踪策略（74只全量）"""
+def run_engine_backtest(data_dict, precomputed_data, auto_monte_carlo=True, mc_simulations=500):
+    """运行事件驱动回测引擎V2 + 趋势跟踪策略（74只全量）
+
+    auto_monte_carlo / mc_simulations 为向后兼容参数（默认值与历史行为一致）；
+    master_backtest Stage3 有界采样时传 auto_monte_carlo=False 以省去蒙特卡洛耗时。
+    """
     from backtest.engine import BacktestEngineV2
     from backtest.broker import CostConfig
     
@@ -226,8 +257,8 @@ def run_engine_backtest(data_dict, precomputed_data):
         start_date=START_DATE,
         end_date=END_DATE,
         benchmark_code="000300" if "000300" in sub_data else None,
-        auto_monte_carlo=True,
-        mc_simulations=500,  # 500次模拟
+        auto_monte_carlo=auto_monte_carlo,
+        mc_simulations=mc_simulations,
     )
     elapsed = time.time() - t0
     report["elapsed_sec"] = round(elapsed, 1)
@@ -235,7 +266,27 @@ def run_engine_backtest(data_dict, precomputed_data):
     # 提取交易明细
     report["order_log"] = engine.order_log
     report["daily_values_df"] = pd.DataFrame(engine.daily_values) if engine.daily_values else pd.DataFrame()
-    
+
+    # FIX P1-#8: 汇总信号异常统计并写入报告，便于用户排查静默失败
+    err_counts = getattr(fast_strategy, "error_counts", {}) or {}
+    err_samples = getattr(fast_strategy, "error_samples", {}) or {}
+    if err_counts:
+        total_errors = sum(err_counts.values())
+        affected = len(err_counts)
+        top5 = sorted(err_counts.items(), key=lambda kv: -kv[1])[:5]
+        logger.warning(
+            f"  [信号异常汇总] 共 {total_errors} 次失败, 涉及 {affected} 只标的; "
+            f"TOP5: " + ", ".join(f"{c}({n}次,{err_samples.get(c, '?')})" for c, n in top5)
+        )
+        report["signal_errors"] = {
+            "total": total_errors,
+            "affected_stocks": affected,
+            "per_stock": dict(err_counts),
+            "samples": dict(err_samples),
+        }
+    else:
+        report["signal_errors"] = {"total": 0, "affected_stocks": 0}
+
     return report
 
 

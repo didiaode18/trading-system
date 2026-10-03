@@ -44,6 +44,21 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# P1-4: 提取的纯函数模块（形态识别 / 大盘门控）
+from strategy.intraday_patterns import (
+    detect_intraday_pattern as _detect_intraday_pattern_ext,
+    detect_m_head as _detect_m_head_ext,
+    detect_staircase as _detect_staircase_ext,
+    detect_v_reversal as _detect_v_reversal_ext,
+    detect_opening_pattern as _detect_opening_pattern_ext,
+)
+from strategy.market_gate import (
+    market_gate_check as _market_gate_check_ext,
+    get_adaptive_rapid_drop_threshold as _get_adaptive_rapid_drop_threshold_ext,
+    check_systemic_risk_alert as _check_systemic_risk_alert_ext,
+    is_mean_reversion_zone as _is_mean_reversion_zone_ext,
+)
+
 try:
     import akshare as ak
     HAS_AKSHARE = True
@@ -59,7 +74,13 @@ _INTRADAY_STATE_FILE = os.path.join(
 
 
 class IntradayMonitor:
-    """盘中实时监控器（V8.0: 梯度减仓+智能缓冲+变频监控增强版）"""
+    """
+    盘中实时监控器（V8.0增强版）
+
+    职责:
+      盘中实时监控持仓风险，包括梯度减仓、智能缓冲、变频监控。
+      支持预警规则自动校准、多场景风控。
+    """
 
     def __init__(self, holdings: dict = None, poll_interval: int = 60):
         """
@@ -112,13 +133,19 @@ class IntradayMonitor:
         self._clear_count = 0        # 连续无异常计数
         self._emergency_since = None  # V10.3: emergency开始时间（防锁定）
         self._emergency_suppressed_until = None  # V10.3 FIX: 降级后抑制窗口（防乒乓回升）
-        self._code_last_alert_time = {}  # V10.3: {code: datetime} 标的级全局冷却
+        self._code_last_alert_time = {}  # V10.3→FIX: {code: {level: datetime}} 按级别分层冷却，info不阻塞warning/critical
+        self._code_type_last_alert = {}  # FIX: {code: {alert_type: datetime}} 同标的同类型去重（15min不重复推送）
 
         # V7.2: 状态跟踪
         self.stop_loss_first_touch = {}  # {code: datetime} 首次触及止损时间
         self.day_lows = {}               # {code: float} 当日最低价
         self.day_volumes = {}            # {code: float} 当日成交量
         self.stop_touch_prices = {}      # V7.2: {code: float} 触及止损时的价格（用于假突破检测）
+        # FIX P1-#7: 缓冲期窄带震荡死循环封顶——记录每标的的缓冲重置次数与首次进入缓冲时间
+        # 若同一交易日重置次数达上限或总缓冲时长超封顶，强制确认止损，避免阴跌行情下
+        # 止损保护永久失效。跨日由 _daily_reset_if_new_day 自动清理。
+        self._stop_buffer_reset_count = {}   # {f"{today}_{code}": int}
+        self._stop_buffer_total_start = {}   # {f"{today}_{code}": datetime} 首次进入缓冲的时间
 
         # V9.0: 看盘策略增强状态
         self.vwap_cfg = getattr(config, 'VWAP_CONFIG', {})
@@ -138,6 +165,12 @@ class IntradayMonitor:
         self._pending_alerts_queue = []  # [(alert, alert_key)] 门控延迟的非紧急预警
         self._prev_gate_state = "pass"   # 上轮门控状态（用于检测 delay→pass 转换）
         self._queued_alert_keys = set()  # 被门控延迟的预警key（防止重复入队）
+
+        # V26: 急跌预警30min确认等待 + 反弹过滤（诊断显示急跌预警T+3 SNR=0.71，误报率46%）
+        self._rapid_drop_pending = {}    # {code: {"first_detected": datetime, "change_pct": float}}
+        self._rapid_drop_alert_price = {} # {code: float} 急跌预警触发时的价格（反弹过滤用）
+        self.RAPID_DROP_CONFIRM_MINUTES = 30  # 急跌持续N分钟后再触发预警（V26新增）
+        self.RAPID_DROP_BOUNCE_PCT = 0.02     # 预警后反弹>2%抑制后续预警（V26新增）
 
         # V9.3: warning级预警邮件冷却与升级追踪
         self._warning_email_cooldown = {}   # {code: datetime} warning级邮件冷却追踪
@@ -217,6 +250,16 @@ class IntradayMonitor:
             self.day_lows = {c: float(v) for c, v in data.get("day_lows", {}).items() if v > 0}
             self.stop_touch_prices = {c: float(v) for c, v in data.get("stop_touch_prices", {}).items() if v > 0}
             self._queued_alert_keys = set(data.get("queued_alert_keys", []))
+            # V26: 加载急跌确认等待状态
+            for c, v in data.get("rapid_drop_pending", {}).items():
+                try:
+                    self._rapid_drop_pending[c] = {
+                        "first_detected": datetime.datetime.fromisoformat(v["first_detected"]),
+                        "change_pct": v.get("change_pct", 0),
+                    }
+                except (TypeError, ValueError, KeyError):
+                    continue
+            self._rapid_drop_alert_price = {c: float(v) for c, v in data.get("rapid_drop_alert_price", {}).items() if v > 0}
             self._state_date = data.get("date", self._state_date)
             logger.info(f"[盘中监控] 已恢复当日状态: 已发预警{len(self.alerts_sent)}条, "
                         f"缓冲计时{len(self.stop_loss_first_touch)}只, "
@@ -244,6 +287,12 @@ class IntradayMonitor:
                 "day_lows": dict(self.day_lows),
                 "stop_touch_prices": dict(self.stop_touch_prices),
                 "queued_alert_keys": list(self._queued_alert_keys),
+                # V26: 持久化急跌确认等待状态
+                "rapid_drop_pending": {
+                    c: {"first_detected": v["first_detected"].isoformat(), "change_pct": v["change_pct"]}
+                    for c, v in self._rapid_drop_pending.items()
+                },
+                "rapid_drop_alert_price": dict(self._rapid_drop_alert_price),
             }
             try:
                 from utils.file_io import atomic_json_write
@@ -286,6 +335,9 @@ class IntradayMonitor:
         self._pending_alerts_queue.clear()
         self._atr_obs_logged.clear()
         self.gradient_triggered.clear()
+        # FIX P1-#7: 同步清理缓冲封顶计数，避免跨日残留导致新交易日首次触发即封顶
+        self._stop_buffer_reset_count.clear()
+        self._stop_buffer_total_start.clear()
 
         # 重置标记
         self.opening_phase_done = False
@@ -461,7 +513,13 @@ class IntradayMonitor:
             # 大盘急跌中: warning/critical/emergency 风控信号立即发送，
             # 仅 info 级预警入队列延迟等待企稳后补发
             pass  # 在 _send_alert 中按 level 分流
-        
+
+        # ---- V27: 大盘系统性风险硬止损触发器 ----
+        # 大盘跌幅超阈值时直接生成预警，不等统一预警扫描的15分钟间隔
+        if gate_state in ("delay", "suppress") and market_quote:
+            _sr_alerts = self._check_systemic_risk_alert(market_quote, gate_state)
+            alerts.extend(_sr_alerts)
+
         # V9.2: 门控/均值回归周期性存活日志（每20轮≈10分钟输出一次，便于确认功能存活）
         if not hasattr(self, '_gate_log_counter'):
             self._gate_log_counter = 0
@@ -692,7 +750,28 @@ class IntradayMonitor:
 
                     # 缓冲期到: 确认止损
                     confirm_price = stop_loss * (1 - self.BUFFER_CONFIRM_PCT)
-                    if current_price <= confirm_price:
+                    # FIX P1-#7: 窄带震荡死循环封顶——同一交易日多次重置后强制确认
+                    _buf_key = f"{today}_{code}"
+                    _reset_n = self._stop_buffer_reset_count.get(_buf_key, 0)
+                    _total_start = self._stop_buffer_total_start.get(_buf_key)
+                    if _total_start is None:
+                        _total_start = first_touch
+                        self._stop_buffer_total_start[_buf_key] = _total_start
+                    _total_elapsed_min = (now - _total_start).total_seconds() / 60
+                    _max_resets = self.smart_buffer_cfg.get("max_reset_count", 3)
+                    _total_cap_min = self.smart_buffer_cfg.get("total_buffer_cap_min", 45)
+                    _force_confirm = (
+                        _reset_n >= _max_resets
+                        or _total_elapsed_min >= _total_cap_min
+                    )
+
+                    if current_price <= confirm_price or _force_confirm:
+                        if _force_confirm and current_price > confirm_price:
+                            logger.warning(
+                                f"[止损缓冲] {code} 重置{_reset_n}次/总时长"
+                                f"{_total_elapsed_min:.0f}分 达封顶，虽现价{current_price:.2f}"
+                                f"高于confirm{confirm_price:.2f}，强制确认止损（避免窄带震荡死循环）"
+                            )
                         alert_key = f"{today}_{code}_stop_confirmed"
                         if alert_key not in self.alerts_sent:
                             shares = holding.get("shares", 0)
@@ -727,10 +806,14 @@ class IntradayMonitor:
                                 f"盘中止损确认(持续{elapsed_minutes:.0f}分钟低于止损线)"
                             )
                             self._send_stop_loss_email(alert)
+                        # 确认后清理缓冲计数（本日不再重复进入缓冲循环）
+                        self._stop_buffer_reset_count.pop(_buf_key, None)
+                        self._stop_buffer_total_start.pop(_buf_key, None)
                     else:
-                        # 价格回升，重置缓冲
+                        # 价格回升，重置缓冲（同时累加重置计数供封顶判定）
                         self.stop_loss_first_touch.pop(code, None)
                         self.stop_touch_prices.pop(code, None)
+                        self._stop_buffer_reset_count[_buf_key] = _reset_n + 1
                 else:
                     # 缓冲期中: 发出进度提示
                     remaining = dynamic_buffer - elapsed_minutes
@@ -773,27 +856,74 @@ class IntradayMonitor:
                 self.stop_loss_first_touch.pop(code, None)
                 self.stop_touch_prices.pop(code, None)
 
-            # ---- 检查2: 急跌预警（V9.3: 自适应阈值）----
+            # ---- 检查2: 急跌预警（V26: 30min确认等待+反弹过滤+ATR自适应放宽）----
             change_pct = quote.get("change_pct", 0)
             _rapid_drop_threshold = self._get_adaptive_rapid_drop_threshold(market_quote)
-            if change_pct and change_pct < _rapid_drop_threshold:
-                alert_key = f"{today}_{code}_rapid_drop_{int(change_pct)}"
-                if alert_key not in self.alerts_sent:
-                    alert = {
-                        "level": "warning",
-                        "type": "急跌预警",
-                        "code": code,
-                        "name": name,
-                        "current_price": current_price,
+            # V25(P2-2): 个股ATR自适应修正 —— 高波动标的放宽阈值，低波动标的收紧
+            _atr_pct_rapid = self._get_atr_pct(code, current_price)
+            # V26: 高波动标的放宽倍数从1.3提昇至1.67（诊断显示-3%*1.3=-3.9%对002655等仍过紧，
+            # 1.67倍使ATR>3%的标的阈值达~-5%，与ATR建议档更匹配）
+            if _atr_pct_rapid > 0.03:
+                _rapid_drop_threshold *= 1.67  # 高波动(日均波>3%): 放宽67%（~-5%）
+            elif _atr_pct_rapid < 0.015:
+                _rapid_drop_threshold *= 0.85  # 低波动(日均波<1.5%): 收竱15%
+            
+            # V26: 急跌预警确认等待 + 反弹过滤逻辑
+            _now = datetime.datetime.now()
+            _is_rapid_dropping = change_pct and change_pct < _rapid_drop_threshold
+            
+            if _is_rapid_dropping:
+                # 记录首次检测到急跌的时间
+                if code not in self._rapid_drop_pending:
+                    self._rapid_drop_pending[code] = {
+                        "first_detected": _now,
                         "change_pct": change_pct,
-                        "message": f"⚡ {name}({code}) 急跌{change_pct:.1f}%！"
-                                  f"现价{current_price:.2f} | 注意风险",
-                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
                     }
-                    alerts.append(alert)
-                    alert["_alert_key"] = alert_key
-                    self.alerts_sent.add(alert_key)
-                    self._send_alert(alert)
+                    logger.debug(f"[急跌确认] {code} 首次检测到急跌{change_pct:.1f}%，开始{self.RAPID_DROP_CONFIRM_MINUTES}min确认等待")
+            
+                _pending_info = self._rapid_drop_pending[code]
+                _elapsed_min = (_now - _pending_info["first_detected"]).total_seconds() / 60
+            
+                # 条件1: 急跌必须持续超过确认时间（30min）
+                if _elapsed_min < self.RAPID_DROP_CONFIRM_MINUTES:
+                    pass  # 等待中，不触发预警
+                else:
+                    # 条件2: 反弹过滤 —— 预警后反弹>2%则抑制
+                    _alert_price = self._rapid_drop_alert_price.get(code)
+                    _bounce_suppressed = False
+                    if _alert_price and _alert_price > 0:
+                        _bounce_pct = (current_price - _alert_price) / _alert_price
+                        if _bounce_pct > self.RAPID_DROP_BOUNCE_PCT:
+                            _bounce_suppressed = True
+                            logger.info(f"[急跌反弹过滤] {code} 预警后反弹{_bounce_pct*100:.1f}%>{self.RAPID_DROP_BOUNCE_PCT*100:.0f}%，抑制后续预警")
+            
+                    if not _bounce_suppressed:
+                        alert_key = f"{today}_{code}_rapid_drop_{int(change_pct)}"
+                        if alert_key not in self.alerts_sent:
+                            alert = {
+                                # FIX(2026-09-28): level从"warning"提升为"high"，
+                                # 急跌是风控前哨信号，需通过钉钉分级路由(ALERT_DINGTALK_MIN_LEVEL=high)
+                                "level": "high",
+                                "type": "急跌预警",
+                                "code": code,
+                                "name": name,
+                                "current_price": current_price,
+                                "change_pct": change_pct,
+                                "message": f"⚡ {name}({code}) 急跌{change_pct:.1f}%！"
+                                          f"现价{current_price:.2f} | 注意风险",
+                                "time": _now.strftime("%H:%M:%S"),
+                            }
+                            alerts.append(alert)
+                            alert["_alert_key"] = alert_key
+                            self.alerts_sent.add(alert_key)
+                            self._send_alert(alert)
+                            # 记录预警时价格（供后续反弹过滤）
+                            self._rapid_drop_alert_price[code] = current_price
+            else:
+                # 急跌条件恢复 → 清除确认等待状态
+                if code in self._rapid_drop_pending:
+                    logger.debug(f"[急跌确认] {code} 急跌条件恢复，清除确认等待")
+                    del self._rapid_drop_pending[code]
 
             # ---- 检查3: 止盈位到达（V6.2: 阈值提高，回测10%/20%提醒过早）----
             if self.PROFIT_TARGET_ALERT and buy_price > 0:
@@ -965,6 +1095,29 @@ class IntradayMonitor:
             pattern_alerts = self.detect_intraday_pattern(code, name, today)
             alerts.extend(pattern_alerts)
 
+        # ---- 检查12.5: V10.1 开盘定性 + 竞价串联 + VWAP偏离 ----
+        _now_hm = datetime.datetime.now().strftime("%H:%M")
+        _is_opening_30min = "09:30" <= _now_hm <= "10:00"
+        for code, quote in quotes.items():
+            if code == "000300":
+                continue
+            name = quote.get("name", code)
+            # 开盘定性: 仅在开盘30分钟内调用
+            if _is_opening_30min:
+                try:
+                    opening_alert = self.detect_opening_pattern(code, name, today)
+                    if opening_alert:
+                        alerts.append(opening_alert)
+                except Exception as e:
+                    logger.debug(f"  {code} 开盘定性异常: {e}")
+            # VWAP偏离: 全天可用(需足够分时数据)
+            try:
+                vwap_alert = self.detect_vwap_deviation(code, name, today)
+                if vwap_alert:
+                    alerts.append(vwap_alert)
+            except Exception as e:
+                logger.debug(f"  {code} VWAP偏离异常: {e}")
+
         # ---- 检查13: 大盘急跌 ----
         if market_quote:
             market_change = market_quote.get("change_pct", 0)
@@ -1072,6 +1225,7 @@ class IntradayMonitor:
         """
         message = alert.get("message", "")
         level = alert.get("level", "info")
+        now = datetime.datetime.now()  # FIX: 尾盘判定需要
 
         # V9.1: 大盘门控 — delay状态下仅 info 级预警入队列延迟
         # FIX(2026-08-19): 原 level!="critical" 误将 warning(梯度减仓-5%)
@@ -1089,48 +1243,62 @@ class IntradayMonitor:
 
         logger.warning(f"[盘中预警-{level.upper()}] {message}")
 
-        # V10.3: 标的级全局冷却（同一标的多类型预警合并，防轰炸）
+        # V10.3→FIX: 标的级全局冷却 — 按级别分层，info不阻塞warning/critical
         # critical/emergency不受限制（风控信号不可延迟）
         code = alert.get("code", "")
+        _tail_session = (now.hour == 14 and now.minute >= 30)  # P2-5: 尾盘14:30-15:00
         if code and level not in ("critical", "emergency"):
             esc_cfg = getattr(config, 'INTRADAY_ESCALATION_CONFIG', {})
             global_cd_min = esc_cfg.get("code_global_cooldown_min", 15)
-            last_time = self._code_last_alert_time.get(code)
-            if last_time is not None:
-                elapsed_min = (datetime.datetime.now() - last_time).total_seconds() / 60
-                if elapsed_min < global_cd_min:
-                    logger.info(f"[标的冷却] {code} {alert.get('type','')} 距上次预警仅{elapsed_min:.0f}分钟(<{global_cd_min}min)，合并跳过")
+            # P2-5: 尾盘冷却窗口缩短至5分钟
+            if _tail_session:
+                global_cd_min = min(global_cd_min, 5)
+            # FIX P0-1: 按级别分层——仅检查同级或更高级别的冷却记录
+            level_times = self._code_last_alert_time.get(code, {})
+            _level_rank = {"info": 0, "warning": 1, "high": 2, "critical": 3, "emergency": 4}
+            _cur_rank = _level_rank.get(level, 1)
+            for _lv, _lt in level_times.items():
+                if _level_rank.get(_lv, 0) >= _cur_rank:
+                    _elapsed = (now - _lt).total_seconds() / 60
+                    if _elapsed < global_cd_min:
+                        logger.info(f"[标的冷却] {code} {alert.get('type','')} "
+                                    f"距上次{level}级预警仅{_elapsed:.0f}分钟"
+                                    f"(<{global_cd_min}min)，合并跳过")
+                        return
+        # P1-3: 同标的同类型预警去重（15min内同类型不重复推送，不同类型允许通过）
+        _alert_type = alert.get("type", "")
+        if code and _alert_type and level not in ("critical", "emergency"):
+            type_times = self._code_type_last_alert.get(code, {})
+            _type_last = type_times.get(_alert_type)
+            if _type_last is not None:
+                _type_elapsed = (now - _type_last).total_seconds() / 60
+                _type_cd = 15  # 同类型固定15min冷却
+                if _tail_session:
+                    _type_cd = 5  # P2-5: 尾盘缩短至5min
+                if _type_elapsed < _type_cd:
+                    logger.info(f"[类型去重] {code} {_alert_type} "
+                                f"距上次同类型仅{_type_elapsed:.0f}分钟"
+                                f"(<{_type_cd}min)，跳过")
                     return
         # 记录本次预警时间（延迟到实际发送判定后，避免仅日志预警占用冷却槽位）
         _code_cooldown_armed = False
 
-        # 企业微信推送
-        if config.WECHAT_WORK_WEBHOOK:
-            self._send_wechat(message, level)
-            _code_cooldown_armed = True
+        # V26: 盘中预警实时路径仅发送邮件（即时存档），钉钉/企微统一收归scheduler批量路径
+        # 根因: 监控线程+scheduler双路径同时发钉钉导致重复告警（诊断确认100%重叠）
+        # scheduler统一路径已有完善的30min冷却+同标的合并+跨源去重逻辑
+        # 邮件不受影响: critical仍立即发送，warning走冷却机制
 
-        # V9.3: warning级通知判定（钉钉+邮件共用，只调用一次避免副作用重复）
+        # V9.3: warning级通知判定（仅邮件，钉钉已移至scheduler统一路径）
         # _should_send_warning_email 有副作用（滑动窗口记录），必须缓存结果
         _warning_notify = False
         if level in ("warning", "emergency"):
             _warning_notify = self._should_send_warning_email(alert)
 
-        # V9.3: 恢复钉钉推送（双通道冗余 — 钉钉秒达 + 邮件存档）
-        # critical/emergency: 立即推送（风控信号不可延迟）
-        # warning: 复用邮件判定逻辑，仅应发邮件的warning同步推钉钉
-        # info: 不发钉钉（避免噪音）
-        if config.DINGTALK_WEBHOOK:
-            if level in ("critical", "emergency"):
-                self._send_dingtalk(message, level)
-                _code_cooldown_armed = True
-            elif _warning_notify:
-                self._send_dingtalk(message, level)
-                _code_cooldown_armed = True
-
         # 邮件推送
         if config.EMAIL_SENDER and config.EMAIL_AUTH_CODE:
-            if level == "critical":
-                # critical 无冷却，立即发送
+            if level in ("critical", "emergency"):
+                # FIX(2026-09-28): emergency与critical同等对待——立即发邮件，
+                # 原逻辑emergency走warning冷却路径导致紧急减仓邮件可能被拦截
                 self._send_email_alert(alert)
                 _code_cooldown_armed = True
             elif _warning_notify:
@@ -1138,11 +1306,14 @@ class IntradayMonitor:
                 self._send_warning_email(alert)
                 _code_cooldown_armed = True
 
-        # FIX(2026-08-24): 仅在实际发出通知后才占用标的冷却槽位——
-        # 原实现无条件记录，导致仅日志类预警（如VWAP失守）占用槽位后，
-        # 15分钟内同标的的必发风控预警（急跌/梯度减仓）被误拦截（实测复现）
+        # FIX P0-1: 按级别分层记录冷却时间（info仅写入info级，不阻塞warning/critical）
+        # P1-3: 同步记录同标的同类型预警时间
         if code and _code_cooldown_armed:
-            self._code_last_alert_time[code] = datetime.datetime.now()
+            _lv_dict = self._code_last_alert_time.setdefault(code, {})
+            _lv_dict[level] = now
+            if _alert_type:
+                _type_dict = self._code_type_last_alert.setdefault(code, {})
+                _type_dict[_alert_type] = now
 
         # 回调函数
         for callback in self.alert_callbacks:
@@ -1530,11 +1701,38 @@ class IntradayMonitor:
                 if atr_suggest is not None:
                     threshold = min(threshold, -atr_suggest)
 
+            # V25(P2-3): 应用校准因子（梯度减仓类预警，仅观察期外生效）
+            if self._calibration and not self._calibration.get("observation_mode", True):
+                _gr_key = f"梯度减仓-{label}" if "梯度减仓" in label else "梯度减仓"
+                _gr_factor = self._calibration.get("threshold_factors", {}).get(_gr_key, 1.0)
+                if _gr_factor != 1.0:
+                    threshold *= _gr_factor  # factor>1放宽(推迟触发), <1收紧(提前触发)
+
             if loss_pct <= threshold and level_name not in self.gradient_triggered[code]:
                 self.gradient_triggered[code].add(level_name)
-                reduce_shares = int(shares * reduce_ratio / 100) * 100  # 整百股
-                if reduce_shares < 100:
-                    reduce_shares = min(shares, 100)
+                # FIX P1-#4: 小仓位（≤300股）按比例精确减仓，避免原先“整百向下取整
+                # → 0股 → 兵底 min(shares,100)=100股”导致“减30%”变“清仓100%”。
+                # 处理原则：
+                #   - shares≤0：异常持仓，直接跳过
+                #   - shares<200：不足两手，按实际比例四舍五入到十股（保留至少10股）
+                #   - 200≤shares≤300：按实际比例向下取整到百股，但兵底不超过实际比例的1.5倍
+                #   - shares>300：保持原有整百向下取整逻辑（与原行为一致）
+                raw_shares = shares * reduce_ratio
+                if shares <= 0:
+                    continue
+                if shares < 200:
+                    reduce_shares = max(int(round(raw_shares / 10) * 10), 10)
+                    reduce_shares = min(reduce_shares, shares)
+                elif shares <= 300:
+                    reduce_shares = int(raw_shares / 100) * 100
+                    if reduce_shares < 100:
+                        # 兵底：最多卖实际比例的1.5倍，避免“减30%”变“卖50%+”
+                        reduce_shares = min(int(raw_shares * 1.5), shares)
+                        reduce_shares = max(reduce_shares, int(raw_shares))
+                else:
+                    reduce_shares = int(raw_shares / 100) * 100
+                    if reduce_shares < 100:
+                        reduce_shares = min(100, int(raw_shares))
                 # FIX(2026-08-12): 按剩余可减股数封顶，保证同日多档条件单合计不超持仓
                 reduce_shares = min(reduce_shares, shares - cum_reduce)
                 if reduce_shares <= 0:
@@ -1582,9 +1780,22 @@ class IntradayMonitor:
         if (change_pct and change_pct < crash_pct * 100 and
                 avg_volume > 0 and volume > avg_volume * crash_vol and
                 crash_key not in self.alerts_sent):
-            reduce_shares = int(shares * 0.5 / 100) * 100
-            if reduce_shares < 100:
-                reduce_shares = min(shares, 100)
+            # FIX P1-#4: 暴跌减仓同样修复小仓位取整——原 50% 比例在 100/200 股上会退化为全仓
+            raw_crash_shares = shares * 0.5
+            if shares <= 0:
+                reduce_shares = 0
+            elif shares < 200:
+                reduce_shares = max(int(round(raw_crash_shares / 10) * 10), 10)
+                reduce_shares = min(reduce_shares, shares)
+            elif shares <= 300:
+                reduce_shares = int(raw_crash_shares / 100) * 100
+                if reduce_shares < 100:
+                    reduce_shares = min(int(raw_crash_shares * 1.5), shares)
+                    reduce_shares = max(reduce_shares, int(raw_crash_shares))
+            else:
+                reduce_shares = int(raw_crash_shares / 100) * 100
+                if reduce_shares < 100:
+                    reduce_shares = min(100, int(raw_crash_shares))
             # FIX(2026-08-24): 暴跌减仓同样受cum_reduce封顶——同日三档梯度已全仓时不再重复发单，
             # 否则条件单合计超持仓（实测：6000股生成9000股卖单）
             reduce_shares = min(reduce_shares, shares - cum_reduce)
@@ -1653,6 +1864,19 @@ class IntradayMonitor:
         except Exception:
             return None
 
+    def _get_atr_pct(self, code: str, price: float) -> float:
+        """V25(P2-2): ATR占价格百分比（波动率归一化指标）
+
+        返回 ATR/price（如0.03表示3%）。ATR不可用时回退到默认值0.025(2.5%)。
+        用于 VWAP偏离/急跌/梯度减仓 等阈值的自适应调整。
+        """
+        if price <= 0:
+            return 0.025
+        atr = self._get_atr_cached(code)
+        if atr is not None and atr > 0:
+            return min(max(atr / price, 0.005), 0.10)  # 限制在[0.5%, 10%]范围
+        return 0.025  # 默认回退: 2.5%
+
     def _generate_reduce_condition_order(self, code: str, name: str,
                                           price: float, shares: int, reason: str):
         """生成东方财富条件单（减仓卖出）"""
@@ -1672,8 +1896,15 @@ class IntradayMonitor:
                     orders = json.load(f)
 
             # 避免重复
+            # FIX P3-#18: 去重键加入 reason 前缀——同日先触发“梯度一档 300股”后触发
+            # “暴跌减仓 300股”时，原仅比较 (code, shares) 会漏发第二张单。
+            _reason_tag = str(reason).split("]")[0] if reason else ""
             for o in orders:
-                if o.get("证券代码") == code and o.get("数量") == shares:
+                _exist_note = str(o.get("说明", ""))
+                _exist_tag = _exist_note.split("]")[0] if _exist_note else ""
+                if (o.get("证券代码") == code
+                        and o.get("数量") == shares
+                        and _exist_tag == _reason_tag):
                     return
 
             # 卖出价: 现价下方0.5%确保成交
@@ -1861,81 +2092,30 @@ class IntradayMonitor:
     # ============================================================
 
     def _get_adaptive_rapid_drop_threshold(self, market_quote: dict) -> float:
-        """V9.3: 根据大盘波动率 regime 动态调整急跌阈值
-
-        原理: 高波动环境下频繁触发急跌预警会产生大量误报，
-              低波动环境下收紧阈值可提前捕捉风险。
-
-        规则:
-          - 高波动（大盘振幅>2% 或 跌幅>2%）: 放宽到 -4.0%
-          - 低波动（大盘振幅<0.5% 且 跌幅<0.5%）: 收紧到 -2.5%
-          - 正常: 保持 -3.0%
-
-        返回: 急跌阈值（负数，如 -3.0 表示跌3%）
-        """
-        if not market_quote:
-            return self.RAPID_DROP_PCT * 100  # 默认 -3.0
-
-        mkt_amplitude = abs(market_quote.get("change_pct", 0))
-        mkt_change = market_quote.get("change_pct", 0)
-
-        # 高波动 regime: 大盘大跌或振幅极大
-        if mkt_change < -2.0 or mkt_amplitude > 2.0:
-            base_threshold = -4.0
-        # 低波动 regime: 大盘平稳
-        elif mkt_amplitude < 0.5 and abs(mkt_change) < 0.5:
-            base_threshold = -2.5
-        # 正常波动
-        else:
-            base_threshold = self.RAPID_DROP_PCT * 100  # -3.0
-
-        # V10.0 P0-①: 应用校准因子（仅观察期外生效）
-        if self._calibration and not self._calibration.get("observation_mode", True):
-            factor = self._calibration.get("threshold_factors", {}).get("急跌预警", 1.0)
-            base_threshold *= factor
-
-        return base_threshold
+        """V9.3: 根据大盘波动率 regime 动态调整急跌阈值（P1-4: 委托给 market_gate 模块）"""
+        return _get_adaptive_rapid_drop_threshold_ext(
+            market_quote, self.RAPID_DROP_PCT, self._calibration,
+        )
 
     # ============================================================
     # V9.1: 大盘门控机制（方案4: 大盘急跌时延迟/压制个股预警）
     # ============================================================
 
     def _market_gate_check(self, market_quote: dict) -> str:
-        """大盘门控: 根据大盘状态决定个股预警的发送策略
+        """大盘门控（P1-4: 委托给 market_gate 模块）"""
+        return _market_gate_check_ext(market_quote, self._prev_gate_state)
 
-        返回:
-            "pass"     — 正常发送所有预警
-            "delay"    — 大盘急跌中，非 critical 预警入队列延迟
-            "suppress" — 大盘极端下跌，完全压制个股预警（此时信号不可靠）
+    # ============================================================
+    # V27: 大盘系统性风险硬止损触发器（盘中10秒轮询，零延迟响应）
+    # ============================================================
 
-        设计逻辑:
-          大盘急跌(-1%~-2.5%)时，个股普遍跟跌，此时发出的止损/减仓预警
-          在大盘企稳后往往迅速失效（价格反弹），导致"卖在最低点"。
-          通过门控延迟，等大盘企稳后再补发，显著提高预警有效性。
-        """
-        if not market_quote:
-            return "pass"
-
-        mkt_chg = market_quote.get("change_pct", 0)
-
-        # 大盘极端下跌(<-2.5%): 完全压制
-        # 此时所有个股预警都不可靠，且用户操作也大概率是错误的
-        if mkt_chg <= -2.5:
-            new_state = "suppress"
-        # 大盘明显下跌(-1%~-2.5%): 延迟非紧急预警
-        elif mkt_chg < -1.0:
-            new_state = "delay"
-        else:
-            new_state = "pass"
-
-        # V9.2: 门控状态转换日志（便于事后复盘门控行为）
-        # FIX(2026-08-19): 不再在此处更新 _prev_gate_state —— 由 _check_all
-        # 统一维护，否则 delay→pass 转换检测永远为 False（延迟队列永远不补发）
-        if new_state != self._prev_gate_state:
-            logger.info(f"[大盘门控] 状态转换: {self._prev_gate_state}→{new_state} "
-                        f"(大盘涨跌{mkt_chg:+.2f}%)")
-
-        return new_state
+    def _check_systemic_risk_alert(self, market_quote: dict, gate_state: str) -> list:
+        """V27: 大盘系统性风险硬止损（P1-4: 委托给 market_gate 模块）"""
+        if not hasattr(self, '_systemic_risk_cooldown'):
+            self._systemic_risk_cooldown = {}
+        return _check_systemic_risk_alert_ext(
+            market_quote, gate_state, self._systemic_risk_cooldown,
+        )
 
     # ============================================================
     # V9.1: 均值回归过滤器（方案1: ATR+VWAP Z-Score 检测极端偏离）
@@ -1943,27 +2123,10 @@ class IntradayMonitor:
 
     def _is_mean_reversion_zone(self, code: str, current_price: float,
                                  quote: dict) -> tuple:
-        """判断当前价格是否处于均值回归高概率区域
-
-        使用 VWAP + ATR 计算标准化偏离度(Z-Score):
-          Z = (价格 - VWAP) / ATR
-          |Z| > 2 意味着价格偏离日内均价超过2倍真实波幅，回归概率极高
-
-        返回:
-            (is_zone: bool, z_score: float)
-            is_zone=True 且 z_score<-2 → 极端低估，止损信号不可靠
-            is_zone=True 且 z_score>2  → 极端高估，止盈信号可加强
-        """
+        """判断当前价格是否处于均值回归高概率区域（P1-4: 委托给 market_gate 模块）"""
         vwap = quote.get("vwap", 0)
-        if vwap <= 0 or current_price <= 0:
-            return False, 0.0
-
         atr = self._get_atr_cached(code)
-        if not atr or atr <= 0:
-            return False, 0.0
-
-        z_score = (current_price - vwap) / atr
-        return (abs(z_score) > 2.0), z_score
+        return _is_mean_reversion_zone_ext(current_price, vwap, atr)
 
     # ============================================================
     # V9.1: 延迟预警补发（大盘企稳后释放门控期间积压的预警）
@@ -2128,8 +2291,17 @@ class IntradayMonitor:
             return alerts
 
         deviation = (current_price - vwap) / vwap
-        bearish_pct = self.vwap_cfg.get("bearish_deviation_pct", -0.015)
-        bullish_pct = self.vwap_cfg.get("bullish_deviation_pct", 0.03)
+        # V25(P2-2): ATR自适应VWAP偏离阈值 —— 高波动标的自动放宽，低波动标的自动收紧
+        _atr_pct = self._get_atr_pct(code, current_price)
+        _base_bearish = self.vwap_cfg.get("bearish_deviation_pct", -0.015)
+        _base_bullish = self.vwap_cfg.get("bullish_deviation_pct", 0.03)
+        bearish_pct = -max(abs(_base_bearish), _atr_pct * 0.8)   # 空头确认阈值: max(1.5%, 0.8×ATR%)
+        bullish_pct = max(_base_bullish, _atr_pct * 1.5)          # 超买偏离阈值: max(3.0%, 1.5×ATR%)
+        # V25(P2-3): 应用校准因子（VWAP类预警，仅观察期外生效）
+        if self._calibration and not self._calibration.get("observation_mode", True):
+            _vwap_factor = self._calibration.get("threshold_factors", {}).get("VWAP失守", 1.0)
+            bearish_pct *= _vwap_factor
+            bullish_pct *= _vwap_factor
         persist_n = self.vwap_cfg.get("bearish_persist_cycles", 3)
 
         # 跟踪VWAP上下方状态
@@ -2925,173 +3097,123 @@ class IntradayMonitor:
     # ============================================================
 
     def detect_intraday_pattern(self, code: str, name: str, today: str) -> list:
-        """基于日内价格序列识别分时形态
-
-        形态:
-          - M头(双顶): 两次高点差<0.3% + 跌破颈线
-          - 阶梯上攻: 3级台阶，每级上涨>0.5%
-          - V反: 急跌>3%后5分钟反弹>2%
-        """
-        alerts = []
+        """基于日内价格序列识别分时形态（P1-4: 委托给 intraday_patterns 模块）"""
         pattern_cfg = getattr(config, 'INTRADAY_PATTERN_CONFIG', {})
-        if not pattern_cfg.get("enabled", True):
-            return alerts
+        return _detect_intraday_pattern_ext(
+            code, name, self.price_history.get(code, []),
+            pattern_cfg, today, self.alerts_sent,
+        )
 
-        history = self.price_history.get(code, [])
-        min_points = pattern_cfg.get("min_data_points", 30)
-        if len(history) < min_points:
-            return alerts
+    def _detect_m_head(self, code, name, prices, cfg, today):
+        """P1-4: 委托给 intraday_patterns.detect_m_head"""
+        return _detect_m_head_ext(code, name, prices, cfg, today, self.alerts_sent)
 
-        prices = [p[1] for p in history]
+    def _detect_staircase(self, code, name, prices, cfg, today):
+        """P1-4: 委托给 intraday_patterns.detect_staircase"""
+        return _detect_staircase_ext(code, name, prices, cfg, today, self.alerts_sent)
 
-        # --- M头检测 ---
-        m_alert = self._detect_m_head(code, name, prices, pattern_cfg, today)
-        if m_alert:
-            alerts.append(m_alert)
+    def _detect_v_reversal(self, code, name, prices, cfg, today):
+        """P1-4: 委托给 intraday_patterns.detect_v_reversal"""
+        return _detect_v_reversal_ext(code, name, prices, cfg, today, self.alerts_sent)
 
-        # --- 阶梯上攻检测 ---
-        stair_alert = self._detect_staircase(code, name, prices, pattern_cfg, today)
-        if stair_alert:
-            alerts.append(stair_alert)
+    # ============================================================
+    # V10.1: 开盘定性 + 竞价串联
+    # ============================================================
 
-        # --- V反检测 ---
-        v_alert = self._detect_v_reversal(code, name, prices, pattern_cfg, today)
-        if v_alert:
-            alerts.append(v_alert)
+    def detect_opening_pattern(self, code: str, name: str, today: str) -> dict:
+        """V10.1: 开盘30分钟定性分析 + 竞价轨迹串联
 
-        return alerts
-
-    def _detect_m_head(self, code: str, name: str, prices: list,
-                       cfg: dict, today: str) -> dict:
-        """M头(双顶)检测: 两个高点差<0.3% + 跌破颈线"""
-        peak_diff_pct = cfg.get("m_head_peak_diff_pct", 0.003)
-        neckline_break = cfg.get("m_head_neckline_break", -0.005)
-
-        if len(prices) < 20:
-            return None
-
-        # 简化: 将价格序列分为前半/后半，各找最高点
-        mid = len(prices) // 2
-        first_half = prices[:mid]
-        second_half = prices[mid:]
-
-        peak1 = max(first_half)
-        peak2 = max(second_half)
-
-        # 两峰接近
-        if peak1 <= 0:
-            return None
-        diff = abs(peak1 - peak2) / peak1
-        if diff > peak_diff_pct:
-            return None
-
-        # 颈线 = 两峰之间的最低点
-        valley = min(prices[mid - 5:mid + 5]) if mid > 5 else min(prices)
-        current = prices[-1]
-
-        # 跌破颈线
-        if current < valley * (1 + neckline_break):
-            alert_key = f"{today}_{code}_m_head"
-            if alert_key not in self.alerts_sent:
-                self.alerts_sent.add(alert_key)
-                return {
-                    "level": "warning",
-                    "type": "分时M头",
-                    "code": code,
-                    "name": name,
-                    "message": f"📉 {name}({code}) 分时M头形成! "
-                              f"双顶{peak1:.2f}/{peak2:.2f}(差{diff*100:.2f}%) | "
-                              f"已跌破颈线{valley:.2f} | 建议减仓",
-                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
-        return None
-
-    def _detect_staircase(self, code: str, name: str, prices: list,
-                          cfg: dict, today: str) -> dict:
-        """阶梯上攻: 3级台阶，每级上涨>0.5%"""
-        min_steps = cfg.get("stair_min_steps", 3)
-        min_rise = cfg.get("stair_min_rise_pct", 0.005)
-
-        if len(prices) < 30:
-            return None
-
-        # 简化算法: 将序列分段，检测每段是否合阶梯特征
-        segment_size = len(prices) // (min_steps + 1)
-        if segment_size < 5:
-            return None
-
-        steps = 0
-        prev_level = prices[0]
-        for i in range(1, min_steps + 2):
-            seg_start = i * segment_size
-            seg_end = min((i + 1) * segment_size, len(prices))
-            if seg_start >= len(prices):
-                break
-            seg_avg = sum(prices[seg_start:seg_end]) / max(len(prices[seg_start:seg_end]), 1)
-            rise = (seg_avg - prev_level) / prev_level if prev_level > 0 else 0
-            if rise > min_rise:
-                steps += 1
-                prev_level = seg_avg
-
-        if steps >= min_steps:
-            alert_key = f"{today}_{code}_staircase"
-            if alert_key not in self.alerts_sent:
-                self.alerts_sent.add(alert_key)
-                total_rise = (prices[-1] - prices[0]) / prices[0] * 100
-                return {
-                    "level": "info",
-                    "type": "阶梯上攻",
-                    "code": code,
-                    "name": name,
-                    "message": f"📈 {name}({code}) 分时阶梯上攻! "
-                              f"{steps}级台阶，累计+{total_rise:.1f}% | "
-                              f"主力有序推升，持有",
-                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
-        return None
-
-    def _detect_v_reversal(self, code: str, name: str, prices: list,
-                           cfg: dict, today: str) -> dict:
-        """V反: 急跌>3%后5分钟反弹>2%"""
-        drop_pct = cfg.get("v_reversal_drop_pct", -0.03)
-        bounce_pct = cfg.get("v_reversal_bounce_pct", 0.02)
-
+        在开盘后30分钟内调用，检测高开低走(出货)/低开高走(吸筹)
+        并与竞价轨迹结果串联确认诱多/诱空
+        """
+        pattern_cfg = getattr(config, 'INTRADAY_PATTERN_CONFIG', {})
+        prices = self.price_history.get(code, [])
         if len(prices) < 10:
             return None
 
-        # 找近10个点内的最低点
-        recent = prices[-10:]
-        min_price = min(recent)
-        min_idx = recent.index(min_price)
+        # 加载竞价轨迹结果
+        auction_result = None
+        try:
+            from strategy.auction_monitor import load_auction_result
+            all_auction = load_auction_result()
+            auction_result = all_auction.get(code)
+        except Exception:
+            pass
 
-        # 最低点之前的最高点
-        before_min = recent[:min_idx] if min_idx > 0 else [prices[-10]]
-        local_high = max(before_min) if before_min else prices[-10]
+        return _detect_opening_pattern_ext(
+            code, name, [p[1] for p in prices],
+            pattern_cfg, today, self.alerts_sent,
+            auction_result=auction_result,
+        )
 
-        # 下跌幅度
-        drop = (min_price - local_high) / local_high if local_high > 0 else 0
-        if drop > drop_pct:  # drop是负数，drop_pct也是负数
+    # ============================================================
+    # V10.1: VWAP偏离检测
+    # ============================================================
+
+    def detect_vwap_deviation(self, code: str, name: str, today: str) -> dict:
+        """V10.1: 分时VWAP偏离检测
+
+        VWAP = Σ(价格×成交量) / Σ成交量
+        偏离度 = (当前价 - VWAP) / VWAP
+        → 偏离>2%且量能萎缩: "价格虚高"(诱多辅助)
+        → 偏离<-2%且量能萎缩: "价格虚低"(诱空辅助)
+        """
+        prices_vols = self.price_history.get(code, [])
+        if len(prices_vols) < 20:
             return None
 
-        # 反弹幅度（从最低点到当前）
-        current = prices[-1]
-        bounce = (current - min_price) / min_price if min_price > 0 else 0
+        # 计算VWAP (用价格序列近似，无成交量时用等权)
+        total_pv = 0
+        total_v = 0
+        for ts, price in prices_vols:
+            # 无成交量数据时用等权VWAP(即简单均价)
+            vol = 1
+            total_pv += price * vol
+            total_v += vol
 
-        if bounce > bounce_pct:
-            alert_key = f"{today}_{code}_v_reversal_intraday"
-            if alert_key not in self.alerts_sent:
-                self.alerts_sent.add(alert_key)
-                return {
-                    "level": "info",
-                    "type": "分时V反",
-                    "code": code,
-                    "name": name,
-                    "message": f"🔄 {name}({code}) 分时V型反转! "
-                              f"急跌{drop*100:.1f}%后反弹+{bounce*100:.1f}% | "
-                              f"短期止跌，观察持续性",
-                    "time": datetime.datetime.now().strftime("%H:%M:%S"),
-                }
-        return None
+        if total_v <= 0:
+            return None
+
+        vwap = total_pv / total_v
+        current = prices_vols[-1][1]
+        deviation = (current - vwap) / vwap if vwap > 0 else 0
+
+        # 偏离阈值
+        vwap_cfg = getattr(config, 'VWAP_DEVIATION_CONFIG', {})
+        high_threshold = vwap_cfg.get("high_deviation", 0.02)
+        low_threshold = vwap_cfg.get("low_deviation", -0.02)
+
+        if abs(deviation) < high_threshold:
+            return None  # 偏离不够大
+
+        if deviation > high_threshold:
+            pattern = "vwap_overbought"
+            label = "VWAP偏离过高"
+            detail = f"当前{current:.2f} vs VWAP{vwap:.2f} | 偏离+{deviation*100:.1f}%，价格虚高"
+            level = "warning"
+        else:
+            pattern = "vwap_oversold"
+            label = "VWAP偏离过低"
+            detail = f"当前{current:.2f} vs VWAP{vwap:.2f} | 偏离{deviation*100:.1f}%，价格虚低"
+            level = "info"
+
+        alert_key = f"{today}_{code}_{pattern}"
+        if alert_key in self.alerts_sent:
+            return None
+        self.alerts_sent.add(alert_key)
+
+        icon = "⚠️" if level == "warning" else "📈"
+        return {
+            "level": level,
+            "type": label,
+            "code": code,
+            "name": name,
+            "message": f"{icon} {name}({code}) {label}: {detail}",
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            "pattern": pattern,
+            "vwap": round(vwap, 3),
+            "deviation": round(deviation * 100, 2),
+        }
 
 
 def main():

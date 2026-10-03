@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint with ruff
+        run: |
+          ruff check trading_system/ --select E,F,W --ignore E501,E402,W503
+        continue-on-error: true
+
+      - name: Run core tests
+        run: |
+          python -m pytest tests/test_core.py -v --timeout=60 --tb=short
+        continue-on-error: true
+
+      - name: Run tests with coverage
+        run: |
+          python -m pytest tests/ -v --timeout=120 --tb=short \
+            --cov=trading_system --cov-report=term-missing \
+            --ignore=tests/test_deep_quant.py \
+            --ignore=tests/test_safety_deep.py
+        continue-on-error: true

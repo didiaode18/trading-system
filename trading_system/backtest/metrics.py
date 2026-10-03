@@ -35,13 +35,25 @@ def calc_max_drawdown(equity_curve: pd.Series) -> tuple:
     返回:
         (max_drawdown_pct, peak_date, trough_date)
     """
+    # V4.1 FIX: 空序列保护，避免 idxmax() 抛出 ValueError
+    if equity_curve.empty:
+        return 0.0, None, None
     cummax = equity_curve.cummax()
     drawdown = (cummax - equity_curve) / cummax
     max_dd = drawdown.max()
 
     # 找到回撤的峰值和谷值日期
+    # 用位置索引(get_loc)而非标签比较，兼容整数索引与日期/字符串索引
+    # （旧实现 trough_idx > 0 在日期索引下会抛 TypeError）
     trough_idx = drawdown.idxmax()
-    peak_idx = equity_curve[:trough_idx].idxmax() if trough_idx > 0 else 0
+    try:
+        trough_pos = equity_curve.index.get_loc(trough_idx)
+    except Exception:
+        trough_pos = 0
+    if isinstance(trough_pos, slice):  # 重复索引兜底
+        trough_pos = trough_pos.stop or 0
+    peak_idx = (equity_curve.iloc[:trough_pos + 1].idxmax()
+                if trough_pos > 0 else equity_curve.index[0])
 
     return max_dd, peak_idx, trough_idx
 

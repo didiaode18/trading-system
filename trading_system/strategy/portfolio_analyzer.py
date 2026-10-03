@@ -146,6 +146,8 @@ def analyze_portfolio(holdings: dict, data_dict: dict = None, consensus_results:
             "consensus_direction": consensus_results.get(code, {}).get("direction", "-"),
             "consensus_action": consensus_results.get(code, {}).get("action", "-"),
             "consensus_confidence": consensus_results.get(code, {}).get("confidence", 0),
+            # V10.1 W1修复: 消费诱多/诱空预警信息
+            "consensus_trap_warning": consensus_results.get(code, {}).get("trap_warning", ""),
         })
 
     # 按仓位占比排序

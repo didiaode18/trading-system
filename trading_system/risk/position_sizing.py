@@ -55,11 +55,33 @@ STOCK_SECTOR = {
 
 
 class PositionSizer:
-    """仓位管理器"""
+    """
+    仓位管理器
+
+    职责:
+      解决“买多少”问题，根据多约束条件计算每只标的的建议仓位。
+      约束包括: 凯利公式、风险预算、板块集中度、波动率、信号强度。
+
+    核心输入:
+      results: CaopanEngine.analyze() 结果列表（含买点/止损/胜率/盈亏比）
+      holdings: 当前持仓 {code: {shares, cost, ...}}
+
+    核心输出 (calc_positions() 返回 dict):
+      positions: 每只标的建议仓位（股数+金额+占比）
+      risk_assessment: 组合风险度（0-100%）
+      rebalance: 再平衡建议
+      summary: 仓位分配摘要
+
+    关键依赖:
+      - config.TOTAL_CAPITAL / AVAILABLE_CASH
+      - kelly.py: Kelly公式计算
+      - risk_control.py: 风控硬约束
+    """
 
     def __init__(self, total_capital: float = None, available_cash: float = None, config: dict = None):
         self.cfg = {**SIZING_CONFIG, **(config or {})}
-        if total_capital:
+        # FIX P0-2: 使用 is not None 判断，确保 total_capital=0 也能正确设置
+        if total_capital is not None:
             self.cfg["total_capital"] = total_capital
         # V2.0: 可用资金约束（用于判断买入建议是否可执行）
         self.available_cash = available_cash
@@ -83,6 +105,17 @@ class PositionSizer:
         """
         capital = self.cfg["total_capital"]
         holdings = holdings or {}
+
+        # FIX P0-2: 零资金/负资金保护——直接返回空仓位计划，避免无效分配
+        if capital <= 0:
+            logger.error(f"[仓位管理] 总资金异常: {capital}，拒绝分配仓位")
+            return {
+                "positions": [],
+                "total_allocated": 0,
+                "remaining_cash": 0,
+                "strategy": self.cfg.get("strategy", "unknown"),
+                "error": f"总资金异常: {capital}",
+            }
 
         # FIX P1: 策略失效检测器联动——降级时仓位缩放
         strategy_scale = 1.0

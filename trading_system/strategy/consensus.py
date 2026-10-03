@@ -21,6 +21,7 @@
 """
 
 import logging
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,9 @@ logger = logging.getLogger(__name__)
 def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
                       signal_dict: dict = None, forecast_result: dict = None,
                       manipulation_result: dict = None,
-                      capital_flow_result: dict = None) -> dict:
+                      capital_flow_result: dict = None,
+                      weekly_trend: dict = None,
+                      sentiment_result: dict = None) -> dict:
     """
     计算单只股票的多空共识
 
@@ -41,6 +44,8 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
         forecast_result: TrendForecaster.analyze_stock() 的输出
         manipulation_result: AntiManipulationAnalyzer.analyze() 的输出
         capital_flow_result: CapitalFlowAnalyzer.calc_flow_score() 的输出
+        weekly_trend: V10.1 周线趋势(check_weekly_trend()返回)
+        sentiment_result: V10.1 市场情绪(MarketSentiment.analyze()返回)
 
     返回:
         {
@@ -53,6 +58,7 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
             "action_confidence": "xx%",
             "key_price": float,       # 关键价位
             "components": {...},      # 各模块贡献分
+            "trap_warning": str,      # V10.1: 诱多/诱空预警
         }
     """
     result = {
@@ -65,6 +71,7 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
         "action_confidence": "50%",
         "key_price": 0.0,
         "components": {},
+        "trap_warning": "",  # V10.1: 诱多/诱空预警
     }
 
     if df.empty or len(df) < 10:
@@ -139,6 +146,8 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     # ============================================================
     vp_score = 0
     vp_direction = "中性"
+    _trap_warnings = []  # V10.1: 收集诱多/诱空预警
+
     if manipulation_result:
         manip_score = manipulation_result.get("manipulation_score", 50)
         # 主力评分高=洗盘概率大=看多；低=真破位=看空
@@ -156,6 +165,14 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
         if manipulation_result.get("bear_trap"):
             vp_score = max(vp_score, 12)
             vp_direction = "诱空机会"
+
+        # V10.1: 早期征兆预警(从anti_manipulation获取)
+        if manipulation_result.get("early_bull_trap"):
+            _trap_warnings.append("⚠️诱多早期征兆: " + manipulation_result.get("early_bull_trap_detail", ""))
+            vp_score = min(vp_score, -8)
+        if manipulation_result.get("early_bear_trap"):
+            _trap_warnings.append("⚠️诱空早期征兆: " + manipulation_result.get("early_bear_trap_detail", ""))
+            vp_score = max(vp_score, 8)
     else:
         # 简单量价分析
         if len(df) >= 5:
@@ -173,10 +190,37 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
                 vp_score = -12
                 vp_direction = "放量下跌"
 
+    # ---- V10.1增强: OBV背离斜率 ----
+    _obv_divergence = _calc_obv_divergence(df)
+    if _obv_divergence is not None:
+        # OBV顶背离: 价格涨但OBV不涨 → 诱多先行
+        if _obv_divergence > 0.05:
+            vp_score = min(vp_score, -6)
+            vp_direction = "OBV顶背离(诱多先行)" if "诱多" not in vp_direction else vp_direction
+            _trap_warnings.append(f"OBV顶背离: 价格涨但量能未跟随(偏离{_obv_divergence*100:.1f}%)")
+        # OBV底背离: 价格跌但OBV不跌 → 诱空先行
+        elif _obv_divergence < -0.05:
+            vp_score = max(vp_score, 6)
+            vp_direction = "OBV底背离(诱空先行)" if "诱空" not in vp_direction else vp_direction
+            _trap_warnings.append(f"OBV底背离: 价格跌但量能未跟随(偏离{_obv_divergence*100:.1f}%)")
+
+    # ---- V10.1增强: 量价弹性系数 ----
+    _vp_elasticity = _calc_volume_price_elasticity(df)
+    if _vp_elasticity is not None:
+        if _vp_elasticity < 0.3:
+            # 弹性极低: 放量也推不动价格 → 诱多环境(上方抛压重)
+            vp_score = min(vp_score, -4)
+            _trap_warnings.append(f"量价弹性极低({_vp_elasticity:.2f}): 放量推不动价格")
+        elif _vp_elasticity > 3.0:
+            # 弹性极高: 缩量也能涨 → 惜售/控盘度高(可能是诱空后吸筹完成)
+            vp_score = max(vp_score, 4)
+
     result["components"]["volume_price"] = {
         "score": round(vp_score, 1),
         "direction": vp_direction,
         "weight": "20%",
+        "obv_divergence": round(_obv_divergence, 4) if _obv_divergence is not None else None,
+        "vp_elasticity": round(_vp_elasticity, 2) if _vp_elasticity is not None else None,
     }
 
     # ============================================================
@@ -207,9 +251,36 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     }
 
     # ============================================================
-    # 5. 综合评分
+    # 5. V10.1: 市场情绪逆向指标 (-5 ~ +5)
     # ============================================================
-    total_score = strategy_score + forecast_score + vp_score + flow_score
+    sentiment_score = 0
+    sentiment_direction = "中性"
+    if sentiment_result:
+        sentiment_total = sentiment_result.get("sentiment_score", 50)
+        # 将0-100映射到-5~+5 (逆向: 极端乐观→看空, 极端悲观→看多)
+        sentiment_score = (sentiment_total - 50) / 50 * -5  # 注意取反
+
+        if sentiment_total >= 80:
+            sentiment_direction = "极端乐观(逆向看空)"
+            _trap_warnings.append("市场情绪极端乐观，注意诱多风险")
+        elif sentiment_total >= 65:
+            sentiment_direction = "偏乐观"
+        elif sentiment_total <= 20:
+            sentiment_direction = "极端悲观(逆向看多)"
+            _trap_warnings.append("市场情绪极端悲观，注意诱空机会")
+        elif sentiment_total <= 35:
+            sentiment_direction = "偏悲观"
+
+    result["components"]["sentiment"] = {
+        "score": round(sentiment_score, 1),
+        "direction": sentiment_direction,
+        "weight": "5%",
+    }
+
+    # ============================================================
+    # 6. 综合评分
+    # ============================================================
+    total_score = strategy_score + forecast_score + vp_score + flow_score + sentiment_score
     total_score = max(-100, min(100, total_score))
     result["score"] = round(total_score, 1)
 
@@ -226,20 +297,24 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
         result["direction"] = "中性"
 
     # ============================================================
-    # 6. 矛盾检测
+    # 7. 矛盾检测（V10.1: 新增多时间框架矛盾）
     # ============================================================
     conflict, conflict_reason = _detect_conflict(
         strategy_direction, forecast_direction, vp_direction, flow_direction,
         strategy_score, forecast_score, signal_dict, forecast_total,
-        flow_total
+        flow_total, weekly_trend=weekly_trend,
     )
     result["conflict"] = conflict
     result["conflict_reason"] = conflict_reason
     if conflict:
         result["direction"] = "分歧"
 
+    # V10.1: 写入诱多/诱空预警
+    if _trap_warnings:
+        result["trap_warning"] = " | ".join(_trap_warnings[:3])
+
     # ============================================================
-    # 7. 置信度计算
+    # 8. 置信度计算
     # ============================================================
     # V9.2: 引入历史准确率加权（各模块历史预测表现影响置信度）
     directions = [strategy_direction, forecast_direction, vp_direction, flow_direction]
@@ -282,7 +357,7 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     result["confidence"] = confidence
 
     # ============================================================
-    # 8. 操作建议
+    # 9. 操作建议
     # ============================================================
     action, action_conf = _generate_action(
         total_score, confidence, holding, signal_dict,
@@ -292,7 +367,7 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     result["action_confidence"] = f"{action_conf}%"
 
     # ============================================================
-    # 9. V9.2: 共识预测接入PredictionTracker（打通预测验证闭环）
+    # 10. V9.2: 共识预测接入PredictionTracker（打通预测验证闭环）
     # ============================================================
     try:
         from monitor.prediction_tracker import PredictionTracker
@@ -319,10 +394,86 @@ def compute_consensus(code: str, df: pd.DataFrame, holding: dict = None,
     return result
 
 
+def _calc_obv_divergence(df: pd.DataFrame) -> float:
+    """V10.1: 计算OBV-价格背离斜率
+
+    返回: price_slope - obv_slope
+      > 0.05: 顶背离(价格涨但OBV不涨, 诱多先行)
+      < -0.05: 底背离(价格跌但OBV不跌, 诱空先行)
+      None: 数据不足或OBV基数为0，不可用
+    """
+    if len(df) < 20:
+        return None
+    close = df["close"].values
+    volume = df["volume"].values
+
+    # 计算OBV
+    obv = np.zeros(len(close))
+    for i in range(1, len(close)):
+        if close[i] > close[i - 1]:
+            obv[i] = obv[i - 1] + volume[i]
+        elif close[i] < close[i - 1]:
+            obv[i] = obv[i - 1] - volume[i]
+        else:
+            obv[i] = obv[i - 1]
+
+    # 20日斜率
+    lookback = min(20, len(df) - 1)
+    price_base = close[-lookback - 1] if close[-lookback - 1] > 0 else None
+    obv_base = abs(obv[-lookback - 1]) if obv[-lookback - 1] != 0 else None
+
+    # W3修复: 基数为0时返回None，避免虚假背离值
+    if price_base is None or obv_base is None:
+        return None
+
+    price_slope = (close[-1] - close[-lookback - 1]) / price_base
+    obv_slope = (obv[-1] - obv[-lookback - 1]) / obv_base
+
+    return price_slope - obv_slope
+
+
+def _calc_volume_price_elasticity(df: pd.DataFrame) -> float:
+    """V10.1: 计算量价弹性系数
+
+    弹性 = 近5日价格涨幅 / 近5日成交量变化率
+    弹性低(<0.3): 放量也推不动价格 → 上方抛压重(诱多环境)
+    弹性高(>3.0): 缩量也能涨 → 惜售/控盘度高
+    """
+    if len(df) < 10:
+        return None
+
+    close = df["close"].values
+    volume = df["volume"].values
+
+    # 近5日价格涨幅
+    price_change_5d = (close[-1] - close[-6]) / close[-6] if close[-6] > 0 else 0
+
+    # 近5日成交量变化率
+    vol_5d_recent = np.mean(volume[-5:])
+    vol_5d_prev = np.mean(volume[-10:-5])
+    vol_change = (vol_5d_recent - vol_5d_prev) / vol_5d_prev if vol_5d_prev > 0 else 0
+
+    if abs(vol_change) < 0.01:  # 成交量几乎不变
+        return None
+
+    elasticity = price_change_5d / vol_change
+    return elasticity
+
+
 def _detect_conflict(strategy_dir, forecast_dir, vp_dir, flow_dir,
                      strategy_score, forecast_score,
-                     signal_dict, forecast_total, flow_total) -> tuple:
-    """检测模块间矛盾"""
+                     signal_dict, forecast_total, flow_total,
+                     weekly_trend=None) -> tuple:
+    """检测模块间矛盾 + V10.1多时间框架矛盾"""
+    # C2修复: V10.1 日线/周线矛盾检测提到最前面（最高优先级）
+    # 原先放在末尾会被前面5个 return True 分支永久遮蔽，永远无法触发
+    if weekly_trend and signal_dict:
+        weekly_dir = weekly_trend.get("trend", "unknown")
+        if signal_dict.get("buy_signal") and weekly_dir == "down":
+            return True, "日线买入信号但周线下跌，假突破风险高(多时间框架矛盾)"
+        if signal_dict.get("sell_signal") and weekly_dir == "up":
+            return True, "日线卖出信号但周线仍上升，洗盘概率大(多时间框架矛盾)"
+
     # 策略说卖但预测看多
     if signal_dict and signal_dict.get("sell_signal") and forecast_total > 60:
         return True, f"短期止损触发但中期趋势评分{forecast_total:.0f}分(偏多)，建议区分短/中期操作"
@@ -402,7 +553,9 @@ def _generate_action(total_score, confidence, holding, signal_dict,
 def batch_consensus(data_dict: dict, holdings: dict = None,
                     signals: list = None, forecast_results: list = None,
                     manipulation_results: dict = None,
-                    capital_flow_results: dict = None) -> dict:
+                    capital_flow_results: dict = None,
+                    weekly_trends: dict = None,
+                    sentiment_result: dict = None) -> dict:
     """
     批量计算所有持仓股的共识
 
@@ -413,6 +566,8 @@ def batch_consensus(data_dict: dict, holdings: dict = None,
         forecast_results: [forecast_result, ...] 预测结果
         manipulation_results: {code: manip_result} 主力分析
         capital_flow_results: {code: flow_result} 资金流分析结果
+        weekly_trends: V10.1 {code: weekly_trend_result} 周线趋势
+        sentiment_result: V10.1 市场情绪分析结果(全局共用)
 
     返回:
         {code: consensus_result}
@@ -423,6 +578,8 @@ def batch_consensus(data_dict: dict, holdings: dict = None,
         manipulation_results = {}
     if capital_flow_results is None:
         capital_flow_results = {}
+    if weekly_trends is None:
+        weekly_trends = {}
 
     # 构建信号字典映射
     signal_map = {}
@@ -453,10 +610,13 @@ def batch_consensus(data_dict: dict, holdings: dict = None,
         forecast_result = forecast_map.get(code)
         manip_result = manipulation_results.get(code)
         flow_result = capital_flow_results.get(code)
+        weekly = weekly_trends.get(code)
 
         results[code] = compute_consensus(
             code, df, holding, signal_dict, forecast_result, manip_result,
-            capital_flow_result=flow_result
+            capital_flow_result=flow_result,
+            weekly_trend=weekly,
+            sentiment_result=sentiment_result,
         )
 
     return results

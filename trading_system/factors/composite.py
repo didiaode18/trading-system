@@ -1,10 +1,11 @@
-# NOTE: 仅供 validate_v8.py/tests 引用，未接入生产链路
+# V7.0 Phase0: 已接入生产链路（原仅供测试 → 正式生产）
 """
 因子合成模块
 ============
 - 因子正交化（去除共线性，VIF>10剔除）
 - 加权合成（IC加权/等权/自定义）
 - 输出综合因子得分
+- 支持预处理+正交化+合成一体化流水线
 """
 
 import logging
@@ -146,3 +147,33 @@ class CompositeFactor:
     def rank_score(self, score: pd.Series) -> pd.Series:
         """将得分转为排名百分位(0~1)"""
         return score.rank(pct=True)
+
+    def pipeline(self, factor_df: pd.DataFrame,
+                 sector_map: dict = None, mcap_map: dict = None,
+                 weights: dict = None, method: str = "equal") -> pd.Series:
+        """
+        一体化流水线: 预处理 → 正交化 → 合成得分
+
+        参数:
+            factor_df: 原始因子DataFrame
+            sector_map: 行业映射（中性化用）
+            mcap_map: 市值映射（中性化用）
+            weights: 因子权重
+            method: 合成方法
+
+        返回:
+            综合得分Series（排名百分位 0~1）
+        """
+        try:
+            from factors.preprocessor import preprocess_factors
+            # Step 1: 预处理
+            processed = preprocess_factors(factor_df, sector_map, mcap_map)
+            # Step 2: 正交化
+            ortho = self.orthogonalize(processed)
+            # Step 3: 合成
+            score = self.compute_score(ortho, weights, method)
+            # Step 4: 排名
+            return self.rank_score(score)
+        except Exception as e:
+            logger.warning(f"[因子合成] 流水线异常: {e}")
+            return pd.Series(dtype=float)

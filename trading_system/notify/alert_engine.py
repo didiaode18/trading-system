@@ -64,7 +64,7 @@ ALERT_CONFIG = {
     "deviation_overbought": 8.0,   # 超买乖离率阈值(%)
     "deviation_oversold": -8.0,    # 超卖乖离率阈值(%)
     "profit_ratio_drop": 0.10,     # 获利盘骤降阈值(10%)
-    "stop_loss_pct": -0.10,        # 止损线(-10%) FIX: 统一使用config.INITIAL_STOP_LOSS_PCT(10%)，原-8%与主系统不一致
+    "stop_loss_pct": -0.12,        # 止损线(-12%) FIX: V7.0统一使用config.INITIAL_STOP_LOSS_PCT(12%)，原-10%与主系统不一致
     "alert_cooldown_min": 30,      # 同一标的预警冷却时间(分钟) FIX(2026-08-12): 15→30，与scheduler统一冷却口径一致
     # V2-FIX: 分级冷却与scheduler统一 —— critical缩短至15分钟加快止损再提醒
     "alert_cooldown_by_level": None,  # 延迟从config初始化，见下方_init_cooldown_config
@@ -769,7 +769,13 @@ class AlertEngine:
         # ============================================================
         # R17. 阶梯止盈提醒（V3.3新增）
         # ============================================================
-        # 基于config.LADDER_SELL_LEVELS: 浮盈10%→减1/3, 浮盈20%→再减1/3
+        # 基于config.LADDER_SELL_LEVELS动态读取止盈档位
+        import config as _cfg_r17  # FIX P0: 修复 name 'config' is not defined
+        _ladder = getattr(_cfg_r17, 'LADDER_SELL_LEVELS', [(0.18, 1/4), (0.25, 1/3)])
+        _tier1_pct = _ladder[0][0] if len(_ladder) > 0 else 0.18
+        _tier1_ratio = _ladder[0][1] if len(_ladder) > 0 else 1/4
+        _tier2_pct = _ladder[1][0] if len(_ladder) > 1 else 0.25
+        _tier2_ratio = _ladder[1][1] if len(_ladder) > 1 else 1/3
         # 同时检测回落止盈：从最高点回落超过阈值触发
         info = self.holdings.get(code, {})
         buy_price_r17 = info.get("buy_price", 0) or info.get("cost", 0)
@@ -778,37 +784,37 @@ class AlertEngine:
             highest = info.get("highest", buy_price_r17)  # 持仓最高价
             drawdown_from_high = (close - highest) / highest if highest > 0 else 0
 
-            # 第一止盈位: 浮盈≥10%
+            # 第一止盈位: 浮盈≥第一档阈值
             # FIX P2-14: 同一交易日同一档位已提醒过则不再重复（语义去重）
-            if profit_pct >= 0.10 and not self._r17_tier_seen(code, "tier1"):
+            if profit_pct >= _tier1_pct and not self._r17_tier_seen(code, "tier1"):
                 shares = info.get("shares", 0)
                 # FIX P1-3: 小仓位兜底100股（原取整会输出0股）；shares<100时输出全部
-                sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
+                sell_ratio = min(shares, max(100, int(shares * _tier1_ratio / 100) * 100)) if shares >= 100 else shares
                 alerts.append({
                     "type": "profit_target_1",
-                    "rule_name": "R17-第一止盈位(浮盈≥10%)",
-                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第一止盈位(10%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
+                    "rule_name": f"R17-第一止盈位(浮盈≥{_tier1_pct*100:.0f}%)",
+                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第一止盈位({_tier1_pct*100:.0f}%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
                     # V9.2 FIX: level从"info"提升为"high"，否则低于ALERT_DINGTALK_MIN_LEVEL被钉钉静默过滤
                     "level": "high",
                     "icon": "🎯",
-                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第一止盈位! 建议卖出{sell_1_3}股(1/3)锁定利润",
+                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第一止盈位! 建议卖出{sell_ratio}股({_tier1_ratio*100:.0f}%)锁定利润",
                     "urgency_score": 70,
                     "r17_tier": "tier1",  # FIX: 供发送成功后登记档位记忆
                 })
 
-            # 第二止盈位: 浮盈≥20%
-            if profit_pct >= 0.20 and not self._r17_tier_seen(code, "tier2"):
+            # 第二止盈位: 浮盈≥第二档阈值
+            if profit_pct >= _tier2_pct and not self._r17_tier_seen(code, "tier2"):
                 shares = info.get("shares", 0)
                 # FIX P1-3: 小仓位兜底100股；shares<100时输出全部
-                sell_1_3 = min(shares, max(100, int(shares / 3 / 100) * 100)) if shares >= 100 else shares
+                sell_ratio = min(shares, max(100, int(shares * _tier2_ratio / 100) * 100)) if shares >= 100 else shares
                 alerts.append({
                     "type": "profit_target_2",
-                    "rule_name": "R17-第二止盈位(浮盈≥20%)",
-                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第二止盈位(20%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
+                    "rule_name": f"R17-第二止盈位(浮盈≥{_tier2_pct*100:.0f}%)",
+                    "rule_detail": f"浮盈{profit_pct*100:.1f}%达第二止盈位({_tier2_pct*100:.0f}%)，成本{buy_price_r17:.3f}→现价{close:.3f}",
                     # V9.2 FIX: level从"warning"提升为"high"，否则低于ALERT_DINGTALK_MIN_LEVEL被钉钉静默过滤
                     "level": "high",
                     "icon": "",
-                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第二止盈位! 建议再卖{sell_1_3}股(1/3)，已锁定大部分利润",
+                    "msg": f"{name} 浮盈{profit_pct*100:.1f}%达第二止盈位! 建议再卖{sell_ratio}股({_tier2_ratio*100:.0f}%)，已锁定大部分利润",
                     "urgency_score": 75,
                     "r17_tier": "tier2",  # FIX: 供发送成功后登记档位记忆
                 })
@@ -1351,7 +1357,7 @@ def send_alert_email(alerts: List[dict]):
             _ack_ok = False
             try:
                 import config as _cfg_ack
-                _ack_enabled = getattr(_cfg_ack, "ALERT_ACK_ENABLED", True)
+                _ack_enabled = getattr(_cfg_ack, "ALERT_AUTO_SILENCE", True)
             except Exception:
                 _ack_enabled = True
 
@@ -1359,10 +1365,9 @@ def send_alert_email(alerts: List[dict]):
                 try:
                     from notify.alert_ack import build_action_card_payload
                     from notify.wechat_notify import send_dingtalk_action_card
-                    _confirm_base = getattr(_cfg_ack, "ALERT_ACK_CALLBACK_URL",
-                                            "http://192.168.88.101:9876/ack/")
+                    # V26: 无按钮ActionCard（自动静默模式，无需回调URL）
                     _payload = build_action_card_payload(
-                        _dt_alerts[:3], header_title, now, today, _confirm_base)
+                        _dt_alerts[:3], header_title, now, today)
                     _ack_ok = send_dingtalk_action_card(_payload)
                 except Exception as _ack_e:
                     logger.debug(f"ActionCard发送失败，回退Markdown: {_ack_e}")
@@ -1468,6 +1473,14 @@ def _generate_action(alert: dict, holdings_info: dict) -> str:
     elif atype in ("止盈提醒", "回落止盈"):
         # intraday_monitor 产生的止盈信号
         return "建议分批止盈锁定利润，剩余持仓上移止损"
+    elif atype in ("systemic_risk", "systemic_risk_intraday"):
+        # V27: 大盘系统性风险
+        if "强制减仓" in msg or "硬止损(>2.5%)" in (alert.get("rule_name", "") if isinstance(alert, dict) else ""):
+            return "🔴 大盘急跌超2.5%! 建议立即减仓至30%以下，优先卖出浮亏最大标的"
+        elif "准备减仓" in msg or "硬止损(>1.5%)" in (alert.get("rule_name", "") if isinstance(alert, dict) else ""):
+            return "🟠 大盘急跌超1.5%! 建议准备减仓计划，设好各标的止损位"
+        else:
+            return "🟡 大盘风险升温! 密切关注，禁止加仓，设好止损"
     else:
         return "密切关注，禁止加仓，等待企稳信号"
 

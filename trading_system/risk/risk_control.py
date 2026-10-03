@@ -77,7 +77,7 @@ RISK_CONFIG = {
 
     # --- 交易行为管控 ---
     "max_daily_opens": 2,           # 单日开仓次数上限
-    "cooldown_after_sell": 3,       # 卖出后N天内禁止重新买入
+    "cooldown_after_sell": 2,       # [P1-#5修复] 卖出后N天内禁止重新买入（与RISK_UNIFIED_CONFIG.cool_down_days对齐=2）
     "max_holdings": 7,              # 持仓数量硬限制
 
     # --- 盈亏比准入 ---
@@ -98,6 +98,7 @@ try:
             'atr_stop_multiplier', 'flexible_max_ratio',
             'daily_loss_limit', 'daily_loss_limit_l2',
             'near_full_position', 'full_position_threshold',
+            'cool_down_days',  # [P1-#5修复] 允许cool_down_days覆盖到RISK_CONFIG
         ):
             RISK_CONFIG[_k] = _v
 except Exception:
@@ -114,7 +115,24 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 class RiskStateManager:
     """
     风控状态管理器
-    持久化记录: 连续亏损、熔断状态、冷却期、日交易计数
+
+    职责:
+      持久化记录风控相关状态，包括：
+      - 连续亏损笔数（触发暂停/降仓）
+      - 熔断状态（日/周亏损熔断）
+      - 冷却期（卖出后N天禁止重新买入同一标的）
+      - 日交易计数（开仓次数/暂停截止日期）
+
+    持久化:
+      data/risk_state.json
+
+    关键接口:
+      - record_loss() / record_profit(): 记录交易结果
+      - record_sell(code): 记录卖出（启动冷却期）
+      - is_paused(): 是否处于暂停开仓状态
+      - is_cooling_down(code): 某标的是否在冷却期
+      - get_market_position_cap(): 根据指数位置获取总仓位上限
+      - get_recovery_position_cap(): 连续亏损后的恢复期仓位上限
     """
 
     def __init__(self):
@@ -142,6 +160,9 @@ class RiskStateManager:
             "snapshot_week": "",            # 周快照基准 ISO周 yyyy-Www
             "snapshot_month": "",           # 月快照基准 yyyy-mm
             "snapshot_year": "",            # 年快照基准 yyyy
+            # FIX P0-1: 补充 get_recovery_position_cap 依赖的字段，防止 KeyError 导致恢复机制失效
+            "monthly_pnl": 0.0,             # 当月已实现盈亏
+            "consecutive_profit_weeks": 0,  # 连续盈利周数
         }
         # FIX: 修复 _load_state 裸except吞没状态损坏异常的问题
         try:
@@ -191,14 +212,19 @@ class RiskStateManager:
         self.save()
 
     def is_paused(self) -> Tuple[bool, str]:
-        """检查是否在暂停期"""
+        """检查是否在暂停期
+
+        FIX P3-#16: 与 is_cooling_down 语义统一为 `today < end_date`
+        （end_date 为解禁首日，当日即可交易）。
+        原实现 `today <= pause_until` 会多暂停1天，与冷却期口径不一致。
+        """
         pause_until = self.state.get("pause_until", "")
-        if pause_until and datetime.date.today().isoformat() <= pause_until:
-            return True, f"暂停开仓中（至{pause_until}）"
+        if pause_until and datetime.date.today().isoformat() < pause_until:
+            return True, f"暂停开仓中（{pause_until}解禁）"
         return False, ""
 
     def is_cooling_down(self, code: str) -> Tuple[bool, str]:
-        """检查某只标的是否在冷却期"""
+        """检查某只标的是否在冷却期（unlock 为解禁首日，当日可买）"""
         unlock = self.state.get("sell_cooldown", {}).get(code, "")
         if unlock and datetime.date.today().isoformat() < unlock:
             return True, f"{code}冷却期中（{unlock}解禁）"
@@ -757,6 +783,7 @@ def check_pullback_add_risk(code: str, holdings: dict, df,
       8. 单票仓位>30%（集中度超限）
       9. MA20在MA60下方（中期趋势向下）
       10. MA20斜率向下（均线拐头）
+      11. 标的已被禁加仓（buy_block）—— V8.3新增
 
     参数:
         code: 股票代码
@@ -784,6 +811,20 @@ def check_pullback_add_risk(code: str, holdings: dict, df,
     # ---- 2. 持仓检查 ----
     if code not in holdings:
         return {"pass": False, "reason": "非持仓股，不适用回调加仓", "add_shares": 0}
+
+    # ---- 2.5 V8.3: buy_block禁加仓检查（跨周期矛盾保护）----
+    try:
+        from notify.buy_point_alert import BLOCK_FILE as _BLOCK_FILE
+        import json as _json, os as _os
+        if _os.path.exists(_BLOCK_FILE):
+            with open(_BLOCK_FILE, "r", encoding="utf-8") as _f:
+                _blocked = (_json.load(_f).get("blocked") or {}).get(str(code))
+                if _blocked and _blocked.get("until", "") > str(datetime.date.today()):
+                    return {"pass": False,
+                            "reason": f"标的已被禁加仓({_blocked.get('reason', '')})，回调加仓被拦截",
+                            "add_shares": 0}
+    except Exception:
+        pass  # 异常不阻断主流程
     pos = holdings[code]
     shares = pos.get("shares", 0)
     buy_price = pos.get("buy_price", 0) or pos.get("cost", 0)
@@ -1729,12 +1770,25 @@ class UnifiedRiskEngine:
     # 持仓健康度巡检（兼容 RiskGate.inspect_holdings）
     # --------------------------------------------------------
     def inspect_holdings(self, holdings: dict,
-                         market_info: dict = None) -> List[dict]:
-        """持仓风险四级巡检（与 RiskGate 完全兼容）"""
+                         market_info: dict = None,
+                         _playbook=None) -> List[dict]:
+        """持仓风险四级巡检（与 RiskGate 完全兼容）
+
+        V10.1改进:
+          _playbook: RegimePlaybook实例，提供regime-aware单只仓位上限。
+                     None时使用config硬编码（向后兼容）。
+          BULL模式ETF上限放宽到25%，BEAR模式收紧到10%。
+        """
         # FIX: 统一止损口径 —— 巡检前用权威源(trend_strategy.compute_trailing_stop)
         # 重算并写回 holdings.stop_loss（Ratchet只升不降），内部已降级兜底
         sync_authoritative_stop_loss()
         cfg = self.cfg
+
+        # V10.1: regime-aware单只仓位上限
+        _regime_max_single = None
+        if _playbook is not None:
+            _regime_max_single = _playbook.position_limits().get("max_single")
+
         results = []
         for code, pos in holdings.items():
             cost = pos.get("cost", pos.get("buy_price", 0))
@@ -1758,8 +1812,20 @@ class UnifiedRiskEngine:
 
             position_ratio = (pos.get("shares", 0) * price) / self.total_capital
             stock_type = pos.get("type", "stock")
-            max_ratio = cfg.get("etf_max_ratio", 0.20) if stock_type == "etf" \
-                else cfg.get("stock_max_ratio", 0.15)
+
+            # V10.1: 单只仓位上限 —— playbook优先，否则用config硬编码
+            if _regime_max_single is not None:
+                # regime-aware上限: BULL=20%/RANGE=15%/BEAR=10%
+                # ETF在BULL模式下额外放宽5%（趋势启动弹性）
+                if stock_type == "etf" and _playbook.state == "BULL":
+                    max_ratio = min(_regime_max_single + 0.05, 0.25)
+                else:
+                    max_ratio = _regime_max_single
+            else:
+                # 向后兼容: 无playbook时用config硬编码
+                max_ratio = cfg.get("etf_max_ratio", 0.20) if stock_type == "etf" \
+                    else cfg.get("stock_max_ratio", 0.15)
+
             over_limit = position_ratio > max_ratio
 
             reduce_shares = 0
@@ -1775,6 +1841,7 @@ class UnifiedRiskEngine:
                 "is_bullish": is_bullish, "action": action,
                 "position_ratio": round(position_ratio * 100, 1),
                 "over_limit": over_limit, "reduce_shares": reduce_shares,
+                "max_ratio": round(max_ratio * 100, 1),  # V10.1: 记录实际使用的上限
                 # 仅巡检参考，执行以 holdings.stop_loss 为准（权威值已由 sync_authoritative_stop_loss 写回）
                 "stop_loss": round(cost * 0.9, 3) if level in ("关注", "预警")
                              else round(max(cost * 0.9, price * 0.92), 3),  # FIX P2: Ratchet原则
@@ -1859,6 +1926,11 @@ class UnifiedRiskEngine:
             month_key = today.strftime("%Y-%m")
             year_key = str(today.year)
 
+            # FIX P0-#1: 在周快照重置前捕获上一周的 weekly_pnl，用于 consecutive_profit_weeks 结算
+            prev_week_key = state.get("snapshot_week", "")
+            prev_weekly_pnl_closed = state.get("weekly_pnl", 0.0)
+            week_rolled_over = bool(prev_week_key) and prev_week_key != week_key
+
             # 快照重置（比较持久化日期，首次使用自动初始化）
             if state.get("snapshot_date") != today.isoformat():
                 state["snapshot_date"] = today.isoformat()
@@ -1876,11 +1948,35 @@ class UnifiedRiskEngine:
             # 盈亏 = 当前总资产 - 周期起始快照
             daily_start = state.get("daily_start_total", current_total) or current_total
             weekly_start = state.get("weekly_start_total", current_total) or current_total
+            monthly_start_val = state.get("monthly_start_capital", current_total) or current_total
             state["daily_pnl"] = current_total - daily_start
             state["weekly_pnl"] = current_total - weekly_start
 
-            # FIX: 修复 total_capital 为静态 config.TOTAL_CAPITAL 导致月度回撤恒差0的问题
-            # 动态总资产口径，config.TOTAL_CAPITAL 仅作兜底
+            # FIX P0-#1: 补齐 monthly_pnl 与 consecutive_profit_weeks 写入路径
+            # 原Bug: get_recovery_position_cap 依赖此两字段进行 0.30→0.45→0.60→1.00
+            # 分档，但全代码库无写入方，导致恢复仓位永久卡在 0.45。
+            # 口径与 daily_pnl/weekly_pnl 保持一致（总资产快照差分）：
+            #   - monthly_pnl 为绝对金额（元），get_recovery_position_cap 用 >=0 判定
+            #   - consecutive_profit_weeks 在 ISO 周切换时结算：上一周 weekly_pnl>0 累加，
+            #     否则清零；首次进入本周不结算（避免用当周未完成的浮盈误判）
+            state["monthly_pnl"] = current_total - monthly_start_val
+
+            # consecutive_profit_weeks 结算：仅在周发生翻滚时一次，使用已捕获的上一周 pnl
+            if week_rolled_over:
+                if prev_weekly_pnl_closed > 0:
+                    state["consecutive_profit_weeks"] = \
+                        int(state.get("consecutive_profit_weeks", 0)) + 1
+                else:
+                    state["consecutive_profit_weeks"] = 0
+                logger.info(
+                    f"[PnL快照] 周翻滚 {prev_week_key}→{week_key}, "
+                    f"上周pnl={prev_weekly_pnl_closed:.2f}, "
+                    f"连续盈利周数={state['consecutive_profit_weeks']}"
+                )
+
+            # FIX P2-4: 动态总资产口径更新
+            # 注意: self.total_capital 在此被更新为当前总资产，用于后续风控计算
+            # 如需保留初始资金作为参考，可使用 state_mgr.state["total_capital"] 的初始值
             self.total_capital = current_total
             state["total_capital"] = current_total
 

@@ -47,8 +47,8 @@ SECTOR_CONFIG = {
     "outflow_alert_days": 3,    # 连续流出N天触发预警
 }
 
-# 申万一级行业分类（持仓标的映射）
-STOCK_SECTOR_MAP = {
+# 硬编码映射表（降级兜底，config导入失败时使用）
+_FALLBACK_STOCK_SECTOR_MAP = {
     "002415": "电子",       # 海康威视
     "600036": "银行",       # 招商银行
     "000858": "食品饮料",   # 五粮液
@@ -63,8 +63,73 @@ STOCK_SECTOR_MAP = {
 }
 
 
+def _build_stock_sector_map() -> dict:
+    """
+    动态构建 股票代码→板块名称 映射表
+
+    数据源优先级:
+      1. config.SECTOR_CANDIDATES（细粒度赛道: 半导体设备/AI应用等）
+      2. config.STOCK_POOL（粗粒度赛道: 能源化工/电力公用等）
+      3. _FALLBACK_STOCK_SECTOR_MAP（硬编码兜底）
+
+    任何异常均降级到硬编码表，绝不抛异常。
+    """
+    try:
+        import config
+        mapping = {}
+        # 1. 从 SECTOR_CANDIDATES 提取（细分赛道作为板块名）
+        for sector_name, sector_info in getattr(config, "SECTOR_CANDIDATES", {}).items():
+            for code, info in sector_info.get("stocks", {}).items():
+                # 优先用细分赛道，其次用大 sector 名
+                mapping[code] = info.get("细分", sector_name)
+        # 2. 从 STOCK_POOL 补充（持仓标的的赛道）
+        for code, info in getattr(config, "STOCK_POOL", {}).items():
+            if code not in mapping:
+                mapping[code] = info.get("赛道", "其他")
+        if mapping:
+            return mapping
+    except Exception:
+        pass
+    return dict(_FALLBACK_STOCK_SECTOR_MAP)
+
+
+# 模块加载时构建，后续通过 get_stock_sector_map() 获取
+_STOCK_SECTOR_MAP_CACHE = None
+
+
+def get_stock_sector_map() -> dict:
+    """获取 股票代码→板块名称 映射表（带缓存，首次调用时构建）"""
+    global _STOCK_SECTOR_MAP_CACHE
+    if _STOCK_SECTOR_MAP_CACHE is None:
+        _STOCK_SECTOR_MAP_CACHE = _build_stock_sector_map()
+    return _STOCK_SECTOR_MAP_CACHE
+
+
+# 向后兼容: 保留模块级变量（指向fallback，新代码请用 get_stock_sector_map()）
+STOCK_SECTOR_MAP = _FALLBACK_STOCK_SECTOR_MAP
+
+
 class SectorMonitor:
-    """板块轮动监控器"""
+    """
+    板块轮动监控器
+
+    职责:
+      1. 板块动量排名: 5日/20日涨幅排名，识别资金流入方向
+      2. 板块资金流: 板块内个股主力净流入汇总
+      3. 轮动信号: 板块从底部启动（连续N日资金流入+涨幅<阈值）
+      4. 持仓板块预警: 持仓所在板块资金转出→预警
+      5. 板块加速度: 5日动量 vs 20日平均动量（V10 P1-B）
+
+    数据源:
+      优先: akshare (板块历史数据)
+      回退: baostock (用持仓个股数据计算板块动量)
+
+    输出 (analyze() 返回 dict):
+      top_sectors: 动量TOP N板块
+      rotation_signals: 轮动启动信号
+      holding_warnings: 持仓板块预警
+      sector_rankings: 完整板块排名
+    """
 
     def __init__(self, config: dict = None):
         self.cfg = {**SECTOR_CONFIG, **(config or {})}
@@ -115,10 +180,11 @@ class SectorMonitor:
         }
 
     def _group_by_sector(self, holdings_data: Dict[str, pd.DataFrame]) -> Dict[str, List]:
-        """按板块分组"""
+        """按板块分组（使用动态映射表）"""
+        _sector_map = get_stock_sector_map()
         groups = {}
         for code, df in holdings_data.items():
-            sector = STOCK_SECTOR_MAP.get(code, "其他")
+            sector = _sector_map.get(code, "其他")
             if sector not in groups:
                 groups[sector] = []
             groups[sector].append({"code": code, "df": df})
@@ -295,8 +361,9 @@ class SectorMonitor:
         if not holdings_info:
             return alerts
 
+        _sector_map = get_stock_sector_map()
         for code, info in holdings_info.items():
-            sector = STOCK_SECTOR_MAP.get(code, "其他")
+            sector = _sector_map.get(code, "其他")
             m = metrics.get(sector)
             if not m:
                 continue
@@ -420,15 +487,15 @@ class SectorMonitor:
             cfa = CapitalFlowAnalyzer()
             codes = list(getattr(config, "STOCK_POOL", {}).keys())[:20]
             if not codes:
-                # 回退到 STOCK_SECTOR_MAP
-                codes = list(STOCK_SECTOR_MAP.keys())
+                # 回退到动态映射表
+                codes = list(get_stock_sector_map().keys())
 
             items = []
             for code in codes:
                 flow = cfa.get_stock_main_flow(code)
                 if not flow.get("success"):
                     continue
-                name = STOCK_SECTOR_MAP.get(code, code)
+                name = get_stock_sector_map().get(code, code)
                 net_5d = flow.get("5d_main_net", 0)  # 万元
                 # 用绝对值做面积，符号做颜色
                 items.append({
@@ -966,3 +1033,93 @@ def sector_summary(result: dict) -> str:
             lines.append(f"    {icon} {a['desc']}")
 
     return "\n".join(lines)
+
+
+# === V9.2: 盘中板块异动检测（供scheduler/预警系统调用）===
+def detect_intraday_sector_surges(threshold_pct: float = 2.0, top_n: int = 5) -> dict:
+    """
+    盘中板块异动检测 —— 识别当日涨幅超阈值的强势板块
+
+    参数:
+        threshold_pct: 涨幅阈值(%)，默认2.0%
+        top_n: 返回TOP N板块
+
+    返回:
+        {
+            "available": bool,  # 数据是否可用
+            "top_sectors": [{"name": str, "change_pct": float, "leader": str}],
+            "surge_detected": bool,  # 是否有板块超阈值
+            "updated": str  # 更新时间
+        }
+
+    任何异常返回 {"available": False}，不影响调用方。
+    """
+    empty = {"available": False, "top_sectors": [], "surge_detected": False, "updated": ""}
+    try:
+        import akshare as ak
+        df = ak.stock_board_industry_name_em()
+        if df is None or df.empty:
+            return empty
+
+        # 提取板块名称、涨跌幅、领涨股
+        sectors = []
+        for _, row in df.iterrows():
+            name = row.get("板块名称", "")
+            change = float(row.get("涨跌幅", 0) or 0)
+            leader = row.get("领涨股票", "")
+            if name and change != 0:
+                sectors.append({"name": name, "change_pct": change, "leader": leader})
+
+        # 按涨幅排序
+        sectors.sort(key=lambda x: x["change_pct"], reverse=True)
+        top_sectors = sectors[:top_n]
+        surge_detected = any(s["change_pct"] >= threshold_pct for s in top_sectors)
+
+        return {
+            "available": True,
+            "top_sectors": top_sectors,
+            "surge_detected": surge_detected,
+            "updated": datetime.datetime.now().strftime("%H:%M:%S"),
+        }
+    except Exception as e:
+        logger.debug(f"[板块异动] 检测失败(降级): {e}")
+        return empty
+
+
+def render_intraday_sector_banner(surge_result: dict) -> str:
+    """
+    渲染盘中板块异动横幅（HTML格式，供预警系统/报告使用）
+
+    参数:
+        surge_result: detect_intraday_sector_surges() 返回的结果
+
+    返回:
+        HTML字符串，无数据或异常返回空字符串
+    """
+    if not surge_result or not surge_result.get("available"):
+        return ""
+
+    top = surge_result.get("top_sectors", [])
+    if not top:
+        return ""
+
+    updated = surge_result.get("updated", "")
+    surge = surge_result.get("surge_detected", False)
+
+    html = f'<div style="background:#fff3e0;border-left:4px solid #ff9800;padding:10px 14px;margin:8px 0;font-size:12px">'
+    html += f'<b>🔥 盘中板块异动</b> <span style="color:#888;font-size:11px">({updated})</span><br>'
+
+    items = []
+    for s in top[:3]:
+        _chg = s["change_pct"]
+        _color = "#e74c3c" if _chg >= 2 else ("#ff9800" if _chg >= 1 else "#555")
+        _leader = f"(领涨: {s['leader']})" if s.get("leader") else ""
+        items.append(f'<span style="color:{_color};font-weight:bold">{s["name"]} {_chg:+.2f}%</span>{_leader}')
+
+    html += ' | '.join(items)
+
+    if surge:
+        html += '<br><span style="color:#e74c3c;font-size:11px">⚡ 检测到板块涨幅超2%，关注板块内个股买点信号</span>'
+
+    html += '</div>'
+    return html

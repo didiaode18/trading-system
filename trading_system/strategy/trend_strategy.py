@@ -63,11 +63,17 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["intraday_range"] = (df["high"] - df["low"]) / df["close"].shift(1)
 
     # ---- RSI ----
+    # FIX P2-#11: 标准 RSI 使用 Wilder EMA (alpha = 1/N)，原实现用 SMA 会导致数值
+    # 与主流行情软件/文献口径偏差 3~8 点，进而使 RSI 超买超卖阈值判定失真。
+    # 采用 ewm(alpha=1/N, adjust=False) 等价于经典 Wilder 递推：
+    #   avg[i] = (avg[i-1] * (N-1) + val[i]) / N
+    # 影响范围：所有引用 df["rsi"] 的买入过滤、卖出提示；建议对照旧回测复算一次。
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.rolling(config.RSI_PERIOD).mean()
-    avg_loss = loss.rolling(config.RSI_PERIOD).mean()
+    _rsi_alpha = 1.0 / max(int(config.RSI_PERIOD), 1)
+    avg_gain = gain.ewm(alpha=_rsi_alpha, adjust=False, min_periods=config.RSI_PERIOD).mean()
+    avg_loss = loss.ewm(alpha=_rsi_alpha, adjust=False, min_periods=config.RSI_PERIOD).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
@@ -617,14 +623,34 @@ def check_sell_signal(df: pd.DataFrame, buy_price: float,
             except (ValueError, TypeError):
                 pass
 
-    # ---- 2. 止损判定（仅收盘价触发）----
+    # ---- 2. 止损判定 ----
+    # FIX P2-#10: 触发口径与执行引擎对齐——backtest_real.py L857 与 intraday_monitor 均
+    # 采用盘中最低价触发（更接近实盘条件单行为），原实现仅用收盘价会导致信号
+    # 生成层与执行层结果不一致：盘中已击穿止损但收盘拉回的样本，回测已平仓而策略
+    # 认为未触发。为兼顾既有语义与执行一致性，引入 config.STOP_LOSS_TRIGGER_MODE：
+    #   "low"   （默认）: low <= stop → 触发，与 backtest_real/intraday_monitor 一致
+    #   "close" : 保留旧口径，仅收盘价触发（保守，用于信号复盘）
+    # 无论采用哪种口径，卖出价均取 min(stop_loss_price, close) 以避免虚增收益。
     stop_loss_price = compute_trailing_stop(buy_price, close)
-    if close <= stop_loss_price:
+    trigger_mode = str(getattr(config, 'STOP_LOSS_TRIGGER_MODE', 'low')).lower()
+    day_low = latest.get("low", close)
+    if pd.isna(day_low):
+        day_low = close
+    if trigger_mode == 'close':
+        stop_hit = close <= stop_loss_price
+        trigger_desc = f"收盘{close:.2f} <= 止损线{stop_loss_price:.2f}"
+    else:
+        stop_hit = (day_low <= stop_loss_price) or (close <= stop_loss_price)
+        trigger_desc = (
+            f"盘中最低{day_low:.2f}/收盘{close:.2f} <= 止损线{stop_loss_price:.2f}"
+        )
+    if stop_hit:
+        exec_price = min(stop_loss_price, close) if trigger_mode == 'low' else close
         result.update({
             "signal": True,
             "sell_type": "stop_loss",
-            "sell_price": round(stop_loss_price, 2),
-            "reason": f"触发止损: 收盘{close:.2f} <= 止损线{stop_loss_price:.2f}, 浮盈={profit_pct:.2%}"
+            "sell_price": round(exec_price, 2),
+            "reason": f"触发止损: {trigger_desc}, 浮盈={profit_pct:.2%}"
         })
         return result
 

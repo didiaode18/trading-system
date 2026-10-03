@@ -184,9 +184,69 @@ class FactorRegistry:
             self.register(name, "momentum", info["func"],
                          info.get("desc", ""), info.get("dir", 1))
 
+        # V7.0 Phase0: 纳入 quant engine 因子
+        try:
+            from factors.quant_factors import QUANT_ENGINE_FACTORS
+            for name, info in QUANT_ENGINE_FACTORS.items():
+                self.register(name, "quant", info["func"],
+                             info.get("desc", ""), info.get("dir", 1))
+        except ImportError:
+            logger.debug("quant_factors 模块未找到，跳过")
+
+        # V7.0 Phase1: 纳入低成本可落地因子
+        _phase1_modules = [
+            ("factors.smart_money", "SMART_MONEY_FACTORS", "smart_money"),
+            ("factors.reversal", "REVERSAL_FACTORS", "reversal"),
+            ("factors.volume_distribution", "VOLUME_DISTRIBUTION_FACTORS", "vol_dist"),
+            ("factors.volatility", "VOLATILITY_FACTORS", "volatility"),
+            ("factors.tail_volume", "TAIL_VOLUME_FACTORS", "tail_volume"),
+        ]
+        for module_path, dict_name, cat in _phase1_modules:
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                factor_dict = getattr(mod, dict_name, {})
+                for name, info in factor_dict.items():
+                    self.register(name, cat, info["func"],
+                                 info.get("desc", ""), info.get("dir", 1))
+            except (ImportError, AttributeError) as e:
+                logger.debug(f"Phase1因子 {cat} 加载失败: {e}")
+
+        # V7.0 Phase2: 纳入基本面因子
+        _phase2_modules = [
+            ("factors.quality", "QUALITY_FACTORS", "quality"),
+            ("factors.value", "VALUE_FACTORS", "value"),
+            ("factors.growth", "GROWTH_FACTORS", "growth"),
+            ("factors.liquidity", "LIQUIDITY_FACTORS", "liquidity"),
+            ("factors.dividend", "DIVIDEND_FACTORS", "dividend"),
+        ]
+        for module_path, dict_name, cat in _phase2_modules:
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                factor_dict = getattr(mod, dict_name, {})
+                for name, info in factor_dict.items():
+                    self.register(name, cat, info["func"],
+                                 info.get("desc", ""), info.get("dir", 1))
+            except (ImportError, AttributeError) as e:
+                logger.debug(f"Phase2因子 {cat} 加载失败: {e}")
+
+        # V9.0 任务A: 情绪因子入库（质量因子已在 Phase2 注册）
+        try:
+            from factors.sentiment import SENTIMENT_FACTORS
+            for name, info in SENTIMENT_FACTORS.items():
+                self.register(name, "sentiment", info["func"],
+                             info.get("desc", ""), info.get("dir", 1))
+        except (ImportError, AttributeError) as e:
+            logger.debug(f"情绪因子 sentiment 加载失败: {e}")
+
+        _n_quant = len(self.factors) - sum(1 for _ in [
+            TECHNICAL_FACTORS, VOLUME_FACTORS, MOMENTUM_FACTORS
+        ] for _ in [1])  # 近似计数
         logger.info(f"因子注册表: 共{len(self.factors)}个因子 "
                    f"(技术{len(TECHNICAL_FACTORS)} + 量价{len(VOLUME_FACTORS)} + "
-                   f"动量{len(MOMENTUM_FACTORS)})")
+                   f"动量{len(MOMENTUM_FACTORS)} + "
+                   f"其他{len(self.factors) - len(TECHNICAL_FACTORS) - len(VOLUME_FACTORS) - len(MOMENTUM_FACTORS)})")
 
     @property
     def count(self) -> int:

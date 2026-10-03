@@ -3,7 +3,7 @@ Kelly公式仓位计算
 ================
 Kelly仓位 = (胜率 * 盈亏比 - 败率) / 盈亏比
 实际仓位 = Kelly * 0.5（半Kelly，降低波动）
-约束: 单只最大仓位由config.MAX_SINGLE_STOCK_RATIO统一管理（默认15%）
+约束: 单只最大仓位由config统一管理（个股15%/ETF20%）
 """
 
 import os
@@ -17,25 +17,39 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# FIX P1(2026-08-07): 单只仓位上限收口config（原硬编码15%与scheduler/报告/recommend_engine口径不一）
-MAX_SINGLE_POSITION = getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15)
+# FIX P1(2026-08-07): 单只仓位上限收口config
+# V8.2: 统一使用instrument模块查询品种仓位上限
+from utils.instrument import get_max_single_position as _get_max_pos
+
+
+def _get_max_position(code: str = "") -> float:
+    """V8.2: 统一品种仓位上限查询（委托给instrument模块）"""
+    if code:
+        return _get_max_pos(code)
+    # 无代码时返回个股默认值
+    return getattr(config, 'MAX_SINGLE_STOCK_RATIO', 0.15)
 
 
 def kelly_position(win_rate: float, profit_factor: float,
-                   max_ratio: float = MAX_SINGLE_POSITION) -> float:
+                   max_ratio: float = None, code: str = "") -> float:
     """
     Kelly公式计算最优仓位比例
     
     参数:
         win_rate: 历史胜率 (0~1)
         profit_factor: 盈亏比 (平均盈利/平均亏损)
-        max_ratio: 单只最大仓位
+        max_ratio: 单只最大仓位（None时根据code自动判定ETF/个股）
+        code: 证券代码（用于自动判定ETF/个股上限）
     
     返回:
         仓位比例 (0~max_ratio)
     """
     if profit_factor <= 0 or win_rate <= 0:
         return 0.0
+
+    # V8.1: 自动判定ETF/个股仓位上限
+    if max_ratio is None:
+        max_ratio = _get_max_position(code)
 
     # Kelly公式: f = (p*b - q) / b
     # p=胜率, q=败率, b=盈亏比
@@ -48,18 +62,20 @@ def kelly_position(win_rate: float, profit_factor: float,
 
 
 def half_kelly_position(win_rate: float, profit_factor: float,
-                        max_ratio: float = MAX_SINGLE_POSITION) -> float:
+                        max_ratio: float = None, code: str = "") -> float:
     """
     半Kelly仓位（推荐，降低波动）
     
     半Kelly = Kelly * 0.5
     牺牲少量期望收益，大幅降低回撤
     """
-    full = kelly_position(win_rate, profit_factor, max_ratio * 2)
+    if max_ratio is None:
+        max_ratio = _get_max_position(code)
+    full = kelly_position(win_rate, profit_factor, max_ratio * 2, code=code)
     return round(full * 0.5, 4)
 
 
-def kelly_from_trades(trades: list) -> float:
+def kelly_from_trades(trades: list, code: str = "") -> float:
     """
     从交易记录计算Kelly仓位
     
@@ -83,7 +99,7 @@ def kelly_from_trades(trades: list) -> float:
     avg_loss = abs(np.mean(losses))
     profit_factor = avg_win / avg_loss if avg_loss > 0 else 1
 
-    return half_kelly_position(win_rate, profit_factor)
+    return half_kelly_position(win_rate, profit_factor, code=code)
 
 
 def portfolio_kelly(holdings_stats: list, total_capital: float) -> dict:
@@ -102,7 +118,7 @@ def portfolio_kelly(holdings_stats: list, total_capital: float) -> dict:
 
     for h in holdings_stats:
         code = h["code"]
-        kelly = kelly_position(h.get("win_rate", 0.5), h.get("profit_factor", 1.5))
+        kelly = kelly_position(h.get("win_rate", 0.5), h.get("profit_factor", 1.5), code=code)
         half = kelly * 0.5
         result[code] = {
             "kelly": round(kelly, 4),

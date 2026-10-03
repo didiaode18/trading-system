@@ -36,7 +36,13 @@ CFG = getattr(config, 'AUCTION_TRACK_CONFIG', {})
 
 
 class AuctionTracker:
-    """集合竞价轨迹采集器"""
+    """
+    集合竞价轨迹采集器
+
+    职责:
+      采集并分析集合竞价阶段的报价轨迹，
+      识别主力竞价意图（试盘/诱多/真实买入）。
+    """
 
     def __init__(self, codes: list = None, holdings: dict = None):
         """
@@ -243,6 +249,7 @@ def run_auction_tracking() -> dict:
     执行竞价轨迹采集（scheduler 09:15调用）
 
     返回: {code: {pattern, label, detail, ...}}
+    V10.1: 结果同时写入intraday_state.json供盘中监控读取
     """
     import json
 
@@ -267,4 +274,54 @@ def run_auction_tracking() -> dict:
     for a in alerts:
         logger.warning(f"  {a['message']}")
 
+    # V10.1: 写入intraday_state.json供盘中监控读取
+    _save_auction_result(result)
+
     return result
+
+
+def _save_auction_result(result: dict):
+    """V10.1: 将竞价轨迹结果写入intraday_state.json（W3修复: 原子写入）"""
+    import json
+    state_file = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "intraday_state.json"
+    )
+    tmp_file = state_file + ".tmp"
+    try:
+        state = {}
+        if os.path.exists(state_file):
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        state["auction_result"] = result
+        state["auction_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # W3修复: 先写临时文件再原子替换，防止进程崩溃时文件截断
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, state_file)
+        logger.info(f"[竞价轨迹] 结果已写入 intraday_state.json ({len(result)}只)")
+    except Exception as e:
+        logger.warning(f"[竞价轨迹] 写入状态文件失败: {e}")
+        # 清理残留临时文件
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except OSError:
+            pass
+
+
+def load_auction_result() -> dict:
+    """V10.1: 从 intraday_state.json 读取竞价轨迹结果(供盘中监控调用)"""
+    import json
+    state_file = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "intraday_state.json"
+    )
+    try:
+        if os.path.exists(state_file):
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return state.get("auction_result", {})
+    except Exception:
+        pass
+    return {}

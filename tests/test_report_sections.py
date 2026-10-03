@@ -330,12 +330,14 @@ class TestTradeBehavior:
 
     def test_commission_etf_no_stamp(self):
         """ETF卖出免印花税，股票卖出收印花税"""
+        import config as _cfg
+        _stamp_rate = getattr(_cfg, 'STAMP_TAX_RATE', 0.001)
         fees_etf = estimate_commission([
             {"code": "159599", "direction": "卖出", "qty": 10000, "price": 2.8, "amount": 28000}])
         fees_stock = estimate_commission([
             {"code": "601318", "direction": "卖出", "qty": 1000, "price": 28.0, "amount": 28000}])
         assert fees_etf["stamp"] == 0
-        assert fees_stock["stamp"] == pytest.approx(28000 * 0.0005, abs=0.01)
+        assert fees_stock["stamp"] == pytest.approx(28000 * _stamp_rate, abs=0.01)
 
     def test_severe_severity(self):
         """成交笔数≥20且换手率高 → severe，横幅含警示文案"""

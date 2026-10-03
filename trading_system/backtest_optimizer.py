@@ -57,6 +57,10 @@ DEFAULT_PARAMS = {
     "support_touch_pct": 0.01,      # 支撑位容差
     "min_signal_quality": 60,       # OPTIMIZE: 信号质量最低分（原55，回测显示低质量交易过多）
     "require_ma60_up": True,        # 是否要求MA60向上
+    "enable_bp3": True,             # V7: 是否启用bp3牛市趋势延续买点
+    "bp3_vol_shrink": 0.85,         # bp3缩量阈值
+    "bp3_min_above_ma20": 1.02,     # bp3最低收盘/MA20比
+    "bp3_max_surge_5d": 0.15,       # bp3近5日最大涨幅
 
     # 止损参数
     "initial_stop_loss": 0.07,      # OPTIMIZE: 初始止损幅度（原0.08，回测显示平均亏损-10.20%含滑点）
@@ -64,6 +68,20 @@ DEFAULT_PARAMS = {
     "breakeven_lock": 0.02,         # 保本后锁定利润
     "profit_lock_1": 0.12,          # 浮盈15-30%锁定
     "profit_lock_2": 0.22,          # 浮盈>30%锁定
+    "atr_mode": True,               # V7: ATR自适应止损（对齐v5）
+    "atr_multiplier": 2.0,          # V7: ATR倍数（BEAR自动降为1.5）
+    "atr_stop_min": 0.04,           # ATR止损下限
+    "atr_stop_max": 0.08,           # ATR止损上限
+
+    # V7: 多因子信号增强（A2）
+    "factor_weight_smf": 0.0,       # 聪明钱因子权重（0=关闭）
+    "factor_weight_reversal": 0.0,  # 反转因子权重（0=关闭）
+    "factor_weight_low_vol": 0.0,   # 低波动因子权重（0=关闭）
+    "factor_max_bonus": 20,         # 因子加分上限（防止因子加分过多）
+
+    # Regime-aware质量门槛（V7: 对齐v5的分市场环境逻辑）
+    "min_quality_bear": 70,         # BEAR市场信号质量门槛
+    "min_quality_non_bear": 65,     # 非BEAR市场信号质量门槛
 
     # 止盈参数
     "ladder_1_pct": 0.08,           # 阶梯止盈第1档
@@ -80,26 +98,136 @@ DEFAULT_PARAMS = {
 
 
 # ============================================================
-# 二、可配置参数的回测引擎（V6）
+# 一b、简化版市场环境预计算（V7: 对齐v5，供bp3/ATR止损/质量门槛使用）
+# ============================================================
+
+def _precompute_regime_v6(df: pd.DataFrame) -> dict:
+    """
+    简化版市场环境序列（对齐v5的_precompute_market_regime）。
+    使用个股自身数据（无基准时降级方案）。
+
+    规则:
+      - BULL: close>MA20 且 MA20>MA60 且 10日动量>2%
+      - BEAR: close<MA60 且 10日动量<-2%
+      - RANGE: 其他
+    返回: {date_str: "BULL"/"BEAR"/"RANGE"}
+    """
+    if len(df) < 60:
+        return {}
+    close = df["close"].values
+    dates = df["date"].values
+    n = len(df)
+    close_s = pd.Series(close)
+    ma20 = close_s.rolling(20).mean().values
+    ma60 = close_s.rolling(60).mean().values
+
+    regime = {}
+    for i in range(60, n):
+        if np.isnan(ma20[i]) or np.isnan(ma60[i]):
+            regime[str(dates[i])] = "RANGE"
+            continue
+        mom10 = (close[i] / close[i - 10] - 1) if i >= 10 and close[i - 10] > 0 else 0
+        if close[i] > ma20[i] and ma20[i] > ma60[i] and mom10 > 0.02:
+            regime[str(dates[i])] = "BULL"
+        elif close[i] < ma60[i] and mom10 < -0.02:
+            regime[str(dates[i])] = "BEAR"
+        else:
+            regime[str(dates[i])] = "RANGE"
+    return regime
+
+
+def _compute_signal_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V7(A2): 预计算多因子信号，用于 signal_quality 增强。
+    仅需 OHLCV 数据，无外部依赖。
+
+    新增列:
+      _smf_signal:  聪明钱代理（20日量价相关性 > 0.2 → 正向）
+      _reversal_signal: 超卖反转（20日收益<-1σ 且近5日开始回升）
+      _low_vol_signal:  低波动（20日波动率 < 历史中位数）
+    """
+    n = len(df)
+    if n < 60:
+        df = df.copy()
+        df["_smf_signal"] = 0.0
+        df["_reversal_signal"] = 0.0
+        df["_low_vol_signal"] = 0.0
+        return df
+
+    close = df["close"].values
+    volume = df["volume"].values
+
+    # --- 聪明钱代理: 20日滚动(价格变化×成交量变化)的均值，标准化 ---
+    price_chg = np.zeros(n)
+    vol_chg = np.zeros(n)
+    for i in range(1, n):
+        price_chg[i] = (close[i] - close[i - 1]) / close[i - 1] if close[i - 1] > 0 else 0
+        vol_chg[i] = (volume[i] - volume[i - 1]) / volume[i - 1] if volume[i - 1] > 0 else 0
+    cross = price_chg * vol_chg
+    smf_raw = pd.Series(cross).rolling(20, min_periods=5).mean().values
+    smf_std = pd.Series(cross).rolling(60, min_periods=10).std().values
+    with np.errstate(divide="ignore", invalid="ignore"):
+        smf_norm = np.where(smf_std > 1e-10, smf_raw / np.maximum(smf_std, 1e-10), 0)
+    smf_signal = (smf_norm > 0.2).astype(float)
+
+    # --- 超卖反转: 20日收益 < -1σ 且近5日回升 ---
+    ret_20 = np.zeros(n)
+    for i in range(20, n):
+        ret_20[i] = (close[i] / close[i - 20] - 1) if close[i - 20] > 0 else 0
+    ret_mean = pd.Series(ret_20).rolling(60, min_periods=20).mean().values
+    ret_std = pd.Series(ret_20).rolling(60, min_periods=20).std().values
+    ret_5 = np.zeros(n)
+    for i in range(5, n):
+        ret_5[i] = (close[i] / close[i - 5] - 1) if close[i - 5] > 0 else 0
+    reversal_signal = np.zeros(n)
+    for i in range(60, n):
+        if ret_std[i] > 1e-10 and ret_20[i] < ret_mean[i] - ret_std[i]:
+            if ret_5[i] > 0:
+                reversal_signal[i] = 1.0
+
+    # --- 低波动: 20日波动率 < 60日中位数 ---
+    daily_vol = pd.Series(close).pct_change().rolling(20).std().values
+    vol_median = pd.Series(daily_vol).rolling(60, min_periods=20).median().values
+    low_vol_signal = np.where(
+        (~np.isnan(daily_vol)) & (~np.isnan(vol_median)) & (vol_median > 1e-10),
+        (daily_vol < vol_median).astype(float), 0)
+
+    df = df.copy()
+    df["_smf_signal"] = smf_signal
+    df["_reversal_signal"] = reversal_signal
+    df["_low_vol_signal"] = low_vol_signal
+    return df
+
+
+# ============================================================
+# 二、可配置参数的回测引擎（V7 — 对齐v5能力）
 # ============================================================
 
 def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> list:
     """
-    V6可配置参数回测引擎
-    
-    基于V5.0逻辑，但所有关键参数可通过params字典配置。
-    用于参数网格搜索。
+    V7可配置参数回测引擎（V7: 对齐v5能力）
+
+    基于V6.0逻辑，新增:
+      - bp3买点（牛市趋势延续）
+      - ATR自适应止损
+      - 连续亏损熔断器
+      - regime-aware质量门槛
     """
     if len(df) < 80:
         return []
 
     df = compute_indicators(df)
+    # V7(A2): 预计算多因子信号
+    df = _compute_signal_factors(df)
     trades = []
     stock_type = info.get("类型", "龙头")
     slippage = SLIPPAGE_LEADER if stock_type == "龙头" else SLIPPAGE_FLEX
 
     # 从params读取参数
     p = {**DEFAULT_PARAMS, **params}  # 合并默认参数和自定义参数
+
+    # V7: 预计算市场环境序列
+    regime_series = _precompute_regime_v6(df)
 
     # 状态
     in_position = False
@@ -111,6 +239,11 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
     initial_shares = 0
     ladder_sold = [False, False]
     below_ma60_days = 0  # 连续跌破MA60天数
+    # V7: 连续亏损熔断器
+    consec_losses = 0
+    cooldown_until_idx = 0
+    # V7: ATR自适应止损
+    atr_at_buy = 0.0
 
     for i in range(60, len(df)):
         row = df.iloc[i]
@@ -190,7 +323,19 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                             bp2 = True
                             break
 
-            if bp1 or bp2:
+            # ---- 买点3: 牛市趋势延续（V7新增，对齐v5）----
+            bp3 = False
+            if p.get("enable_bp3", True):
+                current_regime_bp = regime_series.get(str(date), "RANGE")
+                if current_regime_bp == "BULL" and not pd.isna(ma60) and ma20 > ma60:
+                    if volume < vol_ma * p.get("bp3_vol_shrink", 0.85):
+                        if close > ma20 * p.get("bp3_min_above_ma20", 1.02):
+                            if i >= 5:
+                                surge_5d = (close - df["close"].iloc[i-5]) / df["close"].iloc[i-5] if df["close"].iloc[i-5] > 0 else 0
+                                if surge_5d < p.get("bp3_max_surge_5d", 0.15):
+                                    bp3 = True
+
+            if bp1 or bp2 or bp3:
                 buy_signal = True
                 if bp1 and bp2:
                     signal_quality += 15
@@ -198,6 +343,8 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                     signal_quality += 5
                 if bp2:
                     signal_quality += 10
+                if bp3 and not bp1 and not bp2:
+                    signal_quality += 5  # bp3单独触发给较低加分
 
                 # 多支撑位重合
                 support_count = 1
@@ -226,10 +373,34 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                 if not pd.isna(ma60) and ma20 > ma60:
                     signal_quality += 5
 
+                # V7(A2): 多因子信号增强
+                factor_bonus = 0.0
+                w_smf = p.get("factor_weight_smf", 0.0)
+                w_rev = p.get("factor_weight_reversal", 0.0)
+                w_vol = p.get("factor_weight_low_vol", 0.0)
+                if w_smf > 0 and i < len(df) and df["_smf_signal"].iloc[i] > 0:
+                    factor_bonus += w_smf
+                if w_rev > 0 and i < len(df) and df["_reversal_signal"].iloc[i] > 0:
+                    factor_bonus += w_rev
+                if w_vol > 0 and i < len(df) and df["_low_vol_signal"].iloc[i] > 0:
+                    factor_bonus += w_vol
+                signal_quality += min(factor_bonus, p.get("factor_max_bonus", 20))
+
                 signal_quality = min(100, signal_quality)
 
-                # 质量门槛（可配置）
-                if signal_quality < p["min_signal_quality"]:
+                # V7: regime-aware质量门槛（对齐v5逻辑）
+                current_regime = regime_series.get(str(date), "RANGE")
+                min_quality = p["min_quality_bear"] if current_regime == "BEAR" else p["min_quality_non_bear"]
+                # 同时兼容旧的 min_signal_quality 参数（WF网格可能传入）
+                min_quality = max(min_quality, p["min_signal_quality"])
+                if signal_quality < min_quality:
+                    buy_signal = False
+
+            # V7: 连续亏损熔断器（对齐v5逻辑）
+            if buy_signal and consec_losses >= 3:
+                if consec_losses >= 6:
+                    buy_signal = False  # 6连亏: 永久禁止该股
+                elif i < cooldown_until_idx:
                     buy_signal = False
 
             if not buy_signal:
@@ -254,6 +425,9 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
             position_shares = initial_shares
             ladder_sold = [False, False]
             below_ma60_days = 0
+            # V7: 记录买入时ATR，用于自适应止损
+            atr_val = row.get("atr14", np.nan)
+            atr_at_buy = atr_val if not pd.isna(atr_val) else buy_price * 0.03
 
         else:
             # ==== 持仓管理 ====
@@ -286,12 +460,21 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                     sell_type = "时间止损"
                     sell_ratio = 1.0
 
-            # ---- 移动止损（可配置）----
+            # ---- 移动止损（V7: ATR自适应 + 分段锁定，对齐v5）----
             if not sell_signal:
-                if profit_pct < p["breakeven_profit"]:
+                current_regime_stop = regime_series.get(str(date), "RANGE")
+                if p.get("atr_mode", True) and profit_pct < p["breakeven_profit"]:
+                    # ATR自适应初始止损（约束在 [atr_stop_min, atr_stop_max]）
+                    atr_mult = 1.5 if current_regime_stop == "BEAR" else p.get("atr_multiplier", 2.0)
+                    atr_stop_pct = (atr_at_buy / buy_price) * atr_mult if buy_price > 0 else p["initial_stop_loss"]
+                    atr_stop_pct = max(p["atr_stop_min"], min(p["atr_stop_max"], atr_stop_pct))
+                    stop_price = buy_price * (1 - atr_stop_pct)
+                elif profit_pct < p["breakeven_profit"]:
                     stop_price = buy_price * (1 - p["initial_stop_loss"])
-                elif profit_pct < 0.15:
+                elif profit_pct < 0.10:
                     stop_price = buy_price * (1 + p["breakeven_lock"])
+                elif profit_pct < 0.15:
+                    stop_price = buy_price * 1.03
                 elif profit_pct < 0.30:
                     stop_price = buy_price * (1 + p["profit_lock_1"])
                 else:
@@ -384,7 +567,7 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                 trades.append({
                     "code": code,
                     "name": info["名称"],
-                    "industry": info["行业"],
+                    "industry": info.get("行业", ""),
                     "stock_type": stock_type,
                     "buy_date": buy_date,
                     "buy_price": round(buy_price, 3),
@@ -396,7 +579,20 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                     "sell_type": sell_type,
                     "highest": round(highest_since_buy, 3),
                     "sell_ratio": round(sell_ratio, 2),
+                    "regime": regime_series.get(str(buy_date), "RANGE"),
                 })
+
+                # V7: 更新连续亏损计数和渐进式熔断期（对齐v5逻辑）
+                if net_profit < 0:
+                    consec_losses += 1
+                    if consec_losses >= 6:
+                        cooldown_until_idx = i + 9999  # 6连亏: 永久禁止
+                    elif consec_losses >= 4:
+                        cooldown_until_idx = i + 60  # 4-5连亏: 暂停60个交易日
+                    elif consec_losses >= 3:
+                        cooldown_until_idx = i + 30  # 3连亏: 暂停30天
+                else:
+                    consec_losses = 0  # 盈利重置
 
                 position_shares -= actual_sell_shares
                 if position_shares <= 0 or sell_ratio >= 1.0:
@@ -410,7 +606,7 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
         trades.append({
-            "code": code, "name": info["名称"], "industry": info["行业"],
+            "code": code, "name": info["名称"], "industry": info.get("行业", ""),
             "stock_type": stock_type, "buy_date": buy_date,
             "buy_price": round(buy_price, 3), "sell_date": last_row["date"],
             "sell_price": round(exec_price, 3),
@@ -419,6 +615,7 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
             "hold_days": len(df) - 1 - buy_index,
             "sell_type": "回测结束", "highest": round(highest_since_buy, 3),
             "sell_ratio": 1.0,
+            "regime": regime_series.get(str(buy_date), "RANGE"),
         })
 
     return trades

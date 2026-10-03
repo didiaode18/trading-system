@@ -15,6 +15,7 @@
 """
 
 import logging
+import json
 # FIX: 清理死代码无用 import（datetime/numpy 均 grep 确认本文件零使用）
 import pandas as pd
 
@@ -364,15 +365,19 @@ def layer4_trend_capital(code: str, df: pd.DataFrame) -> dict:
                 signals.append("近3日缩量回调")
 
     # ---- 相对强度 (最高15分) ----
-    if len(df) >= 60:
-        change_60 = (close / df["close"].iloc[-60] - 1) * 100
-        if change_60 > 20:
+    # V9.0(P0-3): 改为20日相对强弱，消除与L2赛道层60日涨幅的重复计算
+    if len(df) >= 20:
+        change_20 = (close / df["close"].iloc[-20] - 1) * 100
+        if change_20 > 10:
             score += 15
-            signals.append(f"60日涨幅{change_60:.0f}%(强)")
-        elif change_60 > 10:
+            signals.append(f"20日涨幅{change_20:.0f}%(强势)")
+        elif change_20 > 5:
             score += 10
-        elif change_60 > 0:
+            signals.append(f"20日涨幅{change_20:.0f}%")
+        elif change_20 > 0:
             score += 5
+        elif change_20 > -3:
+            signals.append(f"20日微跌{change_20:.0f}%")
 
     result["score"] = max(0, min(100, score))
     result["signals"] = signals
@@ -618,6 +623,20 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     if not risk_notes:
         risk_notes.append("暂无重大风险信号")
 
+    # ---- V9.0(P0-2): 动量衰减惩罚 ----
+    # 检测短期涨幅是否过度集中在近期（追高信号）
+    momentum_decay_penalty = 0
+    if len(df) >= 20:
+        close_arr = df["close"].values
+        chg_5d = (close_arr[-1] / close_arr[-6] - 1) * 100 if len(close_arr) >= 6 else 0
+        chg_20d = (close_arr[-1] / close_arr[-21] - 1) * 100 if len(close_arr) >= 21 else 0
+        if abs(chg_20d) > 3:
+            recent_ratio = chg_5d / chg_20d
+            if chg_20d > 0 and recent_ratio > 0.6 and chg_5d > 5:
+                momentum_decay_penalty = 10
+            elif chg_20d > 0 and recent_ratio > 0.45 and chg_5d > 3:
+                momentum_decay_penalty = 5
+
     result.update({
         "score": min(100, score),
         "reason": entry_type,
@@ -638,6 +657,7 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
         "first_resistance_name": resistances[0][0] if resistances else "估算",
         "atr": round(atr, 3),
         "dist_to_support_pct": round(dist_to_support, 1),
+        "momentum_decay_penalty": momentum_decay_penalty,
     })
     return result
 
@@ -647,9 +667,13 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
 # ============================================================
 def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
                           df: pd.DataFrame, realtime_price: float = 0,
-                          realtime_change: float = 0, fund_data: dict = None) -> dict:
+                          realtime_change: float = 0, fund_data: dict = None,
+                          _playbook=None) -> dict:
     """
     对单只股票运行完整五层分析，生成交易计划
+
+    参数:
+        _playbook: V10 RegimePlaybook实例，提供regime-aware权重和门槛。None时使用默认硬编码权重。
 
     返回: {
         "pass": bool,  # 是否通过全部筛选
@@ -679,25 +703,41 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
     # 第五层：买点性价比
     l5 = layer5_entry_value(code, df, realtime_price)
 
-    # 综合评分（加权）
-    # 赛道20% + 基本面15% + 趋势40% + 买点25%
+    # V10: 综合评分（regime-aware加权）
+    # 有playbook时用regime动态权重，无playbook时保持原有硬编码权重（向后兼容）
+    if _playbook is not None:
+        _pw = _playbook.score_weights()
+        _w_l2 = _pw.get("L2_赛道", 0.25)
+        _w_l3 = _pw.get("L3_基本面", 0.15)
+        _w_l4 = _pw.get("L4_趋势", 0.35)
+        _w_l5 = _pw.get("L5_买点", 0.15)
+        _w_md = _pw.get("momentum_decay", 0.10)
+    else:
+        _w_l2, _w_l3, _w_l4, _w_l5, _w_md = 0.25, 0.15, 0.35, 0.15, 0.10
+
     total_score = (
-        l2["score"] * 0.20 +
-        l3["score"] * 0.15 +
-        l4["score"] * 0.40 +
-        l5["score"] * 0.25
+        l2["score"] * _w_l2 +
+        l3["score"] * _w_l3 +
+        l4["score"] * _w_l4 +
+        l5["score"] * _w_l5 +
+        (100 - l5.get("momentum_decay_penalty", 0) * 10) * _w_md
     )
 
-    # 通过条件（分级 + 趋势硬门槛）:
-    # 硬规则: 空头排列（收盘价<MA20<MA60）直接进排除池，连观察池都不进
-    # A级推荐: 综合分>=55 且 盈亏比>=2.5 且 趋势分>=50 且 多头排列
-    # B级推荐: 综合分>=50 且 盈亏比>=2.0 且 趋势分>=40（中风险标注）
+    # V10: 通过条件（regime-aware门槛）
+    # 有playbook时用regime动态门槛，无playbook时保持原有硬编码门槛
+    if _playbook is not None:
+        _pass_threshold = _playbook.pass_threshold()
+        _core_threshold = _playbook.core_pool_threshold()
+    else:
+        _pass_threshold = 50
+        _core_threshold = 55
+
     is_bearish = l4["score"] < 20  # 趋势分极低 = 空头排列
-    passed_a = (total_score >= 55 and
+    passed_a = (total_score >= _core_threshold and
                 l5["risk_reward"] >= 2.5 and
                 l4["score"] >= 50 and
                 not is_bearish)
-    passed_b = (total_score >= 50 and
+    passed_b = (total_score >= _pass_threshold and
                 l5["risk_reward"] >= MIN_RISK_REWARD and  # 2.0
                 l4["score"] >= 40 and
                 not is_bearish)
@@ -743,15 +783,17 @@ def generate_trading_plan(code: str, name: str, sector: str, stock_type: str,
         "plan": l5 if passed else None,
         "trend_dir": l4["trend_dir"],
         "signals": l4["signals"],
+        "momentum_decay": l5.get("momentum_decay_penalty", 0),
     }
 
 
 # ============================================================
 # 批量推荐：扫描候选池，输出三级股票池
 # ============================================================
-def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list = None) -> dict:
+def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list = None,
+                       regime_result: dict = None) -> dict:
     """
-    批量运行推荐引擎 V2（三级池分级 + 操盘密码DK信号加分）
+    批量运行推荐引擎 V3（regime-aware + 三级池分级 + 操盘密码DK信号加分）
 
     三级池:
       核心池: 全部筛选通过 + 盈亏比≥2.5 + 买点已到，可直接建仓，数量≤8
@@ -762,10 +804,20 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
         candidate_data: [{"code", "name", "sector", "type", "df", "realtime_price", "realtime_change", "fund_data"}]
         top_n: 核心池上限
         held_sectors: 当前持仓赛道列表，同赛道推荐扣分（避免集中度风险）
+        regime_result: V10 regime检测结果，用于动态调整选股权重/门槛/板块偏好
 
     返回:
         {"recommended": [...], "watchlist": [...], "excluded": [...], "rejected_count", "total_scanned"}
     """
+    # V10: 加载RegimePlaybook（regime-aware选股）
+    _playbook = None
+    try:
+        from strategy.regime_playbook import RegimePlaybook
+        _playbook = RegimePlaybook(regime_result)
+        logger.info(f"[推荐引擎] V10 regime={_playbook.state}, 门槛={_playbook.pass_threshold()}分, "
+                    f"模式={_playbook.action_mode_cn()}")
+    except Exception as _e:
+        logger.debug(f"[推荐引擎] V10 playbook加载失败，使用默认权重: {_e}")
     # 加载操盘密码引擎（DK信号加分）
     try:
         from strategy.caopan_signal import CaopanEngine
@@ -773,6 +825,48 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
         caopan_available = True
     except Exception:
         caopan_available = False
+
+    # V9.1(P0-2): 板块景气加成 —— 读取sector_rotation_cache，强势板块加分/弱势减分
+    _sector_boost = {}  # {sector_name: (boost_value, status_text)}
+    try:
+        import json as _json
+        _rot_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'sector_rotation_cache.json'
+        )
+        if os.path.exists(_rot_path):
+            with open(_rot_path, 'r', encoding='utf-8') as _rf:
+                _rot_data = _json.load(_rf)
+            # 校验新鲜度（24小时内有效）
+            _rot_updated = _rot_data.get('updated', '')
+            _rot_valid = True
+            if _rot_updated:
+                try:
+                    import datetime as _dt
+                    _rot_ts = _dt.datetime.fromisoformat(str(_rot_updated))
+                    if (_dt.datetime.now() - _rot_ts).total_seconds() > 24 * 3600:
+                        _rot_valid = False
+                except Exception:
+                    pass
+            if _rot_valid:
+                _strong = set(_rot_data.get('strong', []))
+                _weak = set(_rot_data.get('weak', []))
+                _scores = _rot_data.get('sector_scores', {})
+                # 构建板块加成映射
+                for _sec in _strong:
+                    _sc = _scores.get(_sec, 60)
+                    _sector_boost[_sec] = (+8, f'强势+{_sc:.0f}分')
+                for _sec in _weak:
+                    _sc = _scores.get(_sec, 30)
+                    _sector_boost[_sec] = (-8, f'弱势{_sc:.0f}分')
+                # 中间板块（非strong非weak但评分较高）也给小幅加成
+                for _sec, _sc in _scores.items():
+                    if _sec not in _sector_boost:
+                        if _sc >= 70:
+                            _sector_boost[_sec] = (+4, f'偏强{_sc:.0f}分')
+                        elif _sc <= 35:
+                            _sector_boost[_sec] = (-4, f'偏弱{_sc:.0f}分')
+    except Exception:
+        pass  # 板块数据不可用时不加成
 
     results = []
 
@@ -786,6 +880,7 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
             realtime_price=item.get("realtime_price", 0),
             realtime_change=item.get("realtime_change", 0),
             fund_data=item.get("fund_data"),
+            _playbook=_playbook,  # V10: regime-aware权重/门槛
         )
 
         # 操盘密码V2.0信号融合（5级趋势+三重DK+资金模式）
@@ -840,12 +935,39 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
             plan["total_score"] = max(0, plan.get("total_score", 0) - 15)
             plan["sector_overlap_penalty"] = True
 
+        # V9.1(P0-2): 板块景气加成/减分
+        _item_sector = item.get("sector", "")
+        _boost_info = _sector_boost.get(_item_sector)
+        if _boost_info:
+            _boost_val, _boost_text = _boost_info
+            plan["total_score"] = max(0, min(100, plan.get("total_score", 0) + _boost_val))
+            plan["sector_boost"] = _boost_val
+            plan["sector_status"] = f"{_item_sector}·{_boost_text}"
+        else:
+            plan["sector_status"] = _item_sector or "未知"
+
+        # V10: BEAR模式非防御板块评分惩罚
+        if _playbook is not None:
+            _sec_pref = _playbook.sector_preference()
+            if _sec_pref.get("mode") == "defensive":
+                _penalty = _sec_pref.get("non_defensive_penalty", 1.0)
+                if _penalty < 1.0 and not _playbook.is_defensive_sector(_item_sector):
+                    plan["total_score"] = max(0, plan.get("total_score", 0) * _penalty)
+                    plan["bear_non_defensive_penalty"] = True
+                    plan["sector_status"] += "·⚠️非防御板块"
+
         results.append(plan)
 
-    # 三级分类
+    # 三级分类（V10: 观察池门槛随regime调整）
+    _watch_threshold = 45  # 默认观察池门槛
+    if _playbook is not None:
+        if _playbook.state == "BEAR":
+            _watch_threshold = 55  # 熊市提高观察池门槛（减少噪音）
+        elif _playbook.state == "BULL":
+            _watch_threshold = 40  # 牛市降低观察池门槛（更多候选）
     # 核心池: 通过全部筛选 + 盈亏比≥2.5 + 多头趋势
     core_pool = []
-    # 观察池: 综合分≥45 但买点未到/盈亏比不足
+    # 观察池: 综合分≥_watch_threshold 但买点未到/盈亏比不足
     watch_pool = []
     # 排除池: 空头趋势、踩雷、评分过低
     excluded_pool = []
@@ -864,7 +986,7 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
             else:
                 r["watch_reason"] = f"盈亏比{rr:.1f}不足"
                 watch_pool.append(r)
-        elif r["total_score"] >= 45:
+        elif r["total_score"] >= _watch_threshold:
             # 观察池: 基本面趋势达标，买点未到
             r["watch_reason"] = f"综合分{r['total_score']}，买点未到/估值偏高"
             watch_pool.append(r)
@@ -876,13 +998,24 @@ def run_recommendation(candidate_data: list, top_n: int = 8, held_sectors: list 
     core_pool.sort(key=lambda x: x["total_score"], reverse=True)
     watch_pool.sort(key=lambda x: x["total_score"], reverse=True)
 
-    return {
+    result = {
         "recommended": core_pool[:top_n],       # 核心池 ≤8只
         "watchlist": watch_pool[:15],           # 观察池 ≤15只
         "excluded": excluded_pool,              # 排除池
         "rejected_count": len(excluded_pool),
         "total_scanned": len(results),
+        # V10: regime信息传递给下游（报告/条件单）
+        "regime_state": _playbook.state if _playbook else "RANGE",
+        "regime_action_mode": _playbook.action_mode_cn() if _playbook else "",
     }
+
+    # V9.0(P1-3): 保存推荐历史，用于信号衰减追踪
+    try:
+        _save_recommend_history(result)
+    except Exception as _e:
+        logger.debug(f"推荐历史保存失败(不影响主流程): {_e}")
+
+    return result
 
 
 # ============================================================
@@ -958,3 +1091,102 @@ def generate_entry_orders(recommendation_result: dict) -> list:
         logger.info(f"[选股联动] {code} {name} 建仓单: 触发价{buy_price:.2f} {buy_shares}股 评分{score:.0f}")
     
     return orders
+
+
+# ============================================================
+# V9.0(P1-3): 选股信号衰减追踪
+# ============================================================
+_RECOMMEND_HISTORY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'recommend_history.json'
+)
+
+
+def _save_recommend_history(result: dict):
+    """保存每次推荐结果到历史文件，用于T+1/T+3/T+5衰减追踪"""
+    import datetime
+    history_file = _RECOMMEND_HISTORY_PATH
+    history = []
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        except Exception:
+            history = []
+    today = datetime.date.today().isoformat()
+    # 记录核心池和观察池的评分快照
+    snapshot = {"date": today, "core": [], "watch": []}
+    for r in result.get("recommended", []):
+        snapshot["core"].append({
+            "code": r.get("code", ""),
+            "name": r.get("name", ""),
+            "score": r.get("total_score", 0),
+            "grade": r.get("grade", ""),
+            "momentum_decay": r.get("momentum_decay", 0),
+            "layers": {
+                "L2": r.get("layers", {}).get("L2_赛道", {}).get("score", 0),
+                "L4": r.get("layers", {}).get("L4_趋势", {}).get("score", 0),
+            },
+        })
+    for r in result.get("watchlist", []):
+        snapshot["watch"].append({
+            "code": r.get("code", ""),
+            "name": r.get("name", ""),
+            "score": r.get("total_score", 0),
+        })
+    history.append(snapshot)
+    # 只保留最近30天的记录
+    history = history[-30:]
+    with open(history_file, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def get_recommendation_decay_stats() -> dict:
+    """
+    读取推荐历史，统计信号衰减情况。
+    返回: {
+        "total_recommendations": int,
+        "avg_decay_3d": float,  # 3日平均衰减
+        "worst_decay_codes": [...],  # 衰减最严重的标的
+    }
+    """
+    history_file = _RECOMMEND_HISTORY_PATH
+    if not os.path.exists(history_file):
+        return {"total_recommendations": 0, "avg_decay_3d": 0, "worst_decay_codes": []}
+    try:
+        with open(history_file, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        if not history or len(history) < 2:
+            return {"total_recommendations": len(history), "avg_decay_3d": 0, "worst_decay_codes": []}
+        # 统计每个code的评分变化
+        code_scores = {}  # {code: [(date, score), ...]}
+        for snap in history:
+            for r in snap.get("core", []) + snap.get("watch", []):
+                code = r["code"]
+                if code not in code_scores:
+                    code_scores[code] = []
+                code_scores[code].append((snap["date"], r["score"]))
+        # 计算衰减
+        decays = []
+        for code, entries in code_scores.items():
+            if len(entries) >= 2:
+                first_score = entries[0][1]
+                last_score = entries[-1][1]
+                decay = last_score - first_score
+                decays.append({
+                    "code": code,
+                    "first_score": first_score,
+                    "last_score": last_score,
+                    "decay": round(decay, 1),
+                    "days": len(entries),
+                })
+        decays.sort(key=lambda x: x["decay"])
+        avg_decay = sum(d["decay"] for d in decays) / len(decays) if decays else 0
+        return {
+            "total_recommendations": len(history),
+            "unique_codes": len(code_scores),
+            "avg_decay_3d": round(avg_decay, 1),
+            "worst_decay_codes": decays[:5],
+        }
+    except Exception as e:
+        logger.debug(f"推荐衰减统计失败: {e}")
+        return {"total_recommendations": 0, "avg_decay_3d": 0, "worst_decay_codes": []}

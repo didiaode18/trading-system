@@ -84,10 +84,18 @@ class ConditionOrder:
         self.priority = order_dict.get("优先级", "★★建议")
         self.note = order_dict.get("说明", "")
 
+        # FIX P3-#17: 回落卖出/反弹买入的个性化阀值（不传则用模块默认）
+        # 优先级：订单字段 > 默认 5%/2%（与原行为兼容）
+        self.drawdown_pct = float(order_dict.get("回落幅度", 0.05))
+        self.rebound_pct = float(order_dict.get("反弹幅度", 0.02))
+
         # 状态追踪
         self.triggered = False
         self.executed = False
         self.create_date = datetime.date.today().isoformat()
+        # FIX P1-#3: 执行失败重试计数（防止 broker 拒单后静默丢单）
+        self.retry_count = 0
+        self.last_error = ""
 
     def to_dict(self):
         return {
@@ -102,8 +110,12 @@ class ConditionOrder:
             "触发时间": self.trigger_time,
             "优先级": self.priority,
             "说明": self.note,
+            "回落幅度": self.drawdown_pct,
+            "反弹幅度": self.rebound_pct,
             "triggered": self.triggered,
             "executed": self.executed,
+            "retry_count": self.retry_count,
+            "last_error": self.last_error,
         }
 
 
@@ -123,6 +135,9 @@ class QMTTrader:
         self.account = None
         self.daily_trade_count = 0
         self.today = datetime.date.today().isoformat()
+        # 成交回报 + 账实对账（trade-reconciliation）
+        self.callback = None   # FillCallback 实例，connect 后建立
+        self.ledger = None     # TradeLedger 实例
 
         # 尝试导入xtquant
         try:
@@ -143,6 +158,7 @@ class QMTTrader:
         if not self.has_xtquant:
             logger.warning("[QMT] 模拟模式：xtquant未安装")
             self.connected = True  # 模拟连接
+            self._setup_reconcile()
             return True
 
         try:
@@ -181,6 +197,7 @@ class QMTTrader:
 
             self.connected = True
             logger.info(f"[QMT] ✅ 连接成功 | 账号: {account_id}")
+            self._setup_reconcile()
             return True
 
         except Exception as e:
@@ -227,7 +244,17 @@ class QMTTrader:
 
         if not self.has_xtquant:
             logger.info("[QMT模拟] 查询账户资金")
-            return {"total_asset": 710000, "cash": 66, "market_value": 710000}
+            # FIX P2-#12: 模拟模式现金从 66 元 改为 总资产的3成（~20万），
+            # 避免 _risk_check 中 min_cash_pct=10% 阀值必然拒绝所有买入，
+            # 使模拟盘可真正验证买入链路。市值同步调低以保证 total = cash + market_value。
+            _sim_total = 710000
+            _sim_cash = 200000
+            return {
+                "total_asset": _sim_total,
+                "cash": _sim_cash,
+                "market_value": _sim_total - _sim_cash,
+                "frozen": 0,
+            }
 
         try:
             asset = self.trader.query_stock_asset(self.account)
@@ -265,7 +292,9 @@ class QMTTrader:
         if not self.has_xtquant:
             logger.info(f"[QMT模拟] 下单: {direction} {code} {quantity}股 @ {price}")
             self.daily_trade_count += 1
-            return int(time.time())
+            sim_order_id = int(time.time())
+            self._record_order_to_ledger(sim_order_id, code, direction, price, quantity)
+            return sim_order_id
 
         try:
             from xtquant.xtconstant import (
@@ -300,6 +329,7 @@ class QMTTrader:
             if order_id and order_id > 0:
                 self.daily_trade_count += 1
                 logger.info(f"[QMT] ✅ 下单成功 | {direction} {code} {quantity}股 @ {price} | 订单号:{order_id}")
+                self._record_order_to_ledger(order_id, code, direction, price, quantity)
                 return order_id
             else:
                 logger.error(f"[QMT] ❌ 下单失败 | {direction} {code} {quantity}股 @ {price}")
@@ -338,6 +368,48 @@ class QMTTrader:
 
     # ---- 内部方法 ----
 
+    def _setup_reconcile(self):
+        """建立成交回报回调与台账（trade-reconciliation）。
+
+        - 创建 TradeLedger 与 FillCallback；
+        - 真实模式：register_callback 注册回报，并主动拉取当日流水兜底；
+        - 模拟模式：仅建台账，供 place_order 记录委托、测试构造回报。
+        全程 try/except 降级，对账链路异常绝不影响下单主流程。
+        """
+        try:
+            recon_cfg = {}
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), "trading_system"))
+                import config as _c
+                recon_cfg = getattr(_c, "RECONCILE_CONFIG", {}) or {}
+            except Exception:
+                pass
+            if not recon_cfg.get("enabled", True):
+                return
+            from execution.trade_ledger import TradeLedger
+            from execution.fill_callback import FillCallback
+            self.ledger = TradeLedger()
+            self.callback = FillCallback(ledger=self.ledger)
+            if self.has_xtquant and self.trader is not None and self.account is not None:
+                if recon_cfg.get("register_callback", True):
+                    self.trader.register_callback(self.callback)
+                    logger.info("[QMT] 已注册成交回报回调 FillCallback")
+                if recon_cfg.get("sync_on_connect", True):
+                    sync = self.callback.sync_from_trader(self)
+                    logger.info(f"[QMT] 连接后流水兜底: {sync}")
+        except Exception as e:
+            logger.warning(f"[QMT] 成交回报/对账初始化失败(降级，不影响交易): {e}")
+
+    def _record_order_to_ledger(self, order_id, code, direction, price, quantity):
+        """将委托登记入台账（成交状态由回报/流水回填，下单仅记委托）。"""
+        try:
+            if self.ledger is not None and order_id:
+                self.ledger.record_order(
+                    order_id=order_id, code=code, direction=direction,
+                    order_price=price, order_qty=quantity, source="place_order")
+        except Exception as e:
+            logger.debug(f"[QMT] 委托入账失败(降级): {e}")
+
     def _convert_code(self, code: str) -> str:
         """转换代码格式: 588000 → 588000.SH, 002558 → 002558.SZ"""
         if "." in code:
@@ -347,30 +419,89 @@ class QMTTrader:
         else:
             return f"{code}.SZ"
 
+    def _get_position_market_value(self, code: str) -> float:
+        """FIX P0-#2: 获取指定标的当前持仓市值（用于单股集中度校验）
+
+        优先从 QMT 实时持仓查询；模拟模式/查询失败时降级为 0（仅影响单股集中度一项，
+        不阻断主链路）。代码后缀差异（588000 vs 588000.SH）统一去除后比较。
+        """
+        try:
+            target = code.split(".")[0]
+            for pos in self.get_positions():
+                pos_code = str(pos.get("code", "")).split(".")[0]
+                if pos_code == target:
+                    mv = pos.get("market_value", 0)
+                    if mv and mv > 0:
+                        return float(mv)
+                    # 降级：volume * cost
+                    return float(pos.get("volume", 0)) * float(pos.get("cost", 0))
+        except Exception as e:
+            logger.debug(f"[风控] {code} 持仓市值查询异常，降级为0: {e}")
+        return 0.0
+
     def _risk_check(self, code: str, direction: str, price: float, quantity: int) -> bool:
-        """风控硬约束检查"""
+        """风控硬约束检查
+
+        FIX P0-#2: 补齐 QMT_CONFIG 中声明但从未使用的 max_single_position_pct /
+        max_total_position_pct 校验，避免实盘下单突破单股集中度与总仓位红线。
+        降级原则：账户信息不可用时仅依赖现金检查，不阻断卖单（卖出只释放风险）。
+        """
         # 1. 每日交易笔数限制
         if self.daily_trade_count >= self.config["max_daily_trades"]:
             logger.warning(f"[风控] 🚫 拒绝下单: 今日已交易{self.daily_trade_count}笔，达到上限{self.config['max_daily_trades']}")
             return False
 
-        # 2. 买入时检查仓位
+        # 2. 买入时检查仓位（卖出不需现金/仓位校验，只校验每日笔数）
         if direction == "买入":
             account = self.get_account_info()
-            if account:
-                total = account.get("total_asset", 0)
-                cash = account.get("cash", 0)
-                order_amount = price * quantity
+            if not account:
+                logger.warning("[风控] ⚠️ 账户信息不可用，买入降级为拒绝（安全默认）")
+                return False
 
-                # 现金不足
-                if order_amount > cash:
-                    logger.warning(f"[风控] 🚫 拒绝买入: 需要{order_amount:.0f}元，可用{cash:.0f}元")
-                    return False
+            total = account.get("total_asset", 0) or 0
+            cash = account.get("cash", 0) or 0
+            market_value = account.get("market_value", 0) or 0
+            order_amount = price * quantity
 
-                # 最低现金比例
-                if total > 0 and (cash - order_amount) / total < self.config["min_cash_pct"] / 100:
-                    logger.warning(f"[风控] 🚫 拒绝买入: 买入后现金比例低于{self.config['min_cash_pct']}%")
-                    return False
+            if total <= 0:
+                logger.warning("[风控] 🚫 拒绝买入: 总资产为0，账户异常")
+                return False
+
+            # 2.1 现金绝对额不足
+            if order_amount > cash:
+                logger.warning(f"[风控] 🚫 拒绝买入: 需要{order_amount:.0f}元，可用{cash:.0f}元")
+                return False
+
+            # 2.2 最低现金比例
+            min_cash_ratio = self.config.get("min_cash_pct", 10) / 100
+            if (cash - order_amount) / total < min_cash_ratio:
+                logger.warning(
+                    f"[风控] 🚫 拒绝买入: 买入后现金比例"
+                    f"{(cash - order_amount) / total:.1%} < {min_cash_ratio:.0%}"
+                )
+                return False
+
+            # 2.3 FIX P0-#2: 总仓位上限
+            max_total_ratio = self.config.get("max_total_position_pct", 90) / 100
+            new_total_pos = market_value + order_amount
+            if new_total_pos / total > max_total_ratio:
+                logger.warning(
+                    f"[风控] 🚫 拒绝买入 {code}: 买入后总仓位"
+                    f"{new_total_pos / total:.1%} > {max_total_ratio:.0%}"
+                )
+                return False
+
+            # 2.4 FIX P0-#2: 单股集中度
+            max_single_ratio = self.config.get("max_single_position_pct", 25) / 100
+            existing_mv = self._get_position_market_value(code)
+            new_single_pos = existing_mv + order_amount
+            if new_single_pos / total > max_single_ratio:
+                logger.warning(
+                    f"[风控] 🚫 拒绝买入 {code}: 单股集中度"
+                    f"{new_single_pos / total:.1%} > {max_single_ratio:.0%} "
+                    f"(现有{existing_mv:.0f}+本次{order_amount:.0f})"
+                )
+                return False
 
         logger.info(f"[风控] ✅ 通过 | {direction} {code} {quantity}股 @ {price}")
         return True
@@ -438,28 +569,60 @@ class ConditionOrderEngine:
                         logger.info(f"[触发] 时间条件单 | {order.name} {current_time}≥{order.trigger_time} 且 价格{price}≤{order.trigger_price}")
 
             elif order.order_type == "回落卖出":
-                # 从日内最高回落5%
+                # FIX P3-#17: 从日内最高回落 —— 使用订单个性化 drawdown_pct（默认5%）
                 high = self.high_prices.get(order.code, price)
                 drawdown = (high - price) / high if high > 0 else 0
-                if drawdown >= 0.05 and price <= order.trigger_price:
+                _dd_threshold = getattr(order, "drawdown_pct", 0.05)
+                if drawdown >= _dd_threshold and price <= order.trigger_price:
                     triggered = True
-                    logger.info(f"[触发] 回落卖出 | {order.name} 日高{high:.3f}→当前{price:.3f} 回落{drawdown*100:.1f}%")
+                    logger.info(
+                        f"[触发] 回落卖出 | {order.name} 日高{high:.3f}→当前{price:.3f} "
+                        f"回落{drawdown * 100:.1f}% ≥ 阀值{_dd_threshold * 100:.1f}%"
+                    )
 
             elif order.order_type == "反弹买入":
-                # 从日内最低反弹2%
+                # FIX P3-#17: 从日内最低反弹 —— 使用订单个性化 rebound_pct（默认2%）
                 low = self.low_prices.get(order.code, price)
                 rebound = (price - low) / low if low > 0 else 0
-                if price <= order.trigger_price and rebound >= 0.02:
+                _rb_threshold = getattr(order, "rebound_pct", 0.02)
+                if price <= order.trigger_price and rebound >= _rb_threshold:
                     triggered = True
-                    logger.info(f"[触发] 反弹买入 | {order.name} 日低{low:.3f}→当前{price:.3f} 反弹{rebound*100:.1f}%")
+                    logger.info(
+                        f"[触发] 反弹买入 | {order.name} 日低{low:.3f}→当前{price:.3f} "
+                        f"反弹{rebound * 100:.1f}% ≥ 阀值{_rb_threshold * 100:.1f}%"
+                    )
 
             # 执行
+            # FIX P1-#3: triggered 后置 + 失败重试
+            # 原 Bug：order.triggered = True 先于 _execute_order，一旦 broker 拒单/
+            # 网络抖动/涨停无法成交，下一轮扫描会因 `if order.triggered` 直接跳过，
+            # 关键止损单静默丢失。现改为：仅当 _execute_order 确认下单成功后才置位；
+            # 失败则累加 retry_count，达上限 3 后才放弃并告警（避免无限重试刷单）。
             if triggered:
-                order.triggered = True
-                self._execute_order(order, price)
+                ok = self._execute_order(order, price)
+                if ok:
+                    order.triggered = True
+                else:
+                    order.retry_count += 1
+                    _max_retry = 3
+                    if order.retry_count >= _max_retry:
+                        logger.error(
+                            f"[执行] 🚨 {order.name}({order.code}) 连续{order.retry_count}次"
+                            f"下单失败，放弃重试 | 最后错误: {order.last_error}"
+                        )
+                        order.triggered = True  # 标记放弃，避免后续无限重试
+                        self._notify_order_failure(order)
+                    else:
+                        logger.warning(
+                            f"[执行] ⚠️ {order.name}({order.code}) 第{order.retry_count}次"
+                            f"失败，下轮重试 | 错误: {order.last_error}"
+                        )
 
-    def _execute_order(self, order: ConditionOrder, current_price: float):
-        """执行条件单"""
+    def _execute_order(self, order: ConditionOrder, current_price: float) -> bool:
+        """执行条件单
+
+        FIX P1-#3: 返回 bool 供上层判断是否需要重试；失败时写入 order.last_error。
+        """
         logger.info(f"[执行] {order.direction} {order.code} {order.name} {order.quantity}股 | 触发价{order.trigger_price} 当前{current_price}")
 
         # 卖出用触发价（限价），买入用当前价
@@ -468,20 +631,55 @@ class ConditionOrderEngine:
         else:
             exec_price = current_price
 
-        order_id = self.trader.place_order(
-            code=order.code,
-            direction=order.direction,
-            price=exec_price,
-            quantity=order.quantity,
-            order_type="限价",
-        )
+        try:
+            order_id = self.trader.place_order(
+                code=order.code,
+                direction=order.direction,
+                price=exec_price,
+                quantity=order.quantity,
+                order_type="限价",
+            )
+        except Exception as e:
+            order.last_error = f"place_order异常: {e}"
+            logger.error(f"[执行] ❌ 异常 | {order.name} {order.last_error}")
+            return False
 
         if order_id:
             order.executed = True
+            order.last_error = ""
             self.executed_orders.append(order)
             logger.info(f"[执行] ✅ 成功 | 订单号{order_id}")
+            return True
         else:
-            logger.error(f"[执行] ❌ 失败 | {order.name} 下单被拒绝")
+            order.last_error = "place_order 返回 None（风控拒绝或下单失败）"
+            logger.error(f"[执行] ❌ 失败 | {order.name} {order.last_error}")
+            return False
+
+    def _notify_order_failure(self, order: ConditionOrder):
+        """FIX P1-#3: 重试耗尽后告警（邮件/钉钉），避免关键止损单静默丢失
+
+        降级原则：通知链路异常不得影响主循环，全部 try/except 包裹。
+        """
+        try:
+            msg = (
+                f"🚨 QMT条件单执行失败\n"
+                f"标的: {order.name}({order.code})\n"
+                f"方向: {order.direction} {order.quantity}股 @ {order.trigger_price}\n"
+                f"类型: {order.order_type}\n"
+                f"重试次数: {order.retry_count}\n"
+                f"最后错误: {order.last_error}\n"
+                f"请立即手工处理！"
+            )
+            logger.critical(f"[告警] {msg}")
+            # 尝试钉钉推送（不阻断）
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), "trading_system"))
+                from notify.dingtalk_notify import send_dingtalk
+                send_dingtalk(msg, level="critical")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"[告警] 失败通知发送异常: {e}")
 
     def _update_high_low(self, code: str, price: float):
         """更新日内高低价"""

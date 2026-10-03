@@ -49,14 +49,18 @@ from strategy.multi_factor import MultiFactorScorer, factor_summary
 from risk.position_sizing import PositionSizer, position_summary
 from notify.alert_engine import AlertEngine
 from notify.email_notify import send_email
-from output.report_email import (
-    build_morning_email, build_evening_email,
-    build_orders_email, build_weekly_email
-)
-from output.report_charts import (
-    generate_kline_chart, generate_fund_flow_chart,
-    generate_position_pie, generate_sector_bar
-)
+try:
+    from output.report_email import (
+        build_morning_email, build_evening_email,
+        build_orders_email, build_weekly_email
+    )
+    from output.report_charts import (
+        generate_kline_chart, generate_fund_flow_chart,
+        generate_position_pie, generate_sector_bar
+    )
+    HAS_REPORT_OUTPUT = True
+except ImportError:
+    HAS_REPORT_OUTPUT = False
 from strategy.stock_screener import run_stock_screener, send_screener_email
 from strategy.capital_flow import CapitalFlowAnalyzer
 from strategy.market_scanner import (scan_market_hot_stocks, merge_scan_results_to_pool,

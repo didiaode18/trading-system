@@ -29,4 +29,6 @@
     intraday_monitor.py    盘中实时监控与预警
     market_scanner.py      全市场动态扫描
     trade_journal.py       交易日志与绩效归因
+    pairs_trading.py       配对交易策略（协整均值回归）
+    dividend_enhance.py    红利ETF增强策略
 """

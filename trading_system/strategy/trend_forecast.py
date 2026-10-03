@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 
 
 class TrendForecaster:
-    """持仓趋势预测分析器"""
+    """
+    持仓趋势预测分析器
+
+    职责:
+      对持仓标的进行趋势预测分析，包括均线系统、动量、
+      量价关系等多维度趋势评估，输出趋势方向和强度。
+    """
 
     def __init__(self, lookback_days=None):
         self.lookback_days = lookback_days or getattr(config, 'FORECAST_LOOKBACK_DAYS', 120)
@@ -43,7 +49,7 @@ class TrendForecaster:
     # 一、单只股票趋势预测
     # ============================================================
 
-    def analyze_stock(self, code: str, df: pd.DataFrame, holding: dict = None) -> dict:
+    def analyze_stock(self, code: str, df: pd.DataFrame, holding: dict = None, _regime: str = None) -> dict:
         """
         对单只股票进行完整趋势预测分析
 
@@ -51,6 +57,7 @@ class TrendForecaster:
             code: 股票代码
             df: 含技术指标的日线DataFrame（需已compute_indicators）
             holding: 持仓信息 {"shares", "buy_price", "highest_price", ...}
+            _regime: V10.1 市场状态(BULL/RANGE/BEAR)，用于压力位修正
 
         返回:
             预测分析结果字典
@@ -68,8 +75,8 @@ class TrendForecaster:
         # ---- 2. 动量分析 ----
         momentum_result = self._analyze_momentum(df)
 
-        # ---- 3. 支撑压力位 ----
-        levels_result = self._calc_support_resistance(df)
+        # ---- 3. 支撑压力位（V10.1: regime修正） ----
+        levels_result = self._calc_support_resistance(df, _regime=_regime)
 
         # ---- 4. 波动率分析 ----
         volatility_result = self._analyze_volatility(df)
@@ -379,12 +386,19 @@ class TrendForecaster:
     # 四、支撑压力位计算
     # ============================================================
 
-    def _calc_support_resistance(self, df: pd.DataFrame) -> dict:
-        """计算关键支撑位和压力位"""
+    def _calc_support_resistance(self, df: pd.DataFrame, _regime: str = None) -> dict:
+        """计算关键支撑位和压力位
+
+        V10.1多维度增强:
+          1. 成交量加权筹码峰(简易版): 高成交量价位形成真实阻力/支撑
+          2. Regime修正: BULL模式压力位上调5%，BEAR模式支撑位下调5%
+          3. 突破确认: 近期放量突破关键阻力时，标记为"已突破"
+        """
         latest = df.iloc[-1]
         close = df["close"].values
         high = df["high"].values
         low = df["low"].values
+        volume = df["volume"].values if "volume" in df.columns else None
         current = close[-1]
 
         # 布林带
@@ -423,13 +437,54 @@ class TrendForecaster:
         if recent_high > current:
             resistances.append(("近期高点", recent_high))
 
+        # V10.1增强1: 成交量加权筹码峰
+        if volume is not None and len(volume) >= 20:
+            vol_lookback = min(20, len(df))
+            recent_vol = volume[-vol_lookback:]
+            recent_close = close[-vol_lookback:]
+            # 简易筹码峰: 高成交量日的收盘价
+            vol_median = np.median(recent_vol)
+            high_vol_days = recent_vol > vol_median * 1.5
+            if np.any(high_vol_days):
+                high_vol_prices = recent_close[high_vol_days]
+                # 筹码峰中心 = 高成交量日均价
+                chip_center = np.mean(high_vol_prices)
+                if chip_center > current:
+                    resistances.append(("筹码峰压力", chip_center))
+                elif chip_center < current:
+                    supports.append(("筹码峰支撑", chip_center))
+
         # 排序：支撑位从高到低，压力位从低到高
         supports.sort(key=lambda x: x[1], reverse=True)
         resistances.sort(key=lambda x: x[1])
 
+        # V10.1增强2: Regime修正
+        _regime_adj = 1.0
+        if _regime == "BULL":
+            _regime_adj = 1.05  # 压力位上调5%（牛市易突破）
+        elif _regime == "BEAR":
+            _regime_adj = 0.95  # 支撑位下调5%（熊市易破位）
+
         # 第一支撑/压力
         first_support = supports[0][1] if supports else current * 0.95
         first_resistance = resistances[0][1] if resistances else current * 1.05
+
+        # V10.1增强3: 突破确认检测
+        _breakout_detected = False
+        if len(close) >= 5 and volume is not None:
+            # 检查近5日是否放量突破关键阻力
+            recent_5d_high = max(high[-5:])
+            avg_vol_20 = np.mean(volume[-20:]) if len(volume) >= 20 else np.mean(volume)
+            latest_vol = volume[-1]
+            # 放量标准: 当日成交量 > 20日均量1.5倍
+            if latest_vol > avg_vol_20 * 1.5 and recent_5d_high >= recent_high * 0.99:
+                _breakout_detected = True
+
+        # Regime修正应用
+        if _regime == "BULL":
+            first_resistance *= _regime_adj  # 压力位上调
+        elif _regime == "BEAR":
+            first_support *= _regime_adj  # 支撑位下调
 
         return {
             "current_price": round(current, 2),
@@ -446,6 +501,10 @@ class TrendForecaster:
             "resistances": [(n, round(v, 2)) for n, v in resistances[:3]],
             "distance_to_support_pct": round((current - first_support) / current * 100, 1),
             "distance_to_resistance_pct": round((first_resistance - current) / current * 100, 1),
+            # V10.1新增字段
+            "regime": _regime,
+            "breakout_detected": _breakout_detected,
+            "regime_adjustment": _regime_adj,
         }
 
     # ============================================================

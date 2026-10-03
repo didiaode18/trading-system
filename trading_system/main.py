@@ -1,5 +1,5 @@
 """
-高胜率A股交易操作系统 V9.0 - 主程序入口
+高胜率A股交易操作系统 V10.0 - 主程序入口
 =========================================
 每日一键运行流程:
   1. 增量更新所有股票池日线数据
@@ -61,6 +61,9 @@ from strategy.trend_forecast import TrendForecaster
 # V7.1 新增模块
 from strategy.anti_manipulation import AntiManipulationAnalyzer
 from strategy.consensus import batch_consensus
+# V10.1: 市场情绪 + 周线趋势
+from strategy.market_sentiment import get_market_sentiment
+from strategy.caopan_signal import check_weekly_trend
 
 # ============================================================
 # 日志配置
@@ -343,7 +346,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     """
     start_time = datetime.datetime.now()
     logger.info("=" * 60)
-    logger.info(f"  高胜率A股交易操作系统 V9.0")
+    logger.info(f"  高胜率A股交易操作系统 V10.0")
     logger.info(f"  运行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
@@ -405,6 +408,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     # ---- Step 2.5: 大盘状态智能识别（V3.0新增）----
     global _current_market_regime
     market_regime_result = None
+    benchmark_with_indicators = None  # FIX P0-2: 提前初始化，避免异常路径下 NameError
     if getattr(config, 'STRATEGY_CONFIG', {}).get('market_regime', {}).get('enabled', True):
         logger.info("[Step 2.5] 大盘状态智能识别...")
         try:
@@ -431,6 +435,48 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 logger.info("  基准数据不足，跳过大盘状态识别")
         except Exception as e:
             logger.warning(f"  大盘状态识别异常: {e}")
+
+    # ---- Step 2.6: V27 大盘系统性风险提前预警（盘后综合扫描）----
+    if market_regime_result and not benchmark_df.empty:
+        logger.info("[Step 2.6] V27 大盘系统性风险扫描...")
+        try:
+            from strategy.systemic_risk import scan_systemic_risk_daily
+            _breadth_now = market_regime_result.get("breadth_now", 50.0)
+            # 如果market_regime_result没有breadth，尝试从breadth_history读取最新值
+            if _breadth_now == 50.0:
+                from strategy.systemic_risk import get_breadth_recent_values
+                _recent = get_breadth_recent_values(1)
+                if _recent:
+                    _breadth_now = _recent[0]
+            # V27.1: 传入M因子状态（regime_state→m_factor_state映射）
+            _m_factor_state = None
+            if market_regime_result:
+                _rs = market_regime_result.get("state", "")
+                _m_factor_state = "up" if _rs == "BULL" else ("down" if _rs == "BEAR" else "neutral")
+            _sr_daily = scan_systemic_risk_daily(
+                benchmark_with_indicators if benchmark_with_indicators is not None else benchmark_df,
+                breadth_now=_breadth_now,
+                m_factor_state=_m_factor_state
+            )
+            if _sr_daily.get("risk_level"):
+                _lvl = _sr_daily["risk_level"]
+                _lvl_cfg = getattr(config, 'SYSTEMIC_RISK_LEVELS', {})
+                _lvl_info = _lvl_cfg.get(_lvl, {})
+                _emoji = _lvl_info.get("emoji", "⚠")
+                _label = _lvl_info.get("label", _lvl)
+                logger.warning(f"  {_emoji} {_label}: {_sr_daily['detail']}")
+                # 将系统性风险结果附加到market_regime_result
+                market_regime_result["systemic_risk"] = _sr_daily
+                # 如果风险级别>=ready，提前降低仓位建议
+                if _lvl in ("ready", "force"):
+                    _cur_max = get_max_position_ratio(market_strength)
+                    _new_max = 0.3 if _lvl == "force" else 0.45
+                    if _new_max < _cur_max:
+                        logger.warning(f"  ⚠ 系统性风险{_lvl}级: 仓位上限从{_cur_max:.0%}降至{_new_max:.0%}")
+            else:
+                logger.info("  ✅ 系统性风险扫描正常，无异常信号")
+        except Exception as e:
+            logger.warning(f"  V27系统性风险扫描异常(不影响主流程): {e}")
 
     # ---- Step 3: 加载持仓 ----
     logger.info("[Step 3] 加载当前持仓...")
@@ -506,7 +552,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
         for code, df in data_dict.items():
             holding = holdings.get(code)
             try:
-                fr = forecaster.analyze_stock(code, df, holding)
+                fr = forecaster.analyze_stock(code, df, holding, _regime=market_regime_result.get("state") if market_regime_result else None)
                 if fr.get("valid"):
                     early_forecast_results.append(fr)
             except Exception as e:
@@ -529,6 +575,23 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
     except Exception as e:
         logger.warning(f"  提前分析异常(不影响主流程): {e}")
 
+    # ---- Step 5.1.6: V10.1 市场情绪 + 周线趋势（供共识计算使用）----
+    logger.info("[Step 5.1.6] V10.1 市场情绪与周线趋势...")
+    sentiment_result = None
+    weekly_trends = {}
+    try:
+        sentiment_result = get_market_sentiment()
+        logger.info(f"  市场情绪: {sentiment_result.get('extreme', 'N/A')}(评分{sentiment_result.get('sentiment_score', 50)})")
+    except Exception as e:
+        logger.warning(f"  市场情绪异常: {e}")
+    try:
+        for code, df in data_dict.items():
+            if code in holdings and len(df) >= 50:
+                weekly_trends[code] = check_weekly_trend(df)
+        logger.info(f"  周线趋势: {len(weekly_trends)}只有效")
+    except Exception as e:
+        logger.warning(f"  周线趋势异常: {e}")
+
     # ---- Step 5.2: 多空共识计算（V7.1新增，V2.0升级四维度）----
     logger.info("[Step 5.2] 多空共识计算...")
     consensus_results = {}
@@ -537,7 +600,9 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             data_dict, holdings, signals,
             forecast_results=early_forecast_results,
             manipulation_results=manipulation_results,
-            capital_flow_results=capital_flow_results
+            capital_flow_results=capital_flow_results,
+            weekly_trends=weekly_trends,
+            sentiment_result=sentiment_result,
         )
         # 将共识结果添加到信号中
         for code, sig in signals:
@@ -1098,9 +1163,10 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             digest_data["v9_summary"] = v9
 
             from output.daily_digest import send_daily_digest
-            digest_ok = send_daily_digest(digest_data)
+            # V23优化(P0-2): 15:30盘后日报启用精简模式，详细分析交由16:15综合分析报告
+            digest_ok = send_daily_digest(digest_data, lite_mode=True)
             if digest_ok:
-                logger.info("  盘后综合日报发送成功")
+                logger.info("  盘后数据确认邮件发送成功(精简模式)")
             else:
                 logger.warning("  盘后综合日报发送失败")
         except Exception as e:
@@ -1128,7 +1194,7 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V9.0")
+    parser = argparse.ArgumentParser(description="高胜率A股交易操作系统 V10.0")
     parser.add_argument("--no-update", action="store_true",
                         help="跳过数据更新，使用已有数据")
     parser.add_argument("--report", action="store_true",

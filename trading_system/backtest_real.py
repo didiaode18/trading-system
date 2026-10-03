@@ -44,12 +44,29 @@ logger = logging.getLogger(__name__)
 # 一、交易环境参数（从 config 读取，禁止硬编码）
 # ============================================================
 
-COMMISSION = config.COMMISSION_RATE * 2 + config.STAMP_TAX_RATE + getattr(config, 'TRANSFER_FEE_RATE', 0.00001)  # 买卖合计(佣金双边+印花税单边+过户费双边) ≈ 0.00161
+# FIX P2-#9: 过户费为双边征收（买+卖），原代码只加一次，与注释“双边”不一致。
+# 上交所 A 股过户费 0.001%（双边），差异虽小但与官方口径对齐，避免长期回测成本低估。
+COMMISSION = (
+    config.COMMISSION_RATE * 2
+    + config.STAMP_TAX_RATE
+    + getattr(config, 'TRANSFER_FEE_RATE', 0.00001) * 2
+)  # 买卖合计(佣金双边+印花税单边卖出+过户费双边) ≈ 0.00162
 SLIPPAGE_LEADER = 0.002  # 龙头股滑点 0.2%
 SLIPPAGE_FLEX = 0.005    # 弹性股滑点 0.5%
 RISK_PER_TRADE = 0.02    # 单笔风险2%本金
 TOTAL_CAPITAL = config.TOTAL_CAPITAL  # 总资金(从 config 读取)
 LIMIT_PCT = 0.095        # 涨跌停判定阈值（9.5%以上视为一字板，仅作为无code时的回退值）
+
+# FIX P1-#6: TOTAL_CAPITAL 降级失败防护——未配置 config_local.py 时默认 0，
+# 原行为会静默 fallback 到 100 股，使回测收益与真实资金完全不匹配。
+# 现改为模块加载时即显式告警；若仍为 0，在 backtest_stock_v5 入口抛 RuntimeError
+# 中止回测，避免产出误导性结果。仅影响真实仓位回测，不影响信号层单元测试。
+if TOTAL_CAPITAL is None or TOTAL_CAPITAL <= 0:
+    logger.error(
+        "[回测引擎] config.TOTAL_CAPITAL=%s 非法，无法进行真实仓位回测。"
+        "请在 config_local.py 中设置 TOTAL_CAPITAL（如 424000）。"
+        "当前仅允许运行不依赖仓位的单元测试。", TOTAL_CAPITAL
+    )
 
 
 def _get_limit_pct_for_code(code: str) -> float:
@@ -172,6 +189,49 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     prev_close[0] = close[0]
     tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
     df["atr14"] = pd.Series(tr, index=df.index).rolling(14).mean()
+
+    # V7(A2): 多因子信号增强 — 预计算聪明钱/反转/低波动代理因子
+    n = len(df)
+    if n >= 60:
+        # 聪明钱代理: 20日滚动(价格变化×成交量变化)标准化 > 0.2
+        price_chg = np.zeros(n)
+        vol_chg = np.zeros(n)
+        for j in range(1, n):
+            price_chg[j] = (close[j] - close[j-1]) / close[j-1] if close[j-1] > 0 else 0
+            vol_chg[j] = (volume[j] - volume[j-1]) / volume[j-1] if volume[j-1] > 0 else 0
+        cross = price_chg * vol_chg
+        smf_raw = pd.Series(cross).rolling(20, min_periods=5).mean().values
+        smf_std = pd.Series(cross).rolling(60, min_periods=10).std().values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            smf_norm = np.where(smf_std > 1e-10, smf_raw / np.maximum(smf_std, 1e-10), 0)
+        df["_smf_signal"] = (smf_norm > 0.2).astype(float)
+
+        # 超卖反转: 20日收益 < -1σ 且近5日回升
+        ret_20 = np.zeros(n)
+        for j in range(20, n):
+            ret_20[j] = (close[j] / close[j-20] - 1) if close[j-20] > 0 else 0
+        ret_mean = pd.Series(ret_20).rolling(60, min_periods=20).mean().values
+        ret_std_arr = pd.Series(ret_20).rolling(60, min_periods=20).std().values
+        ret_5 = np.zeros(n)
+        for j in range(5, n):
+            ret_5[j] = (close[j] / close[j-5] - 1) if close[j-5] > 0 else 0
+        rev = np.zeros(n)
+        for j in range(60, n):
+            if ret_std_arr[j] > 1e-10 and ret_20[j] < ret_mean[j] - ret_std_arr[j]:
+                if ret_5[j] > 0:
+                    rev[j] = 1.0
+        df["_reversal_signal"] = rev
+
+        # 低波动: 20日波动率 < 60日中位数
+        daily_vol = pd.Series(close).pct_change().rolling(20).std().values
+        vol_median = pd.Series(daily_vol).rolling(60, min_periods=20).median().values
+        df["_low_vol_signal"] = np.where(
+            (~np.isnan(daily_vol)) & (~np.isnan(vol_median)) & (vol_median > 1e-10),
+            (daily_vol < vol_median).astype(float), 0)
+    else:
+        df["_smf_signal"] = 0.0
+        df["_reversal_signal"] = 0.0
+        df["_low_vol_signal"] = 0.0
 
     return df
 
@@ -397,10 +457,23 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                 })
                 in_position = False
 
-    # 回测结束仍持仓（收盘价平仓，不加滑点）
+    # 回测结束仍持仓（FIX P1-#5: 加滑点 + 一字跌停判定，与常规卖出口径一致）
     if in_position:
         last_row = df.iloc[-1]
-        exec_price = last_row["close"]
+        # FIX P1-#5: 一字跌停时无法卖出，降级为前一日收盘价估算（若存在），否则按当日收盘
+        if is_limit_down(last_row, code):
+            logger.warning(
+                f"{code} 回测末日一字跌停无法平仓，降级为前一日收盘价估算"
+            )
+            if len(df) >= 2:
+                base_price = float(df.iloc[-2]["close"])
+            else:
+                base_price = float(last_row["close"])
+            exec_price = base_price * (1 - slippage)
+            _sell_date = str(df.iloc[-2]["date"]) if len(df) >= 2 else str(last_row["date"])
+        else:
+            exec_price = float(last_row["close"]) * (1 - slippage)
+            _sell_date = str(last_row["date"])
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
         hold_days = len(df) - 1 - buy_index
@@ -411,7 +484,7 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
             "stock_type": stock_type,
             "buy_date": buy_date,
             "buy_price": round(buy_price, 3),
-            "sell_date": last_row["date"],
+            "sell_date": _sell_date,
             "sell_price": round(exec_price, 3),
             "gross_profit": round(gross_profit * 100, 2),
             "net_profit": round(net_profit * 100, 2),
@@ -507,22 +580,28 @@ def _precompute_market_regime(df: pd.DataFrame, benchmark_df: pd.DataFrame = Non
 
 def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.DataFrame = None) -> list:
     """
-    V5.1回测引擎 - 市场环境自适应版
+    V5.2回测引擎 - 市场环境自适应版 + 牛市修复
     
-    V5.1新增（P0级优化）:
+    V5.2新增:
+    - 买点3: 牛市趋势延续模式（不要求回踩MA20）
+    - MA60斜率过滤放宽（允许微幅走平）
+    - ETF品种豁免流动性/ATR过滤
+    - 止损分段细化（ATR上限8%+更早保本）
+    - 个股黑名单机制（回测诊断用）
+    - 连续亏损熔断器增强
+    
+    V5.1原有优化:
     - 市场环境自适应: 根据大盘状态动态调整信号质量门槛/止损/回落止盈
-      - BEAR: 信号质量60→70, 止损7%→5%（严格防守）
-      - BULL: 回落止盈6%→8%（让利润多跑）
-      - RANGE: 保持默认参数
-    
-    V5.0原有优化:
     - 硬性过滤: 流动性/振幅/放量暴跌
-    - 买点2: 放量突破后缩量回踩确认
-    - 双轨止盈: 阶梯(8%卖1/3, 20%再卖1/3) + 回落(底仓)
+    - 双轨止盈: 阶梯 + 回落
     - 强制卖出: 单日放量大跌>8%且量>均量2倍
-    - 信号质量评分: 多支撑重合+MACD金叉+RSI超卖
     """
     if len(df) < 80:
+        return []
+
+    # V5.2: 个股黑名单机制（回测诊断用，实盘不受影响）
+    blacklist = getattr(config, 'BACKTEST_BLACKLIST', set())
+    if code in blacklist:
         return []
 
     df = compute_indicators(df)
@@ -589,10 +668,14 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
 
         if not in_position:
             # ==== 硬性过滤 ====
-            # 1. 流动性: 日均成交额 >= 8亿
+            # V5.2: ETF品种识别（豁免流动性和ATR过滤）
+            is_etf = code.startswith("51") or code.startswith("56") or code.startswith("15")
+
+            # 1. 流动性: 日均成交额 >= 8亿（ETF降低至2亿）
             if has_amount and i >= 20:
                 avg_amount = amount_arr[i-19:i+1].mean()
-                if avg_amount < getattr(config, 'MIN_DAILY_AMOUNT', 8e8):
+                min_amount = 2e8 if is_etf else getattr(config, 'MIN_DAILY_AMOUNT', 8e8)
+                if avg_amount < min_amount:
                     continue
 
             # 2. 股性稳定: 近30日振幅>10%的天数 <= 3
@@ -617,10 +700,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             if has_crash:
                 continue
 
-            # V5.2优化: 个股适应性过滤 - 排除极低波动白马股
+            # V5.2优化: 个股适应性过滤 - 排除极低波动白马股（ETF豁免）
             if i >= 60 and not np.isnan(atr14_arr[i]):
                 atr_pct_60 = atr14_arr[i] / close * 100 if close > 0 else 0
-                if atr_pct_60 < 1.5:
+                if not is_etf and atr_pct_60 < 1.5:
                     continue
 
             # ==== 买点判定 ====
@@ -634,10 +717,10 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             if ma20_slope <= 0 or close < ma20:
                 continue
 
-            # MA60不能明确向下
+            # MA60不能明确向下（V5.2: 允许微幅走平，从底部回升阶段不被误杀）
             if not np.isnan(ma60) and i >= 5:
                 ma60_slope = ma60_arr[i] - ma60_arr[max(0, i-5)]
-                if ma60_slope < 0:
+                if ma60_slope < -0.005:
                     continue
 
             vol_ma = vol_ma20_arr[i]
@@ -679,7 +762,20 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                             bp2 = True
                             break
 
-            if bp1 or bp2:
+            # ---- 买点3: 牛市趋势延续（V5.2新增）----
+            # 条件: BULL环境 + MA20>MA60 + close>MA20 + 缩量但不要求触及MA20
+            bp3 = False
+            current_regime_bp = regime_series.get(date, "RANGE")
+            if current_regime_bp == "BULL" and not np.isnan(ma60) and ma20 > ma60:
+                # 缩量但不要求触及MA20（允许强势不回踩）
+                if volume < vol_ma * 0.85 and close > ma20 * 1.02:
+                    # 近5日涨幅<15%（排除急涨追高）
+                    if i >= 5:
+                        surge_5d_bp3 = (close - close_arr[i-5]) / close_arr[i-5] if close_arr[i-5] > 0 else 0
+                        if surge_5d_bp3 < 0.15:
+                            bp3 = True
+
+            if bp1 or bp2 or bp3:
                 buy_signal = True
                 # 信号质量评分
                 if bp1 and bp2:
@@ -688,6 +784,8 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     signal_quality += 5
                 if bp2:
                     signal_quality += 10
+                if bp3 and not bp1 and not bp2:
+                    signal_quality += 5  # bp3单独触发给较低加分
 
                 # 多支撑位重合
                 support_count = 1
@@ -715,6 +813,21 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                 # 均线多头排列
                 if not np.isnan(ma60) and ma20 > ma60:
                     signal_quality += 5
+
+                # V7(A2): 多因子信号增强（权重从 config 读取，默认0=关闭）
+                _w_smf = getattr(config, 'FACTOR_WEIGHT_SMF', 0.0)
+                _w_rev = getattr(config, 'FACTOR_WEIGHT_REVERSAL', 0.0)
+                _w_vol = getattr(config, 'FACTOR_WEIGHT_LOW_VOL', 0.0)
+                _factor_max = getattr(config, 'FACTOR_MAX_BONUS', 20)
+                if (_w_smf > 0 or _w_rev > 0 or _w_vol > 0) and i < len(df):
+                    _fbonus = 0.0
+                    if _w_smf > 0 and "_smf_signal" in df.columns and df["_smf_signal"].iloc[i] > 0:
+                        _fbonus += _w_smf
+                    if _w_rev > 0 and "_reversal_signal" in df.columns and df["_reversal_signal"].iloc[i] > 0:
+                        _fbonus += _w_rev
+                    if _w_vol > 0 and "_low_vol_signal" in df.columns and df["_low_vol_signal"].iloc[i] > 0:
+                        _fbonus += _w_vol
+                    signal_quality += min(_fbonus, _factor_max)
 
                 signal_quality = min(100, signal_quality)
 
@@ -778,10 +891,26 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             in_position = True
             # P1: 记录买入时ATR，用于自适应止损
             atr_at_buy = atr14_arr[i] if not np.isnan(atr14_arr[i]) else buy_price * 0.03
-            # 初始仓位（简化为固定金额）
-            initial_shares = int(TOTAL_CAPITAL * 0.12 / exec_price / 100) * 100
-            if initial_shares < 100:
-                initial_shares = 100
+            # FIX P1-#6: 初始仓位——TOTAL_CAPITAL<=0 时显式跳过该信号，
+            # 避免原先静默 fallback 到 100 股导致回测收益与真实资金不匹配。
+            if TOTAL_CAPITAL is None or TOTAL_CAPITAL <= 0:
+                logger.error(
+                    f"[回测中止] {code} {buy_date}: TOTAL_CAPITAL={TOTAL_CAPITAL} 非法，"
+                    f"无法计算真实仓位。请在 config_local.py 中设置 TOTAL_CAPITAL。"
+                )
+                raise RuntimeError(
+                    f"TOTAL_CAPITAL={TOTAL_CAPITAL} 非法，回测中止。请配置 config_local.py"
+                )
+            raw_shares = int(TOTAL_CAPITAL * 0.12 / exec_price / 100) * 100
+            if raw_shares < 100:
+                # FIX P1-#6: 价格过高导致12%仓位不足一手，跳过该信号（而非强买100股）
+                logger.warning(
+                    f"{code} {buy_date}: 价格{exec_price:.2f}过高，"
+                    f"12%仓位={TOTAL_CAPITAL * 0.12:.0f}元 不足100股，跳过该信号"
+                )
+                in_position = False
+                continue
+            initial_shares = raw_shares
             position_shares = initial_shares
             ladder_sold = [False, False]
 
@@ -806,22 +935,23 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     sell_ratio = 1.0
 
             # ---- 移动止损 ----
-            # OPTIMIZE: 初始止损从8%收紧至7%（回测显示平均亏损-10.20%含滑点）
-            # P0: 市场环境自适应 - BEAR时止损收紧至5%（快速止损），BULL时保持7%
+            # V5.2优化: 收紧止损分段，更早保本
             # P1: ATR自适应止损 - 根据买入时波动率动态调整止损距离
             #   公式: stop_pct = ATR_at_buy / buy_price * multiplier
             #   multiplier: BEAR=1.5, BULL/RANGE=2.0
-            #   约束: 最小4%, 最大10% (防止极端值)
+            #   约束: 最小4%, 最大8% (V5.2: 从10%收紧至8%)
             if not sell_signal:
                 current_regime = regime_series.get(date, "RANGE")
                 if profit_pct < 0.05:
-                    # P1: ATR自适应初始止损
+                    # P1: ATR自适应初始止损（V5.2: 上限从10%收紧至8%）
                     atr_multiplier = 1.5 if current_regime == "BEAR" else 2.0
                     atr_stop_pct = (atr_at_buy / buy_price) * atr_multiplier
-                    atr_stop_pct = max(0.05, min(0.10, atr_stop_pct))  # 约束[5%, 10%]（与trend_strategy.py calc_atr_stop_pct一致）
+                    atr_stop_pct = max(0.04, min(0.08, atr_stop_pct))  # V5.2: 约束[4%, 8%]
                     stop_price = buy_price * (1 - atr_stop_pct)
+                elif profit_pct < 0.10:
+                    stop_price = buy_price * 1.01  # V5.2: 保本+1%（更早保本，原15%段才保本+2%）
                 elif profit_pct < 0.15:
-                    stop_price = buy_price * 1.02  # 保本+2%
+                    stop_price = buy_price * 1.03  # V5.2: 锁定3%（原15%段统一1.02）
                 elif profit_pct < 0.30:
                     stop_price = buy_price * 1.12  # 锁定12%
                 else:
@@ -952,13 +1082,15 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     "regime": regime_series.get(buy_date, "RANGE"),  # P1: 记录买入时市场环境
                 })
 
-                # V5.3: 更新连续亏损计数和渐进式熔断期
+                # V5.2: 更新连续亏损计数和渐进式熔断期（增强版）
                 if net_profit < 0:
                     consec_losses += 1
-                    if consec_losses >= 5:
-                        cooldown_until_idx = i + 60  # 5连亏: 暂停60个交易日
+                    if consec_losses >= 6:
+                        cooldown_until_idx = i + 9999  # 6连亏: 永久禁止
+                    elif consec_losses >= 4:
+                        cooldown_until_idx = i + 60  # 4-5连亏: 暂停60个交易日
                     elif consec_losses >= 3:
-                        cooldown_until_idx = i + 20  # 3连亏: 暂停20天
+                        cooldown_until_idx = i + 30  # V5.2: 3连亏: 暂停30天（原20天）
                 else:
                     consec_losses = 0  # 盈利重置
 
@@ -969,9 +1101,24 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     position_shares = 0
                     last_sell_bar_idx = i  # V6.1: 记录卖出bar索引
 
-    # 回测结束仍持仓（收盘价平仓，不加滑点）
+    # 回测结束仍持仓（FIX P1-#5: 加滑点 + 一字跌停判定，与V4口径一致）
     if in_position and position_shares > 0:
-        exec_price = close_arr[-1]
+        last_row = df.iloc[-1]
+        # FIX P1-#5: 一字跌停时无法卖出，降级为前一日收盘价估算
+        if is_limit_down(last_row, code):
+            logger.warning(
+                f"{code} V5回测末日一字跌停无法平仓，降级为前一日收盘价估算"
+            )
+            if len(close_arr) >= 2:
+                base_price = float(close_arr[-2])
+                _sell_date_v5 = str(dates_arr[-2])
+            else:
+                base_price = float(close_arr[-1])
+                _sell_date_v5 = str(dates_arr[-1])
+            exec_price = base_price * (1 - slippage)
+        else:
+            exec_price = float(close_arr[-1]) * (1 - slippage)
+            _sell_date_v5 = str(dates_arr[-1])
         gross_profit = (exec_price - buy_price) / buy_price
         net_profit = gross_profit - COMMISSION
         hold_days = n - 1 - buy_index
@@ -982,7 +1129,7 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
             "stock_type": stock_type,
             "buy_date": buy_date,
             "buy_price": round(buy_price, 3),
-            "sell_date": dates_arr[-1],
+            "sell_date": _sell_date_v5,
             "sell_price": round(exec_price, 3),
             "gross_profit": round(gross_profit * 100, 2),
             "net_profit": round(net_profit * 100, 2),

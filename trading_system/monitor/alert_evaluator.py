@@ -102,20 +102,30 @@ class AlertEvaluator:
                 self._pending = [i - offset for i in self._pending if i >= offset]
             # V10.3: 清理pending中已验证完毕的索引（防无限增长）
             self._pending = [i for i in self._pending if i < len(self.records)]
-            # V10.3: 文件大小安全检查（超过50MB时强制截断）
+            # [P1-#8修复] 文件大小安全检查（超过50MB时强制截断，在写入前检查）
             if os.path.exists(EVAL_DB_PATH):
                 fsize = os.path.getsize(EVAL_DB_PATH)
                 if fsize > 50 * 1024 * 1024:  # 50MB
                     logger.warning(f"[预警评估] 文件过大({fsize/1024/1024:.1f}MB)，强制裁剪")
                     self.records = self.records[-100:]  # 只保留最近100条
                     self._pending = []
-            with open(EVAL_DB_PATH, 'w', encoding='utf-8') as f:
+            # [P1-#8修复] 原子写入：先写临时文件再os.replace，防止进程中断导致JSON损坏
+            tmp_path = EVAL_DB_PATH + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     "records": self.records,
                     "pending": self._pending,
                 }, f, ensure_ascii=False, indent=1, default=str)
+            os.replace(tmp_path, EVAL_DB_PATH)
         except Exception as e:
             logger.warning(f"[预警评估] 保存失败: {e}")
+            # 清理临时文件
+            tmp_path = EVAL_DB_PATH + '.tmp'
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     # ============================================================
     # 记录预警

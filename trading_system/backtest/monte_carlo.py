@@ -34,7 +34,27 @@ logger = logging.getLogger(__name__)
 
 
 class MonteCarloStressTest:
-    """蒙特卡洛压力测试"""
+    """
+    蒙特卡洛压力测试
+
+    职责:
+      通过随机模拟评估策略的尾部风险和置信区间。
+      包括交易顺序随机化、极端场景模拟、最大回撤分布、破产概率。
+
+    核心输入:
+      trades: 历史交易列表 [{pnl, pnl_pct, hold_days}, ...]
+      initial_capital: 初始资金
+
+    核心输出 (run() 返回 dict):
+      return_distribution: 收益率分布（5%/50%/95%分位）
+      max_drawdown_distribution: 最大回撤分布
+      ruin_probability: 破产概率
+      confidence_interval: 收益置信区间
+
+    原理:
+      历史回测只展示了一条路径，蒙特卡洛通过重采样生成数千条可能路径，
+      揭示“在95%的情况下，最大回撤不超过X%”。
+    """
 
     def __init__(self, n_simulations: int = 1000, seed: int = 42):
         """
@@ -93,53 +113,45 @@ class MonteCarloStressTest:
         returns = np.array([t.get("pnl_pct", 0) for t in trades])
         n_trades = len(returns)
 
-        # ---- 1. 交易顺序随机化 ----
-        final_returns = []
-        max_drawdowns = []
-        sharpe_ratios = []
-        max_consecutive_losses = []
+        # ---- 1. 交易顺序随机化（向量化加速）----
+        n = self.n_simulations
+        n_trades_local = len(returns)
 
-        for _ in range(self.n_simulations):
-            # 随机打乱交易顺序
-            # FIX: 修复Monte Carlo使用有放回抽样导致压力测试统计失真
-            shuffled = self.rng.permutation(returns)
-            
-            # 模拟资金曲线
-            equity = initial_capital
-            peak = equity
-            max_dd = 0
-            consecutive_loss = 0
-            max_consec_loss = 0
-            daily_returns = []
+        # 批量生成置换矩阵：每行是一次随机打乱
+        random_keys = self.rng.random((n, n_trades_local))
+        shuffled_matrix = returns[np.argsort(random_keys, axis=1)]
 
-            for r in shuffled:
-                equity *= (1 + r)
-                daily_returns.append(r)
+        # 向量化计算资金曲线 (n_simulations x n_trades)
+        equity_matrix = np.cumprod(1 + shuffled_matrix, axis=1) * initial_capital
 
-                # 最大回撤
-                if equity > peak:
-                    peak = equity
-                dd = (peak - equity) / peak
-                if dd > max_dd:
-                    max_dd = dd
+        # 向量化计算逐日最大回撤
+        peak_matrix = np.maximum.accumulate(equity_matrix, axis=1)
+        dd_matrix = (peak_matrix - equity_matrix) / peak_matrix
+        max_drawdowns = np.max(dd_matrix, axis=1)
 
-                # 连续亏损
-                if r < 0:
-                    consecutive_loss += 1
-                    max_consec_loss = max(max_consec_loss, consecutive_loss)
-                else:
-                    consecutive_loss = 0
+        # 最终收益
+        final_returns = (equity_matrix[:, -1] - initial_capital) / initial_capital
 
-            final_returns.append((equity - initial_capital) / initial_capital)
-            max_drawdowns.append(max_dd)
-            max_consecutive_losses.append(max_consec_loss)
+        # 夏普比率（向量化）
+        daily_ret = shuffled_matrix
+        mean_ret = np.mean(daily_ret, axis=1)
+        std_ret = np.std(daily_ret, axis=1)
+        avg_hold = np.mean([t.get("hold_days", 5) for t in trades])
+        ann_factor = np.sqrt(252 / max(1, avg_hold))
+        sharpe_ratios = np.where(std_ret > 0, mean_ret / std_ret * ann_factor, 0)
 
-            # 夏普比率（简化）
-            if np.std(daily_returns) > 0:
-                sharpe = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252 / max(1, np.mean([t.get("hold_days", 5) for t in trades])))
-            else:
-                sharpe = 0
-            sharpe_ratios.append(sharpe)
+        # 最大连续亏损（仍需逐行计算，但用 NumPy 加速）
+        loss_mask = (shuffled_matrix < 0).astype(int)
+        max_consecutive_losses = np.zeros(n, dtype=int)
+        for idx in range(n):
+            row = loss_mask[idx]
+            # 用 diff 法计算最大连续 1 段
+            padded = np.concatenate(([0], row, [0]))
+            diffs = np.diff(padded)
+            starts = np.where(diffs == 1)[0]
+            ends = np.where(diffs == -1)[0]
+            if len(starts) > 0:
+                max_consecutive_losses[idx] = int(np.max(ends - starts))
 
         # ---- 2. 统计分布 ----
         final_returns = np.array(final_returns)
@@ -147,18 +159,10 @@ class MonteCarloStressTest:
         sharpe_ratios = np.array(sharpe_ratios)
         max_consecutive_losses = np.array(max_consecutive_losses)
 
-        # ---- 3. 破产概率（资金跌破50%）----
-        ruin_count = 0
-        for _ in range(self.n_simulations):
-            # FIX: 修复Monte Carlo使用有放回抽样导致压力测试统计失真
-            shuffled = self.rng.permutation(returns)
-            equity = initial_capital
-            for r in shuffled:
-                equity *= (1 + r)
-                if equity < initial_capital * 0.5:
-                    ruin_count += 1
-                    break
-        ruin_probability = ruin_count / self.n_simulations
+        # ---- 3. 破产概率（向量化：资金跌破50%）----
+        ruin_matrix = np.cumprod(1 + shuffled_matrix, axis=1)
+        ruin_hits = np.any(ruin_matrix < 0.5, axis=1)
+        ruin_probability = float(np.mean(ruin_hits))
 
         # ---- 4. 极端场景 ----
         stress = self._run_stress_scenarios(returns, initial_capital)

@@ -37,7 +37,9 @@ def williams_r(df):
     """Williams %R(14)"""
     high_14 = df["high"].rolling(14).max()
     low_14 = df["low"].rolling(14).min()
-    return (high_14 - df["close"]) / (high_14 - low_14).replace(0, np.nan) * -100
+    # FIX P1-2: high==low 时填0（中性值），避免 NaN 传播
+    result = (high_14 - df["close"]) / (high_14 - low_14).replace(0, np.nan) * -100
+    return result.fillna(0)
 
 def roc_12(df):
     """变动率ROC(12)"""

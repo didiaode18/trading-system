@@ -62,7 +62,13 @@ class DeflatedSharpe:
             T = len(returns)
             skew = float(stats.skew(returns))
             kurt = float(stats.kurtosis(returns, fisher=True))  # 超额峰度
-            sr_std = np.std(returns) / np.mean(returns) if np.mean(returns) != 0 else 1
+            # FIX(G3): sr_std 保护——日收益 mean 接近 0 时 sr_std 会爆炸，
+            # cap 到 10.0 避免预期最大夏普尺度失真。
+            mean_ret = float(np.mean(returns))
+            sr_std = min(
+                np.std(returns) / max(abs(mean_ret), 1e-8),
+                10.0
+            ) if T > 1 else 1.0
         else:
             T = track_record_length or 252
             skew = 0.0

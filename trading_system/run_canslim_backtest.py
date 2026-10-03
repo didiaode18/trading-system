@@ -340,6 +340,7 @@ def calc_composite(df, idx, use_v2=False):
                 vol_trend = -1  # 缩量下跌
 
     composite = 50 + trend_score * 8 + momentum_score * 6 + (vol_trend * 4 if use_v2 else 0)
+    # [P2-#12注释] 理论范围[4,96]⊂[0,100]，clip仅做安全守卫，实际不触发
     composite = max(0, min(100, composite))
     return {"composite": composite, "trend_score": trend_score, "momentum_score": momentum_score}
 
@@ -537,7 +538,7 @@ def run_canslim_backtest(data_dict, use_v2=False):
             if date_mask.sum() < 1:
                 continue
             idx = date_mask.sum() - 1
-            buy_price = sig["close"]
+            buy_price = sig["close"] * (1 + config.SLIPPAGE if hasattr(config, 'SLIPPAGE') else 1.001)  # A4分析用当日close(非交易模拟，仅效果估算)
             stop_price = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
             # 检查后续20日
             triggered = False
@@ -1038,7 +1039,7 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                     ma60_5ago = df["ma60"].iloc[max(0, idx-5)]
                     if not pd.isna(ma60_5ago) and row["ma60"] < ma60_5ago * 0.995:
                         continue
-                day_signals.append({"code": code, "score": factors["total"], "close": row["close"]})
+                day_signals.append({"code": code, "score": factors["total"], "close": row["close"], "idx": idx})
 
         # 按评分排序,买入前2只
         day_signals.sort(key=lambda x: x["score"], reverse=True)
@@ -1046,7 +1047,13 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
             if len(positions) >= _mp:
                 break
             code = sig["code"]
-            buy_price = sig["close"] * (1 + SLIPPAGE)
+            # [P1-#9修复] 消除前视偏差: 信号日T产生，实际执行在T+1开盘价买入
+            df = precomputed[code]
+            sig_idx = sig["idx"]
+            if sig_idx + 1 >= len(df):
+                continue  # 最后一个交易日无法次日执行，跳过
+            next_open = df["open"].iloc[sig_idx + 1]
+            buy_price = next_open * (1 + SLIPPAGE)
 
             # V2(P1-3): 动态仓位 - 震荡市缩减仓位
             if use_v2 and _regime == "RANGE":
