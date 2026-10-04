@@ -183,6 +183,7 @@ class BacktestEngineV2:
         self.feed = DataFeed(data_dict, start_date, end_date)
         self.daily_values = []
         self.order_log = []
+        self._pending_orders = []  # T日信号产生的订单，延迟到T+1开盘成交
         # TradeLog：仅内存使用，不写入实盘日志文件
         self.trade_log = TradeLog()
         self.trade_log.trades = []
@@ -213,7 +214,12 @@ class BacktestEngineV2:
         return report
 
     def _process_day(self, date: str, strategy_fn: StrategyFn):
-        """处理单个交易日"""
+        """处理单个交易日
+        
+        时序模型（铁律2）：
+        - T日收盘后策略生成信号（订单）
+        - T+1开盘价成交（用当日bar的open执行昨日pending订单）
+        """
         # 1. 新的一天，解除T+1冻结
         self.broker.new_day(date)
 
@@ -224,53 +230,62 @@ class BacktestEngineV2:
         for code, price in price_dict.items():
             self.broker.update_highest(code, price)
 
-        # 4. 调用策略生成订单
+        # 4. 执行昨日 pending 订单（T+1开盘成交）
+        today_bar_dict = {}  # {code: bar}
+        for order in self._pending_orders:
+            bar = self.feed.get_bar(order.code, date)
+            if bar is None:
+                # 停牌/无数据，订单作废
+                logger.debug(f"pending订单 {order.code} 在{date}无数据，作废")
+                continue
+            today_bar_dict[order.code] = bar
+            if order.direction == "sell":
+                fill = self.broker.execute_sell(order, bar)
+                if fill:
+                    self.order_log.append({
+                        "date": date, "code": order.code, "action": "sell",
+                        "shares": fill.shares, "price": fill.price,
+                        "cost": fill.total_cost, "reason": order.reason,
+                        "signal_date": order.signal_date if hasattr(order, 'signal_date') else date,
+                    })
+                    try:
+                        self.trade_log.record_sell(
+                            code=order.code, price=fill.price,
+                            date=date, reason=order.reason,
+                        )
+                    except Exception as e:
+                        logger.debug(f"TradeLog record_sell 异常: {e}")
+            elif order.direction == "buy":
+                fill = self.broker.execute_buy(order, bar)
+                if fill:
+                    self.order_log.append({
+                        "date": date, "code": order.code, "action": "buy",
+                        "shares": fill.shares, "price": fill.price,
+                        "cost": fill.total_cost, "reason": order.reason,
+                        "signal_date": order.signal_date if hasattr(order, 'signal_date') else date,
+                    })
+                    try:
+                        self.trade_log.record_buy(
+                            code=order.code, price=fill.price,
+                            shares=fill.shares, date=date,
+                            reason=order.reason,
+                        )
+                    except Exception as e:
+                        logger.debug(f"TradeLog record_buy 异常: {e}")
+        self._pending_orders = []  # 清空已执行队列
+
+        # 5. 调用策略生成今日订单（信号日），存入pending队列待明日执行
         try:
             orders = strategy_fn(date, self.feed, self.broker)
         except Exception as e:
             logger.warning(f"策略执行异常 {date}: {e}")
             orders = []
 
-        # 5. 执行订单（先卖后买）
-        sell_orders = [o for o in orders if o.direction == "sell"]
-        buy_orders = [o for o in orders if o.direction == "buy"]
-
-        for order in sell_orders:
-            bar = self.feed.get_bar(order.code, date)
-            fill = self.broker.execute_sell(order, bar)
-            if fill:
-                self.order_log.append({
-                    "date": date, "code": order.code, "action": "sell",
-                    "shares": fill.shares, "price": fill.price,
-                    "cost": fill.total_cost, "reason": order.reason,
-                })
-                # TradeLog 记录卖出
-                try:
-                    self.trade_log.record_sell(
-                        code=order.code, price=fill.price,
-                        date=date, reason=order.reason,
-                    )
-                except Exception as e:
-                    logger.debug(f"TradeLog record_sell 异常: {e}")
-
-        for order in buy_orders:
-            bar = self.feed.get_bar(order.code, date)
-            fill = self.broker.execute_buy(order, bar)
-            if fill:
-                self.order_log.append({
-                    "date": date, "code": order.code, "action": "buy",
-                    "shares": fill.shares, "price": fill.price,
-                    "cost": fill.total_cost, "reason": order.reason,
-                })
-                # TradeLog 记录买入
-                try:
-                    self.trade_log.record_buy(
-                        code=order.code, price=fill.price,
-                        shares=fill.shares, date=date,
-                        reason=order.reason,
-                    )
-                except Exception as e:
-                    logger.debug(f"TradeLog record_buy 异常: {e}")
+        for order in (orders or []):
+            # 标记信号日期，便于追踪
+            if not hasattr(order, 'signal_date'):
+                order.signal_date = date
+            self._pending_orders.append(order)
 
         # 5.5 更新持仓MFE/MAE
         for code in list(self.broker.positions.keys()):
@@ -300,6 +315,11 @@ class BacktestEngineV2:
         if not self.feed.trading_dates:
             return
         final_date = self.feed.trading_dates[-1]
+        # 清空未执行的pending订单（最后一日信号无法在T+1成交）
+        dropped = len(self._pending_orders)
+        if dropped:
+            logger.debug(f"回测结束，丢弃{dropped}个未执行的pending订单")
+        self._pending_orders = []
         for code in list(self.broker.positions.keys()):
             bar = self.feed.get_bar(code, final_date)
             if bar:

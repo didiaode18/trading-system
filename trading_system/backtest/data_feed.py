@@ -141,6 +141,17 @@ class DataFeed:
         df = self.data_dict[code]
         return df[df["date"] <= date].copy()
 
+    def get_history_excl_today(self, code: str, date: str) -> Optional[pd.DataFrame]:
+        """获取截止至某日前一天的全部历史数据（不含当日）。
+        用于策略信号生成，防止未来函数。"""
+        if code not in self.data_dict:
+            return None
+        df = self.data_dict[code]
+        history = df[df["date"] < date].copy()
+        if history.empty:
+            return None
+        return history
+
     def get_price_dict(self, date: str) -> dict:
         """获取某日所有股票的收盘价字典 {code: close_price}"""
         prices = {}

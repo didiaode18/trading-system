@@ -30,9 +30,22 @@ def calc_alpha_beta_attribution(strategy_returns: pd.Series,
         return {"alpha": 0, "beta": 0, "r_squared": 0,
                 "alpha_contribution": 0, "beta_contribution": 0}
 
-    n = min(len(strategy_returns), len(benchmark_returns))
-    y = strategy_returns.values[:n]
-    x = benchmark_returns.values[:n]
+    # 修复BUG-100: 按日期inner join对齐，而非截断
+    if hasattr(strategy_returns, 'index') and hasattr(benchmark_returns, 'index'):
+        aligned = pd.DataFrame({
+            'strategy': strategy_returns,
+            'benchmark': benchmark_returns
+        }).dropna()
+        if len(aligned) < 10:
+            return {"alpha": 0, "beta": 0, "r_squared": 0,
+                    "alpha_contribution": 0, "beta_contribution": 0}
+        y = aligned['strategy'].values
+        x = aligned['benchmark'].values
+        n = len(y)
+    else:
+        n = min(len(strategy_returns), len(benchmark_returns))
+        y = strategy_returns.values[:n]
+        x = benchmark_returns.values[:n]
 
     # OLS: y = alpha + beta*x
     X = np.column_stack([np.ones(n), x])
@@ -78,9 +91,21 @@ def timing_attribution(strategy_returns: pd.Series,
     if len(strategy_returns) < 20:
         return {"timing_ability": 0, "has_timing": False}
 
-    n = min(len(strategy_returns), len(benchmark_returns))
-    y = strategy_returns.values[:n]
-    x = benchmark_returns.values[:n]
+    # 修复BUG-100: 按日期inner join对齐
+    if hasattr(strategy_returns, 'index') and hasattr(benchmark_returns, 'index'):
+        aligned = pd.DataFrame({
+            'strategy': strategy_returns,
+            'benchmark': benchmark_returns
+        }).dropna()
+        if len(aligned) < 20:
+            return {"timing_ability": 0, "has_timing": False}
+        y = aligned['strategy'].values
+        x = aligned['benchmark'].values
+        n = len(y)
+    else:
+        n = min(len(strategy_returns), len(benchmark_returns))
+        y = strategy_returns.values[:n]
+        x = benchmark_returns.values[:n]
     x2 = x ** 2
 
     X = np.column_stack([np.ones(n), x, x2])

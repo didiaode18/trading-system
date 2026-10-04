@@ -614,7 +614,9 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
 
     # ---- 风险提示 ----
     risk_notes = []
-    if not pd.isna(latest.get("rsi", 50)) and latest["rsi"] > 75:
+    # 修复BUG-055: 统一使用get避免KeyError
+    rsi_val = latest.get("rsi", 50)
+    if not pd.isna(rsi_val) and rsi_val > 75:
         risk_notes.append("RSI超买，短期回调风险")
     if vol_ratio > 2.5:
         risk_notes.append("成交量异常放大，注意主力出货")

@@ -764,7 +764,11 @@ def _fetch_index_eastmoney(index_code: str = "000300") -> dict:
         
         # 取最新一行
         latest = df.iloc[-1]
-        prev_close = float(latest.get("open", 0) or 0)
+        # 修复BUG-037: prev_close取前一交易日close而非当日open
+        if len(df) >= 2:
+            prev_close = float(df.iloc[-2].get("close", 0) or 0)
+        else:
+            prev_close = float(latest.get("open", 0) or 0)
         close = float(latest.get("close", 0) or 0)
         
         if close <= 0:

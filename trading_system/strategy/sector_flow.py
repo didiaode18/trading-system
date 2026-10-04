@@ -260,7 +260,11 @@ class SectorMonitor:
             return 0
 
         # 取板块内所有个股的main_flow，按日汇总
-        min_len = min(len(s["df"]) for s in stocks if s["df"] is not None and "main_flow" in s["df"].columns)
+        # 修复BUG-023: 空生成器保护，无main_flow列时返回0
+        vals = [len(s["df"]) for s in stocks if s["df"] is not None and "main_flow" in s["df"].columns]
+        if not vals:
+            return 0
+        min_len = min(vals)
         if min_len == 0:
             return 0
 

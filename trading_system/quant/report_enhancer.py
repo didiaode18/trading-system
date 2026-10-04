@@ -329,9 +329,10 @@ class QuantReportEnhancer:
             return {"avg_confidence": 0, "high_confidence_count": 0, "detail": []}
 
         detail = []
-        for code, sig in signals if isinstance(signals, list) else []:
+        for sig in (signals or []):
             if not isinstance(sig, dict):
                 continue
+            code = sig.get('code', '')
 
             # 计算共振策略数
             strategy_count = 0

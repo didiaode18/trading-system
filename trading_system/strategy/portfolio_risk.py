@@ -419,6 +419,17 @@ class PortfolioRiskManager:
         # 获取ATR
         atr = self._get_atr(code)
         if atr <= 0 or price <= 0:
+            # 修复BUG-085: price<=0时直接返回空建议，避免除零崩溃
+            if price <= 0:
+                return {
+                    "shares": 0,
+                    "amount": 0,
+                    "position_ratio": 0,
+                    "atr": 0,
+                    "atr_pct": 0,
+                    "risk_amount": 0,
+                    "method": "invalid_price"
+                }
             # 无ATR数据，使用固定比例法
             risk_amount = self.total_capital * config.MAX_SINGLE_LOSS_RATIO
             shares = int(risk_amount / (price * stop_loss_pct))

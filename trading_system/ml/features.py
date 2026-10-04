@@ -53,7 +53,11 @@ def build_features(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     factor_df = factor_df.ffill().fillna(0)
 
     # 标准化
-    factor_df = (factor_df - factor_df.mean()) / factor_df.std().replace(0, 1)
+    # 修复BUG-014: 改为expanding滚动标准化，防止未来函数
+    # 每行只用截止当行的历史均值/标准差，不使用未来数据
+    expanding_mean = factor_df.expanding(min_periods=20).mean()
+    expanding_std = factor_df.expanding(min_periods=20).std().replace(0, 1)
+    factor_df = (factor_df - expanding_mean) / expanding_std
 
     # V9.3 FIX: 标准化后仍可能产生NaN（如常数因子std=0导致0/0），统一填充为0
     # 同时处理inf/-inf（极端数值情况），防止sklearn/lightgbm训练崩溃

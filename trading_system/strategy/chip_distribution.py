@@ -119,6 +119,19 @@ class ChipAnalyzer:
         # 10. 历史获利盘变化（最近5天）
         profit_history = self._calc_profit_history(df_calc, lookback=5)
 
+        # 11. 修复BUG-074: 补充chip_score和signals字段，与main.py调用方契约对齐
+        # chip_score: 综合控盘度+获利盘的0-100分
+        ctrl_score = control_level.get("score", 0) if isinstance(control_level, dict) else 0
+        chip_score = round(ctrl_score * 0.6 + profit_ratio * 40, 1)
+        # signals: 筹码形态触发的信号列表
+        signals = []
+        if trapped_ratio > 0.7:
+            signals.append("套牢盘>70%，买入信号降级")
+        if "底部密集" in pattern or "单峰集中" in pattern:
+            signals.append("筹码集中支撑强")
+        if profit_ratio > 0.9:
+            signals.append("获利盘过高，注意抛压")
+
         return {
             "current_price": round(current_price, 3),
             "profit_ratio": round(profit_ratio, 4),       # 获利盘比例 0-1
@@ -134,6 +147,8 @@ class ChipAnalyzer:
             "pattern": pattern,                          # 筹码形态
             "profit_history": profit_history,            # 近5日获利盘变化
             "chip_dist": {"prices": price_bins.tolist(), "chips": chips_pct.tolist()},
+            "chip_score": chip_score,                    # 筹码综合评分 0-100
+            "signals": signals,                          # 筹码信号列表
         }
 
     def _calc_chip_distribution(self, df: pd.DataFrame) -> dict:

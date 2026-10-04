@@ -133,10 +133,15 @@ class WalkForwardAnalyzer:
         return self._summarize(results)
 
     def _generate_windows(self, all_dates: list) -> list:
-        """生成滚动窗口 [(train_start, train_end, test_start, test_end), ...]"""
+        """生成滚动窗口 [(train_start, train_end, test_start, test_end), ...]
+        
+        修复BUG-006: 训练集终点严格为验证集起点前一日，防止窗口N+1训练集包含窗口N验证段。
+        滑动步长=test_days，允许训练集重叠（同一数据点在不同窗口的训练集中出现是合法的），
+        但每个窗口的训练集与自己的验证集严格不重叠。
+        """
         windows = []
         total = len(all_dates)
-        step = self.test_days  # 每次前进一个验证窗口
+        step = self.test_days  # 滑动步长=验证窗长
 
         start = 0
         while start + self.train_days + self.test_days <= total:
@@ -275,7 +280,8 @@ class WalkForwardAnalyzer:
                 continue
             df = data_dict[code]
             # 截取窗口内数据（含前置预热期）
-            mask = df["date"] <= end_date
+            # 修复BUG-010: 同时用start_date和end_date双端截断，防止训练集从数据起点开始
+            mask = (df["date"] >= start_date) & (df["date"] <= end_date)
             df_window = df[mask].copy()
             if len(df_window) < 80:
                 continue
@@ -325,6 +331,14 @@ class WalkForwardAnalyzer:
         sharpe = master_common.sharpe_from_trade_returns(trade_rets, avg_hold)
         
         returns = [t.get("net_profit", 0) for t in all_trades]
+        # 修复BUG-007: max_drawdown改为净值曲线峰谷回撤，而非单笔最小收益
+        if returns:
+            cum = (1 + pd.Series(returns)).cumprod()
+            running_max = cum.cummax()
+            drawdowns = (cum - running_max) / running_max
+            max_dd = round(float(drawdowns.min()), 4)
+        else:
+            max_dd = 0
         return {
             "total_trades": n,
             "win_rate": round(win_rate, 1),
@@ -333,7 +347,7 @@ class WalkForwardAnalyzer:
             "avg_loss": round(avg_loss, 2),
             "sharpe_ratio": round(sharpe, 2),
             "total_return": round(sum(returns), 2),
-            "max_drawdown": round(min(returns) if returns else 0, 2),
+            "max_drawdown": max_dd,
         }
 
     def _summarize(self, results: list) -> dict:

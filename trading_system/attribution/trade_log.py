@@ -74,7 +74,9 @@ class TradeLog:
         """更新持仓期间的MFE/MAE"""
         for trade in reversed(self.trades):
             if trade["code"] == code and trade["status"] == "open":
-                pnl_pct = (current_price - trade["buy_price"]) / trade["buy_price"]
+                # 修复BUG-029: buy_price=0时除零崩溃
+                buy_price = trade["buy_price"]
+                pnl_pct = (current_price - buy_price) / buy_price if buy_price > 0 else 0.0
                 trade["mfe"] = max(trade["mfe"], pnl_pct)
                 trade["mae"] = min(trade["mae"], pnl_pct)
                 break

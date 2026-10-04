@@ -1226,11 +1226,13 @@ def verify_dimension_weights(sample_results: list) -> dict:
         # 计算各维度与实际收益的Spearman IC
         dimension_ic = {}
         for dim in ["trend_score", "momentum_score", "volume_score", "position_score"]:
-            dim_values = [r.get("composite", {}).get(dim, 50) for r in sample_results]
-            actual_returns = [r.get("actual_return_5d", 0) for r in sample_results
-                              if r.get("actual_return_5d") is not None]
-            if len(actual_returns) >= 10:
-                dim_values = dim_values[:len(actual_returns)]
+            # 修复BUG-063: 用同一布尔冒码对齐dim_values和actual_returns
+            valid_pairs = [(r.get("composite", {}).get(dim, 50), r.get("actual_return_5d"))
+                           for r in sample_results
+                           if r.get("actual_return_5d") is not None]
+            if len(valid_pairs) >= 10:
+                dim_values = [p[0] for p in valid_pairs]
+                actual_returns = [p[1] for p in valid_pairs]
                 ic, _ = stats.spearmanr(dim_values, actual_returns)
                 dimension_ic[dim] = round(ic, 4) if not pd.isna(ic) else 0.0
 
