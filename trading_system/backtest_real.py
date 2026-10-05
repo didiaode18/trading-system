@@ -839,7 +839,9 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                     else:
                         consec_limit = 0
                         for k in range(max(0, i-2), i+1):
-                            if not np.isnan(pct_change_arr[k]) and pct_change_arr[k] > 9.5:
+                            # BUG-024修复: pct_change_arr为小数，用board_rules动态阈值替代硬编码9.5
+                            _lp = _get_limit_pct_for_code(code)
+                            if not np.isnan(pct_change_arr[k]) and pct_change_arr[k] > _lp * 0.98:
                                 consec_limit += 1
                             else:
                                 consec_limit = 0

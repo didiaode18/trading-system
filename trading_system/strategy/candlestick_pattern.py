@@ -405,7 +405,8 @@ class CandlestickPatternEngine:
         if (_is_bearish(po, pc) and _is_bullish(o, c) and
             body_prev > body_now * 1.5 and
             o > pc and c < po):
-            conf = 0.65 + 0.1 if vol_ratio < 0.8 else 0
+            # BUG-054修复: 运算符优先级，正常量能时应为0.65而非0
+            conf = 0.65 + (0.1 if vol_ratio < 0.8 else 0)
             results.append(self._mk("阳孕阴", "bullish", date, conf,
                                     trend == "downtrend", ctx))
 
@@ -413,7 +414,8 @@ class CandlestickPatternEngine:
         if (_is_bullish(po, pc) and _is_bearish(o, c) and
             body_prev > body_now * 1.5 and
             o < pc and c > po):
-            conf = 0.65 + 0.1 if vol_ratio < 0.8 else 0
+            # BUG-054修复: 同上
+            conf = 0.65 + (0.1 if vol_ratio < 0.8 else 0)
             results.append(self._mk("阴孕阳", "bearish", date, conf,
                                     trend == "uptrend", ctx))
 

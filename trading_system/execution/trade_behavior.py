@@ -30,12 +30,12 @@ try:
     import config as _cfg
     COMMISSION_RATE = getattr(_cfg, 'COMMISSION_RATE', 0.0003)
     COMMISSION_MIN = getattr(_cfg, 'MIN_COMMISSION', 5.0)
-    STAMP_TAX_RATE = getattr(_cfg, 'STAMP_TAX_RATE', 0.001)
+    STAMP_TAX_RATE = getattr(_cfg, 'STAMP_TAX_RATE', 0.0005)
     TRANSFER_FEE_RATE = getattr(_cfg, 'TRANSFER_FEE_RATE', 0.00001)
 except ImportError:
     COMMISSION_RATE = 0.0003    # 佣金 万3
     COMMISSION_MIN = 5.0        # 单笔最低佣金
-    STAMP_TAX_RATE = 0.001      # 印花税千1（仅卖出股票）
+    STAMP_TAX_RATE = 0.0005     # 印花税万5（仅卖出股票，2023-08-28起减半）
     TRANSFER_FEE_RATE = 0.00001 # 过户费 万0.1（双边）
 
 # ---- 行为阈值 ----

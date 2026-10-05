@@ -153,7 +153,8 @@ class PositionSizer:
             pos = self._calc_single_position(r, capital, holdings)
             # FIX P1: 策略失效时统一缩放
             if strategy_scale < 1.0 and pos["suggested_shares"] > 0:
-                scaled = max(100, int(pos["suggested_shares"] * strategy_scale // 100) * 100)
+                # BUG-028修复: 缩放后不足100股则放弃开仓
+                scaled = int(pos["suggested_shares"] * strategy_scale // 100) * 100
                 pos["suggested_shares"] = scaled
                 pos["suggested_amount"] = scaled * pos["close"]
                 pos["position_pct"] = round(pos["suggested_amount"] / capital * 100, 1) if capital > 0 else 0

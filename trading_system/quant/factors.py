@@ -90,14 +90,18 @@ class FactorEngine:
             v = series.dropna()
             return float(v.iloc[-1]) if len(v) > 0 else None
 
+        # BUG-053修复: 用显式None判断替代or，避免合法值0.0被替换为默认值
+        def _safe(val, default):
+            return val if val is not None else default
+
         factors = {
-            "momentum":      _last_val(calc_qe_momentum(df))      or 0,
-            "turnover":      _last_val(calc_qe_turnover(df))      or 1.0,
-            "volatility":    _last_val(calc_qe_volatility(df))    or 0.05,
-            "vol_price_div": _last_val(calc_qe_vol_price_div(df)) or 0,
-            "ma_trend":      _last_val(calc_qe_ma_trend(df))      or 0,
-            "breakout":      _last_val(calc_qe_breakout(df))      or 0.5,
-            "pullback":      _last_val(calc_qe_pullback(df))      or 0,
+            "momentum":      _safe(_last_val(calc_qe_momentum(df)), 0),
+            "turnover":      _safe(_last_val(calc_qe_turnover(df)), 1.0),
+            "volatility":    _safe(_last_val(calc_qe_volatility(df)), 0.05),
+            "vol_price_div": _safe(_last_val(calc_qe_vol_price_div(df)), 0),
+            "ma_trend":      _safe(_last_val(calc_qe_ma_trend(df)), 0),
+            "breakout":      _safe(_last_val(calc_qe_breakout(df)), 0.5),
+            "pullback":      _safe(_last_val(calc_qe_pullback(df)), 0),
         }
         return factors
 

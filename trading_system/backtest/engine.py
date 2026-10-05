@@ -74,8 +74,8 @@ def default_strategy(date: str, feed: DataFeed, broker: SimBroker) -> list:
     orders = []
 
     for code in feed.stock_codes:
-        # 获取历史数据
-        df = feed.get_full_history(code, date)
+        # BUG-003修复: 策略决策只用截止昨日数据（不含当日），防止未来函数
+        df = feed.get_history_excl_today(code, date)
         if df is None or len(df) < config.MA_MID:
             continue
 
@@ -88,7 +88,7 @@ def default_strategy(date: str, feed: DataFeed, broker: SimBroker) -> list:
         # 生成信号
         signal = generate_strategy_signal(df, holding)
 
-        # 卖出信号
+        # 卖出信号（信号日→pending→T+1开盘成交，铁律2）
         if signal.get("sell_signal") and holding:
             bar = feed.get_bar(code, date)
             sell_price = signal.get("sell_price") or (bar["close"] if bar else 0)
@@ -102,7 +102,7 @@ def default_strategy(date: str, feed: DataFeed, broker: SimBroker) -> list:
                     reason=signal.get("signal_reason", "策略卖出"),
                 ))
 
-        # 买入信号（无持仓时）
+        # 买入信号（无持仓时，信号日→pending→T+1开盘成交）
         elif signal.get("buy_signal") and not holding:
             bar = feed.get_bar(code, date)
             buy_price = signal.get("buy_price") or (bar["close"] if bar else 0)
@@ -355,15 +355,27 @@ class BacktestEngineV2:
                         limit_down_price = round(bar["pre_close"] * (1 - limit_pct), 2)
                     else:
                         limit_down_price = bar["close"]
+                    # BUG-004修复: 跌停无法卖出时按跌停价估值，扣除卖出费用
+                    amount = pos.shares * limit_down_price
+                    commission = max(amount * self.broker.commission_rate, self.broker.min_commission)
+                    # V11: 印花税按生效日分段
+                    _stamp_rate = (self.broker.cost_config.stamp_tax_rate_pre_20230828
+                                   if final_date < self.broker.cost_config.stamp_tax_cutover_date
+                                   else self.broker.cost_config.stamp_tax_rate_post_20230828)
+                    stamp_tax = amount * _stamp_rate
+                    transfer_fee = amount * self.broker.transfer_fee_rate
+                    net_amount = amount - commission - stamp_tax - transfer_fee
                     self.order_log.append({
                         "date": final_date, "code": code, "action": "sell",
                         "shares": pos.shares, "price": limit_down_price,
-                        "cost": 0, "reason": "末日未平仓(跌停无法卖出)",
+                        "cost": commission + stamp_tax + transfer_fee,
+                        "reason": "末日未平仓(跌停无法卖出,已扣费用)",
                     })
-                    # 修正净值：将该持仓按跌停价重新估值
-                    self.broker.cash += pos.shares * limit_down_price
+                    self.broker.cash += net_amount
+                    self.broker.total_commission += commission
+                    self.broker.total_stamp_tax += stamp_tax
                     del self.broker.positions[code]
-                    logger.warning(f"{code} 末日跌停无法平仓，按跌停价{limit_down_price}估值")
+                    logger.warning(f"{code} 末日跌停无法平仓，按跌停价{limit_down_price}估值(已扣费用)")
 
     def _build_report(self, benchmark_code: str = None) -> dict:
         """构建绩效报告"""
@@ -674,7 +686,8 @@ def _simple_ma_strategy(date: str, feed: DataFeed, broker: SimBroker) -> list:
     for code in feed.stock_codes:
         if code == "000300":
             continue
-        df = feed.get_history(code, date, lookback=70)
+        # BUG-003修复: 测试策略同样只用截止昨日数据
+        df = feed.get_history_excl_today(code, date)
         if df is None or len(df) < 60:
             continue
         ma20 = df["close"].tail(20).mean()

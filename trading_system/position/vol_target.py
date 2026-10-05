@@ -156,8 +156,8 @@ class VolTargetManager:
         individual_scale = vol_result["individual_scales"].get(code, 1.0)
 
         adjusted = original_shares * total_scale * individual_scale
-        # 取整到100股
-        adjusted = max(100, int(adjusted / 100) * 100)
+        # BUG-028修复: 取整到100股，不足100股则返回0（放弃开仓）
+        adjusted = int(adjusted / 100) * 100
         return adjusted
 
     # ============================================================

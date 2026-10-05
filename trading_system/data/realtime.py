@@ -357,7 +357,8 @@ def fetch_realtime_eastmoney(codes: list) -> dict:
                 "high": float(row.get("最高", 0) or 0),
                 "low": float(row.get("最低", 0) or 0),
                 "volume": float(row.get("成交量", 0) or 0),
-                "amount": float(row.get("成交额", 0) or 0),
+                # BUG-036修复: 东财成交额单位为元，统一转万元（与腾讯/新浪口径对齐）
+                "amount": float(row.get("成交额", 0) or 0) / 10000.0,
                 "change_pct": float(row.get("涨跌幅", 0) or 0),
                 "turnover": float(row.get("换手率", 0) or 0),
                 "amplitude": float(row.get("振幅", 0) or 0),

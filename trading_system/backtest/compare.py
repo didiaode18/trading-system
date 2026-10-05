@@ -29,7 +29,7 @@ class StrategyComparator:
     """策略对比器"""
 
     def compare(self, strategies: list, initial_capital: float = 730000,
-                risk_free_rate: float = 0.02) -> dict:
+                risk_free_rate: float = 0.03) -> dict:  # BUG-121修复: rf统一为3%
         """
         对比多个策略的表现
         

@@ -216,16 +216,22 @@ def _fetch_up_down_spot_em() -> dict:
             limit_down = 0
             if code_col is not None:
                 codes = df[code_col].astype(str)
-                # 创业板(300xxx) / 科创板(688xxx) → 20%涨跌停
+                # BUG-024修复: 北交所(8xx/4xx/920xx)→30%, 创业/科创(300/301/688/689)→20%, 主板→10%
+                is_30pct = codes.str.startswith(("8", "4", "920"))
                 is_20pct = codes.str.startswith(("300", "301", "688", "689"))
+                is_10pct = ~is_30pct.reindex(changes.index, fill_value=False) & ~is_20pct.reindex(changes.index, fill_value=False)
+                chg_30 = changes[is_30pct.reindex(changes.index, fill_value=False)]
                 chg_20 = changes[is_20pct.reindex(changes.index, fill_value=False)]
-                chg_10 = changes[~is_20pct.reindex(changes.index, fill_value=True)]
+                chg_10 = changes[is_10pct.reindex(changes.index, fill_value=True)]
                 # 主板 ≥9.8% 涨停, ≤-9.8% 跌停
                 limit_up += int((chg_10 >= 9.8).sum())
                 limit_down += int((chg_10 <= -9.8).sum())
                 # 创业板/科创板 ≥19.6% 涨停, ≤-19.6% 跌停
                 limit_up += int((chg_20 >= 19.6).sum())
                 limit_down += int((chg_20 <= -19.6).sum())
+                # 北交所 ≥29.4% 涨停, ≤-29.4% 跌停
+                limit_up += int((chg_30 >= 29.4).sum())
+                limit_down += int((chg_30 <= -29.4).sum())
             else:
                 # 无代码列时回退到旧逻辑（主板为主）
                 limit_up = int((changes >= 9.8).sum())

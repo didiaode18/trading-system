@@ -173,8 +173,9 @@ def analyze_alpha_purity(组合每日净值: list,
     if len(aligned_df) < 30:
         return {"执行状态": "失败", "结果": {}, "已知限制": [f"对齐后数据不足({len(aligned_df)}天)"]}
 
-    # 3. 无风险利率
-    rf = 0.0  # 默认无风险利率为0（简化）
+    # 3. 无风险利率（BUG-121修复: 统一口径3%年化，转为日度）
+    rf_annual = 0.03
+    rf = rf_annual / 252  # 日度无风险利率
     y = aligned_df["日收益率"].values - rf
 
     # 4. OLS 回归

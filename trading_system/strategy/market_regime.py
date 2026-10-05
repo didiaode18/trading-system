@@ -137,6 +137,18 @@ class MarketRegimeDetector:
         except Exception:
             pass
 
+    def _load_pending_state(self) -> str:
+        """BUG-016修复: 加载昨日pending状态，用于确认连续第2日同向切换"""
+        try:
+            pending_file = self._state_file.replace(".json", "_pending.json")
+            if os.path.exists(pending_file):
+                with open(pending_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return data.get("pending_state")
+        except Exception:
+            pass
+        return None
+
     def detect(self, benchmark_df: pd.DataFrame, extra_data: dict = None) -> dict:
         """
         检测当前大盘状态（核心入口）
@@ -213,19 +225,25 @@ class MarketRegimeDetector:
                     f"日跌幅={_daily_return:.2%}, 波动率得分={_vol_check:.2f}"
                 )
 
-        # FIX P0-A: 状态防抖——状态切换需连续2天确认，避免单日噪声导致误切换
+        # FIX P0-A + BUG-016修复: 状态防抖——连续2天同向确认才切换
         _prev_state = self._load_prev_state() if self._enable_debounce else None
+        _pending_state = self._load_pending_state() if self._enable_debounce else None
         _state_changed = (_prev_state is not None and state != _prev_state)
         if _state_changed and not _crash_override:
-            # 状态发生变化，记录为“待确认”
-            self._save_pending_state(state)
-            # 使用前一状态作为当前输出（待确认期间不切换）
-            _confirmed = False
+            # BUG-016修复: 检查昨日pending是否与今日计算态一致（连续第2日同向）
+            if _pending_state == state:
+                # 连续第2日确认，执行切换
+                _confirmed = True
+                logger.info(f"[大盘状态] P0-A 防抖确认: 连续2日{state}，确认切换")
+            else:
+                # 第1日发现变化，记录pending，维持旧态
+                self._save_pending_state(state)
+                _confirmed = False
         elif _state_changed and _crash_override:
             # 极端行情下强制切换，跳过防抖
             _confirmed = True
         else:
-            # 状态未变，确认切换
+            # 状态未变，确认
             _confirmed = True
 
         if _confirmed:

@@ -576,7 +576,10 @@ def layer5_entry_value(code: str, df: pd.DataFrame, realtime_price: float = 0) -
     max_shares_by_position = int(max_amount_by_position / price / 100) * 100
 
     buy_shares = min(max_shares_by_risk, max_shares_by_position)
-    buy_shares = max(buy_shares, 100)  # 最少100股
+    # BUG-028修复: 不足100股则放弃开仓，而非强制拉到100股
+    buy_shares = (buy_shares // 100) * 100
+    if buy_shares < 100:
+        return {"pass": False, "reason": "风险预算/仓位上限不足1手", "buy_shares": 0}
     buy_amount = buy_shares * price
     position_pct = buy_amount / TOTAL_CAPITAL * 100
 

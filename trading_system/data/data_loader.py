@@ -57,6 +57,9 @@ def _to_baostock_code(code: str) -> str:
     """
     if code.startswith("sh.") or code.startswith("sz."):
         return code
+    # BUG-038修复: 北交所(8xx/4xx/920xxx)不支持baostock，返回bj.前缀供调用方识别
+    if code.startswith(("8", "4")) or code.startswith("920"):
+        return f"bj.{code}"
     if code.startswith("6") or code.startswith("9") or code.startswith("5") or code == "000300":
         return f"sh.{code}"
     else:
@@ -175,6 +178,76 @@ def init_db(db_path: str = None) -> sqlite3.Connection:
             PRIMARY KEY (code, date)
         )
     """)
+    # V11 回测升级: PIT数据层五张表（根治 BUG-001/011，支撑 Stage0-16）
+    # 1. 不复权日线（根治 BUG-001 前复权增量假跳空）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_kline_raw (
+            代码 TEXT NOT NULL,
+            日期 TEXT NOT NULL,
+            开盘 REAL, 最高 REAL, 最低 REAL, 收盘 REAL,
+            成交量 REAL, 成交额 REAL, 换手率 REAL,
+            是否停牌 INTEGER DEFAULT 0,
+            涨停价 REAL, 跌停价 REAL,
+            前收盘 REAL,
+            数据源 TEXT,
+            数据版本 TEXT,
+            PRIMARY KEY (代码, 日期)
+        )
+    """)
+    # 2. 复权因子表（独立，运行时复权；根治前复权增量假跳空）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS adjust_factor (
+            代码 TEXT NOT NULL,
+            除权日 TEXT NOT NULL,
+            复权因子 REAL NOT NULL,
+            每股分红 REAL, 送股比例 REAL, 转增比例 REAL, 配股比例 REAL,
+            披露日 TEXT,
+            PRIMARY KEY (代码, 除权日)
+        )
+    """)
+    # 3. PIT股票池（根治 BUG-011 幸存者/后视）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS universe_pit (
+            日期 TEXT NOT NULL,
+            代码 TEXT NOT NULL,
+            名称当日 TEXT,
+            板块 TEXT,
+            上市日 TEXT, 退市日 TEXT,
+            是否ST当日 INTEGER,
+            交易状态 TEXT,
+            PRIMARY KEY (日期, 代码)
+        )
+    """)
+    # 4. PIT财报（关键：披露日 announcement_date）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fundamental_pit (
+            代码 TEXT NOT NULL,
+            报告期 TEXT NOT NULL,
+            披露日 TEXT NOT NULL,
+            营收 REAL, 归母净利 REAL, 扣非 REAL,
+            经营现金流 REAL, 净资产 REAL,
+            PE_TTM REAL, PB REAL, 总市值 REAL, 流通市值 REAL,
+            PRIMARY KEY (代码, 报告期)
+        )
+    """)
+    # 5. 数据版本（复现性）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS data_version (
+            版本 TEXT PRIMARY KEY,
+            生成时间 TEXT,
+            git_commit TEXT,
+            来源清单 TEXT,
+            说明 TEXT
+        )
+    """)
+    # V11: 索引
+    try:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_kline_raw_code_date ON daily_kline_raw(代码, 日期 DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_adjust_code ON adjust_factor(代码, 除权日 DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_universe_pit_date ON universe_pit(日期)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fund_pit_code ON fundamental_pit(代码, 披露日)")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 

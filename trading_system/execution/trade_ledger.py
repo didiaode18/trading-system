@@ -41,9 +41,10 @@ XT_ORDER_STATUS = {
 }
 
 # xtquant 原始态 → canonical 态
+# BUG-030修复: '已报待撤'(51)是撤单请求处理中、委托仍活，应映射为SUBMITTED而非CANCELLED
 _STATUS_CANON = {
     "未报": STATUS_SUBMITTED, "待报": STATUS_SUBMITTED, "已报": STATUS_SUBMITTED,
-    "已报待撤": STATUS_CANCELLED, "部成待撤": STATUS_PARTIAL, "部撤": STATUS_CANCELLED,
+    "已报待撤": STATUS_SUBMITTED, "部成待撤": STATUS_PARTIAL, "部撤": STATUS_CANCELLED,
     "已撤": STATUS_CANCELLED, "部成": STATUS_PARTIAL, "已成": STATUS_FILLED,
     "废单": STATUS_REJECTED,
 }

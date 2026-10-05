@@ -32,23 +32,24 @@ def get_limit_pct(code: str, name: str = "") -> float:
     code = str(code).zfill(6)
     name_upper = (name or "").upper()
 
-    # ST股: 名称含 ST / *ST → 5%
-    if "ST" in name_upper:
-        return 0.05
-
-    # 创业板 300xxx / 301xxx → 20%
+    # BUG-002修复: 先按板块判幅度，仅主板ST降为5%
+    # 创业板 300xxx / 301xxx → 20%（ST也是20%）
     if code.startswith("300") or code.startswith("301"):
         return 0.20
 
-    # 科创板 688xxx → 20%
+    # 科创板 688xxx → 20%（ST也是20%）
     if code.startswith("688"):
         return 0.20
 
-    # 北交所 8xxxxx / 4xxxxx → 30%
-    if code.startswith("8") or code.startswith("4"):
+    # 北交所 8xxxxx / 4xxxxx / 920xxx → 30%（ST也是30%）
+    if code.startswith("8") or code.startswith("4") or code.startswith("920"):
         return 0.30
 
-    # 主板（60xxxx / 000xxx / 001xxx / 002xxx / 003xxx）→ 10%
+    # 主板（60xxxx / 000xxx / 001xxx / 002xxx / 003xxx）
+    # 仅主板ST股降为5%
+    if "ST" in name_upper:
+        return 0.05
+
     return 0.10
 
 

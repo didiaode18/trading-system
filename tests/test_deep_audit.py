@@ -481,14 +481,14 @@ class TestSimBrokerEdgeCases:
         assert price > 0
 
     def test_participation_limit_zero_volume(self):
-        """日成交量为0时参与率限制应跳过"""
-        from backtest.broker import SimBroker, CostConfig
+        """BUG-044修复: 日成交量为0(停牌)时应拒单"""
+        from backtest.broker import SimBroker, CostConfig, RejectReason
         broker = SimBroker(100000, CostConfig())
         shares, reject = broker._apply_participation_limit(
             1000, 10.0, {"volume": 0}, "buy"
         )
-        assert shares == 1000  # 不限制
-        assert reject is None
+        assert shares == 0  # 停牌拒单
+        assert reject == RejectReason.SUSPENDED
 
     def test_signal_mode_no_fees(self):
         """signal模式应零费用"""

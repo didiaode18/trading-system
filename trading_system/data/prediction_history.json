@@ -1,0 +1,7993 @@
+[
+ {
+  "code": "601615",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -6.8999999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002368",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600426",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002603",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.020000000000002238,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002024",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.62,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600292",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000977",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.9200000000000017,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601012",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.2600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600551",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.7000000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002335",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 11.179999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002472",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601669",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000997",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.020000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601038",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.139999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -40.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600085",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.379999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603259",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.820000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002291",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.09999999999999964,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 68,
+  "score": -30.38,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": true
+  }
+ },
+ {
+  "code": "002378",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -23.379999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601992",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.4,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000723",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.839999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "605089",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.6200000000000019,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002920",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.839999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002460",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002320",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.960000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002655",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.679999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601607",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -22.439999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002733",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.520000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002241",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 11.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 68,
+  "score": -35.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002050",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603881",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.6399999999999988,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600809",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.760000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601919",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.940000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002049",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.659999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600111",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002223",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 7.220000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600438",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603056",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601933",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002371",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.3600000000000012,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-25",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.139999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓1/3",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 48.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "宝丰能源"
+  }
+ },
+ {
+  "code": "600887",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 68.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "伊利股份"
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 58.4,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "广汇能源"
+  }
+ },
+ {
+  "code": "002281",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 55.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "光迅科技"
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 53.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "安井食品"
+  }
+ },
+ {
+  "code": "510210",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 45.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "综指ETF"
+  }
+ },
+ {
+  "code": "001979",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 74.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "招商蛇口"
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 58.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "半导材料"
+  }
+ },
+ {
+  "code": "603099",
+  "date": "2026-09-25",
+  "source": "trend_forecast",
+  "direction": "中性",
+  "confidence": 50,
+  "score": 83.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "name": "长白山"
+  }
+ },
+ {
+  "code": "002657",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.5600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601390",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.339999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600363",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.879999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000858",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -7.379999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002352",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.679999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002459",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.7200000000000015,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600096",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.020000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000401",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002230",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.16,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002745",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601933",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600436",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.8600000000000012,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601138",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.079999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "510210",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -41.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000977",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.9200000000000017,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600292",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600887",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 7.220000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002340",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002733",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.520000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601127",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0799999999999983,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002368",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600737",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -5.939999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000513",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 11.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603986",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.7600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600610",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 68,
+  "score": -36.14,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001979",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 67,
+  "score": -26.540000000000006,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": true
+  }
+ },
+ {
+  "code": "301155",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -3.1200000000000028,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002371",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.3600000000000012,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601360",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.620000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603019",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.2799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000963",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.520000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002292",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.7799999999999976,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001270",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.979999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600515",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603259",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.820000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000065",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.240000000000004,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603099",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 15.86,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601607",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -22.439999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002335",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 11.179999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002594",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.9799999999999986,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000538",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.359999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002152",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600519",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.620000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600803",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.320000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000723",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.839999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601919",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.940000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000831",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601615",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -6.8999999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002603",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.020000000000002238,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601038",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.139999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 58,
+  "score": -38.839999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 68,
+  "score": -35.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002747",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600085",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.379999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002050",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002409",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600438",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600809",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.760000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601992",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.4,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002291",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.09999999999999964,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601012",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.2600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301236",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.760000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002655",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.679999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002241",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 56,
+  "score": 11.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600547",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600760",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -19.74,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603690",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600536",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.18,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600859",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.2399999999999993,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601669",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000625",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000661",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002460",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600551",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.7000000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002491",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 1.1999999999999993,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600276",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 7.940000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601888",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.520000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600426",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600487",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 68,
+  "score": 36.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "可买入",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002281",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 68,
+  "score": -37.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002223",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 7.220000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002415",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.020000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600141",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -22.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002378",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -23.379999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601800",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002472",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002475",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.100000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603056",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "605089",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.6200000000000019,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601698",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.239999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002320",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.960000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603993",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002024",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.62,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002202",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -8.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603501",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.759999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600988",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601668",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600111",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600900",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.2399999999999993,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000158",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601899",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.439999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600879",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603881",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.6399999999999988,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000657",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -3.84,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002865",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -40.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000939",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002920",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.839999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002049",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.659999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000997",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.020000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002385",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -21.42,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603993",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002865",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.639999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002385",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.379999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001270",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000939",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600760",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.8,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001979",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 4.559999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000963",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.2399999999999993,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601800",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.78,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603501",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.2600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601698",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.260000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002459",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601390",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.84,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "510210",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 84,
+  "score": -43.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601138",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.34,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603986",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.920000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000513",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000831",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 2.16,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600536",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.32,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600141",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.92,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002340",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.339999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000657",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 0.47999999999999865,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000538",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -1.0200000000000014,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600515",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600803",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.1600000000000006,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601668",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.18,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000401",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.399999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601899",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.28,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002415",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002747",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.879999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301236",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002352",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.32,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600519",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.760000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600363",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.920000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000858",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.960000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600096",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002292",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.9000000000000004,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600436",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603019",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.860000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603690",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.979999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603099",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 57,
+  "score": 21.620000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002594",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.339999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000661",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.420000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002409",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.320000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600879",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -17.339999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600547",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.620000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002152",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -20.560000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600487",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.36,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600988",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.460000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600887",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 8.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002230",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002491",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.2799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600276",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.0799999999999983,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002202",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.779999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000625",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601888",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000065",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 0.8399999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002745",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.020000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600859",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.239999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600900",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.939999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601127",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600737",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.820000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301155",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -0.9600000000000009,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002281",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -46.32,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000158",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002475",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.98,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002657",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.56,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601360",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.379999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600610",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601615",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -7.320000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002368",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.22,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600426",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002603",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.2200000000000015,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002024",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.760000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600292",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.679999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000977",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.879999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601012",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600551",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.40000000000000036,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002335",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.5999999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002472",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 9.540000000000004,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601669",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -20.8,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000997",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -9.639999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601038",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.839999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 85,
+  "score": -55.019999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600085",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.4799999999999986,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603259",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.100000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002291",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.060000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 58,
+  "score": -38.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002378",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.379999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601992",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.9399999999999991,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000723",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "605089",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.1000000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002920",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002460",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002320",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.920000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002655",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.9399999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601607",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.520000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002733",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.94,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002241",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.879999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.7600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002050",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.1200000000000014,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603881",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.86,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600809",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.98,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601919",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.4,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002049",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600111",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002223",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.160000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600438",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.4399999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603056",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601933",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002371",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.460000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-28",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 59,
+  "score": -40.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603993",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002865",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.320000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002385",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.260000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001270",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.1600000000000006,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000939",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600760",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -8.56,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001979",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 67,
+  "score": -26.78,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": true
+  }
+ },
+ {
+  "code": "000963",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.3000000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601800",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -7.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603501",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.7799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601698",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.32,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002459",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.739999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601390",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.42,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "510210",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 84,
+  "score": -49.56,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601138",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603986",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.4399999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000513",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 66,
+  "score": 12.079999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000831",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600536",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600141",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.799999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002340",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -20.5,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000657",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000538",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 1.8600000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600515",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600803",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601668",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.14,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000401",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.6799999999999979,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601899",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002415",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.079999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002747",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.28,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301236",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002352",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.979999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600519",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.420000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600363",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.920000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000858",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.260000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600096",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002292",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.3200000000000012,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600436",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.28,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603019",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -20.380000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603690",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603099",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 67,
+  "score": -25.440000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": true
+  }
+ },
+ {
+  "code": "002594",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.78,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000661",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -21.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002409",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600879",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -20.28,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600547",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.92,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002152",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -21.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600487",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.260000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600988",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.94,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600887",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 6.200000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002230",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002491",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -8.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600276",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.3399999999999994,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002202",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.120000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000625",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.54,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601888",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.260000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000065",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.0200000000000014,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002745",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.860000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600859",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.360000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600900",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.540000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601127",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.40000000000000036,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600737",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.62,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301155",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -1.2600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002281",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -46.8,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000158",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002475",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -23.44,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002657",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.56,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601360",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.3799999999999981,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600610",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601615",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.479999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002368",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600426",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.939999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002603",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.86,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002024",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.76,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600292",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -20.860000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000977",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -22.72,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601012",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600551",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.7200000000000015,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002335",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.660000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002472",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 6.959999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601669",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -17.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000997",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.420000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601038",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -17.52,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 82,
+  "score": -23.32,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓1/3",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600085",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.339999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603259",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.940000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002291",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.5,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 68,
+  "score": -36.739999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002378",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.5,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601992",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.4399999999999986,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000723",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "605089",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 1.2799999999999976,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002920",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002460",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -21.58,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002320",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.66,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002655",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.44,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601607",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -16.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002733",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.48,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002241",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.339999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -44.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002050",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.420000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603881",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.079999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600809",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.96,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601919",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 5.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002049",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.339999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600111",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -18.64,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002223",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.120000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600438",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.200000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603056",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601933",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -19.18,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002371",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-29",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 2.0999999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603993",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.919999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002865",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.58,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002385",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -9.7,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001270",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.56,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000939",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600760",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.2,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "001979",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 67,
+  "score": -20.659999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": true
+  }
+ },
+ {
+  "code": "000963",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 1.9200000000000017,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601800",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.620000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603501",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.2600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601698",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.1,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002459",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.579999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601390",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.9200000000000017,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "510210",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 84,
+  "score": -46.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601138",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.74,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603986",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.139999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000513",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏多",
+  "confidence": 66,
+  "score": 12.920000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000831",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -1.0200000000000014,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600536",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600141",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 57,
+  "score": -24.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002340",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.739999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000657",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 1.9799999999999986,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000538",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -1.1399999999999988,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600515",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.360000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600803",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -2.2799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601668",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.20000000000000018,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000401",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 7.159999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601899",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002415",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.299999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002747",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.08,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301236",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.139999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002352",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.9399999999999991,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600519",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -7.84,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600363",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -7.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000858",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.3000000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600096",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002292",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -3.520000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600436",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.2799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603019",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603690",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603099",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 2.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002594",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.98,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000661",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.879999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002409",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -7.239999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600879",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -18.060000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600547",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -15.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002152",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -19.84,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600487",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.0600000000000005,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600988",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.739999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600887",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 7.640000000000004,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002230",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.18,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002491",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -9.720000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600276",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 9.440000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002202",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -13.9,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000625",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601888",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.360000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000065",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.360000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002745",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.7200000000000015,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600859",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -5.079999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600900",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 0.17999999999999794,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601127",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -8.020000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600737",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "301155",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 7.440000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002281",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 59,
+  "score": -41.64,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000158",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.4,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002475",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.22,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002657",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -11.379999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601360",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600610",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.6,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601615",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 1.9799999999999986,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002368",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -17.74,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600426",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -17.5,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002603",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.3799999999999981,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002024",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -8.979999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600292",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -10.720000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000977",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -15.46,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601012",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -2.979999999999998,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600551",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 4.640000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002335",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.7399999999999984,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002472",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 8.759999999999996,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601669",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -12.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000997",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -9.399999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601038",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -11.94,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600989",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -23.220000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓1/3",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600085",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 2.9000000000000004,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603259",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 8.940000000000003,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002291",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.639999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603345",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": 2.16,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "持有观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002378",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.74,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601992",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 8.72,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "000723",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -13.78,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "605089",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.4399999999999995,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002920",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 67,
+  "score": -20.68,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002460",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.24,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002320",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -17.22,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002655",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 65,
+  "score": -9.520000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601607",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -6.479999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002733",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.48,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002241",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 3.679999999999999,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600256",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 69,
+  "score": -44.3,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002050",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -4.420000000000002,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603881",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.299999999999997,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600809",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -10.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601919",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.2799999999999985,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002049",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -16.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600111",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -14.44,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002223",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -0.7600000000000007,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "600438",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": -1.4799999999999982,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "603056",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "中性",
+  "confidence": 55,
+  "score": 0.0,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "601933",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 56,
+  "score": -14.200000000000001,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "002371",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 66,
+  "score": -12.82,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "观望",
+   "conflict": false
+  }
+ },
+ {
+  "code": "562590",
+  "date": "2026-09-30",
+  "source": "consensus",
+  "direction": "偏空",
+  "confidence": 58,
+  "score": -39.5,
+  "verified": false,
+  "actual_return_5d": null,
+  "actual_direction": null,
+  "is_correct": null,
+  "extra": {
+   "action": "减仓",
+   "conflict": false
+  }
+ }
+]

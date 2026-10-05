@@ -1,0 +1,589 @@
+{
+  "date": "2026-09-28",
+  "level_history": [
+    {
+      "time": "09:57:17",
+      "level": "ready"
+    },
+    {
+      "time": "09:58:30",
+      "level": "ready"
+    },
+    {
+      "time": "10:01:49",
+      "level": "ready"
+    },
+    {
+      "time": "10:03:36",
+      "level": "ready"
+    },
+    {
+      "time": "10:08:01",
+      "level": "ready"
+    },
+    {
+      "time": "10:09:17",
+      "level": "ready"
+    },
+    {
+      "time": "10:12:33",
+      "level": "ready"
+    },
+    {
+      "time": "10:13:45",
+      "level": "ready"
+    },
+    {
+      "time": "10:14:57",
+      "level": "ready"
+    },
+    {
+      "time": "10:16:23",
+      "level": "ready"
+    },
+    {
+      "time": "10:18:22",
+      "level": "ready"
+    },
+    {
+      "time": "10:19:33",
+      "level": "ready"
+    },
+    {
+      "time": "10:20:53",
+      "level": "ready"
+    },
+    {
+      "time": "10:26:44",
+      "level": "ready"
+    },
+    {
+      "time": "10:29:20",
+      "level": "ready"
+    },
+    {
+      "time": "10:32:49",
+      "level": "ready"
+    },
+    {
+      "time": "10:33:32",
+      "level": "ready"
+    },
+    {
+      "time": "10:34:53",
+      "level": "ready"
+    },
+    {
+      "time": "10:36:05",
+      "level": "ready"
+    },
+    {
+      "time": "10:37:38",
+      "level": "ready"
+    },
+    {
+      "time": "10:39:08",
+      "level": "ready"
+    },
+    {
+      "time": "10:40:21",
+      "level": "ready"
+    },
+    {
+      "time": "10:41:33",
+      "level": "ready"
+    },
+    {
+      "time": "10:42:56",
+      "level": "ready"
+    },
+    {
+      "time": "10:44:07",
+      "level": "ready"
+    },
+    {
+      "time": "10:45:43",
+      "level": "ready"
+    },
+    {
+      "time": "10:46:58",
+      "level": "ready"
+    },
+    {
+      "time": "10:48:21",
+      "level": "ready"
+    },
+    {
+      "time": "10:49:33",
+      "level": "ready"
+    },
+    {
+      "time": "10:51:23",
+      "level": "ready"
+    },
+    {
+      "time": "10:52:35",
+      "level": "ready"
+    },
+    {
+      "time": "10:53:55",
+      "level": "ready"
+    },
+    {
+      "time": "10:55:10",
+      "level": "ready"
+    },
+    {
+      "time": "10:56:22",
+      "level": "ready"
+    },
+    {
+      "time": "10:57:52",
+      "level": "ready"
+    },
+    {
+      "time": "10:59:13",
+      "level": "ready"
+    },
+    {
+      "time": "11:00:27",
+      "level": "ready"
+    },
+    {
+      "time": "11:01:40",
+      "level": "ready"
+    },
+    {
+      "time": "11:03:27",
+      "level": "ready"
+    },
+    {
+      "time": "11:04:54",
+      "level": "ready"
+    },
+    {
+      "time": "11:06:08",
+      "level": "ready"
+    },
+    {
+      "time": "11:07:22",
+      "level": "ready"
+    },
+    {
+      "time": "11:08:59",
+      "level": "ready"
+    },
+    {
+      "time": "11:10:20",
+      "level": "ready"
+    },
+    {
+      "time": "11:11:36",
+      "level": "ready"
+    },
+    {
+      "time": "11:12:47",
+      "level": "ready"
+    },
+    {
+      "time": "11:14:22",
+      "level": "ready"
+    },
+    {
+      "time": "11:15:44",
+      "level": "ready"
+    },
+    {
+      "time": "11:16:56",
+      "level": "ready"
+    },
+    {
+      "time": "11:18:09",
+      "level": "ready"
+    },
+    {
+      "time": "11:19:41",
+      "level": "ready"
+    },
+    {
+      "time": "11:21:02",
+      "level": "ready"
+    },
+    {
+      "time": "11:22:13",
+      "level": "ready"
+    },
+    {
+      "time": "11:23:25",
+      "level": "ready"
+    },
+    {
+      "time": "11:24:37",
+      "level": "ready"
+    },
+    {
+      "time": "11:26:07",
+      "level": "ready"
+    },
+    {
+      "time": "11:27:29",
+      "level": "ready"
+    },
+    {
+      "time": "11:28:43",
+      "level": "ready"
+    },
+    {
+      "time": "11:30:13",
+      "level": "ready"
+    },
+    {
+      "time": "13:00:58",
+      "level": "ready"
+    },
+    {
+      "time": "13:02:13",
+      "level": "ready"
+    },
+    {
+      "time": "13:03:25",
+      "level": "ready"
+    },
+    {
+      "time": "13:04:39",
+      "level": "ready"
+    },
+    {
+      "time": "13:06:15",
+      "level": "ready"
+    },
+    {
+      "time": "13:07:26",
+      "level": "ready"
+    },
+    {
+      "time": "13:08:46",
+      "level": "ready"
+    },
+    {
+      "time": "13:10:02",
+      "level": "ready"
+    },
+    {
+      "time": "13:11:42",
+      "level": "ready"
+    },
+    {
+      "time": "13:12:55",
+      "level": "ready"
+    },
+    {
+      "time": "13:14:10",
+      "level": "ready"
+    },
+    {
+      "time": "13:15:23",
+      "level": "ready"
+    },
+    {
+      "time": "13:17:03",
+      "level": "ready"
+    },
+    {
+      "time": "13:18:18",
+      "level": "ready"
+    },
+    {
+      "time": "13:19:31",
+      "level": "ready"
+    },
+    {
+      "time": "13:20:42",
+      "level": "ready"
+    },
+    {
+      "time": "13:22:29",
+      "level": "ready"
+    },
+    {
+      "time": "13:23:44",
+      "level": "ready"
+    },
+    {
+      "time": "13:24:58",
+      "level": "ready"
+    },
+    {
+      "time": "13:26:10",
+      "level": "ready"
+    },
+    {
+      "time": "13:27:59",
+      "level": "ready"
+    },
+    {
+      "time": "13:29:22",
+      "level": "ready"
+    },
+    {
+      "time": "13:30:34",
+      "level": "ready"
+    },
+    {
+      "time": "13:32:21",
+      "level": "ready"
+    },
+    {
+      "time": "13:34:01",
+      "level": "ready"
+    },
+    {
+      "time": "13:35:14",
+      "level": "ready"
+    },
+    {
+      "time": "13:36:25",
+      "level": "ready"
+    },
+    {
+      "time": "13:37:36",
+      "level": "force"
+    },
+    {
+      "time": "13:38:59",
+      "level": "force"
+    },
+    {
+      "time": "13:40:31",
+      "level": "force"
+    },
+    {
+      "time": "13:41:43",
+      "level": "force"
+    },
+    {
+      "time": "13:42:56",
+      "level": "force"
+    },
+    {
+      "time": "13:44:16",
+      "level": "force"
+    },
+    {
+      "time": "13:45:47",
+      "level": "ready"
+    },
+    {
+      "time": "13:46:59",
+      "level": "ready"
+    },
+    {
+      "time": "13:48:09",
+      "level": "force"
+    },
+    {
+      "time": "13:49:31",
+      "level": "force"
+    },
+    {
+      "time": "13:50:43",
+      "level": "ready"
+    },
+    {
+      "time": "13:52:30",
+      "level": "force"
+    },
+    {
+      "time": "13:53:43",
+      "level": "ready"
+    },
+    {
+      "time": "13:55:06",
+      "level": "ready"
+    },
+    {
+      "time": "13:56:22",
+      "level": "ready"
+    },
+    {
+      "time": "13:57:53",
+      "level": "ready"
+    },
+    {
+      "time": "13:59:06",
+      "level": "ready"
+    },
+    {
+      "time": "14:00:27",
+      "level": "ready"
+    },
+    {
+      "time": "14:01:43",
+      "level": "ready"
+    },
+    {
+      "time": "14:03:13",
+      "level": "ready"
+    },
+    {
+      "time": "14:05:30",
+      "level": "ready"
+    },
+    {
+      "time": "14:06:42",
+      "level": "ready"
+    },
+    {
+      "time": "14:07:56",
+      "level": "ready"
+    },
+    {
+      "time": "14:09:40",
+      "level": "ready"
+    },
+    {
+      "time": "14:10:59",
+      "level": "ready"
+    },
+    {
+      "time": "14:12:10",
+      "level": "ready"
+    },
+    {
+      "time": "14:13:22",
+      "level": "ready"
+    },
+    {
+      "time": "14:14:35",
+      "level": "ready"
+    },
+    {
+      "time": "14:16:06",
+      "level": "ready"
+    },
+    {
+      "time": "14:17:32",
+      "level": "ready"
+    },
+    {
+      "time": "14:18:44",
+      "level": "ready"
+    },
+    {
+      "time": "14:19:58",
+      "level": "ready"
+    },
+    {
+      "time": "14:21:26",
+      "level": "ready"
+    },
+    {
+      "time": "14:22:47",
+      "level": "ready"
+    },
+    {
+      "time": "14:23:59",
+      "level": "ready"
+    },
+    {
+      "time": "14:25:11",
+      "level": "ready"
+    },
+    {
+      "time": "14:26:25",
+      "level": "ready"
+    },
+    {
+      "time": "14:28:04",
+      "level": "ready"
+    },
+    {
+      "time": "14:29:30",
+      "level": "ready"
+    },
+    {
+      "time": "14:30:47",
+      "level": "ready"
+    },
+    {
+      "time": "14:32:00",
+      "level": "ready"
+    },
+    {
+      "time": "14:33:43",
+      "level": "ready"
+    },
+    {
+      "time": "14:35:06",
+      "level": "ready"
+    },
+    {
+      "time": "14:36:19",
+      "level": "ready"
+    },
+    {
+      "time": "14:37:34",
+      "level": "ready"
+    },
+    {
+      "time": "14:39:03",
+      "level": "ready"
+    },
+    {
+      "time": "14:40:29",
+      "level": "ready"
+    },
+    {
+      "time": "14:41:41",
+      "level": "ready"
+    },
+    {
+      "time": "14:42:55",
+      "level": "ready"
+    },
+    {
+      "time": "14:44:28",
+      "level": "ready"
+    },
+    {
+      "time": "14:45:53",
+      "level": "ready"
+    },
+    {
+      "time": "14:47:08",
+      "level": "ready"
+    },
+    {
+      "time": "14:48:19",
+      "level": "ready"
+    },
+    {
+      "time": "14:50:02",
+      "level": "ready"
+    },
+    {
+      "time": "14:51:22",
+      "level": "ready"
+    },
+    {
+      "time": "14:52:34",
+      "level": "ready"
+    },
+    {
+      "time": "14:53:46",
+      "level": "ready"
+    },
+    {
+      "time": "14:54:58",
+      "level": "ready"
+    },
+    {
+      "time": "14:56:48",
+      "level": "ready"
+    }
+  ],
+  "last_alert_level": "ready",
+  "reduce_orders_generated": 1305,
+  "l1_consecutive_high_days": 0,
+  "l1_last_date": "2026-09-30"
+}

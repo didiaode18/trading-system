@@ -1012,13 +1012,24 @@ def _generate_overlimit_reduce_orders():
         except Exception:
             pass
 
+    # BUG-107修复: 写入前按证券代码+方向去重，避免重复执行时产生多条减仓单
+    existing_sell_codes = {
+        o.get("证券代码") or o.get("code", "")
+        for o in existing_orders
+        if (o.get("方向") or o.get("direction", "")) in ("卖出", "sell")
+    }
+    deduped_reduce = [
+        o for o in reduce_orders
+        if (o.get("证券代码") or o.get("code", "")) not in existing_sell_codes
+    ]
+
     orders_json = {
         "date": tomorrow.strftime("%Y-%m-%d"),
         "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "overlimit_auto_reduce",
         "total_capital": total_capital,
         "max_daily_trades": 10,
-        "orders": existing_orders + reduce_orders,
+        "orders": existing_orders + deduped_reduce,
     }
     with open(json_path, "w", encoding="utf-8") as f:
         _json.dump(orders_json, f, ensure_ascii=False, indent=2)

@@ -1178,10 +1178,20 @@ class UnifiedRiskEngine:
                 f"绝对禁止买入/加仓（情绪化交易防护）"
             )
 
-        if available_cash < amount and available_cash < price * 100:
+        # BUG-089修复: 资金校验分两段，连100股都不够才拦截，否则缩股
+        if available_cash < price * 100:
             return self._block_result(
                 f"资金不足: 可用{available_cash:.0f}元 < 最低买入{price*100:.0f}元，禁止买入"
             )
+        elif available_cash < amount:
+            # 现金够买100股但买不全单，缩股到可买整手数
+            affordable_shares = int(available_cash / price / 100) * 100
+            if affordable_shares < 100:
+                return self._block_result(
+                    f"资金不足: 可用{available_cash:.0f}元，缩股后不足1手，禁止买入"
+                )
+            shares = affordable_shares
+            amount = shares * price
 
         if current_position_ratio >= near_full and code not in positions:
             return self._block_result(
@@ -1431,9 +1441,11 @@ class UnifiedRiskEngine:
         max_single_loss = cfg.get("max_single_loss_ratio",
                                     getattr(config, 'MAX_SINGLE_LOSS_RATIO', 0.02))
         if max_loss_ratio > max_single_loss:
-            # FIX P1: 从警告升级为强制缩股（单笔风险≤2%本金硬约束）
+            # FIX P1 + BUG-028修复: 缩股后不足100股则放弃开仓
             safe_shares = int(total_capital * max_single_loss / (price - stop_loss)) if price > stop_loss else shares
-            safe_shares = max(100, (safe_shares // 100) * 100)
+            safe_shares = (safe_shares // 100) * 100
+            if safe_shares < 100:
+                return self._block(f"风险预算不足1手: {code} 止损距离{price-stop_loss:.2f}元，预算仅允许{safe_shares}股")
             result["warnings"].append(
                 f"单笔风险{max_loss_ratio:.2%}>{max_single_loss:.0%}，"
                 f"强制缩股: {shares}→{safe_shares}"
@@ -1721,6 +1733,8 @@ class UnifiedRiskEngine:
                 return self._block(corr_warning)
 
         # 全部通过
+        # BUG-025修复: 买入校验通过时记录开仓计数，使max_daily_opens熔断生效
+        self.state_mgr.record_open()
         pass_result = {
             "pass": True,
             "reason": "风控通过",
@@ -2239,6 +2253,7 @@ class UnifiedRiskEngine:
     def _expire_intraday_flags(self):
         """
         盘中风险标记自动过期机制：
+        BUG-026修复: 标记日期!=今日则立即清除（避免跨日污染）；
         当日15:30后自动清除所有盘中风险标记（盘后自动解除）
         """
         try:
@@ -2246,12 +2261,27 @@ class UnifiedRiskEngine:
             if not flags:
                 return
             now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            expired = []
+            # BUG-026修复: 按日期判断，昨日残留标记立即清除
+            for flag_name, flag_data in list(flags.items()):
+                flag_time_str = ""
+                if isinstance(flag_data, dict):
+                    flag_time_str = str(flag_data.get("time", ""))[:10]
+                elif isinstance(flag_data, str):
+                    flag_time_str = flag_data[:10]
+                if flag_time_str and flag_time_str != today_str:
+                    expired.append(flag_name)
+                    del flags[flag_name]
+            # 当日15:30后清除所有剩余标记
             expire_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-            if now >= expire_time:
-                expired_flags = list(flags.keys())
-                self.state_mgr.state["intraday_risk_flags"] = {}
+            if now >= expire_time and flags:
+                expired.extend(list(flags.keys()))
+                flags.clear()
+            if expired:
+                self.state_mgr.state["intraday_risk_flags"] = flags
                 self.state_mgr.save()
-                logger.info(f"[盘中风控] 盘后自动过期清除标记: {expired_flags}")
+                logger.info(f"[盘中风控] 过期清除标记: {expired}")
         except Exception as e:
             logger.error(f"[盘中风控] 过期清理失败: {e}")
 

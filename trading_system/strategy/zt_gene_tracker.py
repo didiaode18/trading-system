@@ -31,6 +31,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from trading_system.utils.board_rules import get_limit_pct as _get_limit_pct
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,11 @@ class ZTGeneTracker:
             # 判断状态
             prev_days = stock.get("consecutive_days", 1)
 
-            if change_pct >= 9.5:
+            # BUG-024修复: 用board_rules动态取涨停幅度，替代硬编码9.5%
+            limit_pct = _get_limit_pct(code, stock.get("name", "")) * 100  # 转百分数
+            zt_threshold = limit_pct * 0.98  # 接近涨停阈值
+
+            if change_pct >= zt_threshold:
                 # 已涨停 → 确认连板
                 continued.append({
                     "code": code,

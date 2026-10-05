@@ -178,14 +178,20 @@ def reconcile_daily_orders(date_str: str = None, orders_dir: str = None,
         # 先回填当日成交再对账，保证双源齐全
         backfill_trades_to_journal(db_path=db_path)
         executed = _load_trades_by_date(iso_date, db_path=db_path)
-        exec_keys = {(e["code"], e["action"]) for e in executed}
+        # BUG-031修复: 匹配键加入数量，避免同标的同方向多单被全部标记为已成交
+        exec_keys = {}
+        for e in executed:
+            key = (e["code"], e["action"])
+            exec_keys[key] = exec_keys.get(key, 0) + 1
 
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         for od in orders:
             code = od.get("证券代码") or od.get("code", "")
             action = _DIRECTION_MAP.get(od.get("方向") or od.get("direction", ""), "")
-            if action and (code, action) in exec_keys:
+            key = (code, action)
+            if action and exec_keys.get(key, 0) > 0:
                 od["status"] = "已成交"
+                exec_keys[key] -= 1  # 每笔成交只匹配一张条件单
                 stats["matched"] += 1
             else:
                 od["status"] = "未触发"

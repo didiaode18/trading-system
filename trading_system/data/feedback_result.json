@@ -1,0 +1,308 @@
+[
+  {
+    "recommend_date": "2026-09-18",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 59.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.84,
+      "T+3": -2.76
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-18",
+    "code": "603986",
+    "name": "兆易创新",
+    "score": 47.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 0.91,
+      "T+3": 2.72
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-18",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 57.2,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.84,
+      "T+3": -2.76
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-18",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 59.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.84,
+      "T+3": -2.76
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-18",
+    "code": "603986",
+    "name": "兆易创新",
+    "score": 47.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 0.91,
+      "T+3": 2.72
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 59.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -1.75,
+      "T+3": -6.07
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "603986",
+    "name": "兆易创新",
+    "score": 55.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 2.65,
+      "T+3": -2.03
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "603019",
+    "name": "中科曙光",
+    "score": 47.3,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 0.87,
+      "T+3": -2.11
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "002371",
+    "name": "北方华创",
+    "score": 45.8,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.55,
+      "T+3": -3.48
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 57.2,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -1.75,
+      "T+3": -6.07
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "603986",
+    "name": "兆易创新",
+    "score": 50.3,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 2.65,
+      "T+3": -2.03
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-20",
+    "code": "603019",
+    "name": "中科曙光",
+    "score": 45.0,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 0.87,
+      "T+3": -2.11
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 59.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -1.75,
+      "T+3": -6.07
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "603986",
+    "name": "兆易创新",
+    "score": 55.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 2.65,
+      "T+3": -2.03
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "002202",
+    "name": "金风科技",
+    "score": 47.6,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.88,
+      "T+3": -1.27
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "603019",
+    "name": "中科曙光",
+    "score": 47.3,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": 0.87,
+      "T+3": -2.11
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "002371",
+    "name": "北方华创",
+    "score": 45.8,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -0.55,
+      "T+3": -3.48
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  },
+  {
+    "recommend_date": "2026-09-21",
+    "code": "002281",
+    "name": "光迅科技",
+    "score": 67.5,
+    "pool": "watch",
+    "sector": "",
+    "regime": "UNKNOWN",
+    "returns": {
+      "T+1": -1.75,
+      "T+3": -6.07
+    },
+    "mfe": 0,
+    "mae": 0,
+    "stop_triggered": false,
+    "settled_days": 5
+  }
+]

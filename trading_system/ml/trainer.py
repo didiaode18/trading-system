@@ -73,6 +73,14 @@ class ModelTrainer:
             logger.warning("训练数据为空")
             return None
 
+        # BUG-032修复: TimeSeriesSplit要求数据按时间升序，确保X/y按索引排序
+        if hasattr(X.index, 'dtype') and X.index.dtype.kind in ('M', 'O'):
+            sort_idx = X.index.argsort()
+            X = X.iloc[sort_idx]
+            y = y.iloc[sort_idx]
+            if temporal_weights is not None:
+                temporal_weights = np.asarray(temporal_weights)[sort_idx]
+
         # 【修复】保留三分类标签(1/0/-1)，不再转为二分类
         # 震荡期(label=0)是重要的"不操作"信号，模型需要学习
         y_train = y.copy()

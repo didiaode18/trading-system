@@ -208,8 +208,10 @@ def calc_turnover(trades: list, daily_nav: pd.Series, trading_days: int) -> dict
     if not trades or trading_days <= 0 or daily_nav is None or len(daily_nav) == 0:
         return result
 
+    # BUG-033修复: 兼容engine._calc_trade_pnl输出的buy_price/sell_price字段
     total_trade_amount = sum(
-        abs(t.get("price", 0) * t.get("shares", 0)) for t in trades
+        abs((t.get("price") or t.get("sell_price") or t.get("buy_price") or 0) * t.get("shares", 0))
+        for t in trades
     )
     avg_nav = daily_nav.mean()
     if avg_nav <= 0:

@@ -106,6 +106,9 @@ def get_instrument_type(code: str) -> InstrumentType:
         return InstrumentType.STOCK  # 上海主板
     if code.startswith("688"):
         return InstrumentType.STOCK  # 科创板
+    # BUG-038修复: 北交所 8xx/4xx/920xxx 识别为股票
+    if code.startswith(("8", "4", "920")):
+        return InstrumentType.STOCK  # 北交所
 
     # 其他以5开头但不是ETF的（可能是封闭式基金等）
     if code.startswith("5"):

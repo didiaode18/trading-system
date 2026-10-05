@@ -1,0 +1,50 @@
+{
+  "canslim_screener": {
+    "name": "CANSLIM选股",
+    "state": "live",
+    "registered": "2026-01-01",
+    "owner": "scheduler"
+  },
+  "consensus_signal": {
+    "name": "四模块共识",
+    "state": "live",
+    "registered": "2026-03-01",
+    "owner": "consensus"
+  },
+  "trend_forecast": {
+    "name": "趋势预测",
+    "state": "live",
+    "registered": "2026-03-01",
+    "owner": "trend_forecast"
+  },
+  "ml_predictor": {
+    "name": "ML预测增强",
+    "state": "live",
+    "registered": "2026-06-01",
+    "owner": "ml"
+  },
+  "alert_engine": {
+    "name": "持仓异动预警",
+    "state": "live",
+    "registered": "2026-04-01",
+    "owner": "notify"
+  },
+  "caopan_signal": {
+    "name": "操盘密码",
+    "state": "live",
+    "registered": "2026-05-01",
+    "owner": "caopan"
+  },
+  "buy_point_alert": {
+    "name": "买点到价提醒",
+    "state": "live",
+    "registered": "2026-06-01",
+    "owner": "notify"
+  },
+  "sector_prediction": {
+    "name": "板块前瞻预测",
+    "state": "live",
+    "registered": "2026-07-01",
+    "owner": "sector"
+  }
+}

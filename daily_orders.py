@@ -368,7 +368,8 @@ def generate_condition_orders(holding, df, realtime_price, _playbook=None):
             })
     elif is_bearish:
         # 空头趋势(非深度): 减仓单
-        reduce_qty = max(qty // 2 // 100 * 100, 100)
+        # BUG-102修复: 零股保护，reduce_qty不超过实际持仓
+        reduce_qty = min(max(qty // 2 // 100 * 100, 100), qty)
         reduce_price = round(price * 0.998, 3)
         # 去重检测
         if abs(reduce_price - stop_price) / stop_price * 100 >= 2.0:

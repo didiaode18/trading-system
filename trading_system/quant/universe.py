@@ -77,17 +77,22 @@ class UniverseManager:
     def get_all_a_share_codes(self, date: str = None) -> pd.DataFrame:
         """
         获取全A股代码列表（含上市日期、ST标记、行业）
+        BUG-026修复: 缓存键含日期，支持PIT语义
 
         返回 DataFrame:
             code, code_name, ipo_date, status, industry
         """
-        if self._all_stocks_cache is not None:
-            return self._all_stocks_cache
-
-        self._bs_login()
-
         if date is None:
             date = datetime.date.today().strftime("%Y-%m-%d")
+
+        # BUG-026修复: 缓存键含日期，避免历史回测复用今日名单
+        cache_key = date
+        if hasattr(self, '_all_stocks_cache_by_date') and cache_key in self._all_stocks_cache_by_date:
+            return self._all_stocks_cache_by_date[cache_key]
+        if not hasattr(self, '_all_stocks_cache_by_date'):
+            self._all_stocks_cache_by_date = {}
+
+        self._bs_login()
 
         # baostock获取指定日期的全部股票
         rs = bs.query_all_stock(day=date)
@@ -112,6 +117,7 @@ class UniverseManager:
         df = pd.DataFrame(rows)
         logger.info(f"全A股列表: {len(df)}只 (日期={date})")
         self._all_stocks_cache = df
+        self._all_stocks_cache_by_date[cache_key] = df
         return df
 
     # ============================================================

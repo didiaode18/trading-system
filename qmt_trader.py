@@ -36,8 +36,9 @@ QMT_CONFIG = {
     "account_type": "STOCK",  # 股票账号
 
     # 风控硬约束（不可覆盖）
+    # BUG-093修复: 单票集中度与risk_control口径对齐(15%)
     "max_daily_trades": 3,        # 每日最大交易笔数
-    "max_single_position_pct": 25, # 单只最大仓位%
+    "max_single_position_pct": 15, # 单只最大仓位%（与risk_control LEADER_STOCK_MAX_RATIO=0.15对齐）
     "max_total_position_pct": 90,  # 总仓位上限%
     "min_cash_pct": 10,           # 最低现金比例%
     "stop_loss_pct": 8,           # 止损线%

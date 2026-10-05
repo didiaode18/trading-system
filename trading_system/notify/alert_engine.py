@@ -599,7 +599,8 @@ class AlertEngine:
 
                 if intraday_chg <= -7.0:
                     # 紧急: 日内暴跌≥7%，建议卖出50%
-                    sell_qty = max(int(shares * 0.5 / 100) * 100, 100) if shares > 0 else 0
+                    # BUG-103修复: 零股保护，sell_qty不超过实际持仓
+                    sell_qty = min(shares, max(int(shares * 0.5 / 100) * 100, 100)) if shares >= 100 else shares
                     alerts.append({
                         "type": "intraday_crash",
                         "rule_name": "R10-日内暴跌≥7%(紧急)",

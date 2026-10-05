@@ -470,6 +470,11 @@ class EventCalendar:
             for col in columns:
                 if col not in df.columns:
                     df[col] = ""
+            # BUG-019修复: 摘要路径占比统一*100转百分数（与队列路径对齐）
+            if "release_market_value_ratio" in df.columns:
+                df["release_market_value_ratio"] = pd.to_numeric(
+                    df["release_market_value_ratio"], errors="coerce"
+                ).fillna(0) * 100
             df = df[columns].reset_index(drop=True)
             return df
         except Exception as e:

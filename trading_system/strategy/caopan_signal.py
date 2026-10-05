@@ -494,6 +494,11 @@ def _detect_false_signals(df: pd.DataFrame, window: int, stock_code: str = "") -
     - D点: ATR动态窗口（高波动5天/低波动3天/中间线性插值），金叉后N日内收盘跌破LL2 → 假D点
     - K点: 对称回检，死叉后N日内收盘站回LL1上方 → 假K点（洗盘诱空）
 
+    ★ BUG-013警告: 本函数使用信号点之后3-5根K线改判历史信号为false，
+    属于未来函数。仅用于实盘信号质量事后评估，
+    回测中禁止使用被本函数修改后的dk_grade（否则自动避开已知会破位的点）。
+    回测应使用原始dk_grade，不做假信号回检。
+
     新增config参数（通过CFG.get获取，无需修改config.py）:
     - dk_false_atr_high_vol: ATR/price高于此值=高波动 (默认0.03)
     - dk_false_atr_low_vol: ATR/price低于此值=低波动 (默认0.015)

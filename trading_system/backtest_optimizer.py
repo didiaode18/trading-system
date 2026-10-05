@@ -642,9 +642,11 @@ def evaluate_trades(trades: list) -> dict:
     expectancy = np.mean([t["net_profit"] for t in trades])
 
     # 累计收益（复利）
+    # BUG-047修复: 乘以仓位比例，与analyze_trades口径对齐
+    position_ratio = getattr(config, 'POSITION_RATIO', 0.12)
     cumulative = 1.0
     for t in trades:
-        cumulative *= (1 + t["net_profit"] / 100)
+        cumulative *= (1 + t["net_profit"] / 100 * position_ratio)
     cumulative_pct = (cumulative - 1) * 100
 
     # 最大连续亏损
@@ -985,7 +987,9 @@ def out_of_sample_validation(data: dict, best_params: dict):
     mc_max_drawdowns = []
     mc_final_returns = []
 
-    profits = [t["net_profit"] / 100 for t in all_trades]
+    # BUG-047修复: 蒙特卡洛也需乘仓位比例
+    position_ratio = getattr(config, 'POSITION_RATIO', 0.12)
+    profits = [t["net_profit"] / 100 * position_ratio for t in all_trades]
     n = len(profits)
 
     for _ in range(1000):

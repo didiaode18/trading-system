@@ -61,7 +61,7 @@ class CostConfig:
     sell_slippage: float = 0.001      # 卖出滑点 0.1%
     commission_rate: float = 0.00025  # 佣金费率 万2.5
     min_commission: float = 5.0       # 最低佣金 5元
-    stamp_tax_rate: float = 0.001     # 印花税 千1（仅卖出）
+    stamp_tax_rate: float = 0.0005    # 印花税 万5（仅卖出，2023-08-28起减半）
     transfer_fee_rate: float = 0.00001  # 过户费 十万分之一
     # V3.2: 市场冲击成本（基于订单量/日成交量比例）
     impact_cost_enabled: bool = True   # 是否启用冲击成本
@@ -69,6 +69,11 @@ class CostConfig:
     # V10: 成交量参与率上限
     max_participation_rate: float = 0.25   # 单笔不超过日成交量25%
     participation_excess_mode: str = "partial"  # "partial"=部分成交, "reject"=整单拒绝
+    # V11: 印花税按生效日分段（BUG-097增强）
+    # 2023-08-28起从千1减半至万5，卖出单边
+    stamp_tax_rate_pre_20230828: float = 0.001   # 2023-08-28之前: 千1
+    stamp_tax_rate_post_20230828: float = 0.0005  # 2023-08-28及之后: 万5
+    stamp_tax_cutover_date: str = "2023-08-28"    # 印花税减半生效日
 
 
 DEFAULT_COST = CostConfig()
@@ -281,14 +286,25 @@ class SimBroker:
         commission = amount * self.cost_config.commission_rate
         return max(commission, self.cost_config.min_commission)
 
-    def _calc_stamp_tax(self, amount: float, direction: str, code: str = "") -> float:
-        """计算印花税（仅卖出，ETF/可转债免印花税）"""
+    def _calc_stamp_tax(self, amount: float, direction: str, code: str = "",
+                         trade_date: str = "") -> float:
+        """计算印花税（仅卖出，ETF/可转债免印花税）
+        
+        V11: 按生效日分段——2023-08-28起从千1减半至万5（BUG-097增强）
+        """
         if direction == "sell":
             # V8.2: 统一使用instrument模块判定品种类型
             from utils.instrument import is_etf, is_bond
             if code and (is_etf(code) or is_bond(code)):
                 return 0.0
-            return amount * self.cost_config.stamp_tax_rate
+            # V11: 按生效日分段确定印花税率
+            rate = self.cost_config.stamp_tax_rate  # 默认用当前配置
+            if trade_date and self.cost_config.stamp_tax_cutover_date:
+                if trade_date < self.cost_config.stamp_tax_cutover_date:
+                    rate = self.cost_config.stamp_tax_rate_pre_20230828
+                else:
+                    rate = self.cost_config.stamp_tax_rate_post_20230828
+            return amount * rate
         return 0.0
 
     def _calc_transfer_fee(self, amount: float) -> float:
@@ -337,7 +353,8 @@ class SimBroker:
         
         daily_volume = (market_data or {}).get("volume", 0)
         if daily_volume <= 0:
-            return target_shares, None  # 无成交量数据时跳过
+            # BUG-044修复: 停牌日(volume=0)应拒单，而非放行
+            return 0, RejectReason.SUSPENDED
         
         max_shares_by_participation = int(daily_volume * self.cost_config.max_participation_rate)
         max_shares_by_participation = (max_shares_by_participation // 100) * 100
@@ -349,7 +366,10 @@ class SimBroker:
             return 0, RejectReason.PARTICIPATION_LIMIT
         
         # partial: 部分成交
-        allowed = max(max_shares_by_participation, 100)
+        # BUG-039修复: 不用100兆底，参与率为0时走reject
+        allowed = max_shares_by_participation
+        if allowed <= 0:
+            return 0, RejectReason.PARTICIPATION_LIMIT
         if allowed < target_shares:
             logger.debug(
                 f"参与率限制: {direction} {target_shares}股 → {allowed}股 "
@@ -462,8 +482,8 @@ class SimBroker:
         total_cost = amount + commission + transfer_fee
 
         if total_cost > self.cash:
-            # 再减少股数
-            target = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate + self.cost_config.transfer_fee_rate + 0.001)))
+            # BUG-041修复: 买入不收印花税，二次缩股去掉0.001
+            target = int(self.cash / (exec_price * (1 + self.cost_config.commission_rate + self.cost_config.transfer_fee_rate)))
             target = (target // 100) * 100
             if target <= 0:
                 self.rejected_orders.append(RejectedOrder(
@@ -586,10 +606,14 @@ class SimBroker:
             return None
 
         # 实际卖出股数
+        # BUG-040修复: 碎股一次性出清，避免//100截断后残留永远无法卖出
         sell_shares = min(order.target_shares, available)
-        sell_shares = (sell_shares // 100) * 100
-        if sell_shares <= 0:
-            sell_shares = available  # 全部卖出
+        rounded = (sell_shares // 100) * 100
+        if rounded <= 0 or (available - rounded) < 100:
+            # 全部卖出（含碎股），避免残留
+            sell_shares = available
+        else:
+            sell_shares = rounded
 
         # V10: 确定执行参考价
         ref_price = self._get_exec_price(order.price, market_data, "sell")
@@ -621,7 +645,9 @@ class SimBroker:
         # 计算费用
         amount = exec_price * sell_shares
         commission = self._calc_commission(amount)
-        stamp_tax = self._calc_stamp_tax(amount, "sell", code=order.code)
+        # V11: 传入成交日期，印花税按生效日分段（BUG-097增强）
+        stamp_tax = self._calc_stamp_tax(amount, "sell", code=order.code,
+                                          trade_date=order.date)
         transfer_fee = self._calc_transfer_fee(amount)
         total_cost = commission + stamp_tax + transfer_fee
 

@@ -418,10 +418,15 @@ class CapitalFlowAnalyzer:
 
     @staticmethod
     def _find_flow_col(df: pd.DataFrame, keywords: list) -> str:
-        """在DataFrame列中按关键字顺序匹配，返回列名或None"""
-        for col in df.columns:
-            for kw in keywords:
+        """在DataFrame列中按关键字顺序匹配，返回列名或None
+        BUG-017修复: '大单'匹配时排除'超大单'，避免子串包含误匹配
+        """
+        for kw in keywords:
+            for col in df.columns:
                 if kw in col:
+                    # 排除'超大单'被'大单'误匹配
+                    if kw == '大单' and '超大单' in col:
+                        continue
                     return col
         return None
 

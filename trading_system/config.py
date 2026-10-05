@@ -1040,7 +1040,7 @@ WEEKLY_LOSS_LIMIT = 0.08         # 单周亏损>=8%: 全仓降至3成以下，�
 
 # --- 交易成本参数（回测必扣）---
 COMMISSION_RATE = 0.0003         # 佣金万3（买卖双边）
-STAMP_TAX_RATE = 0.001           # 印花税千1（卖出单边）
+STAMP_TAX_RATE = 0.0005          # 印花税万5（卖出单边，2023-08-28起减半）
 TRANSFER_FEE_RATE = 0.00001      # 过户费十万分之一（买卖双边）
 MIN_COMMISSION = 5.0             # 最低佣金5元
 
@@ -1505,7 +1505,7 @@ BACKTEST_CONFIG = {
     "buy_slippage": 0.001,              # 买入滑点 0.1%
     "sell_slippage": 0.001,             # 卖出滑点 0.1%
     "commission_rate": COMMISSION_RATE,     # [P1-#3修复] 统一引用全局佣金费率(万3)
-    "stamp_tax_rate": 0.001,            # 印花税千1
+    "stamp_tax_rate": 0.0005,            # 印花税万5（2023-08-28起减半）
     "benchmark": "000300",              # 基准指数
     "walk_forward_train": 60,           # Walk-Forward训练窗口
     "walk_forward_test": 20,            # Walk-Forward验证窗口
@@ -1709,7 +1709,7 @@ CAOPAN_CONFIG = {
     # --- 回测参数 ---
     "backtest_years": 3,
     "backtest_commission": 0.0003,
-    "backtest_stamp_tax": 0.001,
+    "backtest_stamp_tax": 0.0005,
     "backtest_slippage": 0.001,
     "backtest_train_ratio": 0.70,      # 训练集70% / 验证集30%
 
