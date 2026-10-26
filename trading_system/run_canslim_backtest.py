@@ -26,7 +26,6 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings('ignore')
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -41,7 +40,7 @@ INITIAL_CAPITAL = config.TOTAL_CAPITAL  # ~73万
 COMMISSION_RATE = 0.00025   # 佣金万2.5
 STAMP_TAX = 0.001           # 印花税千1
 SLIPPAGE = 0.001            # 滑点0.1%
-SCAN_INTERVAL = 5           # 每5个交易日扫描一次(周度)
+SCAN_INTERVAL = getattr(config, 'CANSLIM_V3PLUS_CONFIG', {}).get('scan_interval', 3)  # V3+: 3天扫描
 
 
 # ============================================================
@@ -124,11 +123,12 @@ def calc_canslim_factors(df, idx, all_data=None, use_v2=False):
     在df的第idx行计算CANSLIM六因子评分(简化版,与stock_screener.py逻辑一致)
     返回: {N, S, L, CAI, P, W, total}
 
-    V2改进:
-      P0-1: P因子从均值回归(RSI超卖)改为动量导向(RSI偏强+MACD金叉)
-      P0-2: CAI从固定8分改为20日动量代理(对齐实盘stock_screener.py)
-      P2-1: N因子增加120日新高维度
-      P2-2: S因子满分对齐实盘(20→10)
+    V2.1 (V11.1 P1-3 回滚修正):
+      保留 V2 的有效改进：熊市闸门/时间止损/MA60过滤/CAI动态化/N因子120日新高
+      回退 V2 的过度激进部分：
+        P0-1 回退: P因子恢复 V1 的均值回归逻辑（RSI 30-50 超卖 + MA20 回踩），
+                   仅保留 MACD 金叉作为额外确认（避免动量追高）
+        P2-2 回退: S因子满分恢复 20（原 V2 的10分削弱了供需因子区分度）
     """
     if idx < 60:
         return None
@@ -161,19 +161,19 @@ def calc_canslim_factors(df, idx, all_data=None, use_v2=False):
     factors["N"] = min(n_score, 20)
 
     # S因子(供需): 量价配合
-    # V2: 满分对齐实盘(20→10)
-    s_max = 10 if use_v2 else 20
+    # V11.1 P1-3: S因子满分恢复 20（原 V2 的10分削弱了供需因子区分度）
+    s_max = 20
     s_score = 0
     if not pd.isna(vol_ma20) and vol_ma20 > 0:
         vol_ratio = volume / vol_ma20
         if vol_ratio < 0.7 and close >= ma20 * 0.99:
-            s_score += 6 if use_v2 else 12  # 缩量回踩
+            s_score += 12  # 缩量回踩
         if vol_ratio > 1.5 and close > df["close"].iloc[max(0, idx-1)]:
-            s_score += 4 if use_v2 else 8   # 放量上涨
+            s_score += 8   # 放量上涨
         if idx >= 5:
             vol_5d = df["volume"].iloc[idx-5:idx].mean()
             if vol_5d < vol_ma20 * 0.8:
-                s_score += 3 if use_v2 else 5  # 近5日缩量
+                s_score += 5  # 近5日缩量
     factors["S"] = min(s_score, s_max)
 
     # L因子(龙头): 相对强度 (满分20)
@@ -220,41 +220,26 @@ def calc_canslim_factors(df, idx, all_data=None, use_v2=False):
         factors["CAI"] = 8
 
     # P因子(买点): 回踩支撑+技术形态 (满分20)
-    if use_v2:
-        # V2(P0-1): 从均值回归(RSI超卖)改为动量导向
-        p_score = 0
-        ma20_slope = row["ma20_slope"]
-        if not pd.isna(ma20_slope) and ma20_slope > 0:
-            p_score += 6  # MA20向上(趋势确认)
-        if not pd.isna(row.get("rsi")):
-            rsi = row["rsi"]
-            # V2: 动量导向 - RSI偏强(50-70)给高分，超卖(30-50)不再奖励
-            if 50 <= rsi < 70:
-                p_score += 8  # 健康动量区间
-            elif 40 <= rsi < 50:
-                p_score += 4  # 中性偏弱(给少量分)
-            # RSI<30不再给分(超跌不等于买点)
-        # V2: MACD金叉确认(替代MA20回踩)
-        if not pd.isna(row.get("macd_dif")) and not pd.isna(row.get("macd_dea")):
-            if row["macd_dif"] > row["macd_dea"]:
-                p_score += 6  # MACD在零轴上方/金叉
-        factors["P"] = min(p_score, 20)
-    else:
-        # V1: 原逻辑(RSI超卖+MA20回踩)
-        p_score = 0
-        ma20_slope = row["ma20_slope"]
-        if not pd.isna(ma20_slope) and ma20_slope > 0:
-            p_score += 6  # MA20向上
-        if not pd.isna(row.get("rsi")):
-            rsi = row["rsi"]
-            if 30 < rsi < 50:
-                p_score += 8  # RSI超卖回升区间
-            elif 50 <= rsi < 70:
-                p_score += 5  # RSI偏强
-        low = row["low"]
-        if not pd.isna(ma20) and low <= ma20 * 1.01 and close >= ma20:
-            p_score += 6  # 回踩MA20确认
-        factors["P"] = min(p_score, 20)
+    # V11.1 P1-3: 回退 V2 的动量追高逻辑，恢复 V1 均值回归 + MACD 确认
+    p_score = 0
+    ma20_slope = row["ma20_slope"]
+    if not pd.isna(ma20_slope) and ma20_slope > 0:
+        p_score += 6  # MA20向上(趋势确认)
+    if not pd.isna(row.get("rsi")):
+        rsi = row["rsi"]
+        # V1 逻辑: RSI 超卖回升区间给高分（避免 V2 的动量追高）
+        if 30 < rsi < 50:
+            p_score += 8  # RSI超卖回升区间
+        elif 50 <= rsi < 70:
+            p_score += 5  # RSI偏强
+    low = row["low"]
+    if not pd.isna(ma20) and low <= ma20 * 1.01 and close >= ma20:
+        p_score += 6  # 回踩MA20确认
+    # V11.1 P1-3: 保留 V2 的 MACD 金叉作为额外确认（+3分，不替代原逻辑）
+    if use_v2 and not pd.isna(row.get("macd_dif")) and not pd.isna(row.get("macd_dea")):
+        if row["macd_dif"] > row["macd_dea"]:
+            p_score += 3  # MACD金叉额外加分
+    factors["P"] = min(p_score, 20)
 
     # W因子(大盘): 简化为基于指数均线(满分+5/-5)
     w_score = 0
@@ -832,13 +817,16 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
     """
     完整组合回测: 模拟CANSLIM选股+composite评分+止损+调仓
 
-    V2(use_v2=True): 激进改进 - V2因子+熊市闸门完全暂停+时间止损15d/3%+阶梯止盈12%/3%+动态仓位
-    V3(version="v3"): 最小改进 - V1因子+V1组合规则+仅增加熊市闸门(完全暂停买入)
+    版本说明:
+      V1 (version="v1"): 原始基线 - 均值回归+15%/6%移动止盈+10%止损
+      V2 (use_v2=True): 激进改进(已废弃) - V2因子+时间止损15d/3%+阶梯止盈12%/3%
+      V3 (version="v3"): 最小改进 - V1因子+熊市闸门
+      V3+ (version="v3plus"): 最优方案 - V2因子(N/L/CAI增强)+V4参数(SL15/P5/F3)+重做时间止损
 
-    参数优化(仅对version="v3"生效):
-      stop_loss_pct: 止损幅度(默认config.INITIAL_STOP_LOSS_PCT=0.10)
-      max_positions: 最大持仓数(默认7)
-      scan_interval: 扫描间隔天数(默认SCAN_INTERVAL=5)
+    参数优化(对 version="v3"/"v3plus" 生效):
+      stop_loss_pct: 止损幅度(默认从 CANSLIM_V3PLUS_CONFIG 读取=0.15)
+      max_positions: 最大持仓数(默认从 CANSLIM_V3PLUS_CONFIG 读取=5)
+      scan_interval: 扫描间隔天数(默认从 CANSLIM_V3PLUS_CONFIG 读取=3)
     """
     logger.info("\n" + "=" * 60)
     logger.info("  [C] 组合模拟回测(完整策略)")
@@ -903,9 +891,26 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
             pnl_pct = (price - pos["buy_price"]) / pos["buy_price"]
             pos["hold_days"] = pos.get("hold_days", 0) + 1
 
-            # 止损
-            _sl = stop_loss_pct if stop_loss_pct is not None else config.INITIAL_STOP_LOSS_PCT
-            if pnl_pct <= -_sl:
+            # 止损（V3+: 15% + 收盘确认机制）
+            _v3p_cfg = getattr(config, 'CANSLIM_V3PLUS_CONFIG', {})
+            _sl = stop_loss_pct if stop_loss_pct is not None else _v3p_cfg.get('initial_stop_loss', config.INITIAL_STOP_LOSS_PCT)
+            _stop_hard_buffer = _v3p_cfg.get('stop_hard_buffer', 0.02)
+            _stop_hard_threshold = -_sl * (1 + _stop_hard_buffer)  # 深度穿破立即触发
+            if pnl_pct <= _stop_hard_threshold:
+                # 深度穿破—立即止损（防黑天鹅）
+                sell_price = price * (1 - SLIPPAGE)
+                revenue = sell_price * pos["shares"]
+                cost = revenue * (COMMISSION_RATE + STAMP_TAX)
+                cash += revenue - cost
+                trades.append({
+                    "code": code, "action": "sell", "date": date,
+                    "price": sell_price, "shares": pos["shares"],
+                    "pnl_pct": pnl_pct * 100 - 0.35, "reason": "stop_loss"
+                })
+                del positions[code]
+                continue
+            elif pnl_pct <= -_sl:
+                # 收盘确认—避免日内假破位
                 sell_price = price * (1 - SLIPPAGE)
                 revenue = sell_price * pos["shares"]
                 cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -924,9 +929,10 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
             drawdown_from_high = (pos["highest"] - price) / pos["highest"]
 
             if use_v2:
-                # V2(P1-4): 阶梯式移动止盈
-                # 浮盈>12%: 回落3%止盈 | 浮盈>20%: 回落5%止盈
-                if pnl_pct > 0.20 and drawdown_from_high > 0.05:
+                # V11.1 P1-3: 阶梯止盈回退—放宽阈值避免过早退出盈利交易
+                # 原 V2: 12%回落3% / 20%回落5%（太紧，导致胜率下降）
+                # 新 V2.1: 15%回落5% / 25%回落7%（与 V1 接近但保留阶梯结构）
+                if pnl_pct > 0.25 and drawdown_from_high > 0.07:
                     sell_price = price * (1 - SLIPPAGE)
                     revenue = sell_price * pos["shares"]
                     cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -934,11 +940,11 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                     trades.append({
                         "code": code, "action": "sell", "date": date,
                         "price": sell_price, "shares": pos["shares"],
-                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_20"
+                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_25"
                     })
                     del positions[code]
                     continue
-                elif pnl_pct > 0.12 and drawdown_from_high > 0.03:
+                elif pnl_pct > 0.15 and drawdown_from_high > 0.05:
                     sell_price = price * (1 - SLIPPAGE)
                     revenue = sell_price * pos["shares"]
                     cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -946,13 +952,14 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                     trades.append({
                         "code": code, "action": "sell", "date": date,
                         "price": sell_price, "shares": pos["shares"],
-                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_12"
+                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "trailing_stop_15"
                     })
                     del positions[code]
                     continue
             else:
-                # V1: 浮盈>15%后回落6%止盈
-                if pnl_pct > 0.15 and drawdown_from_high > 0.06:
+                # V1/V3/V3+: 浮盈>15%后回落5%止盈（V3+: 6%→5% 稍紧以配合 5 只集中持仓）
+                _trail_dd = _v3p_cfg.get('trailing_drawdown', 0.05) if version in ('v3', 'v3plus') else 0.06
+                if pnl_pct > 0.15 and drawdown_from_high > _trail_dd:
                     sell_price = price * (1 - SLIPPAGE)
                     revenue = sell_price * pos["shares"]
                     cost = revenue * (COMMISSION_RATE + STAMP_TAX)
@@ -965,41 +972,44 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                     del positions[code]
                     continue
 
-            # V2(P1-2): 时间止损 - 持仓>15天且浮盈<3%则卖出(提高资金效率)
-            if use_v2 and pos["hold_days"] >= 15 and pnl_pct < 0.03:
-                sell_price = price * (1 - SLIPPAGE)
-                revenue = sell_price * pos["shares"]
-                cost = revenue * (COMMISSION_RATE + STAMP_TAX)
-                cash += revenue - cost
-                trades.append({
-                    "code": code, "action": "sell", "date": date,
-                    "price": sell_price, "shares": pos["shares"],
-                    "pnl_pct": pnl_pct * 100 - 0.35, "reason": "time_stop"
-                })
-                del positions[code]
-                continue
+            # V3+ 时间止损（重做）: 持仓>25天且浮亏则卖出（仅清理明确失败交易）
+            # 原 V2: 15天/<3% → 104笔时间止损是最大收益杀手
+            # V3+: 25天/<0% → 给趋势更多时间，仅清理明确失败
+            _ts_days = _v3p_cfg.get('time_stop_days', 25)
+            _ts_profit = _v3p_cfg.get('time_stop_profit', 0.0)
+            if use_v2 or version in ('v3', 'v3plus'):
+                if pos["hold_days"] >= _ts_days and pnl_pct < _ts_profit:
+                    sell_price = price * (1 - SLIPPAGE)
+                    revenue = sell_price * pos["shares"]
+                    cost = revenue * (COMMISSION_RATE + STAMP_TAX)
+                    cash += revenue - cost
+                    trades.append({
+                        "code": code, "action": "sell", "date": date,
+                        "price": sell_price, "shares": pos["shares"],
+                        "pnl_pct": pnl_pct * 100 - 0.35, "reason": "time_stop"
+                    })
+                    del positions[code]
+                    continue
 
         # 扫描买入
-        _si = scan_interval if scan_interval is not None else SCAN_INTERVAL
+        _v3p = getattr(config, 'CANSLIM_V3PLUS_CONFIG', {})
+        _si = scan_interval if scan_interval is not None else _v3p.get('scan_interval', SCAN_INTERVAL)
         if t_idx % _si != 0 or t_idx < 60:
             continue
 
-        _mp = max_positions if max_positions is not None else 7
+        _mp = max_positions if max_positions is not None else _v3p.get('max_positions', 5)
         if len(positions) >= _mp:  # 最大持仓
             continue
 
-        # V2: 熊市闸门 - BEAR市场暂停买入
-        if use_v2 and _regime == "BEAR":
-            _bear_pause_count += 1
-            continue
-
-        # V3: 熊市闸门 - BEAR市场暂停买入(唯一与V1不同的地方)
-        if version == "v3" and _regime == "BEAR":
+        # V2/V3/V3+: 熊市闸门 - BEAR市场暂停买入
+        if (use_v2 or version in ('v3', 'v3plus')) and _regime == "BEAR":
             _bear_pause_count += 1
             continue
 
         # 扫描候选
         day_signals = []
+        # V3+ 使用 V2 因子增强(N/L/CAI)，但 P/S 回退 V1 均值回归
+        _use_v2_factors = use_v2 or version == 'v3plus'
         for code in candidates:
             if code in positions:
                 continue
@@ -1009,7 +1019,7 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                 continue
             idx = date_mask.sum() - 1
 
-            factors = calc_canslim_factors(df, idx, precomputed, use_v2=use_v2)
+            factors = calc_canslim_factors(df, idx, precomputed, use_v2=_use_v2_factors)
             if factors is None:
                 continue
 
@@ -1022,9 +1032,12 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
             market_up = (not pd.isna(idx_row.get("ma20")) and not pd.isna(idx_row.get("ma60")) and
                          idx_row["close"] > idx_row["ma20"] > idx_row["ma60"])
 
-            if use_v2:
-                # V2: 弱势门槛收紧 - 非强势市场>=50
-                min_score = 50  # 统一门槛
+            if version == 'v3plus':
+                # V3+: 从配置读取门槛（牛市55/震荡50/熊市闸门已关闭）
+                min_score = _v3p.get('min_score_bull', 55) if market_up else _v3p.get('min_score_range', 50)
+            elif use_v2:
+                # V2: 弱势门槛收紧 - 统一>=50
+                min_score = 50
             else:
                 # V1/V3: 原逻辑
                 min_score = 50 if market_up else 35
@@ -1034,8 +1047,8 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
                 row = df.iloc[idx]
                 if row["close"] < row["ma20"] * 0.95:
                     continue
-                # V2 only: MA60下行不买
-                if use_v2 and not pd.isna(row.get("ma60")) and idx >= 5:
+                # V2/V3+: MA60下行不买
+                if _use_v2_factors and not pd.isna(row.get("ma60")) and idx >= 5:
                     ma60_5ago = df["ma60"].iloc[max(0, idx-5)]
                     if not pd.isna(ma60_5ago) and row["ma60"] < ma60_5ago * 0.995:
                         continue
@@ -1055,11 +1068,9 @@ def run_portfolio_backtest(data_dict, precomputed, use_v2=False, version="v1",
             next_open = df["open"].iloc[sig_idx + 1]
             buy_price = next_open * (1 + SLIPPAGE)
 
-            # V2(P1-3): 动态仓位 - 震荡市缩减仓位
-            if use_v2 and _regime == "RANGE":
-                position_size = INITIAL_CAPITAL / 10  # 震荡市10分仓(原7分仓)
-            else:
-                position_size = INITIAL_CAPITAL / 7
+            # V3+: 统一 7 分仓（从配置读取，不再按 regime 动态调整）
+            _pos_divisor = _v3p.get('position_size_divisor', 7)
+            position_size = INITIAL_CAPITAL / _pos_divisor
 
             shares = int(position_size / buy_price / 100) * 100
             if shares < 100:
@@ -1350,17 +1361,19 @@ td{{padding:8px;text-align:center;border-bottom:1px solid #ecf0f1;font-size:12px
 <p>回测区间: {START_DATE} ~ {END_DATE} | 初始资金: {INITIAL_CAPITAL:,.0f}元 | 生成: {today}</p>
 
 <div class="improve">
-<b>V2改进清单:</b><br>
-[P0-1] P因子动量化: RSI 30-50超卖不再奖励 → RSI 50-70动量区间给高分 + MACD金叉确认<br>
+<b>V2.1 改进清单 (V11.1 P1-3 回滚修正):</b><br>
+<b>保留的有效改进:</b><br>
 [P0-2] CAI动态化: 固定8分 → 20日动量代理(4-10分) 对齐实盘<br>
 [P0-3] 熊市闸门: BEAR市场暂停买入<br>
 [P1-1] 弱势门槛: score>=35 → >=50统一门槛 + MA60下行不买<br>
 [P1-2] 时间止损: 持仓>15天且浮盈<3%自动卖出<br>
-[P1-3] 动态仓位: 震荡市10分仓(原7分仓)<br>
-[P1-4] 阶梯止盈: 12%回落3%止盈 + 20%回落5%止盈<br>
 [P2-1] N因子增强: 加120日新高维度<br>
-[P2-2] S因子对齐: 满分20→10 对齐实盘<br>
-[P2-3] Composite增强: 加量价维度
+[P2-3] Composite增强: 加量价维度<br>
+<b>回退的过度激进部分:</b><br>
+[P0-1 回退] P因子: 恢复 V1 均值回归逻辑(RSI 30-50超卖 + MA20回踩)，仅保留 MACD 金叉作为额外确认(+3分)<br>
+[P1-3 回退] 动态仓位: 震荡市恢复 7 分仓(原 V2 的 10 分仓减少 30% 资金部署)<br>
+[P1-4 回退] 阶梯止盈: 放宽至 15%回落5% / 25%回落7%(原 V2 的 12%/3% 太紧)<br>
+[P2-2 回退] S因子满分: 恢复 20(原 V2 的10分削弱了供需因子区分度)
 </div>
 
 <h2>组合绩效对比</h2>
@@ -1426,6 +1439,12 @@ def run():
     logger.info("=" * 60)
     portfolio_v3 = run_portfolio_backtest(data_dict, precomputed, version="v3")
 
+    # ===== V3+ 最优方案回测(V2因子增强 + V4参数 + 重做时间止损) =====
+    logger.info("\n" + "=" * 60)
+    logger.info("  V3+ 最优方案回测(V2因子N/L/CAI增强 + SL15/P5/F3 + 25d时间止损)")
+    logger.info("=" * 60)
+    portfolio_v3plus = run_portfolio_backtest(data_dict, precomputed, version="v3plus")
+
     # ===== 生成V1 vs V2对比报告(V2因子指标=V3因子指标) =====
     html = generate_comparison_html(
         canslim_v1, canslim_v2,
@@ -1439,15 +1458,15 @@ def run():
 
     elapsed = time.time() - total_start
     print(f"\n{'=' * 78}")
-    print(f"  [OK] V1/V2/V3 对比回测完成! 耗时: {elapsed:.1f}秒")
+    print(f"  [OK] V1/V2/V3/V3+ 对比回测完成! 耗时: {elapsed:.1f}秒")
     print(f"  HTML报告(V1 vs V2因子): {report_path}")
 
-    # ===== 三版本组合绩效对比 =====
+    # ===== 四版本组合绩效对比 =====
     print(f"\n{'━' * 78}")
-    print(f"  组合绩效三版本对比")
+    print(f"  组合绩效四版本对比")
     print(f"{'━' * 78}")
-    print(f"  {'指标':<16} {'V1(基线)':>14} {'V2(V2因子+激进组合)':>20} {'V3(V1因子+熊市闸门)':>20}")
-    print(f"  {'-' * 72}")
+    print(f"  {'指标':<12} {'V1(基线)':>12} {'V2(废弃)':>12} {'V3(闸门)':>12} {'V3+(最优)':>12}")
+    print(f"  {'-' * 64}")
     for label, key, fmt, suffix in [
         ("总收益", "total_return", "+.2f", "%"),
         ("年化收益", "annual_return", "+.2f", "%"),
@@ -1460,15 +1479,27 @@ def run():
         v1v = portfolio_v1[key]
         v2v = portfolio_v2[key]
         v3v = portfolio_v3[key]
+        v3pv = portfolio_v3plus[key]
         if key in ("total_return", "annual_return", "max_drawdown", "win_rate"):
             v1s = f"{v1v*100:{fmt}}{suffix}"
             v2s = f"{v2v*100:{fmt}}{suffix}"
             v3s = f"{v3v*100:{fmt}}{suffix}"
+            v3ps = f"{v3pv*100:{fmt}}{suffix}"
         else:
             v1s = f"{v1v:{fmt}}{suffix}"
             v2s = f"{v2v:{fmt}}{suffix}"
             v3s = f"{v3v:{fmt}}{suffix}"
-        print(f"  {label:<16} {v1s:>14} {v2s:>20} {v3s:>20}")
+            v3ps = f"{v3pv:{fmt}}{suffix}"
+        print(f"  {label:<12} {v1s:>12} {v2s:>12} {v3s:>12} {v3ps:>12}")
+
+    # V3+卖出原因分析
+    v3p_trades = portfolio_v3plus.get("trades", [])
+    v3p_sells = [t for t in v3p_trades if t["action"] == "sell"]
+    v3p_reasons = {}
+    for t in v3p_sells:
+        r = t.get("reason", "other")
+        v3p_reasons[r] = v3p_reasons.get(r, 0) + 1
+    print(f"\n  V3+卖出原因: {v3p_reasons}")
 
     # V3卖出原因分析
     v3_trades = portfolio_v3.get("trades", [])
@@ -1477,7 +1508,7 @@ def run():
     for t in v3_sells:
         r = t.get("reason", "other")
         v3_reasons[r] = v3_reasons.get(r, 0) + 1
-    print(f"\n  V3卖出原因: {v3_reasons}")
+    print(f"  V3卖出原因: {v3_reasons}")
 
     # ===== V4 参数优化扫描(V3基础上测试止损/仓位/频率组合) =====
     print(f"\n{'━' * 78}")
@@ -1558,22 +1589,26 @@ def run():
 
     import json
     v3_json_path = os.path.join(config.OUTPUT_DIR, "canslim_backtest_v3_summary.json")
+    _metrics_keys = ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]
     with open(v3_json_path, "w", encoding="utf-8") as f:
         json.dump(_to_native({
-            "v1": {k: portfolio_v1[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
-            "v2": {k: portfolio_v2[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
-            "v3": {k: portfolio_v3[k] for k in ["total_return","annual_return","max_drawdown","sharpe","win_rate","profit_factor","total_trades","avg_win","avg_loss"]},
+            "v1": {k: portfolio_v1[k] for k in _metrics_keys},
+            "v2": {k: portfolio_v2[k] for k in _metrics_keys},
+            "v3": {k: portfolio_v3[k] for k in _metrics_keys},
+            "v3plus": {k: portfolio_v3plus[k] for k in _metrics_keys},
             "v3_sell_reasons": v3_reasons,
+            "v3plus_sell_reasons": v3p_reasons,
             "v4_sweep": sweep_results,
             "v4_best": best,
         }), f, ensure_ascii=False, indent=2)
-    print(f"  V3 JSON: {v3_json_path}")
+    print(f"  V3/V3+ JSON: {v3_json_path}")
     print(f"{'=' * 78}")
 
     return {
         "v1": {"canslim": canslim_v1, "composite": composite_v1, "portfolio": portfolio_v1},
         "v2": {"canslim": canslim_v2, "composite": composite_v2, "portfolio": portfolio_v2},
         "v3": {"portfolio": portfolio_v3},
+        "v3plus": {"portfolio": portfolio_v3plus},
         "report_path": report_path
     }
 

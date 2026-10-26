@@ -251,13 +251,13 @@ class TestRiskControlDeep:
         assert cooling is True, "卖出后应在冷却期"
 
     def test_sell_order_not_blocked(self):
-        """卖出订单不应被拦截"""
+        """持仓充足的卖出订单不应被拦截"""
         from risk.risk_control import pre_trade_check_orders
         orders = [{"方向": "卖出", "证券代码": "002371", "证券名称": "测试股",
                     "触发价": 50.0, "数量": 1000}]
-        positions = {"002371": {"market_value": 200000, "sector": "半导体"}}
+        positions = {"002371": {"market_value": 200000, "sector": "半导体", "shares": 5000}}
         blocked = pre_trade_check_orders(orders, positions, 750000)
-        assert len(blocked) == 0, "卖出单不应被拦截"
+        assert len(blocked) == 0, "持仓充足的卖出单不应被拦截"
 
 
 # ============================================================

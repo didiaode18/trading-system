@@ -31,8 +31,13 @@ import pandas as pd
 
 # 确保项目根目录在sys.path中
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT_ROOT)
-
+# FIX(P0-01): 恢复仓库根目录注入——脚本模式下 __init__.py 不执行，
+# 而 output/ 包（condition_sheet/daily_digest 等）位于仓库根目录，缺失会导致启动即崩
+REPO_ROOT = os.path.dirname(PROJECT_ROOT)
+for _p in (PROJECT_ROOT, REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+del _p
 import config
 from data.data_loader import init_db, batch_update_all, load_daily_data, get_all_candidate_codes
 # FIX: 清理死代码无用 import（generate_strategy_signal / notify_risk_alert /
@@ -193,13 +198,15 @@ def load_holdings() -> dict:
 
 
 def save_holdings(holdings: dict):
-    """保存持仓数据（原子写 + 异常降级，防止进程中断导致 holdings.json 截断）"""
+    """保存持仓数据（原子写 + 文件锁 + 异常降级，防止进程中断/并发导致 holdings.json 截断或 lost update）"""
     global HOLDINGS_FILE
     HOLDINGS_FILE = config.get_holdings_file()
     try:
-        from utils.file_io import atomic_json_write
-        if not atomic_json_write(HOLDINGS_FILE, holdings):
-            logger.error(f"[持仓保存] {HOLDINGS_FILE} 原子写入失败，请检查磁盘空间")
+        from utils.file_io import atomic_json_write, FileLock
+        # FIX(P0-16): 跨进程文件锁，与 scheduler 盘中巡检 / update_holdings / risk_control.sync 并发写入防丢失
+        with FileLock(HOLDINGS_FILE, timeout=8.0):
+            if not atomic_json_write(HOLDINGS_FILE, holdings):
+                logger.error(f"[持仓保存] {HOLDINGS_FILE} 原子写入失败，请检查磁盘空间")
     except ImportError:
         # 降级: utils 模块不可用时回退到直接写入
         try:
@@ -437,6 +444,9 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             logger.warning(f"  大盘状态识别异常: {e}")
 
     # ---- Step 2.6: V27 大盘系统性风险提前预警（盘后综合扫描）----
+    # FIX(P1-25): 系统性风险降仓上限——原 _new_max 计算后只打日志、从未传给下游（死代码），
+    # 提升为函数作用域变量，在 Step 6 传入 risk_check 覆盖仓位上限。
+    _systemic_position_cap = None
     if market_regime_result and not benchmark_df.empty:
         logger.info("[Step 2.6] V27 大盘系统性风险扫描...")
         try:
@@ -472,7 +482,9 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                     _cur_max = get_max_position_ratio(market_strength)
                     _new_max = 0.3 if _lvl == "force" else 0.45
                     if _new_max < _cur_max:
-                        logger.warning(f"  ⚠ 系统性风险{_lvl}级: 仓位上限从{_cur_max:.0%}降至{_new_max:.0%}")
+                        # FIX(P1-25): 接线——将系统性风险降仓上限传给 Step 6 的 risk_check
+                        _systemic_position_cap = _new_max
+                        logger.warning(f"  ⚠ 系统性风险{_lvl}级: 仓位上限从{_cur_max:.0%}降至{_new_max:.0%}（已接入风控校验）")
             else:
                 logger.info("  ✅ 系统性风险扫描正常，无异常信号")
         except Exception as e:
@@ -674,6 +686,20 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             effective_vol_scale = min(scale, _prev_vol_scale * 1.10)
         else:
             effective_vol_scale = scale
+        # FIX P1-03: 接入组合级回撤熔断（RegimeVolOverlay）——此前该模块+
+        # POSITION_OVERLAY_CONFIG 零生产消费方，10%/18% 组合回撤熔断完全不存在。
+        # 基于 journal 净值序列计算 breaker_scale 并叠加到总仓位缩放（只降不升）。
+        try:
+            from position.regime_vol_overlay import drawdown_breaker_scale
+            from strategy.trade_journal import TradeJournal as _TJ
+            _eq = _TJ().get_nav_series()
+            _brk = drawdown_breaker_scale(_eq)
+            _brk_scale = float(_brk.get("scale", 1.0))
+            if _brk.get("level") in ("warn", "trip"):
+                logger.warning(f"  [组合回撤熔断] {_brk.get('reason')} → 总仓位×{_brk_scale:.2f}")
+                effective_vol_scale = effective_vol_scale * _brk_scale
+        except Exception as _be:
+            logger.debug(f"  组合回撤熔断降级(不影响主流程，scale不变): {_be}")
         original_max = get_max_position_ratio(market_strength)
         logger.info(f"  [波动率目标] regime={vol_result['vol_regime']} | "
                     f"缩放={scale:.2f} | {vol_result['recommendation']}")
@@ -693,9 +719,12 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
             # 计算仓位
             buy_p = sig["buy_price"]
             stop_p = sig.get("stop_loss_initial", buy_p * 0.9)
+            # FIX P1-04: 补 stock_code + is_etf，激活 Kelly/ATR 历史胜率降仓与 ETF 20% 口径
+            from utils.instrument import is_etf as _is_etf
             batch = calc_first_batch(buy_p, stop_p,
                                      stock_info.get("类型", "龙头"),
-                                     config.TOTAL_CAPITAL)
+                                     config.TOTAL_CAPITAL,
+                                     is_etf=_is_etf(code), stock_code=code)
             # 风控校验
             plan = {
                 "code": code,
@@ -707,16 +736,29 @@ def run_daily_pipeline(skip_update: bool = False, report_only: bool = False):
                 "stop_loss": stop_p
             }
             risk_result = risk_check(plan, risk_state, market_strength,
-                                      vol_scale=effective_vol_scale)
+                                      vol_scale=effective_vol_scale,
+                                      systemic_position_cap=_systemic_position_cap)
             if risk_result["pass"]:
+                # FIX(P0-19): 回写风控缩股建议 adjusted_shares——原引擎判"只能买 N 股"
+                # 但下游仍按原计划股数输出，缩股结果从不被读取。
+                _adj = risk_result.get("adjusted_shares", batch["shares"])
+                if _adj is not None and 0 < _adj < batch.get("shares", 0):
+                    batch = {**batch, "shares": _adj, "risk_adjusted": True}
+                    logger.info(f"  {code} 风控缩股: {risk_result.get('warnings', '')} → {_adj}股")
                 sig["position"] = batch
                 sig["risk_level"] = risk_result["level"]
+                sig["pass_risk"] = True
                 filtered_signals.append((code, sig))
                 logger.info(f"  {code} 买入: [PASS] {batch['shares']}股 @ {buy_p}")
             else:
                 logger.warning(f"  {code} 买入: [FAIL] {risk_result['reasons']}")
+                # FIX(P0-19): FAIL 信号不再以"买入"身份进条件单表——降级为观察（buy_signal=False），
+                # 与事件日历风控降级路径一致，防止 condition_sheet 输出 shares=0 的"买入"行。
+                sig["buy_signal"] = False
+                sig["pass_risk"] = False
+                sig["risk_rejected"] = True
                 sig["signal_reason"] += f" [风控拒绝: {risk_result['reasons']}]"
-                filtered_signals.append((code, sig))  # 仍然保留，但标记为风控拒绝
+                filtered_signals.append((code, sig))  # 保留作为观察/拒绝记录，但不再触发买入输出
         else:
             filtered_signals.append((code, sig))
 

@@ -12,7 +12,7 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def calc_annual_return(total_return: float, trading_days: int) -> float:
     return (1 + total_return) ** (252 / trading_days) - 1
 
 
-def calc_max_drawdown(equity_curve: pd.Series) -> tuple:
+def calc_max_drawdown(equity_curve: pd.Series) -> Tuple[float, Optional[str], Optional[str]]:
     """
     最大回撤
     
@@ -125,7 +125,7 @@ def calc_expectancy(trades: pd.DataFrame) -> float:
 # MFE/MAE 分析
 # ============================================================
 
-def calc_mfe_mae(trades_with_extremes: pd.DataFrame) -> dict:
+def calc_mfe_mae(trades_with_extremes: pd.DataFrame) -> Dict[str, float]:
     """
     计算MFE/MAE统计
     
@@ -192,7 +192,7 @@ def calc_cvar(daily_returns: pd.Series, confidence: float = 0.95) -> float:
     return float(tail.mean())
 
 
-def calc_turnover(trades: list, daily_nav: pd.Series, trading_days: int) -> dict:
+def calc_turnover(trades: list, daily_nav: pd.Series, trading_days: int) -> Dict[str, Any]:
     """
     换手率统计
     
@@ -261,7 +261,7 @@ def calc_monthly_returns(equity_curve: pd.Series, dates: list) -> pd.DataFrame:
 # 基准对比
 # ============================================================
 
-def calc_alpha_beta(strategy_returns: pd.Series, benchmark_returns: pd.Series) -> dict:
+def calc_alpha_beta(strategy_returns: pd.Series, benchmark_returns: pd.Series) -> Dict[str, float]:
     """
     CAPM回归计算Alpha和Beta
     
@@ -277,9 +277,13 @@ def calc_alpha_beta(strategy_returns: pd.Series, benchmark_returns: pd.Series) -
     x = benchmark_returns.values[:n]
 
     # OLS回归
+    # x_with_const = [ones, x]，lstsq 返回系数顺序为 [截距, 斜率]。
+    # CAPM 中 截距=alpha(日)、斜率=beta，故必须按 alpha, beta 解包。
+    # BUGFIX(P0-1): 旧代码写成 `beta, alpha = ...` 导致二者交换，
+    #   连带 y_pred=alpha+beta*x 与年化 alpha*252 全部错位（报告 Beta≈0.001、Alpha≈258 即此因）。
     x_with_const = np.column_stack([np.ones(n), x])
     try:
-        beta, alpha = np.linalg.lstsq(x_with_const, y, rcond=None)[0]
+        alpha, beta = np.linalg.lstsq(x_with_const, y, rcond=None)[0]
     except Exception:
         return {"alpha": 0, "beta": 0, "r_squared": 0, "info_ratio": 0}
 

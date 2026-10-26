@@ -32,10 +32,9 @@ import logging
 
 import pandas as pd
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from utils.board_rules import get_limit_pct as _board_get_limit_pct
+from utils.instrument import is_etf as _is_etf_code  # FIX P2-02: ETF判定统一权威源
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -69,10 +68,19 @@ if TOTAL_CAPITAL is None or TOTAL_CAPITAL <= 0:
     )
 
 
-def _get_limit_pct_for_code(code: str) -> float:
-    """根据股票代码返回涨跌停幅度（主板10%/创业板20%/ST 5%/科创板20%）"""
+def _get_limit_pct_for_code(code: str, name: str = "") -> float:
+    """根据股票代码返回涨跌停幅度（主板10%/创业板20%/ST 5%/科创板20%）
+
+    FIX P1-17: 未显式传 name 时，从 config.get_stock_info 解析名称，
+    以正确识别主板 ST 股（±5% 而非 ±10%）。
+    """
     try:
-        return _board_get_limit_pct(code)
+        if not name:
+            try:
+                name = config.get_stock_info(code).get("名称", "") or ""
+            except Exception:
+                name = ""
+        return _board_get_limit_pct(code, name)
     except Exception:
         return LIMIT_PCT
 
@@ -388,8 +396,15 @@ def backtest_stock_v4(df: pd.DataFrame, code: str, info: dict, version: str = "v
                 else:
                     stop_price = buy_price * 1.22  # 锁定22%
 
-            # FIX B5: 用盘中最低价判定止损触发（实盘条件单是盘中实时触发，非收盘价）
-            if low <= stop_price:
+            # V11.1 P1-2: 止损确认机制（与 backtest_optimizer v6 同步）
+            #   - hard_buffer=2%: low<stop_price*(1-0.02)→立即触发防黑天鹅
+            #   - 否则需 close<stop_price 收盘确认，避免日内假破位
+            _hard_buffer = getattr(config, 'STOP_HARD_BUFFER', 0.02)
+            _stop_hard_price = stop_price * (1 - _hard_buffer)
+            if low <= _stop_hard_price:
+                sell_signal = True
+                sell_type = "止损"
+            elif close < stop_price:
                 sell_signal = True
                 sell_type = "止损"
 
@@ -669,7 +684,8 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
         if not in_position:
             # ==== 硬性过滤 ====
             # V5.2: ETF品种识别（豁免流动性和ATR过滤）
-            is_etf = code.startswith("51") or code.startswith("56") or code.startswith("15")
+            # FIX P2-02: 原前缀硬编码(51/56/15)漏判 588 科创板ETF，改用权威源 instrument.is_etf
+            is_etf = _is_etf_code(code)
 
             # 1. 流动性: 日均成交额 >= 8亿（ETF降低至2亿）
             if has_amount and i >= 20:
@@ -959,8 +975,14 @@ def backtest_stock_v5(df: pd.DataFrame, code: str, info: dict, benchmark_df: pd.
                 else:
                     stop_price = buy_price * 1.22  # 锁定22%
 
-                # FIX: 用盘中最低价判定止损触发（与V4 L322一致，实盘条件单盘中实时触发，非收盘价）
-                if low <= stop_price:
+                # V11.1 P1-2: 止损确认机制（与 v5/v6 同步）
+                _hard_buffer = getattr(config, 'STOP_HARD_BUFFER', 0.02)
+                _stop_hard_price = stop_price * (1 - _hard_buffer)
+                if low <= _stop_hard_price:
+                    sell_signal = True
+                    sell_type = "止损"
+                    sell_ratio = 1.0
+                elif close < stop_price:
                     sell_signal = True
                     sell_type = "止损"
                     sell_ratio = 1.0

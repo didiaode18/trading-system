@@ -57,17 +57,19 @@ class TestLimitUpDown:
         assert SimBroker._is_limit_down(row) is True
 
     def test_broker_no_pre_close(self):
-        """broker: 缺少pre_close时不判定涨跌停"""
+        """broker: 缺少pre_close时 fail-safe 保守拒单（FIX P1-18）"""
         from backtest.broker import SimBroker
         row = {"close": 10.0}
-        assert SimBroker._is_limit_up(row) is False
-        assert SimBroker._is_limit_down(row) is False
+        # FIX P1-18: pre_close 缺失无法确认涨跌停 → 保守判定为涨停/跌停（拒绝成交），
+        # 避免在不可成交价上产生乐观回测收益。data_feed 正常会补齐 pre_close。
+        assert SimBroker._is_limit_up(row) is True
+        assert SimBroker._is_limit_down(row) is True
 
     def test_broker_zero_pre_close(self):
-        """broker: pre_close=0时不判定（防除零）"""
+        """broker: pre_close=0时 fail-safe 保守拒单（FIX P1-18，防除零）"""
         from backtest.broker import SimBroker
         row = {"pre_close": 0, "close": 11.0}
-        assert SimBroker._is_limit_up(row) is False
+        assert SimBroker._is_limit_up(row) is True
 
     def test_broker_gemm_20pct_not_recognized(self):
         """BUG验证: broker不区分创业板20%涨跌幅，19.5%即被误判为涨停"""

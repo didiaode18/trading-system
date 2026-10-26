@@ -45,8 +45,6 @@ import json
 import logging
 import datetime
 import math
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -61,6 +59,11 @@ try:
     from data.realtime import fetch_realtime_batch, fetch_index_realtime
 except (ImportError, ValueError):
     from ..data.realtime import fetch_realtime_batch, fetch_index_realtime
+
+# FIX P0(2026-10-09): is_etf 提升至模块级导入——原仅在 get_ma5_trend() 内局部导入，
+# 导致 generate_decision_report() 风控预检分支(line~570)引用 NameError，
+# 600887/603099 等标的全天风控预检 fail-safe 降级为"持有观察"。
+from utils.instrument import is_etf
 
 
 # ============================================================
@@ -132,8 +135,6 @@ def get_ma5_trend(codes: list) -> dict:
 
     for code in codes:
         try:
-            # V8.2: 统一品种判定
-            from utils.instrument import is_etf
             if is_etf(code):
                 df = ak.fund_etf_hist_em(symbol=code, period="daily",
                                          start_date=start_date, end_date=end_date,
@@ -548,11 +549,30 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
                     logger.info(f"[盘中决策] {d['code']} 仓位引擎输出0股，" 
                                 "决策由'可以加仓'降级为'持有观察'")
                     continue
+                _rc_stop = _ap.get("new_stop") or d["price"] * 0.95
+                # FIX(P0-13): 补真实盈亏比——原硬编码 risk_reward=0 会无条件绕过
+                # 盈亏比≥2.5 门槛。用近期日线高点作为上行目标(resistance)，连同止损位
+                # 交给风控引擎推算盈亏比；无法推算时引擎 fail-safe 拦截（宁缺毋滥）。
+                _rc_target = 0.0
+                try:
+                    from data.data_loader import fetch_stock_daily
+                    _rr_start = (datetime.date.today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+                    _rr_df = fetch_stock_daily(d["code"], start_date=_rr_start)
+                    # FIX P1-16: 陈旧数据（DB兜底）不得用于推算盈亏比目标价；
+                    # _rc_target 保持 0.0 → quick_risk_check fail-safe 拦截（宁缺毋滥）。
+                    if (_rr_df is not None and len(_rr_df) >= 5 and "high" in _rr_df.columns
+                            and not getattr(_rr_df, "attrs", {}).get("is_stale")):
+                        _rc_target = float(_rr_df["high"].iloc[-60:].max())
+                except Exception as _e:
+                    logger.debug(f"[盘中决策] {d['code']} 盈亏比目标价获取失败: {_e}")
                 _rc = quick_risk_check({
                     "code": d["code"], "name": d["name"], "price": d["price"],
                     "shares": _add_shares, "sector": d.get("sector", ""),
-                    "type": "stock",
-                    "stop_loss": _ap.get("new_stop") or d["price"] * 0.95,
+                    # FIX P2-02: 品种类型改用权威源 instrument.is_etf，避免 ETF 被
+                    # 误判为 stock 后按 15%（而非 20%）上限误报超限。
+                    "type": "etf" if is_etf(d["code"]) else "stock",
+                    "stop_loss": _rc_stop,
+                    "target": _rc_target,
                     "risk_reward": 0,
                 }, holdings)
                 if not _rc.get("pass", True):
@@ -569,7 +589,17 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
                     }
                     logger.warning(f"[盘中决策] {d['code']} 风控预检未通过({_veto_reason})，"
                                    f"决策由'可以加仓'降级为'持有观察'")
-            except Exception:
+            except Exception as _e:
+                # FIX(P1-24): fail-safe —— 风控预检异常时不再 fail-open（原 `continue` 会保留
+                # "可以加仓"），而是降级为"持有观察"并标记 risk_veto，避免输出未经风控的加仓建议。
+                d["decision"] = "持有观察"
+                d["decision_icon"] = "👀"
+                d["risk_veto"] = {
+                    "reason": f"风控预检异常(fail-safe降级): {_e}",
+                    "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "original_decision": "可以加仓",
+                }
+                logger.warning(f"[盘中决策] {d['code']} 风控预检异常，fail-safe 降级为持有观察: {_e}")
                 continue
     except Exception as e:
         logger.warning(f"[盘中决策] 风控预检异常(不影响报告): {e}")
@@ -585,6 +615,11 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
             for d in decisions:
                 if d["decision"] not in ("持有观察", "禁止加仓"):
                     continue  # 仅对非紧急标的检查回调加仓
+                # FIX(P0-20): 候选集排除 risk_veto 标的——被风控否决而从"可以加仓"降级为
+                # "持有观察"的标的，不得再被回调加仓扫描重新升级为"回调加仓"（反转风控否决，
+                # 与"任何浮亏绝对禁止加仓"铁律直接冲突）。
+                if d.get("risk_veto"):
+                    continue
                 code = d["code"]
                 try:
                     # 获取日K线数据
@@ -592,6 +627,12 @@ def generate_decision_report(send_email_flag: bool = True) -> dict:
                     _start = (datetime.date.today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
                     df = fetch_stock_daily(code, start_date=_start)
                     if df is None or len(df) < 25:
+                        continue
+                    # FIX P1-16: 数据源全挂时回退到本地 DB 的陈旧数据不得据此
+                    # 生成加仓信号（避免用过期价格下单）。
+                    if getattr(df, "attrs", {}).get("is_stale"):
+                        logger.warning(f"[盘中决策] {code} 回调加仓数据陈旧(DB兜底,"
+                                       f"data_date={df.attrs.get('data_date')})，跳过不生成加仓信号")
                         continue
                     # 计算所需指标
                     from strategy.trend_strategy import compute_indicators

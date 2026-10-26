@@ -24,7 +24,6 @@ from multiprocessing import Pool, cpu_count
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 # FIX: 双模式导入，支持 backtest 与 trading_system.backtest 两种包路径
@@ -110,7 +109,14 @@ def default_strategy(date: str, feed: DataFeed, broker: SimBroker) -> list:
 
             if buy_price > 0:
                 stock_type = config.get_stock_info(code).get("类型", "龙头")
-                batch = calc_first_batch(buy_price, stop_loss, stock_type, broker.initial_capital)
+                # FIX P1-04: 回测仅补 is_etf（按代码静态判定，无未来函数），修正
+                # ETF 应按 20% 而非 15% 算仓。故意不传 stock_code：
+                # calc_first_batch 的 Kelly 胜率读“实盘 trade_journal.db”、ATR 读
+                # get_stock_data(days=60) 最新数据，均非日期切片 → 回测传入会泄露未来。
+                from utils.instrument import is_etf as _is_etf
+                batch = calc_first_batch(buy_price, stop_loss, stock_type,
+                                         broker.initial_capital,
+                                         is_etf=_is_etf(code))
                 if batch.get("pass_risk") and batch.get("shares", 0) > 0:
                     orders.append(Order(
                         code=code,
@@ -349,7 +355,13 @@ class BacktestEngineV2:
                     # 跌停无法卖出：按跌停价估值，记录为末日未平仓（板块差异化）
                     if bar.get("pre_close", 0) > 0:
                         try:
-                            limit_pct = _board_get_limit_pct(code)
+                            # FIX P1-17: 传 name 以正确识别主板 ST（±5% 而非 ±10%）
+                            _nm = ""
+                            try:
+                                _nm = config.get_stock_info(code).get("名称", "") or ""
+                            except Exception:
+                                _nm = ""
+                            limit_pct = _board_get_limit_pct(code, _nm)
                         except Exception:
                             limit_pct = 0.10
                         limit_down_price = round(bar["pre_close"] * (1 - limit_pct), 2)

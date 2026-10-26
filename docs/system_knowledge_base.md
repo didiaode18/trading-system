@@ -1,6 +1,8 @@
 # 操盘密码 V10.0 系统设计知识库
 
-> 版本: V10.0+V6.0 | 最后同步日期: 2026-09-21 | 对应代码版本: 操盘密码 V10.0 + CANSLIM选股V6.0 | 基于代码实际实现编写
+> 版本: V10.0+V6.0 | 最后同步日期: 2026-10-11 | 对应代码版本: 操盘密码 V10.0 + CANSLIM选股V6.0 | 基于代码实际实现编写
+> 2026-10-11: P1 CS-07估值门成长股豁免 + P2 CS-06 eps_growth_3y错误映射修复 + P2 CS-17止损注释对齐 + P1 CS-15/16优先级提升
+> 2026-10-10: P0成本交叉验证修复 + P0可用资金修复 + P1技术指标数据源统一 + P1股票名称显示修复
 > 2026-09-21: P0-A状态防抖 + P0-D熔断约束 + P0-C ActionPlanner集成 + P1-A极端应急 + P1-G仓位对齐 + P2-A宽度改进
 > P1-4: intraday_monitor 拆分出 intraday_patterns + market_gate 模块
 > P1-3: quant/factors 因子计算统一委托给 factors/quant_factors（单一数据源）
@@ -328,6 +330,66 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 > `M_FACTOR_FLEXIBLE_ENABLED`, `M_FACTOR_DOWN_POSITION_LIMIT`, `BUY_SCORE_BREADTH_ADJUST_ENABLED`, `CAI_MULTI_PROXY_ENABLED`, `V_FACTOR_ENABLED`, `V_FACTOR_WEIGHT`, `IC_IR_WEIGHT_ENABLED`, `SCREENER_MAX_DRAWDOWN_WEAK`, `SCREENER_MAX_60D_DECLINE_WEAK`
 >
 > **新增脚本**：`scripts/compare_screener_versions.py` — V6.0改进版 vs V5.2基线版选股对比测试工具
+
+### 3.10 综合报告与选股报告数据准确性修复（2026-10-09/10）
+
+针对2026-10-09生成的综合分析报告和CANSLIM选股报告的数据准确性全面审计，发现并修复了3类典型Bug：
+
+#### P0级修复
+
+| 编号 | 问题 | 根因 | 修复方案 | 修改文件 |
+|------|------|------|----------|----------|
+| P0-成本 | 4只持仓成本价被交叉验证篡改（偏差1.0%-5.4%） | `generate_holdings_report.py` L1637-1651 用实时价(tencent)反推隐含成本，但broker_pnl基于JSON快照时价格，跨日价格错配 | 改用 `json_current_price`（与broker_pnl同时间口径）替代实时价 `latest` | `output/generate_holdings_report.py` L1637-1651 |
+| P0-资金 | 可用资金显示¥6,069/¥7,899（实际¥30.50） | L303/L800 用 `TOTAL_CAPITAL - 实时市值` 推算，完全绕过 `config.AVAILABLE_CASH` | 改为直接读取 `config.AVAILABLE_CASH` | `output/generate_holdings_report.py` L304-306, L800-801 |
+
+#### P1级修复
+
+| 编号 | 问题 | 根因 | 修复方案 | 修改文件 |
+|------|------|------|----------|----------|
+| P1-指标 | 603345 MACD_DIF偏差93%、RSI偏差8.3% | 实时价(tencent)与历史K线(baostock)收盘价不同源，双数据源复权算法/精度差异 | 将实时价追加/替换到历史K线后再统一计算指标，消除双源偏差 | `output/generate_holdings_report.py` L1336-1360 |
+| P1-名称 | 选股报告7只股票名称显示为代码 | `config.get_stock_info()` 仅查STOCK_POOL+SECTOR_CANDIDATES，未命中时返回代码作名称 | 升级为四级回退链: STOCK_POOL→SECTOR_CANDIDATES→baostock动态查询→_FALLBACK_NAME_CACHE | `trading_system/config.py` L889-960 |
+
+#### 数据流修复后状态
+
+```
+成本价流程: holdings.json.buy_price → 交叉验证(json快照价同口径) → 报告展示
+可用资金流程: config.AVAILABLE_CASH → 直接读取 → 报告展示（不再推算）
+技术指标流程: baostock历史K线 + 实时价(tencent)合并 → compute_indicators() → analyze_technical()
+股票名称流程: config.get_stock_info() → 四级回退链 → 报告展示
+```
+
+### 3.11 《笑傲股市》CANSLIM系统提升实施路线图（2026-10-11评审）
+
+基于《笑傲股市（How to Make Money in Stocks）》原书第4版的36张任务卡实施计划，经架构师评审后调整如下：
+
+#### 已完成的修复（本轮）
+
+| 卡片 | 内容 | 状态 |
+|------|------|------|
+| CS-07 | 估值门PE百分位成长股豁免机制 | ✅ 已实施（C/A双达标时豁免PE>80%硬拦截） |
+| CS-06 | fundamental.py eps_growth_3y错误映射修复 | ✅ 已实施（禁止用营收增速近似3年EPS复合增速） |
+| CS-17 | 止损默认值注释对齐原著-8%兆底 | ✅ 注释已标注，代码实施待回测验证 |
+
+#### 实施阶段规划
+
+| Phase | 任务卡 | 阶段目标 | 预计工期 |
+|-------|--------|---------|--------|
+| **Phase 0** | BUG-001/072/013/016/基线#1 | 地基修复（复权/PIT/未来函数/regime） | 3-5天 |
+| **Phase 1** | CS-05/06/08/10 + CS-07(已完成) | CANSLIM核心因子对齐原著 | 5-7天 |
+| **Phase 2** | CS-02/03/04/17/20 | 买卖点体系重构（形态+枢轴+止损） | 7-10天 |
+| **Phase 3** | **CS-15/16**(★升P1)、CS-18/19/21 | 大盘门控+卖出纪律 | 5-7天 |
+| **Phase 4** | CS-11/12/13/14/22/26 | 行业/机构维度补齐 | 5-7天 |
+| **Phase 5** | CS-24/28/29/30/35/36 | 门禁/统计/文档闭环 | 5-7天 |
+
+#### 优先级调整（评审建议）
+
+| 调整 | 卡片 | 理由 |
+|------|------|------|
+| P2→**P1** | CS-15, CS-16 | M大盘方向是CANSLIM前提，无M门控则熊市买卖点全部失效 |
+| P2→**P1** | CS-10 | RS评级是CS-11/CS-26的前置，且本身对选股质量提升巨大 |
+| P2→P3 | CS-09 | NLP事件提取投入大、A股公告格式不统一、收益不确定 |
+| P3→砍掉 | CS-27 | 行业生命周期量化困难、A股政策驱动难建模 |
+| P3→P3后段 | CS-25 | 牛股模型库投入大但A股本土化效果不确定 |
 
 ---
 
@@ -808,3 +870,15 @@ V3.2升级后，选股体系从"双引擎"升级为"三引擎并行"：
 > - 新增数据源本地DB兜底（data_loader.py P2-4）
 > - 新增因子正交化去多重共线性（P2-1）
 > - 新增 compare_screener_versions.py 版本对比测试脚本
+>
+> V6.0+更新记录（2026-10-10）：
+> - 新增 3.10 综合报告与选股报告数据准确性修复（P0成本交叉验证+P0可用资金+P1技术指标数据源+P1股票名称）
+> - 更新 config.get_stock_info()/get_stock_name() 为四级回退链（含baostock动态查询+兜底缓存）
+> - 更新 generate_holdings_report.py 成本验证/可用资金/技术指标三处数据流修复
+>
+> V6.0+更新记录（2026-10-11）：
+> - 新增 3.11 《笑傲股市》CANSLIM系统提升实施路线图（5 Phase + 优先级调整）
+> - 修复 CS-07: 估值门新增`_check_growth_qualification()`成长股豁免（C/A双达标时PE>80%放行）
+> - 修复 CS-06: `fundamental.py` eps_growth_3y禁止用营收增速近似，无数据时返回None
+> - 标注 CS-17: 止损15%与原著-8%差距注释，代码实施待回测
+> - 提升 CS-15/16 优先级 P2→P1（M大盘门控为CANSLIM前提）

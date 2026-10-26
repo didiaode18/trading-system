@@ -922,21 +922,37 @@ class AlertEngine:
                     sizing_method_r18 = _sizing_r18.get("method", "")
                 except Exception:
                     add_shares, new_stop, sizing_method_r18 = 0, close * 0.95, "引擎异常降级"
-                # FIX P2-12: 加仓建议过风控预检，不通过则不输出（异常时降级放行不阻断）
+                # FIX P2-12: 加仓建议过风控预检，不通过则不输出
                 risk_ok_r18 = True
                 try:
                     from risk.risk_control import quick_risk_check
+                    from utils.instrument import is_etf as _is_etf_code
+                    # FIX(P0-13): 补真实盈亏比——原硬编码 risk_reward=0 会无条件绕过
+                    # 盈亏比≥2.5 门槛。用 R18 上下文已有的日线 df_r18 近期高点作为上行目标，
+                    # 不新增任何网络调用；无法推算时引擎 fail-safe 拦截（宁缺毋滥）。
+                    _target_r18 = 0.0
+                    try:
+                        if df_r18 is not None and "high" in df_r18.columns and len(df_r18) >= 5:
+                            _target_r18 = float(df_r18["high"].iloc[-60:].max())
+                    except Exception:
+                        _target_r18 = 0.0
                     _rc_r18 = quick_risk_check({
                         "code": code, "name": name, "price": close, "shares": add_shares,
-                        "sector": info_r18.get("sector", ""), "type": "stock",
-                        "stop_loss": new_stop, "risk_reward": 0,
+                        # FIX P2-02: 品种类型改用权威源 instrument.is_etf（避免 ETF
+                        # 被硬编码为 stock 后按 15% 上限误报超限）。
+                        "sector": info_r18.get("sector", ""),
+                        "type": "etf" if _is_etf_code(code) else "stock",
+                        "stop_loss": new_stop, "target": _target_r18, "risk_reward": 0,
                     }, self.holdings)
                     if not _rc_r18.get("pass", True):
                         risk_ok_r18 = False
                         logger.info(f"[R18] {name}({code}) 加仓提醒被风控预检拦截: "
                                     f"{_rc_r18.get('reason', '')}")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    # FIX(P1-24): fail-safe —— 风控预检异常时不再 fail-open（原 `pass` 使
+                    # risk_ok_r18 保持 True → 输出未经风控的加仓建议），改判为不通过。
+                    risk_ok_r18 = False
+                    logger.warning(f"[R18] {name}({code}) 风控预检异常，fail-safe 不输出加仓提醒: {_e}")
                 if not risk_ok_r18:
                     return alerts
                 # V3.4: R18每日每标的去重（防邮件轰炸，仅查询不写入，发送成功后登记）

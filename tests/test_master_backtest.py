@@ -255,11 +255,11 @@ class TestWFParamsUsed:
 class TestWFWindowCoverage:
     """验证 WF 窗口覆盖 > 70% 数据（FIX G2-P0）。"""
 
-    def test_default_max_windows_is_20(self):
-        """max_windows 默认值从 10 提升到 20。"""
+    def test_default_max_windows_is_15(self):
+        """V11.1 P0-1: max_windows 从 20 调整为 15（训练窗扩大后总窗口数下降）。"""
         from backtest.walk_forward import WalkForwardAnalyzer
         wf = WalkForwardAnalyzer()
-        assert wf.max_windows == 20
+        assert wf.max_windows == 15
 
     def test_window_coverage_exceeds_70pct(self):
         """20 窗口 × step=60 覆盖 > 70% 日期（合成 500 天数据）。"""
@@ -631,6 +631,271 @@ class TestV7SignalFactors:
         trades = backtest_stock_v6(df, "000001", info, params)
         # 只要不崩溃即可，因子加分被 cap 到 20
         assert isinstance(trades, list)
+
+
+# ------------------------------------------------------------------
+# 策略优化实施路线图_V1 · P0-1 calc_alpha_beta 解包 bug 回归
+# ------------------------------------------------------------------
+class TestCalcAlphaBeta:
+    """P0-1: 旧代码 `beta, alpha = lstsq(...)` 解包顺序错误导致二者交换。
+
+    验收（路线图明确要求）：构造 y=0.001+1.02*x+噪声，断言 beta≈1.02、
+    年化 alpha≈0.001*252。
+    """
+
+    def test_beta_and_alpha_recovered(self):
+        from backtest.metrics import calc_alpha_beta
+        rng = np.random.default_rng(0)
+        n = 300
+        x = pd.Series(rng.normal(0.0005, 0.01, n))
+        y = pd.Series(0.001 + 1.02 * x.values + rng.normal(0, 0.0005, n))
+        r = calc_alpha_beta(y, x)
+        assert abs(r["beta"] - 1.02) < 0.05, f"beta 应≈1.02，实际 {r['beta']}"
+        # 年化 alpha ≈ 0.001 * 252 = 0.252
+        assert abs(r["alpha"] - 0.252) < 0.10, f"年化alpha 应≈0.252，实际 {r['alpha']}"
+        assert r["r_squared"] > 0.9
+
+    def test_short_series_returns_zero(self):
+        from backtest.metrics import calc_alpha_beta
+        r = calc_alpha_beta(pd.Series([0.01] * 5), pd.Series([0.01] * 5))
+        assert r == {"alpha": 0, "beta": 0, "r_squared": 0, "info_ratio": 0}
+
+
+# ------------------------------------------------------------------
+# P0-2 主动成交口径日收益 + pooled/median OOS 夏普
+# ------------------------------------------------------------------
+class TestActiveStrategyReturns:
+    """P0-2: active_strategy_daily_returns 按 sell_date 归集、按 position_ratio 折算。"""
+
+    def test_bucket_by_sell_date_and_position_ratio(self):
+        trades = [
+            {"net_profit": 4.0, "sell_date": "2023-01-10"},
+            {"net_profit": 2.0, "sell_date": "2023-01-10"},   # 同日归集
+            {"net_profit": -3.0, "sell_date": "2023-01-11"},
+        ]
+        s = master_common.active_strategy_daily_returns(trades, position_ratio=0.5)
+        assert list(s.index) == ["2023-01-10", "2023-01-11"]
+        # 01-10: (4+2)/100*0.5=0.03 ; 01-11: -3/100*0.5=-0.015
+        assert np.isclose(s.iloc[0], 0.03)
+        assert np.isclose(s.iloc[1], -0.015)
+
+    def test_empty_trades_returns_empty_series(self):
+        s = master_common.active_strategy_daily_returns([])
+        assert len(s) == 0
+
+    def test_summarize_active_strategy_basis(self):
+        trades = [{"net_profit": float(i), "sell_date": f"2023-01-{10 + i:02d}"}
+                  for i in range(1, 8)]
+        summ = master_common.summarize_active_strategy(trades, position_ratio=1.0)
+        assert summ.get("basis") == "active_trades"
+        assert summ["n_trades"] == 7
+        assert summ["status"] == "ok"
+
+
+class TestWFPooledMedianOOS:
+    """P0-2: _summarize 输出 pooled/median 稳健 OOS 夏普口径。"""
+
+    def _mk_results(self):
+        res = []
+        for sh in (1.2, -3.0, 0.8):   # 含一个灾难窗，验证 median 抗极端
+            res.append({
+                "test_trades": 10, "test_sharpe": sh, "test_return": 5.0,
+                "test_win_rate": 55.0, "test_max_dd": 8.0,
+                "test_trade_rets": [0.01, 0.02, -0.005, 0.015],
+                "test_avg_hold": 5.0, "train_sharpe": 1.0,
+                "best_params": {"initial_stop_loss": 0.06},
+            })
+        res.append({   # 无成交窗（无效样本）
+            "test_trades": 0, "test_sharpe": 0.0, "test_return": 0.0,
+            "test_win_rate": 0.0, "test_max_dd": 0.0, "test_trade_rets": [],
+            "test_avg_hold": 5.0, "train_sharpe": 1.0,
+            "best_params": {"initial_stop_loss": 0.06},
+        })
+        return res
+
+    def test_pooled_and_median_present(self):
+        from backtest.walk_forward import WalkForwardAnalyzer
+        wf = WalkForwardAnalyzer()
+        summ = wf._summarize(self._mk_results())
+        assert summ["num_valid_windows"] == 3
+        assert summ["oos_sharpe_pooled"] is not None
+        # median 抗极端：中位数=0.8，mean=(1.2-3.0+0.8)/3≈-0.33
+        assert summ["oos_sharpe_median"] == 0.8
+        assert summ["oos_sharpe"] < summ["oos_sharpe_median"]
+
+    def test_all_invalid_windows_returns_none(self):
+        from backtest.walk_forward import WalkForwardAnalyzer
+        wf = WalkForwardAnalyzer()
+        res = [{"test_trades": 0, "test_sharpe": 0.0, "test_return": 0.0,
+                "test_win_rate": 0.0, "test_max_dd": 0.0, "test_trade_rets": [],
+                "test_avg_hold": 5.0, "train_sharpe": 1.0,
+                "best_params": {"initial_stop_loss": 0.06}}]
+        summ = wf._summarize(res)
+        assert summ["num_valid_windows"] == 0
+        assert summ["oos_sharpe"] is None
+        assert summ["oos_sharpe_pooled"] is None
+        assert summ["oos_sharpe_median"] is None
+
+
+# ------------------------------------------------------------------
+# P0-3 训练集成交数下限惩罚
+# ------------------------------------------------------------------
+class TestTradeCountPenalty:
+    """P0-3: 低成交高夏普组合被线性降权，杜绝 1-2 笔交易撑起虚高夏普被选为最优。"""
+
+    _REPORTS = {
+        0.06: {"expectancy": 0.05, "total_trades": 2, "win_rate": 50.0},
+        0.08: {"expectancy": 0.01, "total_trades": 20, "win_rate": 50.0},
+    }
+
+    def _make_wf(self, min_train_trades):
+        from backtest.walk_forward import WalkForwardAnalyzer
+        wf = WalkForwardAnalyzer(param_grid={"initial_stop_loss": [0.06, 0.08]})
+        wf.reg_lambda = 0.0        # 隔离正则化，单独验证成交数惩罚
+        wf.train_cap_steps = 0     # 关闭门槛上界过滤
+        wf.min_train_trades = min_train_trades
+        return wf
+
+    def _run(self, wf):
+        from unittest.mock import patch
+
+        def fake_run(data_dict, codes, s, e, params, regime_adj=0.0):
+            return dict(self._REPORTS[params["initial_stop_loss"]])
+
+        with patch.object(wf, "_run_v5_backtest", side_effect=fake_run):
+            best, _ = wf._optimize_on_train_v5(
+                {}, ["600000"], "2023-01-01", "2023-06-30")
+        return best
+
+    def test_low_trade_combo_penalized(self):
+        # 惩罚后 0.06(2笔) 被降权 → 选 0.08(20笔)
+        assert self._run(self._make_wf(10))["initial_stop_loss"] == 0.08
+
+    def test_no_penalty_when_disabled(self):
+        # 关闭惩罚(min_train_trades=0) → 高期望的 0.06 胜出
+        assert self._run(self._make_wf(0))["initial_stop_loss"] == 0.06
+
+
+# ------------------------------------------------------------------
+# P2-2 PBO / CSCV 过拟合概率
+# ------------------------------------------------------------------
+class TestComputePBO:
+    def test_not_2d_insufficient(self):
+        from backtest.deflated_sharpe import compute_pbo
+        assert compute_pbo([1.0, 2.0, 3.0])["status"] == "insufficient"
+
+    def test_single_config_insufficient(self):
+        from backtest.deflated_sharpe import compute_pbo
+        r = compute_pbo(np.random.default_rng(0).normal(0, 0.01, (100, 1)))
+        assert r["status"] == "insufficient" and r["pbo"] is None
+
+    def test_short_periods_insufficient(self):
+        from backtest.deflated_sharpe import compute_pbo
+        assert compute_pbo(np.random.default_rng(0).normal(0, 0.01, (5, 4)))["status"] == "insufficient"
+
+    def test_stable_config_low_pbo(self):
+        """一列持续正漂移（样本内外都最优）→ PBO 应显著 < 0.5。"""
+        from backtest.deflated_sharpe import compute_pbo
+        rng = np.random.default_rng(7)
+        T, N = 200, 6
+        M = rng.normal(0.0, 0.01, (T, N))
+        M[:, 0] += 0.004
+        r = compute_pbo(M)
+        assert r["status"] == "ok"
+        assert r["n_configs"] == N
+        assert r["pbo"] is not None and r["pbo"] < 0.5, f"稳定配置 PBO 应<0.5，实际 {r['pbo']}"
+
+    def test_facade_method_forwards(self):
+        from backtest.deflated_sharpe import DeflatedSharpe
+        rng = np.random.default_rng(1)
+        M = rng.normal(0.0, 0.01, (120, 4))
+        M[:, 0] += 0.003
+        assert DeflatedSharpe().compute_pbo(M)["status"] == "ok"
+
+
+# ------------------------------------------------------------------
+# P2-1 组合级回撤熔断（纯函数）
+# ------------------------------------------------------------------
+_CB_CFG = {"enabled": True, "warn_drawdown": 0.10, "warn_scale": 0.6,
+           "trip_drawdown": 0.18, "trip_scale": 0.0, "cooldown_days": 5}
+
+
+class TestDrawdownBreaker:
+    def test_normal(self):
+        from position.regime_vol_overlay import drawdown_breaker_scale
+        r = drawdown_breaker_scale(list(np.linspace(1.0, 1.2, 60)), _CB_CFG)
+        assert r["level"] == "normal" and r["scale"] == 1.0 and r["tripped"] is False
+
+    def test_warn(self):
+        from position.regime_vol_overlay import drawdown_breaker_scale
+        eq = list(np.concatenate([np.linspace(1.0, 1.2, 40), np.linspace(1.2, 1.06, 20)]))
+        r = drawdown_breaker_scale(eq, _CB_CFG)   # dd=(1.2-1.06)/1.2≈0.1167
+        assert r["level"] == "warn" and r["scale"] == 0.6
+
+    def test_trip(self):
+        from position.regime_vol_overlay import drawdown_breaker_scale
+        eq = list(np.concatenate([np.linspace(1.0, 1.2, 40), np.linspace(1.2, 0.95, 20)]))
+        r = drawdown_breaker_scale(eq, _CB_CFG)   # dd=(1.2-0.95)/1.2≈0.2083
+        assert r["level"] == "trip" and r["scale"] == 0.0 and r["tripped"] is True
+
+    def test_disabled(self):
+        from position.regime_vol_overlay import drawdown_breaker_scale
+        r = drawdown_breaker_scale([1.0, 0.5], {"enabled": False})
+        assert r["level"] == "disabled" and r["scale"] == 1.0
+
+    def test_insufficient(self):
+        from position.regime_vol_overlay import drawdown_breaker_scale
+        assert drawdown_breaker_scale([1.0], _CB_CFG)["level"] == "insufficient"
+
+    def test_overlay_never_exceeds_regime_cap(self):
+        """红线：叠加层最终总仓位目标永不超过 regime 上限。"""
+        from position.regime_vol_overlay import RegimeVolOverlay
+        ov = RegimeVolOverlay()
+        eq_trip = list(np.concatenate([np.linspace(1.0, 1.2, 40), np.linspace(1.2, 0.95, 20)]))
+        r = ov.total_position_target({}, {}, {"state": "RANGE"}, eq_trip)
+        assert r["final_total_target"] <= r["regime_max_total"] + 1e-9
+        assert r["final_total_target"] == 0.0   # trip → 全平
+
+
+# ------------------------------------------------------------------
+# P1-2 RegimePlaybook RANGE 调优覆盖层
+# ------------------------------------------------------------------
+class TestRegimePlaybookTuning:
+    def test_deep_merge_nested(self):
+        from strategy.regime_playbook import _deep_merge
+        base = {"a": 1, "nested": {"x": 1, "y": 2}}
+        out = _deep_merge(base, {"nested": {"y": 99, "z": 3}})
+        assert out == {"a": 1, "nested": {"x": 1, "y": 99, "z": 3}}
+        assert base["nested"]["y"] == 2   # 不修改原字典
+
+    def test_range_tuning_applied(self):
+        import config
+        from strategy.regime_playbook import RegimePlaybook
+        tuning = getattr(config, "REGIME_PLAYBOOK_TUNING", {}).get("RANGE")
+        if not tuning:
+            pytest.skip("REGIME_PLAYBOOK_TUNING.RANGE 未配置")
+        pb = RegimePlaybook({"state": "RANGE"})
+        assert pb.state == "RANGE"
+        assert pb.mean_reversion().get("enabled") is True
+        # position_limits 与风控取更严，max_total 不超过调优上限
+        assert pb.position_limits()["max_total"] <= tuning["position_limits"]["max_total"] + 1e-9
+
+    def test_bull_unaffected(self):
+        from strategy.regime_playbook import RegimePlaybook
+        pb = RegimePlaybook({"state": "BULL"})
+        assert pb.state == "BULL"
+        assert pb.mean_reversion().get("enabled", False) is False
+
+    def test_class_configs_not_polluted(self):
+        """实例调优（深拷贝）不得污染类级 CONFIGS 基线。"""
+        import copy
+        import config
+        from strategy.regime_playbook import RegimePlaybook
+        if not getattr(config, "REGIME_PLAYBOOK_TUNING", {}).get("RANGE"):
+            pytest.skip("REGIME_PLAYBOOK_TUNING.RANGE 未配置")
+        before = copy.deepcopy(RegimePlaybook.CONFIGS["RANGE"])
+        _ = RegimePlaybook({"state": "RANGE"})
+        assert RegimePlaybook.CONFIGS["RANGE"] == before
 
 
 if __name__ == "__main__":

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-system"
+version = "10.0.0"
+description = "高胜率A股交易操作系统"
+requires-python = ">=3.10"
+# FIX P2-14: 补齐 [project.dependencies]（原缺失→pip install 不拉依赖）。
+# 与 requirements.txt 核心运行依赖对齐；可选依赖（xgboost/win10toast/streamlit/xtquant）
+# 放入 optional-dependencies，缺失时系统自动降级。
+dependencies = [
+    "baostock>=0.8.8",
+    "akshare>=1.10.0",
+    "pandas>=1.5.0",
+    "numpy>=1.21.0",
+    "scipy>=1.9.0",
+    "openpyxl>=3.0.0",
+    "schedule>=1.2.0",
+    "scikit-learn>=1.1.0",
+    "joblib>=1.2.0",
+    "lightgbm>=4.0.0",
+    "matplotlib>=3.5.0",
+    "pyecharts>=1.9.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+ml = ["xgboost>=1.6.0"]
+dashboard = ["streamlit>=1.28.0"]
+notify = ["win10toast>=0.9"]
+dev = ["pytest>=7.0.0"]
+
+[tool.setuptools.packages.find]
+# FIX P2-14: 纳入根级 output 包（condition_sheet/eastmoney_orders/morning_brief 等源模块），
+# 否则 pip install 后 output.* 缺失，与 P0-01 入口导入叠加导致条件单邮件/晨间简报静默失败。
+include = ["trading_system*", "output*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "network: 依赖实时行情/数据源网络的用例（数据源不可达时自动 skip）",
+]

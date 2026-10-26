@@ -35,13 +35,13 @@ import time as _time
 
 # 确保项目根目录在sys.path中
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT_ROOT)
-# FIX P1-1: 将trading-system根目录也加入sys.path，支持子模块中 "from trading_system.xxx" 的绝对导入
-# （intraday_alert.py等使用 trading_system.strategy.xxx 路径，缺少此配置导致盘中异动预警持续报错）
-_PROJECT_BASE = os.path.dirname(PROJECT_ROOT)
-if _PROJECT_BASE not in sys.path:
-    sys.path.insert(0, _PROJECT_BASE)
-
+# FIX(P0-01): 脚本模式下 __init__.py 不执行，需手动注入；仓库根目录下的
+# output/ 包（eastmoney_orders/morning_brief）被本文件延迟 import，缺失会导致邮件任务静默失败
+REPO_ROOT = os.path.dirname(PROJECT_ROOT)
+for _p in (PROJECT_ROOT, REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+del _p
 import config
 
 try:
@@ -126,30 +126,17 @@ def _release_lock():
 # 一、交易日判断
 # ============================================================
 
-# FIX: 填入2026年A股法定节假日和调休日，修复节假日判断失效
-# 注意：具体日期以国务院年度公告为准，当前为合理预估值
-HOLIDAYS = {
-    # 元旦
-    "2026-01-01", "2026-01-02",
-    # 春节（预估，以国务院公告为准）
-    "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22",
-    # 清明节
-    "2026-04-05", "2026-04-06", "2026-04-07",
-    # 劳动节
-    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
-    # 端午节
-    "2026-06-19", "2026-06-20", "2026-06-21",
-    # 中秋节+国庆节
-    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
-}
-
-# 周末调休上班日（需每年手动更新）
-WORKDAYS = {
-    # 调休上班日（周末补班）
-    "2026-02-14", "2026-02-28",  # 春节前后调休
-    "2026-04-26",  # 劳动节调休
-    "2026-10-10",  # 国庆调休
-}
+# FIX(2026-10-08 P0): 原此处维护了一份 HOLIDAYS/WORKDAYS 副本，与
+# utils/trading_calendar.py 各自为政，两份都错了同一处（把节后首个交易日
+# 2026-10-08 当成国庆假期），导致当日盘前作战计划/竞价选股/涨停基因/盘中监控/
+# 自愈全部静默跳过。现改为单一权威来源：直接复用 utils.trading_calendar，
+# 常量名保持 HOLIDAYS/WORKDAYS 不变，兼容 auto_scheduler.py 的
+# `from scheduler import HOLIDAYS, WORKDAYS` 既有导入。
+from utils.trading_calendar import (  # noqa: E402
+    HOLIDAYS,
+    WORKDAYS,
+    validate_calendar as _validate_calendar,
+)
 
 
 def is_trading_day(date: datetime.date = None) -> bool:
@@ -510,7 +497,14 @@ def run_holdings_report_task():
     try:
         _cache_market_regime_state()
     except Exception as e:
-        logger.warning(f"[{today}] MarketRegime缓存失败: {e}")
+        # FIX(P1-01): 缓存失败不再静默 warning —— regime 缓存过期>2天时风控引擎
+        # 会回退到保守上限，但缓存任务连续失败会造成 RANGE 60% 上限长期不生效，
+        # 属资金安全相关，升级为 critical 告警。
+        logger.critical(f"[{today}] MarketRegime缓存失败（风控动态仓位上限可能退化，需排查000300日线拉取）: {e}")
+        try:
+            _send_report_failure_alert(today, f"MarketRegime缓存失败: {e}")
+        except Exception:
+            pass
 
     # V4.2(P0-2/P0-3): 执行台账 —— 成交回填trade_journal.db + 条件单终态对账
     # 全部异常静默降级，不影响盘后主流程
@@ -573,9 +567,6 @@ def run_reconcile_task():
         # 连接 QMT（未安装/未登录则降级为模拟，DailyReconciler 会标记未完成）
         trader = None
         try:
-            _root = os.path.dirname(PROJECT_ROOT)
-            if _root not in sys.path:
-                sys.path.insert(0, _root)
             from qmt_trader import QMTTrader, QMT_CONFIG
             trader = QMTTrader(QMT_CONFIG)
             trader.connect()
@@ -956,7 +947,10 @@ def _generate_overlimit_reduce_orders():
         buy_price = h.get("buy_price", 0)
         if shares <= 0 or buy_price <= 0:
             continue
-        market_value = shares * buy_price  # 用成本价估算（保守）
+        # FIX(P1-30): 统一现价口径——原用成本价 buy_price 估算市值，与 inspect_holdings
+        # 现价口径矛盾（实证：赚钱的仓位现价口径已超限而成本口径漏检，恰是最需减仓的情形）。
+        cur_price = h.get("current_price", 0) or buy_price
+        market_value = shares * cur_price
         ratio = market_value / total_capital
 
         # V8.2: 统一品种判定
@@ -969,11 +963,13 @@ def _generate_overlimit_reduce_orders():
             target_value = total_capital * max_ratio
             excess_value = market_value - target_value
             # FIX: 修复小仓位取整为0导致超限仓位无减仓单的问题（建议卖出量不超持有股数）
-            reduce_shares = min(shares, max(100, int(excess_value / buy_price / 100) * 100)) if shares >= 100 else shares
+            # FIX(P1-30): 减仓量按现价口径计算（与市值分母一致）
+            _unit_price = cur_price if cur_price > 0 else buy_price
+            reduce_shares = min(shares, max(100, int(excess_value / _unit_price / 100) * 100)) if shares >= 100 else shares
             if reduce_shares < 100:
                 continue
-            # 触发价: 用成本价×98%作为保护性触发（次日开盘若低于此价则执行）
-            trigger_price = round(buy_price * 0.98, 2)
+            # 触发价: 用现价×98%作为保护性触发（次日开盘若低于此价则执行）
+            trigger_price = round(_unit_price * 0.98, 2)
             reduce_orders.append({
                 "order_id": f"REDUCE_{code}",
                 "证券代码": code,
@@ -1244,10 +1240,6 @@ def run_morning_screener():
 
     def _screener_worker():
         try:
-            # 统一入口：手动触发和定时触发调用同一函数，避免逻辑分叉
-            PROJECT_BASE = os.path.dirname(PROJECT_ROOT)  # trading-system根目录
-            if PROJECT_BASE not in sys.path:
-                sys.path.insert(0, PROJECT_BASE)
             from report_dispatcher import run_canslim
             result = run_canslim()
             if result:
@@ -1421,13 +1413,20 @@ def run_morning_reminder():
             # 计算首批买入股数
             try:
                 from strategy.position import calc_first_batch
-                batch = calc_first_batch(buy_price, stop_loss, stock_type, config.TOTAL_CAPITAL)
+                from utils.instrument import is_etf as _is_etf
+                # FIX P1-04: 补 stock_code + is_etf，激活 Kelly/ATR 历史胜率降仓
+                # 与 ETF 20% 仓位口径（原 4 个调用点全不传 → 主链路失效）
+                batch = calc_first_batch(buy_price, stop_loss, stock_type,
+                                         config.TOTAL_CAPITAL,
+                                         is_etf=_is_etf(code), stock_code=code)
                 shares = batch["shares"] if batch["pass_risk"] else 0
             except Exception:
                 buy_amount = config.TOTAL_CAPITAL * 0.05
                 shares = int(buy_amount / buy_price / 100) * 100
             if shares <= 0:
-                shares = 100
+                # FIX(P0-08): 仓位引擎判 0 股往往正是 pass_risk=False 或不足最小交易额的
+                # 明确风控否决，原实现强行改写为 100 股会绕过否决。改为跳过候选。
+                continue
 
             # CANSLIM评分
             score = 0
@@ -3866,6 +3865,25 @@ def start_scheduler():
 
     # V9.3: 初始化策略生命周期文件
     _init_strategy_lifecycle()
+
+    # FIX(2026-10-08 P0): 启动时交易日历自检 + 当日交易日判定留痕。
+    # 日历错填会造成全天任务静默跳过（日志只有一行"非交易日"），
+    # 此处主动把判定结果与自检告警写进日志，便于事后回溯"当日到底是
+    # 真休市还是日历错填"，避免静默失效难以定位。
+    try:
+        _cal_problems = _validate_calendar(verbose=False)
+        for _p in _cal_problems:
+            logger.warning(f"[交易日历自检] ⚠️ {_p}")
+        _today_chk = datetime.date.today()
+        logger.info(f"[交易日历自检] {_today_chk} 判定为"
+                    f"{'交易日' if is_trading_day(_today_chk) else '非交易日'}"
+                    f"（HOLIDAYS {len(HOLIDAYS)}项 / WORKDAYS {len(WORKDAYS)}项，"
+                    f"自检{'通过' if not _cal_problems else f'{len(_cal_problems)}项告警'}）")
+        if not _cal_problems and not is_trading_day(_today_chk):
+            # 休市日不做行情交叉校验，避免节假日网络请求噪声
+            logger.info(f"[交易日历自检] {_today_chk} 休市，盘中任务将全部跳过")
+    except Exception as _cal_e:
+        logger.warning(f"[交易日历自检] 异常(不影响主流程): {_cal_e}")
 
     # 每个交易日 08:30 盘前作战计划（合并原盘前预测+操作清单+持仓快览）
     schedule.every().day.at("08:30").do(run_forecast_morning)

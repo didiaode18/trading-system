@@ -20,11 +20,7 @@ import logging
 import argparse
 import datetime
 
-# 确保项目根目录在sys.path
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
+# P0-7: trading_system/__init__.py 已统一处理路径
 try:
     from notify.alert_ack import (
         record_delivery, get_ack_record, get_ack_summary,

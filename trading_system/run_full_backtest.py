@@ -31,8 +31,6 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings('ignore')
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 # 配置日志
@@ -188,7 +186,12 @@ def create_fast_strategy(precomputed_data):
 
                     if buy_price > 0:
                         stock_type = config.get_stock_info(code).get("类型", "龙头")
-                        batch = calc_first_batch(buy_price, stop_loss, stock_type, broker.initial_capital)
+                        # FIX P1-04: 回测仅补 is_etf（静态判定，无未来函数）修正 ETF 20% 口径；
+                        # 故意不传 stock_code：Kelly 胜率/ATR 均读非日期切片的实盘数据 → 会泄露未来。
+                        from utils.instrument import is_etf as _is_etf
+                        batch = calc_first_batch(buy_price, stop_loss, stock_type,
+                                                 broker.initial_capital,
+                                                 is_etf=_is_etf(code))
                         if batch.get("pass_risk") and batch.get("shares", 0) > 0:
                             orders.append(Order(
                                 code=code,

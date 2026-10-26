@@ -26,7 +26,7 @@ CANSLIM量化对应（A股适配版）:
   - 浮盈≥3% 再加第二批 60%（确认趋势）
 
 止损策略:
-  - 初始止损：买入价 × 90%（10%止损）
+  - 初始止损：买入价 × 85%（15%止损，V3+最优参数）
   - 浮盈后上移移动止损（保护利润）
 
 使用方式:
@@ -45,8 +45,6 @@ import threading
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 # FIX: 移除未使用的calc_first_batch导入（买点计划由本文件calculate_buy_plan自行计算）
 
@@ -294,8 +292,56 @@ from strategy.market_analysis import check_market_direction, detect_market_regim
 # ============================================================
 # 零'、估值安全闸门（V10.1 Top1: 防止高估值陷阱）
 # ============================================================
+# FIX CS-07(2026-10-11): 成长股豁免机制
+# 原逻辑: PE百分位>80%无条件拦截 → 把符合C/A的成长龙头全部挡掉，策略偏向价值股
+# 修复后: C/A同时达标时豁免PE百分位硬拦截（仅标注估值风险），PE<0亏损股仍拦截
+# 判定标准(对齐CANSLIM原著): C达标=单季EPS增速≥25%, A达标=3年复合增速≥25%
+# 注: 待CS-05/CS-06实施后，C/A达标将升级为营收+加速+ROE+CFO全口径
 
-def _check_valuation_gate(code: str) -> dict:
+def _check_growth_qualification(code: str) -> dict:
+    """
+    CS-07(2026-10-11): 判断个股是否满足CANSLIM成长资质（C/A双达标）
+    用于估值门成长股豁免判定。
+    
+    当前使用简化口径（eps_growth_q/eps_growth_3y），
+    待CS-05/CS-06实施后升级为营收+加速+ROE+CFO全口径。
+    
+    返回:
+        {"c_pass": bool, "a_pass": bool, "growth_exempt": bool,
+         "detail": str}
+    """
+    fund_data = FUNDAMENTAL_DATA.get(code, {})
+    if not fund_data:
+        return {"c_pass": False, "a_pass": False, "growth_exempt": False,
+                "detail": "无基本面数据"}
+    
+    _eps_q = fund_data.get("eps_growth_q", None)
+    _eps_3y = fund_data.get("eps_growth_3y", None)
+    
+    # C达标: 单季EPS同比≥25%（原著CANSLIM标准）
+    _c_pass = _eps_q is not None and _eps_q >= 25
+    # A达标: 3年复合增速≥25%（原著CANSLIM标准）
+    _a_pass = _eps_3y is not None and _eps_3y >= 25
+    
+    _detail_parts = []
+    if _eps_q is not None:
+        _detail_parts.append(f"C={_eps_q:.1f}%({'达标' if _c_pass else '未达25%'})")
+    else:
+        _detail_parts.append("C=无数据")
+    if _eps_3y is not None:
+        _detail_parts.append(f"A={_eps_3y:.1f}%({'达标' if _a_pass else '未达25%'})")
+    else:
+        _detail_parts.append("A=无数据")
+    
+    return {
+        "c_pass": _c_pass,
+        "a_pass": _a_pass,
+        "growth_exempt": _c_pass and _a_pass,
+        "detail": ", ".join(_detail_parts),
+    }
+
+
+def _check_valuation_gate(code: str, growth_exempt: bool = False) -> dict:
     """
     V10.1 Top1: 估值安全闸门
     
@@ -303,14 +349,19 @@ def _check_valuation_gate(code: str) -> dict:
     与现有V_估值因子(0-5分加分)互补：V因子是软打分，本闸门是硬拦截。
     
     拦截规则:
-      1. PE(TTM) < 0 → 亏损股，直接拦截
-      2. PE百分位 > 80% → 处于历史最贵的20%区间，拦截
+      1. PE(TTM) < 0 → 亏损股，直接拦截（不可豁免）
+      2. PE百分位 > 80% → 处于历史最贵的20%区间，默认拦截
+         FIX CS-07(2026-10-11): C/A双达标的成长股豁免硬拦截，仅标注估值风险
       3. 无估值数据 → 放行（不惩罚信息缺失的股票）
     
+    参数:
+        code: 股票代码
+        growth_exempt: 是否满足成长资质豁免（C/A双达标时为True）
+    
     返回:
-        {"pass": bool, "reason": str}
+        {"pass": bool, "reason": str, "growth_exempt": bool}
     """
-    result = {"pass": True, "reason": ""}
+    result = {"pass": True, "reason": "", "growth_exempt": False}
     
     if not getattr(config, 'VALUATION_GATE_ENABLED', True):
         return result
@@ -325,17 +376,26 @@ def _check_valuation_gate(code: str) -> dict:
     _pe = fund_data.get("pe_ttm", None)
     _pe_pct = fund_data.get("pe_percentile", None)
     
-    # 规则1: PE<0 亏损股拦截
+    # 规则1: PE<0 亏损股拦截（不可豁免）
     if _pe is not None and _pe < 0:
         result["pass"] = False
         result["reason"] = f"估值闸门: PE={_pe:.1f}<0，亏损股"
         return result
     
-    # 规则2: PE百分位过高拦截
+    # 规则2: PE百分位过高
     if _pe_pct is not None and _pe_pct > pe_pct_max:
-        result["pass"] = False
-        result["reason"] = f"估值闸门: PE百分位{_pe_pct:.0f}%>{pe_pct_max}%，历史高位"
-        return result
+        # FIX CS-07(2026-10-11): 成长股豁免
+        # 原逻辑: 无条件拦截 → 修复后: C/A双达标时放行并标注估值风险
+        if growth_exempt:
+            result["pass"] = True
+            result["growth_exempt"] = True
+            result["reason"] = (f"估值闸门: PE百分位{_pe_pct:.0f}%>{pe_pct_max}%，"
+                               f"但C/A双达标成长股豁免（仅标注风险）")
+            return result
+        else:
+            result["pass"] = False
+            result["reason"] = f"估值闸门: PE百分位{_pe_pct:.0f}%>{pe_pct_max}%，历史高位"
+            return result
     
     return result
 
@@ -2403,7 +2463,7 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     - V5.1: 第二批 50%：浮盈≥3%后加仓（与首批均衡确保首批有足够盈利贡献）
     
     止损策略:
-    - 初始止损：买入价×90%（10%止损）
+    - 初始止损：买入价×85%（15%止损，V3+最优参数）
     - ATR止损与技术支撑止损取较高者
     - 浮盈后上移移动止损
     """
@@ -2428,6 +2488,12 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     ma60 = latest.get("ma60", current_price)
 
     # ---- 买点价格 ----
+    # FIX(2026-10-09): ETF品种识别提前至买点计算，用于支撑位锚定
+    from utils.instrument import is_etf as _is_etf_fn, get_etf_subtype
+    _is_etf = _is_etf_fn(code)
+    _etf_type = get_etf_subtype(code) if _is_etf else ""
+    _etf_buy_tier = getattr(config, 'ETF_BUY_TIER', {}).get(_etf_type if _is_etf else "stock", {})
+
     # 激进买点：根据信号类型决定
     # - 突破/动量类信号：现价+0.5%（追入）
     # - 回踩/缩量类信号：现价（直接买入，不应高于现价）
@@ -2441,17 +2507,50 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     else:
         aggressive_buy = round(current_price * 1.005, 2)  # 突破/动量：现价+0.5%
 
-    # V5.1: 稳健买点 —— 固定梯度（现价×(1-1.5%)），避免均线粘合时三档重合
-    _screener_cfg = getattr(config, 'SCREENER_CONFIG', {})
-    _moderate_pct = _screener_cfg.get("buy_tier_moderate_pct", 0.015)
-    moderate_buy = round(current_price * (1 - _moderate_pct), 2)
-    # FIX: 除零防护（数据异常时current_price可能为0）
-    if moderate_buy <= 0:
-        moderate_buy = round(current_price * (1 - _moderate_pct), 2) if current_price > 0 else 1.0
+    # FIX(2026-10-09): ETF买点三档锚定最近支撑位——根治"买在半空"和"追高"
+    # 根因: 原三档买点完全基于现价固定百分比(稳健-1.5%/保守-3%)，不参考MA20/MA60/布林等
+    #   实际支撑位，导致买点悬在支撑上方1.5~3.5%处，"买在半空"。
+    # 新逻辑: ETF优先以最近有效支撑位为锚，三档在支撑位上方紧凑分布；
+    #   支撑位太远(>8%)或不存在时回退到ETF差异化固定梯度。
+    _support_anchor = 0.0
+    _support_candidates = []
+    for _ma_val in [ma10, ma20, ma60]:
+        if not pd.isna(_ma_val) and 0 < _ma_val < current_price:
+            _support_candidates.append(_ma_val)
+    _boll_lower_val = latest.get("boll_lower", 0)
+    if not pd.isna(_boll_lower_val) and 0 < _boll_lower_val < current_price:
+        _support_candidates.append(_boll_lower_val)
+    if _support_candidates:
+        _support_anchor = max(_support_candidates)  # 最近的有效支撑
+    _support_dist = (current_price - _support_anchor) / current_price if _support_anchor > 0 else 999
 
-    # V5.1: 保守买点 —— 固定梯度（现价×(1-3%)），与稳健档保持合理间距
-    _conservative_pct = _screener_cfg.get("buy_tier_conservative_pct", 0.03)
-    conservative_buy = round(current_price * (1 - _conservative_pct), 2)
+    # ETF最大支撑锚定距离（超过此距离回退到固定梯度）
+    _max_sr_dist = {"宽基ETF": 0.05, "行业ETF": 0.08, "主题ETF": 0.08}.get(_etf_type, 0.10)
+
+    if _is_etf and _support_anchor > 0 and _support_dist <= _max_sr_dist:
+        # ---- ETF支撑锚定模式：三档在支撑位上方紧凑分布 ----
+        # 间距按品种差异化: 宽基ETF波动低→窄间距, 主题/行业ETF波动高→宽间距
+        _tier_spread = {"宽基ETF": 0.005, "行业ETF": 0.008, "主题ETF": 0.008}.get(_etf_type, 0.008)
+        conservative_buy = round(_support_anchor * 1.003, 2)   # 支撑上方0.3%
+        moderate_buy = round(_support_anchor * (1 + _tier_spread), 2)  # 支撑上方0.5~0.8%
+        aggressive_buy = round(_support_anchor * (1 + _tier_spread * 2), 2)  # 支撑上方1.0~1.6%
+        # 安全阀: 所有买点不得高于现价+0.5%(防止支撑位异常接近现价时追高)
+        aggressive_buy = min(aggressive_buy, round(current_price * 1.005, 2))
+        logger.info(f"  [买点-ETF支撑锚定] {code}({_etf_type}) 支撑={_support_anchor:.3f}"
+                    f"(距离{_support_dist:.1%}) → 激进={aggressive_buy} 稳健={moderate_buy} 保守={conservative_buy}")
+    else:
+        # ---- 固定梯度模式（个股回退 / ETF无有效支撑） ----
+        _moderate_pct = _etf_buy_tier.get("moderate_pct",
+                       getattr(config, 'SCREENER_CONFIG', {}).get("buy_tier_moderate_pct", 0.015))
+        moderate_buy = round(current_price * (1 - _moderate_pct), 2)
+        if moderate_buy <= 0:
+            moderate_buy = round(current_price * (1 - _moderate_pct), 2) if current_price > 0 else 1.0
+        _conservative_pct = _etf_buy_tier.get("conservative_pct",
+                           getattr(config, 'SCREENER_CONFIG', {}).get("buy_tier_conservative_pct", 0.03))
+        conservative_buy = round(current_price * (1 - _conservative_pct), 2)
+        if _is_etf:
+            logger.info(f"  [买点-ETF固定梯度] {code}({_etf_type}) 无有效支撑(距离{_support_dist:.1%}>"
+                        f"{_max_sr_dist:.0%})，回退梯度: 稳健-{_moderate_pct:.1%}/保守-{_conservative_pct:.1%}")
 
     # ---- 出口规范化（2026-08-13 新增）：钳制/重排/降级标记 ----
     # _degrade_reasons 非空 → 本标的降级仅观察，不进入买点落盘（调用点依据 plan_degraded 处理）
@@ -2460,9 +2559,18 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
     base_price = float(current_price)
 
     # (1) 买点不得高于现价：否则读侧 price<=买点 会在开盘即触发追高（恒瑞医药实证）
+    # FIX(2026-10-09): ETF突破信号豁免现价钳制——保留+0.3%确认溢价，防止开盘即触发追高
+    # 根因: 原逻辑将突破信号激进买点(现价×1.005)钳制为现价，开盘即触发"买在高点"
     if aggressive_buy > base_price:
-        logger.info(f"  [买点规范化] {code} 激进档钳制: {aggressive_buy} -> {round(base_price, 2)}（买点不得高于现价）")
-        aggressive_buy = round(base_price, 2)
+        if _is_etf and not is_pullback_signal:
+            _clamp_to = round(base_price * 1.003, 2)  # ETF突破: 最多钳制到+0.3%
+            if aggressive_buy > _clamp_to:
+                logger.info(f"  [买点规范化] {code} ETF突破激进档钳制: {aggressive_buy} -> {_clamp_to}"
+                            f"（保留+0.3%确认溢价，防开盘即触发追高）")
+                aggressive_buy = _clamp_to
+        else:
+            logger.info(f"  [买点规范化] {code} 激进档钳制: {aggressive_buy} -> {round(base_price, 2)}（买点不得高于现价）")
+            aggressive_buy = round(base_price, 2)
 
     # (2) 三档单调性 aggressive >= moderate >= conservative：倒挂时以现价为锚重算
     #     （稳健档=现价×0.995、保守档=现价×0.98，保持小幅梯度且不脱离现价）
@@ -2485,14 +2593,15 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
 
     # ---- 止损价 ----
     # V8.2: ETF使用分类止损参数（宽基ETF放宽至12%/行业ETF 8%/主题ETF 10%）
-    from utils.instrument import is_etf as _is_etf_fn, get_etf_subtype
-    _is_etf = _is_etf_fn(code)
-    _etf_type = get_etf_subtype(code) if _is_etf else ""
+    # FIX(2026-10-09): _is_etf/_etf_type 已在买点计算段提前获取，此处复用
     _etf_params = config.ETF_STRATEGY_PARAMS.get(_etf_type, {}) if _is_etf else {}
-    _stop_pct = _etf_params.get("stop_loss_pct", 0.10)  # ETF用分类参数，个股默认10%
+    _stop_pct = _etf_params.get("stop_loss_pct", getattr(config, 'CANSLIM_V3PLUS_CONFIG', {}).get('initial_stop_loss', 0.15))  # V3+: ETF用分类参数，个股默认15%
     _atr_mult = _etf_params.get("atr_multiplier", 2.0 if stock_type == "龙头" else 2.5)
 
     # 1. 固定止损（底线）
+    # TODO CS-17(2026-10-11): 原著要求-8%无条件硬止损兆底，当前15%为V4回测优化值
+    #   CS-17实施后: final_stop = max(fixed_stop, atr_stop, support_stop, hard_stop_floor)
+    #   其中 hard_stop_floor = moderate_buy * 0.92 (-8%兆底，只紧不松)
     fixed_stop = round(moderate_buy * (1 - _stop_pct), 2)
 
     # 2. ATR自适应止损（V8.1: ETF使用差异化乘数）
@@ -2508,23 +2617,42 @@ def calculate_buy_plan(df: pd.DataFrame, code: str, factor_result: dict,
         if ma60_stop > support_stop:
             support_stop = ma60_stop
 
-    # 最终止损：取ATR/技术支撑/固定止损中较高者（更保守）。
-    # fixed_stop(买点-10%)在候选中充当最大距离底线，即距买点必≤10%；
-    # FIX P1(2026-08-07): 原min()封顶值与fixed_stop数学等同，导致ATR/支撑止损
-    # 两个方向都不可能生效(恒等于fixed_stop的死代码)，已移除封顶行
-    candidates_stop = [s for s in [atr_stop, support_stop, fixed_stop] if s > 0]
-    final_stop = max(candidates_stop) if candidates_stop else fixed_stop
+    # 最终止损
+    # FIX(2026-10-09): ETF分类止损优先——根治分类参数被max()架空
+    # 根因: 原 max(atr, support, fixed) 取最紧止损，导致:
+    #   ① 宽基ETF设计12%宽松止损，被MA20×0.99(仅-3%)覆盖→止损过紧
+    #   ② 行业ETF设计8%紧止损，被固定止损覆盖→分类参数形同虚设
+    # 新逻辑: ETF以固定分类止损为主，仅当ATR和支撑都更紧时才收紧
+    if _is_etf:
+        final_stop = fixed_stop  # 主止损: 分类固定止损(行业8%/宽基12%/主题10%)
+        _atr_tighter = atr_stop > 0 and atr_stop > fixed_stop   # ATR止损更紧(价更高)
+        _sup_tighter = support_stop > 0 and support_stop > fixed_stop  # 支撑止损更紧
+        if _atr_tighter and _sup_tighter:
+            final_stop = max(atr_stop, support_stop)  # 两者都更紧时取较紧者
+            logger.info(f"  [止损-ETF收紧] {code} ATR+支撑均紧于分类止损，止损收紧: "
+                        f"{fixed_stop} -> {final_stop}")
+    else:
+        # 个股: 维持 max() 逻辑（保守优先）
+        candidates_stop = [s for s in [atr_stop, support_stop, fixed_stop] if s > 0]
+        final_stop = max(candidates_stop) if candidates_stop else fixed_stop
     # 止损价保护：确保止损价 < 现价（参考report_email.py保护逻辑）
     if final_stop >= current_price:
         final_stop = round(current_price * 0.92, 2)
         logger.warning(f"  [止损保护] {code} 止损价异常，强制调整为现价×92%={final_stop}")
 
     # ---- 止损下限（2026-08-13 新增，对齐回测/trend_strategy 的 5% 口径）----
-    # 止损距稳健买点必须 >= 5%，只允许下移止损（永辉超市实证：止损距买点仅2.7%过窄）
-    # 用分位向下取整而非 round，避免低价股两位小数舍入后距离跌破5%
-    _stop_cap = int(moderate_buy * (1 - _STOP_MIN_GAP_RATIO) * 100) / 100.0
+    # 止损距稳健买点必须 >= N%，只允许下移止损（永辉超市实证：止损距买点仅2.7%过窄）
+    # FIX(2026-10-09): ETF差异化止损下限——宽基ETF低波动5%过宽
+    # 根因: 原 _STOP_MIN_GAP_RATIO=0.05 源自个股实证，一刀切致宽基ETF止损被强制下移到
+    #   距买点5%处，但宽基ETF设计止损12%，5%下限把止损从12%拉到5%，完全扭曲设计意图
+    _stop_gap_ratio = _STOP_MIN_GAP_RATIO  # 个股默认 5%
+    if _is_etf:
+        _stop_gap_ratio = getattr(config, 'ETF_STOP_GAP', {}).get(_etf_type, _STOP_MIN_GAP_RATIO)
+    # 用分位向下取整而非 round，避免低价股两位小数舍入后距离跌破阈值
+    _stop_cap = int(moderate_buy * (1 - _stop_gap_ratio) * 100) / 100.0
     if moderate_buy > 0 and final_stop > _stop_cap:
-        logger.info(f"  [止损规范化] {code} 止损距稳健买点<5%: 止损 {final_stop} -> {_stop_cap}（稳健买点={moderate_buy}）")
+        logger.info(f"  [止损规范化] {code} 止损距稳健买点<{_stop_gap_ratio:.0%}: "
+                    f"止损 {final_stop} -> {_stop_cap}（稳健买点={moderate_buy}）")
         final_stop = _stop_cap
 
     # ---- 保守档安全垫（2026-08-13 新增）----
@@ -2810,11 +2938,16 @@ def _score_stock_worker(code: str, df, market_state: str, regime_info: dict,
         return result
 
     # V10.1 Top1: 估值安全闸门（硬筛通过后、评分前拦截高估值）
-    vg_result = _check_valuation_gate(code)
+    # FIX CS-07(2026-10-11): 先计算成长资质，C/A双达标时豁免PE百分位硬拦截
+    _growth_info = _check_growth_qualification(code)
+    vg_result = _check_valuation_gate(code, growth_exempt=_growth_info["growth_exempt"])
     if not vg_result["pass"]:
         result["filtered"] = True
         result["fate"] = {"sector": sector_name, "fate": "估值闸门拦截", "score": 0, "detail": vg_result["reason"]}
         return result
+    # 成长股豁免标注（不影响评分，仅信息透传）
+    if vg_result.get("growth_exempt"):
+        logger.info(f"  估值门: {code} PE百分位偏高但C/A双达标，豁免硬拦截({vg_result['reason']})")
 
     # V8.2: ETF使用专用评分模型（CANSLIM框架不适合ETF品种）
     from utils.instrument import is_etf as _is_etf_fn
@@ -2913,15 +3046,31 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
             _latest = _freshness["latest_date"] or "未知"
             _days = _freshness["stale_days"]
             _total = _freshness.get("total_codes", 0)
-            # V22: 自然日→交易日换算（排除周末，节假日暂不处理）
+            # V22: 自然日→交易日换算
+            # FIX(2026-10-08 P1): 原实现只排周末（注释自认"节假日暂不处理"），
+            #   长假后首个交易日必然被误判为落后N天（9/30→10/8 数出6个工作日），
+            #   超阈值4 → 走硬错误分支 return 空 stock_pool，评分主链路整条被中断，
+            #   报告只剩实时行情兜底的少量标的（"0只入选"的结论因此不可信）。
+            #   现改用 utils.trading_calendar.is_trading_day，并且**当日盘未收盘时不计入**
+            #   （竞价后/盘中运行时当日K线本就还没生成，属正常状态而非数据过时）。
             try:
                 import datetime as _dt
                 _latest_dt = _dt.datetime.strptime(_latest, "%Y-%m-%d").date()
                 _today_dt = _dt.date.today()
+                _now_dt = _dt.datetime.now()
+                try:
+                    from utils.trading_calendar import is_trading_day as _is_td
+                except Exception:
+                    def _is_td(_x):
+                        return _x.weekday() < 5
+                # 期望的最新K线日 = 最近一个"已收盘"的交易日（15:30 后才计入当日）
+                _expect_end = _today_dt
+                if _is_td(_today_dt) and (_now_dt.hour, _now_dt.minute) < (15, 30):
+                    _expect_end = _today_dt - _dt.timedelta(days=1)
                 _trading_stale = 0
                 _d = _latest_dt + _dt.timedelta(days=1)
-                while _d <= _today_dt:
-                    if _d.weekday() < 5:  # 周一~周五
+                while _d <= _expect_end:
+                    if _is_td(_d):
                         _trading_stale += 1
                     _d += _dt.timedelta(days=1)
             except Exception:
@@ -3427,6 +3576,9 @@ def run_stock_screener(data_dict: dict, holdings: dict = None,
                             f"止损{buy_plan['stop_loss']}(-{buy_plan['stop_loss_pct']}%)")
         else:
             # 仅观察：不生成买点计划，仅展示评分和趋势状态
+            # FIX P0(2026-10-10): config.get_stock_info()已升级为四级回退链
+            # (STOCK_POOL→SECTOR_CANDIDATES→baostock动态查询→兜底缓存)，
+            # 不在配置中的股票也能获取中文名称，不再显示为代码。
             stock_info = config.get_stock_info(cand["code"])
             watch_item = {
                 "code": cand["code"],
@@ -3963,11 +4115,13 @@ def generate_screener_report_html(result: dict) -> str:
     pool = result.get("stock_pool") or []
     scan_time = result.get("scan_time", "")
 
-    # FIX: 下一交易日改用公共交易日历（含节假日/调休），异常时降级到原跳周末逻辑
+    # FIX: 适用交易日改用公共交易日历统一口径（含节假日/调休），异常时降级到原跳周末逻辑
     # （口径同 send_screener_email 处改法）
+    # FIX(2026-10-08): 原恒取 next_trading_day，盘中/竞价后生成的报告会被标成
+    #   "适用日期=明日"，与同一次运行落盘的买点提醒 valid_date（当日）矛盾。
     try:
-        from utils.trading_calendar import next_trading_day
-        next_day = next_trading_day(datetime.date.today())
+        from utils.trading_calendar import effective_trading_day
+        next_day = effective_trading_day()
     except Exception:
         next_day = datetime.date.today() + datetime.timedelta(days=1)
         while next_day.weekday() >= 5:
@@ -4568,12 +4722,12 @@ def generate_screener_report_html(result: dict) -> str:
             <ol style="margin:5px 0;padding-left:20px;line-height:1.8">
                 <li><b>★缩量回踩20日均线</b>：成交量较20日均量萎缩30%以上，价格回踩MA20不跌破 → <span style="color:#FF4D4F">核心买点</span></li>
                 <li><b>分批建仓</b>：第一批40%试仓（买点附近），浮盈≥3%再加第二批60%（确认趋势）</li>
-                <li><b>同步设置止损</b>：买入即挂止损（初始止损=买入价×{1-getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10):.0%}），浮盈后上移移动止损保护利润</li>
+                <li><b>同步设置止损</b>：买入即挂止损（初始止损=买入价×{1-getattr(config, 'CANSLIM_V3PLUS_CONFIG', {}).get('initial_stop_loss', 0.15):.0%}），浮盈后上移移动止损保护利润</li>
                 <li><b>激进买点</b>：现价+0.5%，适合强势突破股直接追入</li>
                 <li><b>稳健买点</b>：MA5/MA10附近，等待短期回踩挂单（推荐）</li>
                 <li><b>保守买点</b>：MA20附近，等待深度回调挂单</li>
                 <li>在东方财富APP中设置<b>定价买入</b>条件单，触发价=买点，委托价=触发价×1.01</li>
-                <li>同时设置<b>定价卖出</b>条件单作为止损保护（止损价=买入价×{1-getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.10):.0%}）</li>
+                <li>同时设置<b>定价卖出</b>条件单作为止损保护（止损价=买入价×{1-getattr(config, 'CANSLIM_V3PLUS_CONFIG', {}).get('initial_stop_loss', 0.15):.0%}）</li>
             </ol>
         </div>
 
@@ -4727,10 +4881,12 @@ def send_screener_email(result: dict) -> bool:
     if degraded:
         result["_data_degraded"] = degraded
 
-    # FIX: 下一交易日改用公共交易日历（含节假日/调休），异常时降级到原跳周末逻辑
+    # FIX: 适用交易日改用公共交易日历统一口径（含节假日/调休），异常时降级到原跳周末逻辑
+    # FIX(2026-10-08): 同 generate_screener_report_html —— 邮件标题日期与
+    #   正文"适用日期"、买点提醒 valid_date 必须同源，避免一份报告两个日期。
     try:
-        from utils.trading_calendar import next_trading_day
-        next_day = next_trading_day(datetime.date.today())
+        from utils.trading_calendar import effective_trading_day
+        next_day = effective_trading_day()
     except Exception:
         next_day = datetime.date.today() + datetime.timedelta(days=1)
         while next_day.weekday() >= 5:

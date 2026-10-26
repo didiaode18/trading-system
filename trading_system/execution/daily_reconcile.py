@@ -179,14 +179,25 @@ class DailyReconciler:
             b_total = float(broker_asset.get("total_asset", 0) or 0)
             b_mv = float(broker_asset.get("market_value", 0) or 0)
             b_cash = float(broker_asset.get("cash", 0) or 0)
+            b_frozen = float(broker_asset.get("frozen", 0) or 0)
             res = {
                 "ok": True,
                 "broker_total": b_total, "broker_cash": b_cash,
                 "broker_market_value": b_mv, "local_net_value": round(local_net, 2),
                 "diffs": [],
             }
-            # 券商市值 vs 本地持仓市值估算
-            if b_mv > 0 and local_net > 0:
+            # FIX P1-15: 空侧判差异而非静默跳过。
+            # 券商有市值而本地净值为0（holdings缺失/读取失败）→ 明确报差异，
+            # 绝不因“两边都拿不到数据”而得出“账实一致”的假结论。
+            if b_mv > 0 and local_net <= 0:
+                res["diffs"].append({
+                    "type": "asset", "code": "", "name": "市值",
+                    "broker": round(b_mv, 2), "local": round(local_net, 2),
+                    "detail": f"本地持仓净值为0但券商市值{b_mv:,.0f}"
+                              f"（holdings缺失/读取失败，结论不可信）",
+                })
+            elif b_mv > 0 and local_net > 0:
+                # 券商市值 vs 本地持仓市值估算
                 dev = abs(b_mv - local_net) / b_mv
                 if dev > self.asset_tol:
                     res["diffs"].append({
@@ -195,6 +206,18 @@ class DailyReconciler:
                         "detail": f"持仓市值偏差 券商{b_mv:,.0f} vs 本地{local_net:,.0f}"
                                   f"（{dev*100:.2f}%）",
                     })
+            # FIX P1-15: b_cash 取出从不比对 → 补券商内部一致性校验
+            # 总资产 应≈ 现金 + 冻结 + 市值，偏差超阈值说明券商口径异常或字段错位。
+            if b_total > 0 and (b_cash > 0 or b_mv > 0):
+                implied = b_cash + b_frozen + b_mv
+                dev_total = abs(b_total - implied) / b_total
+                if dev_total > self.asset_tol:
+                    res["diffs"].append({
+                        "type": "asset", "code": "", "name": "资金一致性",
+                        "broker": round(b_total, 2), "local": round(implied, 2),
+                        "detail": f"券商总资产{b_total:,.0f} ≠ 现金{b_cash:,.0f}"
+                                  f"+冻结{b_frozen:,.0f}+市值{b_mv:,.0f}（偏差{dev_total*100:.2f}%）",
+                    })
             return res
         except Exception as e:
             logger.warning(f"[对账] 资金对账异常(降级): {e}")
@@ -202,25 +225,57 @@ class DailyReconciler:
 
     # ---- 差异告警（去重）----
     def _record_and_alert(self, diffs, recon_date) -> int:
-        """写台账去重，返回新增差异数；有新增才聚合告警一次。"""
+        """FIX P1-12: 先告警成功再落“已告警”标记，杜绝差异永久静默丢失。
+    
+        原逻辑先落库去重（立即 commit）后发送，而 send_notification 从不抛异常且不检查
+        返回值 → 发送失败时差异已被标记“已告警”，次日因去重不再发。现改为：
+        每条 diff 独立 try；先筛新增→告警→仅在告警成功后才 record_diff 落标记。
+        """
+        if not diffs:
+            return 0
+        # 1. 筛出近窗口首次出现的新增差异（跨日去重）
+        new_diffs = []
+        for d in diffs:
+            try:
+                if self.ledger.is_new_diff(
+                        d.get("type", "position"), d.get("code", ""),
+                        d.get("detail", ""), recon_date):
+                    new_diffs.append(d)
+            except Exception:
+                new_diffs.append(d)  # 查询失败保守视为新增
+        if not new_diffs:
+            return 0
+    
+        # 2. 先告警（未启用通知时视为已处理，直接落库）
+        alerted = True
+        if self.notify:
+            alerted = self._send_alert(new_diffs, len(new_diffs), recon_date)
+    
+        # 3. 仅在告警成功（或未启用通知）后才落库标记“已告警”
+        if not alerted:
+            logger.error(
+                f"[对账] ❌ 告警发送失败，{len(new_diffs)}项差异未落标记，"
+                f"将于下次对账重试（避免静默丢失）")
+            return 0
+    
         new_count = 0
-        try:
-            for d in diffs:
-                is_new = self.ledger.record_diff(
+        for d in new_diffs:
+            try:
+                self.ledger.record_diff(
                     recon_type=d.get("type", "position"),
                     code=d.get("code", ""),
                     diff_detail=d.get("detail", ""),
                     recon_date=recon_date)
-                if is_new:
-                    new_count += 1
-            if new_count > 0 and self.notify:
-                self._send_alert(diffs, new_count, recon_date)
-        except Exception as e:
-            logger.warning(f"[对账] 差异告警异常(降级): {e}")
+                new_count += 1
+            except Exception as e:
+                logger.error(f"[对账] 单条差异落库失败(不影响其余): {e}")
         return new_count
-
-    def _send_alert(self, diffs, new_count, recon_date):
-        """通过现有 notify 通道发送聚合告警（复用企业微信/邮件，不新增通道）。"""
+    
+    def _send_alert(self, diffs, new_count, recon_date) -> bool:
+        """FIX P1-12: 发送聚合告警，检查返回 dict；企业微信/钉钉均失败时邮件兜底。
+    
+        返回 True=至少一个通道发送成功，False=全部失败（上层据此不落“已告警”标记）。
+        """
         try:
             lines = [f"🧾 账实对账差异 {recon_date}（新增{new_count}项）"]
             for d in diffs[:15]:
@@ -229,20 +284,141 @@ class DailyReconciler:
                 lines.append(f"… 另有{len(diffs)-15}项，详见对账台账")
             lines.append("以券商流水为准，请人工核对后确认是否修正 holdings。")
             content = "\n".join(lines)
+            title = f"[账实对账] {recon_date} 发现{new_count}项差异"
             logger.warning("[对账告警]\n" + content)
+    
+            # 通道1：企业微信/钉钉（检查返回 dict）
             try:
                 from notify.wechat_notify import send_notification
-                send_notification(f"[账实对账] {recon_date} 发现{new_count}项差异", content)
-            except Exception:
-                try:
-                    import sys
-                    sys.path.insert(0, _project_root())
-                    from notify.wechat_notify import send_notification
-                    send_notification(f"[账实对账] {recon_date} 发现{new_count}项差异", content)
-                except Exception as ne:
-                    logger.debug(f"[对账告警] notify 不可用(降级): {ne}")
+                res = send_notification(title, content)
+                if isinstance(res, dict) and any(res.values()):
+                    return True
+                logger.warning(f"[对账告警] 即时通道均未发送成功: {res}，尝试邮件兜底")
+            except Exception as ne:
+                logger.warning(f"[对账告警] 即时通道异常: {ne}，尝试邮件兜底")
+    
+            # 通道2：邮件兜底
+            try:
+                from notify.email_notify import send_email
+                ok = send_email(title, content)
+                if ok:
+                    logger.info("[对账告警] 邮件兜底发送成功")
+                    return True
+                logger.error("[对账告警] 邮件兜底发送失败")
+            except Exception as ee:
+                logger.error(f"[对账告警] 邮件兜底异常: {ee}")
+            return False
         except Exception as e:
-            logger.debug(f"[对账告警] 组装失败(降级): {e}")
+            logger.error(f"[对账告警] 组装失败: {e}")
+            return False
+
+    # ---- 对账状态跟踪（补跑 + 连续未对账升级）----
+    def _status_file(self) -> str:
+        """reconcile_status.json 路径（记录已对账交易日与连续失败天数）。
+
+        优先级：config.status_file 显式指定 > 与 holdings_path 同目录（便于测试隔离）
+        > DATA_DIR。避免测试运行时污染生产对账状态。
+        """
+        explicit = self.config.get("status_file")
+        if explicit:
+            return explicit
+        if self.holdings_path:
+            return os.path.join(os.path.dirname(self.holdings_path),
+                                "reconcile_status.json")
+        try:
+            import config as _c
+            base = getattr(_c, "DATA_DIR", os.path.join(_project_root(), "data"))
+        except Exception:
+            base = os.path.join(_project_root(), "data")
+        return os.path.join(base, "reconcile_status.json")
+
+    def _load_status(self) -> dict:
+        try:
+            p = self._status_file()
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("reconciled_days", [])
+                    data.setdefault("fail_streak", 0)
+                    data.setdefault("last_fail_date", "")
+                    return data
+        except Exception as e:
+            logger.warning(f"[对账] 读取对账状态失败(降级): {e}")
+        return {"reconciled_days": [], "fail_streak": 0, "last_fail_date": ""}
+
+    def _save_status(self, status: dict):
+        try:
+            p = self._status_file()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(status, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+        except Exception as e:
+            logger.warning(f"[对账] 写入对账状态失败(降级): {e}")
+
+    def _mark_reconciled(self, recon_date: str):
+        """标记该交易日对账成功，清零连续失败计数。"""
+        status = self._load_status()
+        days = status.get("reconciled_days", [])
+        if recon_date not in days:
+            days.append(recon_date)
+            # 只保留最近 60 个交易日记录，避免无限增长
+            status["reconciled_days"] = sorted(days)[-60:]
+        status["fail_streak"] = 0
+        status["last_fail_date"] = ""
+        self._save_status(status)
+
+    def _consecutive_failures(self, recon_date: str) -> int:
+        """累加连续未完成对账的交易日数（同一日多次运行不重复累加）。"""
+        status = self._load_status()
+        if status.get("last_fail_date") == recon_date:
+            return int(status.get("fail_streak", 0))
+        streak = int(status.get("fail_streak", 0)) + 1
+        status["fail_streak"] = streak
+        status["last_fail_date"] = recon_date
+        self._save_status(status)
+        return streak
+
+    def _pending_reconcile_days(self, recon_date: str, lookback: int = 10) -> list:
+        """返回最近 lookback 个交易日内尚未成功对账的日期（供补跑）。"""
+        pending = []
+        try:
+            from utils.trading_calendar import is_trading_day
+            status = self._load_status()
+            done = set(status.get("reconciled_days", []))
+            d = datetime.date.fromisoformat(recon_date)
+            checked = 0
+            while checked < lookback:
+                iso = d.isoformat()
+                try:
+                    trading = is_trading_day(iso)
+                except Exception:
+                    trading = d.weekday() < 5
+                if trading and iso not in done:
+                    pending.append(iso)
+                if trading:
+                    checked += 1
+                d -= datetime.timedelta(days=1)
+        except Exception as e:
+            logger.warning(f"[对账] 计算待补跑交易日失败(降级): {e}")
+        return sorted(pending)
+
+    def _escalate_alert(self, recon_date: str, streak: int, message: str):
+        """连续 N 日未完成对账 → 邮件升级告警（区别于普通差异告警）。"""
+        try:
+            title = f"[账实对账] ⚠️ 连续{streak}日未完成对账"
+            content = (
+                f"截至 {recon_date}，盘后账实对账已连续 {streak} 个交易日未能完成。\n"
+                f"最近一次原因：{message}\n"
+                f"账实一致性无法确认，请尽快人工核查券商连接/数据源。"
+            )
+            logger.error(f"[对账升级] {content}")
+            from notify.email_notify import send_email
+            send_email(title, content)
+        except Exception as e:
+            logger.error(f"[对账升级] 邮件升级告警失败: {e}")
 
     # ---- 主流程 ----
     def run(self, broker_positions=None, broker_asset=None, trade_date=None) -> dict:
@@ -301,8 +477,23 @@ class DailyReconciler:
             all_diffs = pos_diffs + asset_diffs + order_diffs
             new_diffs = self._record_and_alert(all_diffs, recon_date)
 
+            # FIX P1-15: completed 由全部子项决定——持仓+资金均拿到权威数据
+            # 且资金对账子项 ok，才算完成；消除“completed=True 与资金对账失败
+            # message 并存”的自相矛盾。
+            completed = bool(authoritative and asset_res.get("ok"))
+            if completed:
+                # 记录成功对账的交易日，用于补跑与连续未对账升级
+                self._mark_reconciled(recon_date)
+                if not result["message"]:
+                    result["message"] = (
+                        f"对账完成：持仓差异{len(pos_diffs)}项 资金差异{len(asset_diffs)}项 "
+                        f"成交异常{len(order_diffs)}项 新增告警{new_diffs}项"
+                        if all_diffs else "对账完成：账实一致")
+            elif not result["message"]:
+                result["message"] = "对账未完成：资金对账子项失败"
+
             result.update({
-                "completed": True,
+                "completed": completed,
                 "has_diff": len(all_diffs) > 0,
                 "positions": pos_diffs,
                 "asset": asset_res,
@@ -310,11 +501,17 @@ class DailyReconciler:
                 "diffs": all_diffs,
                 "new_diffs": new_diffs,
             })
-            if not result["message"]:
-                result["message"] = (
-                    f"对账完成：持仓差异{len(pos_diffs)}项 资金差异{len(asset_diffs)}项 "
-                    f"成交异常{len(order_diffs)}项 新增告警{new_diffs}项"
-                    if all_diffs else "对账完成：账实一致")
+            # FIX P1-15: 未完成时检查连续失败天数并升级告警；
+            # 同时返回待补跑的未对账交易日列表。
+            if not completed:
+                streak = self._consecutive_failures(recon_date)
+                result["fail_streak"] = streak
+                esc_days = int(self.config.get("escalate_after_days", 3))
+                if streak >= esc_days:
+                    self._escalate_alert(recon_date, streak, result["message"])
+            pending = self._pending_reconcile_days(recon_date)
+            if pending:
+                result["pending_days"] = pending
             logger.info(f"[对账] {result['message']}")
             return result
         except Exception as e:

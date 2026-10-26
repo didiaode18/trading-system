@@ -35,8 +35,6 @@ from copy import deepcopy
 
 import pandas as pd
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from backtest_real import (
     fetch_history_data, compute_indicators, is_limit_up, is_limit_down,
@@ -55,7 +53,7 @@ DEFAULT_PARAMS = {
     # 买入参数
     "vol_shrink_ratio": 0.70,       # 缩量阈值（量<均量×N）
     "support_touch_pct": 0.01,      # 支撑位容差
-    "min_signal_quality": 60,       # OPTIMIZE: 信号质量最低分（原55，回测显示低质量交易过多）
+    "min_signal_quality": 65,       # V11.1 P1-1: 60→65（与 config MIN_SIGNAL_QUALITY_NON_BEAR 对齐）
     "require_ma60_up": True,        # 是否要求MA60向上
     "enable_bp3": True,             # V7: 是否启用bp3牛市趋势延续买点
     "bp3_vol_shrink": 0.85,         # bp3缩量阈值
@@ -72,6 +70,8 @@ DEFAULT_PARAMS = {
     "atr_multiplier": 2.0,          # V7: ATR倍数（BEAR自动降为1.5）
     "atr_stop_min": 0.04,           # ATR止损下限
     "atr_stop_max": 0.08,           # ATR止损上限
+    # V11.1 P1-2: 止损确认机制参数
+    "stop_hard_buffer": 0.02,       # 深度穿破缓冲（low<stop_price*(1-0.02)→立即触发防黑天鹅）
 
     # V7: 多因子信号增强（A2）
     "factor_weight_smf": 0.0,       # 聪明钱因子权重（0=关闭）
@@ -79,9 +79,13 @@ DEFAULT_PARAMS = {
     "factor_weight_low_vol": 0.0,   # 低波动因子权重（0=关闭）
     "factor_max_bonus": 20,         # 因子加分上限（防止因子加分过多）
 
-    # Regime-aware质量门槛（V7: 对齐v5的分市场环境逻辑）
-    "min_quality_bear": 70,         # BEAR市场信号质量门槛
-    "min_quality_non_bear": 65,     # 非BEAR市场信号质量门槛
+    # Regime-aware质量门槛（V11.1 P1-1: 对齐 config 提高后的门槛，减少低质量交易）
+    "min_quality_bear": 78,         # V11.1 P1-1: 70→78（熊市命中率仅 33.2%）
+    "min_quality_non_bear": 68,     # V11.1 P1-1: 65→68（与 config MIN_SIGNAL_QUALITY_NON_BEAR 对齐）
+    # V11.2 P1-2: RANGE 震荡市专用门槛溢价——震荡市假突破/假回踩多，
+    #   在 non_bear 门槛上叠加此溢价（RANGE 实际门槛 = non_bear + premium），
+    #   过滤低质量震荡交易。叠加式设计保证网格扫 non_bear 时 RANGE 门槛同步移动。
+    "range_quality_premium": 4,
 
     # 止盈参数
     "ladder_1_pct": 0.08,           # 阶梯止盈第1档
@@ -390,7 +394,13 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
 
                 # V7: regime-aware质量门槛（对齐v5逻辑）
                 current_regime = regime_series.get(str(date), "RANGE")
-                min_quality = p["min_quality_bear"] if current_regime == "BEAR" else p["min_quality_non_bear"]
+                # V11.2 P1-2: 三态门槛——BEAR 最严 / RANGE 中（non_bear+溢价）/ BULL 基准
+                if current_regime == "BEAR":
+                    min_quality = p["min_quality_bear"]
+                elif current_regime == "RANGE":
+                    min_quality = p["min_quality_non_bear"] + p.get("range_quality_premium", 4)
+                else:
+                    min_quality = p["min_quality_non_bear"]
                 # 同时兼容旧的 min_signal_quality 参数（WF网格可能传入）
                 min_quality = max(min_quality, p["min_signal_quality"])
                 if signal_quality < min_quality:
@@ -480,11 +490,23 @@ def backtest_stock_v6(df: pd.DataFrame, code: str, info: dict, params: dict) -> 
                 else:
                     stop_price = buy_price * (1 + p["profit_lock_2"])
 
-                # FIX: 用盘中最低价判定止损触发（与backtest_real.py B5修复保持一致）
-                if low <= stop_price:
+                # V11.1 P1-2: 止损确认机制—减少假止损（回测显示止损占卖出60%但胜率仅21%）
+                # 旧逻辑: low <= stop_price → 立即触发（日内触碰即止损，噪声敏感）
+                # 新逻辑: 需收盘确认 OR 深度穿破（防黑天鹅）
+                #   - hard_buffer=2%: 若 low < stop_price*(1-0.02) 立即触发（防跳空/黑天鹅）
+                #   - 否则要求 close < stop_price（收盘确认，避免日内假破位）
+                stop_hard_price = stop_price * (1 - p.get("stop_hard_buffer", 0.02))
+                if low <= stop_hard_price:
+                    # 深度穿破—立即触发（防黑天鹅）
                     sell_signal = True
                     sell_type = "止损"
                     sell_ratio = 1.0
+                elif close < stop_price:
+                    # 收盘确认—避免日内假破位（V11.1 P1-2 新增）
+                    sell_signal = True
+                    sell_type = "止损"
+                    sell_ratio = 1.0
+                # 否则仅日内触碰不触发（等收盘确认）
 
             # ---- 趋势破位（可配置模式）----
             if not sell_signal and p["trend_break_mode"] != "none" and not pd.isna(row["ma60"]):

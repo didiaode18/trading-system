@@ -178,6 +178,19 @@ def reconcile_daily_orders(date_str: str = None, orders_dir: str = None,
         # 先回填当日成交再对账，保证双源齐全
         backfill_trades_to_journal(db_path=db_path)
         executed = _load_trades_by_date(iso_date, db_path=db_path)
+        # FIX P1-21: executed 为空集时拒绝写"未触发"终态。
+        # trades_today.json 长期无写入方 → executed 恒空 → 所有条件单被写死
+        # "未触发"（实证 orders_2026092x 100% 未触发），成交率归因/纪律评分/
+        # 滑点样本全部基于假数据。无成交证据时不改写任何终态，如实标注。
+        if not executed:
+            stats["ok"] = True
+            stats["no_evidence"] = True
+            stats["total"] = len(orders)
+            logger.warning(
+                f"[执行台账] 条件单对账 {date_str}: 无任何成交证据"
+                f"（trades_today.json/trade_journal.db 均空），"
+                f"拒绝将{len(orders)}条条件单写死为\"未触发\"终态，保持原状态")
+            return stats
         # BUG-031修复: 匹配键加入数量，避免同标的同方向多单被全部标记为已成交
         exec_keys = {}
         for e in executed:

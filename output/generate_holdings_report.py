@@ -190,6 +190,8 @@ def _load_holdings_from_json():
                 "stock_type": v.get("stock_type", "龙头"),
                 # FIX(2026-08-26) BUG-01: 券商盈亏字段透传，供主循环交叉验证成本口径
                 "broker_pnl": v.get("pnl"),
+                # FIX P0(2026-10-09): 透传JSON快照时的最新价，供成本交叉验证使用同时间口径价格
+                "json_current_price": v.get("current_price", 0),
             })
         return result
     except Exception as _e:
@@ -299,7 +301,9 @@ def _render_action_spotlight(holdings, regime_result=None, vol_result=None,
             _strategy = _advice.get("primary_strategy", "")
         except Exception:
             pass
-    _avail_cash = max(0, _CAPITAL - current_mv)
+    # FIX P0(2026-10-09): 可用资金直接读取config.AVAILABLE_CASH，不再从TOTAL_CAPITAL-市值推算。
+    # 原逻辑(TOTAL_CAPITAL-实时市值)因实时价格变动导致可用资金失真(如报告6069/7899 vs 实际30.50)。
+    _avail_cash = getattr(config, 'AVAILABLE_CASH', max(0, _CAPITAL - current_mv))
     _vol_desc = ""
     if vol_result:
         _vol_scale = vol_result["scale"]
@@ -723,11 +727,31 @@ def _render_action_plan(regime_result, sector_result, holdings, all_data,
     """
     if not HAS_ACTION_PLANNER:
         return ""
+    # FIX(2026-10-08): ActionPlanner 只认英文键 schema(name/shares/buy_price/sector)，
+    # 而报告主流程的 holdings 是中文键(名称/数量/成本/市值)。直传会让
+    # _calc_current_position() 恒为0 → 行动清单显示"仓位0% / 可用资金=全部本金 /
+    # 需加仓"，与"明日行动指令卡"的真实仓位自相矛盾；减仓/换仓清单也因读不到
+    # 持仓而恒为空。此处按 daily_orders.py 的 _holdings_dict 同一口径归一化。
+    ap_holdings = {}
+    for _c, _h in (holdings or {}).items():
+        if not isinstance(_h, dict):
+            continue
+        _sh = _h.get("shares", _h.get("数量", 0)) or 0
+        if _sh <= 0:
+            continue
+        ap_holdings[_c] = {
+            "name": _h.get("name") or _h.get("名称") or _c,
+            "shares": _sh,
+            "buy_price": _h.get("buy_price", _h.get("成本", 0)) or 0,
+            "current_price": _h.get("current_price", _h.get("最新", 0)) or 0,
+            "sector": _h.get("sector") or _h.get("赛道") or "",
+            "market_value": _h.get("market_value", _h.get("市值", 0)) or 0,
+        }
     try:
         planner = ActionPlanner(
             regime_result=regime_result,
             sector_result=sector_result,
-            holdings=holdings,
+            holdings=ap_holdings,
             all_data=all_data,
             total_capital=total_capital,
         )
@@ -738,6 +762,14 @@ def _render_action_plan(regime_result, sector_result, holdings, all_data,
 
     if not plan:
         return ""
+
+    # FIX(2026-10-08): 与主流程仓位口径交叉校验，偏差>5pp 说明归一化又失效了
+    _ap_pos = plan.get("current_position", 0) or 0
+    if current_pct and abs(_ap_pos - current_pct) > 0.05:
+        print(f"  ⚠️ ActionPlanner仓位{_ap_pos:.0%}与主流程{current_pct:.0%}偏差过大，"
+              f"以主流程口径为准展示")
+        plan["current_position"] = current_pct
+        plan["position_gap"] = plan.get("position_target", 0.6) - current_pct
 
     regime_state = plan.get("regime_state", "RANGE")
     regime_action = plan.get("regime_action", "")
@@ -765,7 +797,8 @@ def _render_action_plan(regime_result, sector_result, holdings, all_data,
     # ---- 1. 仓位仪表盘 ----
     _gap_dir = "需加仓" if pos_gap > 0.02 else ("需减仓" if pos_gap < -0.02 else "已达标")
     _gap_color = "#1976d2" if pos_gap > 0.02 else ("#cf1322" if pos_gap < -0.02 else "#389e0d")
-    _avail_cash = max(0, total_capital - pos_current * total_capital)
+    # FIX P0(2026-10-09): 同上，可用资金直接读取config.AVAILABLE_CASH
+    _avail_cash = getattr(config, 'AVAILABLE_CASH', max(0, total_capital - pos_current * total_capital))
 
     # 仓位进度条
     _bar_width = min(int(pos_current * 100), 100)
@@ -808,7 +841,11 @@ def _render_action_plan(regime_result, sector_result, holdings, all_data,
             _pnl = item.get("pnl_pct", 0)
             _sector = item.get("sector", "")
             _priority = item.get("priority", "")
-            _conf = item.get("confidence", 0)
+            # FIX(2026-10-08): 防御型强转——priority 历史上有 int/str 两种形态，
+            # int 时 `"必减" in _priority` 会 TypeError 并把整个面板静默丢掉
+            _priority = _priority if isinstance(_priority, str) else (
+                "必减" if isinstance(_priority, (int, float)) and _priority >= 5 else "建议减")
+            _conf = item.get("confidence", 0) or 0
             _pnl_color = "#27ae60" if _pnl >= 0 else "#cf1322"
             _pri_bg = "#fff1f0" if "必减" in _priority else "#fff7e6"
             _pri_border = "#ffa39e" if "必减" in _priority else "#ffd591"
@@ -859,10 +896,17 @@ def _render_action_plan(regime_result, sector_result, holdings, all_data,
         html += (f'<div style="margin:12px 0 6px;font-size:14px;font-weight:bold;color:#1565c0">'
                  f'\U0001f501 换仓配对（{len(switch_list)}组）</div>')
         for pair in switch_list:
-            _sell = pair.get("sell", {})
-            _buy = pair.get("buy", {})
+            # FIX(2026-10-08): ActionPlanner._identify_switch_pairs 输出的是扁平键
+            # (sell_code/sell_name/buy_code/buy_name)，而此处只读嵌套的 sell/buy 字典，
+            # 导致换仓配对渲染成"卖出  → 买入 "空白行。兼容两种形态。
+            _sell = pair.get("sell") or {
+                "code": pair.get("sell_code", ""), "name": pair.get("sell_name", ""),
+                "sector": pair.get("sell_sector", "")}
+            _buy = pair.get("buy") or {
+                "code": pair.get("buy_code", ""), "name": pair.get("buy_name", ""),
+                "sector": pair.get("buy_sector", "")}
             _reason = pair.get("reason", "")
-            _conf = pair.get("confidence", 0)
+            _conf = pair.get("confidence", 0) or 0
             html += (f'<div style="background:#f0f7ff;border:1px solid #b3d9ff;border-radius:6px;'
                      f'padding:10px 14px;margin:6px 0">'
                      f'<div style="font-size:13px">'
@@ -959,16 +1003,22 @@ def analyze_technical(df, realtime_price=None):
     latest = df.iloc[-1]
     close = realtime_price if realtime_price and realtime_price > 0 else latest["close"]
 
-    ma5 = latest.get("ma5", close)
-    ma10 = latest.get("ma10", close)
-    ma20 = latest.get("ma20", close)
-    ma60 = latest.get("ma60", close)
-    rsi = latest.get("rsi", 50)
-    macd_dif = latest.get("macd_dif", 0)
-    macd_dea = latest.get("macd_dea", 0)
-    macd_hist = latest.get("macd_hist", 0)
-    atr = latest.get("atr", close * 0.02)
-    boll_upper = latest.get("boll_upper", close * 1.1)
+    # FIX P2(2026-10-09): MA NaN 回退修复——rolling()数据不足时值为NaN，
+    # dict.get(key, default) 不会触发回退（key存在但value=NaN），需显式检查 pd.isna()
+    def _safe_get(series, key, fallback):
+        v = series.get(key, fallback)
+        return fallback if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+
+    ma5 = _safe_get(latest, "ma5", close)
+    ma10 = _safe_get(latest, "ma10", close)
+    ma20 = _safe_get(latest, "ma20", close)
+    ma60 = _safe_get(latest, "ma60", close)
+    rsi = _safe_get(latest, "rsi", 50)
+    macd_dif = _safe_get(latest, "macd_dif", 0)
+    macd_dea = _safe_get(latest, "macd_dea", 0)
+    macd_hist = _safe_get(latest, "macd_hist", 0)
+    atr = _safe_get(latest, "atr", close * 0.02)
+    boll_upper = _safe_get(latest, "boll_upper", close * 1.1)
     boll_lower = latest.get("boll_lower", close * 0.9)
     vol_ma20 = latest.get("vol_ma20", 0)
     volume = latest.get("volume", 0)
@@ -1283,6 +1333,31 @@ for item in holdings_list:
                     print(f"  [数据质量] {code}: 数据缺口{_days_gap}天(最新{_kline_last_date})，技术评分可能失真")
             except Exception:
                 pass
+            # FIX P1(2026-10-09): 统一技术指标数据源 —— 实时行情(tencent)与历史K线(baostock)
+            # 收盘价可能不同（复权算法/精度差异），导致MA/RSI/MACD与展示价格错位。
+            # 修复：将最后一行OHLC替换为实时行情值，确保指标基于与展示价一致的数据计算。
+            _rt_q = quotes.get(code, {})
+            _rt_px = _rt_q.get("price", 0)
+            if _rt_px > 0:
+                _last_date = str(df["date"].iloc[-1])[:10] if "date" in df.columns else ""
+                _today_str = datetime.date.today().isoformat()
+                try:
+                    if _last_date == _today_str:
+                        # 历史数据已含今日→替换OHLC为实时值
+                        df.iloc[-1, df.columns.get_loc("open")] = float(_rt_q.get("open", _rt_px) or _rt_px)
+                        df.iloc[-1, df.columns.get_loc("close")] = float(_rt_px)
+                        df.iloc[-1, df.columns.get_loc("high")] = float(_rt_q.get("high", _rt_px) or _rt_px)
+                        df.iloc[-1, df.columns.get_loc("low")] = float(_rt_q.get("low", _rt_px) or _rt_px)
+                    elif _last_date < _today_str:
+                        # 历史数据不含今日→追加实时行为新行
+                        _new_row = pd.DataFrame([{
+                            "date": _today_str, "open": float(_rt_q.get("open", _rt_px) or _rt_px),
+                            "close": float(_rt_px), "high": float(_rt_q.get("high", _rt_px) or _rt_px),
+                            "low": float(_rt_q.get("low", _rt_px) or _rt_px), "volume": 0
+                        }])
+                        df = pd.concat([df, _new_row], ignore_index=True)
+                except Exception as _ue:
+                    print(f"  [数据质量] {code}: 实时数据合并失败({_ue})，沿用原历史数据计算指标")
             df = compute_indicators(df)
             hist_dataframes[code] = df  # 保存原始数据
             rt_price = quotes.get(code, {}).get("price", 0)
@@ -1559,13 +1634,16 @@ for item in holdings_list:
     buy_price = item.get("buy_price", 0)
     highest_hist = item.get("highest", 0)
 
-    # FIX(2026-08-26) BUG-01: 成本口径交叉验证 —— 用券商盈亏反推隐含成本价，
+    # FIX(2026-08-26) BUG-01 + FIX P0(2026-10-09): 成本口径交叉验证 —— 用券商盈亏反推隐含成本价，
     # 当buy_price(买入均价)与券商持仓盈亏使用的成本价偏差>0.5%时，修正为隐含成本价。
-    # 修复前: 6只持仓盈亏失真(000661偏差+12.56pp, 002603偏差+10.19pp)。
+    # FIX P0(2026-10-09): 原逻辑用实时价latest反推成本，但broker_pnl基于JSON快照时的价格计算，
+    # 跨日/盘中价格变动导致隐含成本失真（如603002成本被篡改为17.645，真实18.655）。
+    # 修正：使用json_current_price（与broker_pnl同时间口径）代替latest。
     _broker_pnl = item.get("broker_pnl")
+    _json_px = item.get("json_current_price", 0)
     _cost_corrected = False
-    if _broker_pnl is not None and shares > 0 and latest > 0 and buy_price > 0:
-        _implied_cost = latest - _broker_pnl / shares
+    if _broker_pnl is not None and shares > 0 and _json_px > 0 and buy_price > 0:
+        _implied_cost = _json_px - _broker_pnl / shares
         if _implied_cost > 0:
             _cost_drift = abs(buy_price / _implied_cost - 1)
             if _cost_drift > 0.005:  # 偏差>0.5%触发修正

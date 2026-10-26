@@ -20,8 +20,6 @@ import threading
 from typing import Tuple
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from trading_system.position.kelly import half_kelly_position
 from .trade_journal import JOURNAL_DB_PATH
@@ -58,8 +56,10 @@ def _get_historical_win_rate(stock_code: str) -> Tuple[float, float]:
     返回:
         (win_rate, profit_factor)
     """
-    if stock_code in _win_rate_cache:
-        with _cache_lock:
+    # FIX P2-20: 缓存读也必须在锁内——原写法先在锁外做 `in` 成员判定、
+    # 再进锁读取，属 TOCTOU（与写入侧 line100 的加锁不一致）。
+    with _cache_lock:
+        if stock_code in _win_rate_cache:
             return _win_rate_cache[stock_code]
 
     # FIX: 修复SQLite连接在异常路径下未关闭导致连接泄漏
@@ -316,7 +316,7 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
                      is_etf: bool = False,
                      stock_code: str = None) -> dict:
     """
-    计算第一批试仓（40%计划仓位）
+    计算第一批试仓（config.FIRST_BATCH_RATIO 计划仓位，当前=50%）
     
     V8.1新增（基于1322笔真实委托验证）:
     - 单笔最低2万元（62.8%小单<1万被手续费吃掉）
@@ -423,7 +423,7 @@ def calc_first_batch(buy_price: float, stop_loss_price: float,
         f"最终股数={final_shares}, 最终金额={final_amount:.0f}"
     )
 
-    # 第一批 = 40%
+    # 第一批 = config.FIRST_BATCH_RATIO（V5.1: 50%，原40%在15%单只上限下首批金额过小）
     first_shares = int(final_shares * config.FIRST_BATCH_RATIO)
     first_shares = (first_shares // 100) * 100
     if first_shares == 0 and final_shares >= 100:

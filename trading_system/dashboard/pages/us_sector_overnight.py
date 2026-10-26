@@ -18,8 +18,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from dashboard.theme import COLOR_UP, COLOR_DOWN, COLOR_ACCENT, PLOTLY_LAYOUT
 
 logger = logging.getLogger(__name__)

@@ -27,8 +27,6 @@ import time
 import logging
 import datetime
 from typing import Dict, List
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)

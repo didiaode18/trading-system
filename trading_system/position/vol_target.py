@@ -30,8 +30,6 @@ import numpy as np
 import logging
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -112,12 +110,16 @@ class VolTargetManager:
         scale = max(self.min_scale, min(self.max_scale, raw_scale))
 
         # 大盘弱势额外惩罚
+        # FIX P1-05: 调用方（main.py）传 strong/normal/weak，而本处旧逻辑只认
+        # down/neutral → 惩罚乘子永不命中。统一枚举：同时接受两套值。
         if market_info:
-            state = market_info.get("market_state", "neutral")
-            if state == "down":
+            state = str(market_info.get("market_state", "") or "").lower()
+            bearish = {"down", "weak", "bear", "bearish"}
+            sideways = {"neutral", "normal", "range", "sideways", "震荡"}
+            if state in bearish:
                 scale *= 0.7  # 熊市再打7折
-            elif state == "neutral":
-                scale *= 0.9
+            elif state in sideways:
+                scale *= 0.9  # 震荡市打9折
 
         scale = max(self.min_scale, min(self.max_scale, scale))
 

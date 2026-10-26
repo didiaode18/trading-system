@@ -12,9 +12,6 @@
 import os
 import sys
 import logging
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
     from ..backtest.broker import SimBroker, Order, CostConfig, MatchMode
 except ImportError:  # pragma: no cover - 顶层包路径兼容
@@ -32,7 +29,7 @@ class SimulatorBroker:
 
     def __init__(self, initial_capital: float, cost_config: CostConfig = None,
                  match_mode: MatchMode = MatchMode.REALISTIC,
-                 match_price: str = "next_open", on_fill=None):
+                 match_price: str = "next_open", on_fill=None, risk_gate=None):
         """
         参数:
             initial_capital: 初始资金
@@ -40,12 +37,14 @@ class SimulatorBroker:
             match_mode:      撮合模式（默认 REALISTIC，与实盘一致）
             match_price:     撮合价来源
             on_fill:         成交回调 fn(fill)，供模拟盘 tracker 落库
+            risk_gate:       FIX P2-16 撮合层风控钩子（透传内部 SimBroker，默认 None=不改变行为）
         """
         self._broker = SimBroker(
             initial_capital=initial_capital,
             cost_config=cost_config,
             match_mode=match_mode,
             match_price=match_price,
+            risk_gate=risk_gate,
         )
         self._on_fill = on_fill
 

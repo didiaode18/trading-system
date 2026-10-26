@@ -33,8 +33,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # 路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
     from .broker import SimBroker, Order, CostConfig, Fill, RejectReason
     from .data_feed import DataFeed

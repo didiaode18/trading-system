@@ -26,8 +26,6 @@ import numpy as np
 import logging
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -65,7 +63,8 @@ class MonteCarloStressTest:
         self.n_simulations = n_simulations
         self.rng = np.random.default_rng(seed)
 
-    def run(self, trades: list, initial_capital: float = None) -> dict:
+    def run(self, trades: list, initial_capital: float = None,
+            position_ratio: float = None) -> dict:
         """
         运行蒙特卡洛模拟
         
@@ -109,8 +108,16 @@ class MonteCarloStressTest:
         if not trades or len(trades) < 5:
             return {"error": "交易记录不足（至少需要5笔）"}
 
-        # 提取收益率序列
-        returns = np.array([t.get("pnl_pct", 0) for t in trades])
+        # P1-1 修复: 逐笔 pnl_pct 是"单笔持仓自身收益率"。旧代码直接全仓复利
+        # np.cumprod(1 + pnl_pct)，等于假设每笔把全部净值压上——81 笔全仓复利
+        # 会滚出 17437% 的天文数字（复利溢出）。实际每笔仅占用 position_ratio(~12%)
+        # 资金，组合净值乘数应为 (1 + pnl_pct × position_ratio)，与
+        # backtest_optimizer.out_of_sample_validation 的 BUG-047 口径一致。
+        if position_ratio is None:
+            position_ratio = getattr(config, 'POSITION_RATIO', 0.12)
+
+        # 提取收益率序列（已按仓位比例折算为组合层面收益）
+        returns = np.array([t.get("pnl_pct", 0) for t in trades]) * position_ratio
         n_trades = len(returns)
 
         # ---- 1. 交易顺序随机化（向量化加速）----
@@ -294,7 +301,7 @@ HISTORICAL_SCENARIOS = {
 
 
 def historical_stress_test(trades: list, initial_capital: float = None,
-                           scenarios: dict = None) -> dict:
+                           scenarios: dict = None, position_ratio: float = None) -> dict:
     """
     V3.2: 历史情景压力测试
     
@@ -317,7 +324,11 @@ def historical_stress_test(trades: list, initial_capital: float = None,
     if not trades:
         return {"error": "无交易记录"}
     
-    returns = np.array([t.get("pnl_pct", 0) for t in trades])
+    # P1-1 修复: 与 run() 一致，按仓位比例折算为组合层面收益，
+    # 避免全仓复利导致情景压力结果失真。
+    if position_ratio is None:
+        position_ratio = getattr(config, 'POSITION_RATIO', 0.12)
+    returns = np.array([t.get("pnl_pct", 0) for t in trades]) * position_ratio
     avg_win = returns[returns > 0].mean() if (returns > 0).any() else 0.02
     avg_loss = returns[returns < 0].mean() if (returns < 0).any() else -0.05
     win_rate = (returns > 0).sum() / len(returns)

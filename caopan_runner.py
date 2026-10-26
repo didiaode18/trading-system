@@ -348,7 +348,9 @@ def _print_final_report(results: list, holdings: dict):
     # 8. 仓位管理
     print(f"\n  ━━ 八、仓位管理 ━━")
     try:
-        sizer = PositionSizer(total_capital=750000)
+        # FIX P1-07: 原硬编码 750000（实际总资金约 617,897）→ 系统性超配 +21%，
+        # 改用 config.TOTAL_CAPITAL 与四级熔断/风控分母口径一致。
+        sizer = PositionSizer(total_capital=config.TOTAL_CAPITAL)
         plan = sizer.calc_positions(results, holdings)
         print(position_summary(plan))
     except Exception as e:
@@ -715,6 +717,27 @@ def run_orders():
                     "dk_signal": result.get("dk_signal"),
                     "deviation_pct": result.get("deviation_pct", 0),
                 }
+                # FIX P1-07: 补方向/数量字段（原表无这两列 → 人工复制易错、无法过风控）
+                _act = action.get("desc", "") or ""
+                _shares = int(info.get("shares", 0) or 0)
+                if any(k in _act for k in ("清仓", "卖出", "离场")):
+                    order["direction"], order["qty"] = "卖出", _shares
+                elif "减仓" in _act:
+                    order["direction"] = "卖出"
+                    order["qty"] = (_shares // 2 // 100) * 100
+                elif any(k in _act for k in ("加仓", "买入")):
+                    order["direction"] = "买入"
+                    # 买入量经仓位引擎算出，以便导出前风控能实际评估并拦截
+                    try:
+                        from risk.position_sizing import calc_add_position
+                        _add = calc_add_position(code, close, _shares,
+                                                 config.TOTAL_CAPITAL,
+                                                 atr=result.get("atr", 0))
+                        order["qty"] = int(_add.get("add_shares", 0) or 0)
+                    except Exception:
+                        order["qty"] = 0
+                else:
+                    order["direction"], order["qty"] = "持有", 0
                 orders.append(order)
 
                 print(f"  {name}({code}) | 趋势{trend_level}级 | 止损{stop_loss} | 超买{overbought_price} | {action.get('desc','')}")
@@ -726,14 +749,50 @@ def run_orders():
 
     # 输出条件单表格
     if orders:
-        print(f"\n{'═' * 70}")
-        print(f"  📋 条件单参数表（可直接复制到东方财富）")
-        print(f"{'═' * 70}")
-        print(f"  {'标的':<10} {'最新价':>7} {'止损价':>7} {'超买止盈':>8} {'目标1':>7} {'目标2':>7} {'趋势':>6} {'建议'}")
-        print(f"  {'─'*66}")
+        # FIX P1-07: 导出前过风控 pre_trade_check_orders 并标注 blocked
+        # （原"可复制到东财"人工参数表不经任何风控）。
+        try:
+            from risk.risk_control import pre_trade_check_orders
+            from risk.position_sizing import _resolve_sector
+            from utils.instrument import is_etf as _is_etf
+            positions_snap = {}
+            for _c, _info in holdings.items():
+                _sh = int(_info.get("shares", 0) or 0)
+                _px = float(_info.get("current_price", _info.get("buy_price", 0)) or 0)
+                positions_snap[_c] = {
+                    "market_value": _sh * _px,
+                    "sector": _resolve_sector(_c),
+                    "is_etf": _is_etf(_c),
+                }
+            check_orders = [{
+                "方向": o.get("direction", ""), "证券代码": o["code"],
+                "证券名称": o["name"], "触发价": o["close"], "数量": o.get("qty", 0),
+            } for o in orders]
+            blocked = pre_trade_check_orders(check_orders, positions_snap,
+                                             config.TOTAL_CAPITAL)
+            _blocked_map = {b["code"]: b["reason"] for b in blocked}
+            for o in orders:
+                if o["code"] in _blocked_map:
+                    o["blocked"] = True
+                    o["block_reason"] = _blocked_map[o["code"]]
+            if blocked:
+                print(f"\n  ⛔ 风控拦截 {len(blocked)} 笔买入单（已在下表与JSON标注 blocked）")
+        except Exception as e:
+            print(f"  ⚠️ 导出前风控校验异常(不阻断导出): {e}")
+
+        print(f"\n{'═' * 78}")
+        print(f"  📋 条件单参数表（已过风控；买入单 blocked=⛔ 不得下单）")
+        print(f"{'═' * 78}")
+        print(f"  {'标的':<10} {'方向':<4} {'数量':>6} {'最新价':>7} {'止损价':>7} "
+              f"{'超买止盈':>8} {'目标1':>7} {'趋势':>6} {'风控':<4} {'建议'}")
+        print(f"  {'─'*74}")
         for o in orders:
-            print(f"  {o['name']:<10} {o['close']:>7.3f} {o['stop_loss']:>7.3f} {o['overbought_price']:>8.3f} "
-                  f"{o['target_1']:>7.3f} {o['target_2']:>7.3f} {o['trend']:>6} {o['action']}")
+            _flag = "⛔" if o.get("blocked") else "✓"
+            print(f"  {o['name']:<10} {o.get('direction',''):<4} {o.get('qty',0):>6} "
+                  f"{o['close']:>7.3f} {o['stop_loss']:>7.3f} {o['overbought_price']:>8.3f} "
+                  f"{o['target_1']:>7.3f} {o['trend']:>6} {_flag:<4} {o['action']}")
+            if o.get("blocked"):
+                print(f"       └─ 拦截原因: {o.get('block_reason','')}")
 
         # 导出JSON
         os.makedirs(OUTPUT_DIR, exist_ok=True)

@@ -20,12 +20,18 @@ import datetime
 import json
 import os
 import logging
+import threading
 # FIX: 清理 RiskGate 死代码，同步移除无引用的 Dict 导入
 from typing import List, Optional, Tuple
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+
+# FIX(P1-23/P0-16): 原子写 + 跨进程文件锁（降级兼容：工具不可用时回退旧行为）
+try:
+    from utils.file_io import atomic_json_write as _atomic_json_write, FileLock as _FileLock
+except Exception:  # pragma: no cover
+    _atomic_json_write, _FileLock = None, None
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +84,7 @@ RISK_CONFIG = {
     # --- 交易行为管控 ---
     "max_daily_opens": 2,           # 单日开仓次数上限
     "cooldown_after_sell": 2,       # [P1-#5修复] 卖出后N天内禁止重新买入（与RISK_UNIFIED_CONFIG.cool_down_days对齐=2）
-    "max_holdings": 7,              # 持仓数量硬限制
+    "max_holdings": getattr(config, "MAX_HOLDINGS", 8),  # FIX P2-20: 持仓数量硬限制单一真源=config.MAX_HOLDINGS（原硬编码7与config.py的8不一致）
 
     # --- 盈亏比准入 ---
     "min_risk_reward": 2.5,         # 最低盈亏比（不达标拦截）
@@ -99,6 +105,7 @@ try:
             'daily_loss_limit', 'daily_loss_limit_l2',
             'near_full_position', 'full_position_threshold',
             'cool_down_days',  # [P1-#5修复] 允许cool_down_days覆盖到RISK_CONFIG
+            'max_single_position',  # FIX P2-01: 单票绝对硬顶纳入读取白名单（原0.25不在白名单被静默丢弃→配置漂移）
         ):
             RISK_CONFIG[_k] = _v
 except Exception:
@@ -180,13 +187,31 @@ class RiskStateManager:
             default["daily_pnl"] = 0.0
             default["last_trade_date"] = today
 
+        # FIX(P2-12): 清理已过期的 sell_cooldown 条目（解禁日不晚于今天），防止状态永久残留
+        _sc = default.get("sell_cooldown") or {}
+        if isinstance(_sc, dict) and _sc:
+            _pruned = {c: u for c, u in _sc.items() if u and str(u) > today}
+            if len(_pruned) != len(_sc):
+                default["sell_cooldown"] = _pruned
+
         return default
 
     def save(self):
-        """持久化状态"""
+        """持久化状态（FIX P1-23: 原子写+跨进程锁，防双引擎实例竞争写坏文件）"""
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False, indent=2)
+        if _atomic_json_write is not None:
+            if _FileLock is not None:
+                with _FileLock(STATE_FILE, timeout=5.0):
+                    if _atomic_json_write(STATE_FILE, self.state):
+                        return
+            elif _atomic_json_write(STATE_FILE, self.state):
+                return
+        # 降级兜底：工具模块不可用时保持旧行为，但失败必须留痕
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[风控状态] 保存失败: {e}")
 
     def record_loss(self):
         """记录一笔亏损"""
@@ -239,9 +264,13 @@ class RiskStateManager:
         {"max_position": 1.00, "condition": "完全恢复"},
     ]
 
-    def get_recovery_position_cap(self) -> Tuple[float, str]:
+    def get_recovery_position_cap(self, current_market_value: float = None) -> Tuple[float, str]:
         """
         获取当前恢复阶段允许的仓位上限
+
+        参数:
+            current_market_value: 当前持仓总市值（可选）。提供时使用动态市值计算回撤深度，
+                                  避免使用静态 total_capital 导致回撤偏低。
 
         返回: (max_position_ratio, description)
         规则:
@@ -253,15 +282,19 @@ class RiskStateManager:
         total_capital = self.state.get("total_capital", 424000)
         monthly_start = self.state.get("monthly_start_capital", total_capital)
 
+        # FIX(BUG-08): 优先使用动态市值计算回撤深度，避免静态值偏低
+        # current_market_value 由调用方传入（当前持仓市值 + 现金 ≈ 实际总资产）
+        effective_capital = current_market_value if current_market_value and current_market_value > 0 else total_capital
+
         # 计算当前回撤深度
         if monthly_start > 0:
-            drawdown_from_month = (monthly_start - total_capital) / monthly_start
+            drawdown_from_month = (monthly_start - effective_capital) / monthly_start
         else:
             drawdown_from_month = 0
 
         # Tier 0: 深亏未恢复
-        if drawdown_from_month > 0.15 or total_capital < monthly_start * 0.85:
-            return 0.30, f"深亏恢复期(回撤{drawdown_from_month*100:.1f}%), 仓位上饨30%"
+        if drawdown_from_month > 0.15 or effective_capital < monthly_start * 0.85:
+            return 0.30, f"深亏恢复期(回撤{drawdown_from_month*100:.1f}%), 仓位上限30%"
 
         # Tier 1: 本月已实现盈亏≥0
         monthly_pnl = self.state.get("monthly_pnl", 0)
@@ -291,19 +324,28 @@ class RiskStateManager:
                 state = regime.get("state", "RANGE")
                 max_pos = regime.get("position_advice", {}).get("max_position", 0.60)
                 detail = regime.get("detail", "")
-                # 缓存超过2天则不可信
+                # FIX(P1-01): 缓存超过2天不可信 —— 返回保守上限60%而非最宽松100%
                 detect_time = regime.get("detect_time", "")
                 if detect_time:
                     from datetime import datetime as _dt
-                    try:
-                        detect_dt = _dt.strptime(detect_time, "%Y-%m-%d %H:%M")
-                        if (_dt.now() - detect_dt).days > 2:
-                            return 1.00, "市场状态缓存过期(>2天)"
-                    except ValueError:
-                        pass
+                    detect_dt = None
+                    for _fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                        try:
+                            detect_dt = _dt.strptime(str(detect_time)[:19], _fmt)
+                            break
+                        except ValueError:
+                            continue
+                    if detect_dt and (_dt.now() - detect_dt).days > 2:
+                        logger.critical(
+                            f"[MarketRegime] 市场状态缓存过期(detect_time={detect_time}, >2天)，"
+                            f"仓位上限保守降至60% —— 请检查 scheduler regime 刷新任务"
+                        )
+                        return 0.60, "市场状态缓存过期(>2天)，保守上限60%"
                 return max_pos, f"市场{state}, 仓位上饨{max_pos:.0%}"
         except Exception as e:
-            logger.debug(f"market_regime_state读取失败: {e}")
+            # FIX(P1-01): 读取异常不再静默放宽，同样返回保守上限并 critical 告警
+            logger.critical(f"[MarketRegime] market_regime_state读取失败，仓位上限保守降至60%: {e}")
+            return 0.60, "市场状态读取失败，保守上限60%"
         return 1.00, "无市场状态限制"
 
 
@@ -366,12 +408,19 @@ class StrategyFailureDetector:
         return default
     
     def _save_state(self):
-        """持久化状态"""
+        """持久化状态（FIX(BUG-02): 改用原子写，防止进程中断导致JSON文件截断损坏）"""
         state_file = self.state.get("_state_file", "")
         if not state_file:
             return
         save_data = {k: v for k, v in self.state.items() if not k.startswith("_")}
         os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        # FIX(BUG-02): 统一使用 atomic_json_write（临时文件+os.replace），与 RiskStateManager 保持一致
+        if _atomic_json_write is not None:
+            try:
+                _atomic_json_write(state_file, save_data, indent=2)
+                return
+            except Exception as e:
+                logger.warning(f"SFD 原子写失败，回退裸写: {e}")
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(save_data, f, ensure_ascii=False, indent=2)
     
@@ -552,10 +601,39 @@ class DynamicFuseEnhancer:
       持续熊市。动态熔断根据市场环境和亏损程度自动调整保护力度。
     """
     
-    def __init__(self):
+    def __init__(self, state_mgr=None):
+        # FIX(P2-11): 接入 RiskStateManager 持久化（原纯内存，重启后恢复渐进/熔断历史全部失效）
+        self._state_mgr = state_mgr
         self._fuse_history = []  # 熔断历史记录
         self._recovery_step = 1.0  # 恢复比例 (0.5=半仓恢复, 1.0=完全恢复)
         self._last_fuse_date = ""
+        self._load_persisted()
+
+    def _load_persisted(self):
+        """FIX(P2-11): 从 risk_state.json 的 dynamic_fuse 段恢复状态"""
+        if not self._state_mgr:
+            return
+        saved = self._state_mgr.state.get("dynamic_fuse") or {}
+        try:
+            self._recovery_step = float(saved.get("recovery_step", 1.0))
+            self._last_fuse_date = saved.get("last_fuse_date", "")
+            self._fuse_history = list(saved.get("fuse_history", []))[-20:]
+        except Exception as e:
+            logger.warning(f"[动态熔断] 持久化状态恢复失败，使用默认值: {e}")
+
+    def _persist(self):
+        """FIX(P2-11): 写回 risk_state.json 的 dynamic_fuse 段"""
+        if not self._state_mgr:
+            return
+        try:
+            self._state_mgr.state["dynamic_fuse"] = {
+                "recovery_step": self._recovery_step,
+                "last_fuse_date": self._last_fuse_date,
+                "fuse_history": self._fuse_history[-20:],
+            }
+            self._state_mgr.save()
+        except Exception as e:
+            logger.warning(f"[动态熔断] 状态持久化失败: {e}")
     
     def get_volatility_adjustment(self, market_info: dict = None) -> dict:
         """
@@ -643,11 +721,13 @@ class DynamicFuseEnhancer:
         })
         self._recovery_step = 0.5  # 熔断后恢复时半仓开始
         self._last_fuse_date = datetime.date.today().isoformat()
+        self._persist()  # FIX(P2-11)
     
     def on_recovery_trade(self, is_profit: bool):
         """熔断解除后的恢复交易结果"""
-        if is_profit:
+        if is_profit and self._recovery_step < 1.0:
             self._recovery_step = 1.0  # 盈利后完全恢复
+            self._persist()  # FIX(P2-11)
         # 亏损则继续保持0.5
 
 
@@ -656,6 +736,47 @@ class DynamicFuseEnhancer:
 # ============================================================
 # 便捷函数（供报告生成器/条件单调用）
 # ============================================================
+def _normalize_holdings_keys(holdings: dict) -> dict:
+    """FIX(P0-02): holdings 键名归一化（holdings.json 原始键 → 引擎内部键）
+
+    背景：生产调用方（intraday_decision.load_holdings / alert_engine）传入的键是
+    buy_price/current_price/stock_type，而引擎内部读 cost/price/type，导致持仓
+    市值恒为0、六道仓位硬约束集体静默失效。归一化同时保留原始键，双向兼容。
+    """
+    norm = {}
+    for code, pos in (holdings or {}).items():
+        if not isinstance(pos, dict):
+            continue
+        p = dict(pos)
+        if not p.get("cost") and p.get("buy_price"):
+            p["cost"] = p.get("buy_price", 0)
+        if not p.get("buy_price") and p.get("cost"):
+            p["buy_price"] = p.get("cost", 0)
+        if not p.get("price") and p.get("current_price"):
+            p["price"] = p.get("current_price", 0)
+        if not p.get("current_price") and p.get("price"):
+            p["current_price"] = p.get("price", 0)
+        if not p.get("type"):
+            p["type"] = p.get("stock_type") or "stock"
+        # 市值兜底：部分调用方只提供 market_value+shares
+        if not p.get("price") and p.get("market_value") and p.get("shares"):
+            try:
+                p["price"] = float(p["market_value"]) / float(p["shares"])
+                p["current_price"] = p["price"]
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        norm[code] = p
+    return norm
+
+
+def _normalize_signal_keys(signal: dict) -> dict:
+    """FIX(P0-02): signal 键名归一化（stock_type→type），并小写化便于 etf 判定"""
+    s = dict(signal or {})
+    if not s.get("type") and s.get("stock_type"):
+        s["type"] = s["stock_type"]
+    return s
+
+
 def quick_risk_check(signal: dict, holdings: dict,
                      total_capital: float = None,
                      market_info: dict = None) -> dict:
@@ -756,6 +877,32 @@ def pre_trade_check_orders(orders: list, positions: dict,
             blocked_list.append({"code": code, "name": name, "reason": reason_txt})
             logger.warning(f"[pre-trade] ⛔ {code} {name} 买入单被风控拦截: {reason_txt}")
 
+    # ---- EDGE-04: 卖出方向超卖检查 ----
+    # 合计卖出数量不得超过持仓数量，防止多张条件单叠加导致超卖
+    for order in orders:
+        _dir = order.get("方向", "")
+        if _dir not in ("卖出", "止损卖出", "止盈卖出"):
+            continue
+        _code = order.get("证券代码", "")
+        _name = order.get("证券名称", _code)
+        _qty = int(order.get("数量", 0) or 0)
+        if _qty <= 0:
+            continue
+        # 累计同标的卖出总量
+        total_sell_qty = sum(
+            int(o.get("数量", 0) or 0)
+            for o in orders
+            if o.get("证券代码") == _code and o.get("方向") in ("卖出", "止损卖出", "止盈卖出")
+        )
+        pos_shares = int(positions.get(_code, {}).get("shares", 0) or 0)
+        if total_sell_qty > pos_shares:
+            _reason = (f"合计卖出{total_sell_qty}股 > 持仓{pos_shares}股，"
+                       f"超卖{total_sell_qty - pos_shares}股")
+            order["blocked"] = True
+            order["block_reason"] = _reason
+            blocked_list.append({"code": _code, "name": _name, "reason": _reason})
+            logger.warning(f"[pre-trade] ⛔ {_code} {_name} 卖出单被风控拦截: {_reason}")
+
     return blocked_list
 
 
@@ -802,6 +949,29 @@ def check_pullback_add_risk(code: str, holdings: dict, df,
     if not cfg.get("enabled", True):
         return {"pass": False, "reason": "回调加仓功能未启用", "add_shares": 0}
 
+    # ---- 0. FIX(P0-20): 引擎级熔断状态校验（原实现绕过暂停期/连亏/冷却/年度熔断，
+    #      风控否决的标的可被回调加仓链路重新升级）----
+    try:
+        _sm = RiskStateManager()
+        if _sm.state.get("annual_halt"):
+            return {"pass": False, "reason": "年度熔断(annual_halt)已触发，禁止回调加仓", "add_shares": 0}
+        _paused, _pr = _sm.is_paused()
+        if _paused:
+            return {"pass": False, "reason": f"风控暂停期({_pr})，禁止回调加仓", "add_shares": 0}
+        _cool, _cr = _sm.is_cooling_down(code)
+        if _cool:
+            return {"pass": False, "reason": f"{_cr}，禁止回调加仓", "add_shares": 0}
+        _consec = int(_sm.state.get("consecutive_losses", 0) or 0)
+        if _consec >= 2:
+            return {"pass": False, "reason": f"连续亏损{_consec}笔（冷静期），禁止回调加仓", "add_shares": 0}
+        _dp = float(_sm.state.get("daily_pnl", 0) or 0)
+        _tc = float(_sm.state.get("total_capital", 0) or 0)
+        if _tc > 0 and _dp < 0 and abs(_dp) / _tc >= 0.02:
+            return {"pass": False, "reason": "日亏熔断已触发，禁止回调加仓", "add_shares": 0}
+    except Exception as e:
+        # fail-safe：风控状态不可读时禁止加仓，而非放行
+        return {"pass": False, "reason": f"风控状态读取失败({e})，fail-safe禁止回调加仓", "add_shares": 0}
+
     # ---- 1. 大盘过滤 ----
     if market_state not in cfg.get("market_state_allow", {"up", "neutral"}):
         return {"pass": False, "reason": f"大盘状态[{market_state}]不允许逆势加仓", "add_shares": 0}
@@ -839,7 +1009,12 @@ def check_pullback_add_risk(code: str, holdings: dict, df,
     current_price = latest["close"]
     pnl_pct = current_price / buy_price - 1 if buy_price > 0 else 0
 
-    # ---- 4. 浮亏>8%禁止（深套锁）----
+    # ---- 4. 浮亏禁止加仓（铁律对齐）----
+    # FIX(P0-20/P1-21): 原 -8% 才拦与引擎铁律"任何浮亏绝对禁止加仓"直接冲突 ——
+    # block_add_on_loss 开启时任何浮亏一律禁止加仓；-8% 深套锁保留作兜底
+    _block_on_loss = getattr(config, 'RISK_UNIFIED_CONFIG', {}).get("block_add_on_loss", True)
+    if _block_on_loss and pnl_pct < 0:
+        return {"pass": False, "reason": f"浮亏{pnl_pct:.1%}，绝对禁止加仓（铁律）", "add_shares": 0}
     if pnl_pct < -0.08:
         return {"pass": False, "reason": f"浮亏{pnl_pct:.1%}>8%，深套锁生效", "add_shares": 0}
 
@@ -888,7 +1063,17 @@ def check_pullback_add_risk(code: str, holdings: dict, df,
         total_mv = sum(h.get("shares", 0) * h.get("current_price", 0) for h in holdings.values())
         if total_mv > 0:
             current_weight = (shares * current_price) / total_mv
-    max_weight = cfg.get("max_single_weight", 0.30)
+    # FIX P2-01: 单票上限口径统一——回调加仓的集中度上限不得宽于主引擎的
+    # 单票硬约束（ETF 20%/个股 15%）。原 0.30 会让回调加仓把个股推到 30%，
+    # 绕过 check_buy 的 15% 上限。取二者更小值（fail-safe 收紧）。
+    _pw = cfg.get("max_single_weight", 0.30)
+    try:
+        from utils.instrument import is_etf as _is_etf_code
+        _hard = (RISK_CONFIG.get("etf_max_ratio", 0.20) if _is_etf_code(code)
+                 else RISK_CONFIG.get("stock_max_ratio", 0.15))
+    except Exception:
+        _hard = RISK_CONFIG.get("stock_max_ratio", 0.15)
+    max_weight = min(_pw, _hard)
     if current_weight > max_weight:
         return {"pass": False, "reason": f"仓位{current_weight:.0%}>{max_weight:.0%}，集中度超限", "add_shares": 0}
 
@@ -988,18 +1173,67 @@ def sync_authoritative_stop_loss(holdings_file: str = None) -> dict:
                 result["skipped"] += 1
 
         if changed:
-            tmp_file = holdings_file + ".tmp"
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(holdings, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, holdings_file)
+            # FIX(P0-16): 跨进程文件锁 + 原子写，防 scheduler 盘中巡检与手工同步并发覆盖
+            if _FileLock is not None and _atomic_json_write is not None:
+                with _FileLock(holdings_file, timeout=5.0):
+                    _atomic_json_write(holdings_file, holdings)
+            else:
+                tmp_file = holdings_file + ".tmp"
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(holdings, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, holdings_file)
             logger.info(
                 f"[止损统一] 权威止损写回 {result['updated']} 只 → {holdings_file}"
             )
+            # FIX(P0-15): 镜像到 legacy 副本，消除双副本 stop_loss 漂移
+            _mirror_stop_loss_to_legacy(holdings, holdings_file)
     except Exception as e:
         # FIX: 写回失败降级跳过，不影响巡检报告
         result["failed"] = True
         logger.warning(f"[止损统一] 写回失败已降级: {e}")
     return result
+
+
+def _mirror_stop_loss_to_legacy(holdings: dict, authoritative_file: str):
+    """FIX(P0-15): 将权威 stop_loss 镜像到 legacy 副本 trading_system/holdings.json（若存在）
+
+    背景：双副本 stop_loss 实测漂移（600887/600256/600989），读旧副本的模块
+    （trend_forecast/portfolio_analyzer/news_monitor/buy_point_alert）与权威源口径矛盾。
+    镜像同样遵循 Ratchet（只升不降），失败不阻断主流程。
+    """
+    try:
+        legacy = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "holdings.json")
+        if os.path.abspath(legacy) == os.path.abspath(authoritative_file):
+            return
+        if not os.path.exists(legacy):
+            return
+        with open(legacy, "r", encoding="utf-8") as f:
+            legacy_data = json.load(f)
+        if not isinstance(legacy_data, dict):
+            return
+        changed = False
+        for code, info in legacy_data.items():
+            src = holdings.get(code)
+            if isinstance(info, dict) and isinstance(src, dict):
+                new_stop = src.get("stop_loss", 0) or 0
+                if new_stop > (info.get("stop_loss", 0) or 0):
+                    info["stop_loss"] = new_stop
+                    changed = True
+        if changed:
+            if _FileLock is not None and _atomic_json_write is not None:
+                with _FileLock(legacy, timeout=5.0):
+                    _atomic_json_write(legacy, legacy_data)
+            else:
+                tmp = legacy + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(legacy_data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, legacy)
+            logger.info(f"[止损统一] 已镜像权威止损到 legacy 副本: {legacy}")
+    except Exception as e:
+        logger.warning(f"[止损统一] legacy 副本镜像失败（不阻断）: {e}")
 
 
 # ============================================================
@@ -1025,12 +1259,16 @@ class UnifiedRiskEngine:
     """
 
     _instance = None  # 单例，保证状态一致
+    _singleton_lock = threading.Lock()  # FIX(BUG-01): 单例创建线程安全
 
     def __new__(cls, total_capital: float = None, allowed_pool: set = None):
-        # 单例模式：确保全局只有一个引擎实例（状态持久化一致）
+        # FIX(BUG-01): 加锁保护单例创建，防止多线程并发初始化导致状态分裂
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
+            with cls._singleton_lock:
+                # 双重检查锁定（DCLP）
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
         return cls._instance
 
     def __init__(self, total_capital: float = None, allowed_pool: set = None):
@@ -1048,11 +1286,16 @@ class UnifiedRiskEngine:
         self.total_capital = total_capital or getattr(config, 'TOTAL_CAPITAL', 424000)
         self.state_mgr = RiskStateManager()
         self.state_mgr.state["total_capital"] = self.total_capital
+        # FIX(P0-12): allowed_pool 未显式传入时自动构建默认池 ——
+        # 原实现生产环境恒为 None，池外拦截关卡永久失效
+        if allowed_pool is None:
+            allowed_pool = self._build_default_pool()
         self.allowed_pool = allowed_pool  # None=不限制, set=只允许池内标的
         # P0: 策略失效检测器（滚动20笔胜率三级熔断）
         self.failure_detector = StrategyFailureDetector()
         # P2: 动态熔断增强器（波动率自适应+严重度分级+恢复渐进）
-        self.fuse_enhancer = DynamicFuseEnhancer()
+        # FIX(P2-11): 接入 state_mgr 实现持久化
+        self.fuse_enhancer = DynamicFuseEnhancer(state_mgr=self.state_mgr)
         # 加载盘中风险标记并执行盘后自动过期
         self._load_intraday_flags()
         self._expire_intraday_flags()
@@ -1062,12 +1305,70 @@ class UnifiedRiskEngine:
         """重置单例（仅用于测试）"""
         cls._instance = None
 
+    @staticmethod
+    def _build_default_pool():
+        """FIX(P0-12): 构建默认允许池（池外拦截关卡在生产环境因 allowed_pool 恒 None 永久失效）
+
+        来源（并集）:
+          1. config_local.STOCK_POOL（用户手工维护的核心标的，dict 或 set/list）
+          2. config.CORE_POOL / WATCH_POOL（若定义）
+          3. 动态股票池文件 trading_system/stock_pool.json（core_pool/watch_pool 段）
+        返回 None = 无可用池信息，保持不限制（带告警）。
+        测试环境可用 config.ENFORCE_ALLOWED_POOL=False 全局关闭。
+        """
+        if not getattr(config, "ENFORCE_ALLOWED_POOL", True):
+            return None
+        pool = set()
+
+        def _absorb(container):
+            if isinstance(container, dict):
+                pool.update(str(c) for c in container.keys())
+            elif isinstance(container, (set, list, tuple)):
+                for item in container:
+                    if isinstance(item, dict):
+                        c = item.get("code") or item.get("代码")
+                        if c:
+                            pool.add(str(c))
+                    else:
+                        pool.add(str(item))
+
+        try:
+            _absorb(getattr(config, "STOCK_POOL", None))
+            _absorb(getattr(config, "CORE_POOL", None))
+            _absorb(getattr(config, "WATCH_POOL", None))
+            pool_file = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "stock_pool.json")
+            if os.path.exists(pool_file):
+                with open(pool_file, "r", encoding="utf-8") as f:
+                    dyn = json.load(f)
+                if isinstance(dyn, dict):
+                    for key in ("core_pool", "watch_pool", "core", "watch"):
+                        _absorb(dyn.get(key))
+        except Exception as e:
+            logger.warning(f"[池外拦截] 默认股票池构建失败，保持不限制: {e}")
+            return None
+        # 归一化6位代码（去掉 .SH/.SZ 后缀）
+        norm = set()
+        for c in pool:
+            c = str(c).strip()
+            if "." in c:
+                c = c.split(".")[0]
+            if c:
+                norm.add(c)
+        if not norm:
+            logger.warning("[池外拦截] STOCK_POOL/CORE_POOL/stock_pool.json 均为空，保持不限制")
+            return None
+        logger.info(f"[池外拦截] 默认股票池已注入: {len(norm)} 只")
+        return norm
+
     # --------------------------------------------------------
     # 接口 1：兼容 risk_check() 的调用方式
     # --------------------------------------------------------
     def check(self, trade_plan: dict, risk_state,
               market_strength: str = "normal",
-              vol_scale: float = 1.0) -> dict:
+              vol_scale: float = 1.0,
+              systemic_position_cap: float = None) -> dict:
         """
         统一风控校验入口（兼容 risk_check 签名）
 
@@ -1083,7 +1384,9 @@ class UnifiedRiskEngine:
              "adjusted_shares": int, "warnings": list}
         """
         try:
-            return self._do_check(trade_plan, risk_state, market_strength, vol_scale=vol_scale)
+            return self._do_check(trade_plan, risk_state, market_strength,
+                                  vol_scale=vol_scale,
+                                  systemic_position_cap=systemic_position_cap)
         except Exception as e:
             logger.exception(f"[UnifiedRiskEngine] 引擎异常: {e}")
             return {
@@ -1096,8 +1399,13 @@ class UnifiedRiskEngine:
 
     def _do_check(self, trade_plan: dict, risk_state,
                   market_strength: str = "normal",
-                  vol_scale: float = 1.0) -> dict:
-        """内部校验逻辑（异常由外层 check() 捕获）"""
+                  vol_scale: float = 1.0,
+                  systemic_position_cap: float = None) -> dict:
+        """内部校验逻辑（异常由外层 check() 捕获）
+
+        systemic_position_cap: FIX(P1-25) 系统性风险降仓上限（main.py 传入），
+            与 MarketRegime 动态上限取更严值。
+        """
         cfg = self.cfg
         result = {
             "pass": True,
@@ -1115,13 +1423,25 @@ class UnifiedRiskEngine:
             self.state_mgr.record_sell(code)
             if pnl < 0:
                 self.state_mgr.record_loss()
+                self.fuse_enhancer.on_recovery_trade(False)  # FIX(P2-11)
             else:
                 self.state_mgr.record_profit()
+                self.fuse_enhancer.on_recovery_trade(True)   # FIX(P2-11): 盈利推进恢复阶段
             result["reasons"].append("卖出信号，直接通过")
             return result
 
         # 同步 RiskState 数据到状态管理器
         self._sync_risk_state(risk_state)
+
+        # ===== FIX(P1-19): 年度熔断关卡（annual_halt 此前只写不读，"需手动重置"名不副实）=====
+        if self.state_mgr.state.get("annual_halt"):
+            return self._block_result(
+                "年度熔断已触发(annual_halt=True)，全面暂停交易（需手动重置）")
+
+        # ===== FIX(P0-10): 盈亏数据源不可用时 fail-safe（原 fail-open 放行买入）=====
+        if self.state_mgr.state.get("pnl_data_unavailable"):
+            return self._block_result(
+                "总资产/盈亏数据源不可用，fail-safe暂停新开仓（请检查持仓与资金数据）")
 
         # ===== 关卡-2: 黑天鹅/极端行情检测（V3.2新增，最高优先级）=====
         # 指数单日跌>3% / 千股跌停 / 连续暴跌 → 全面禁止开仓
@@ -1226,6 +1546,11 @@ class UnifiedRiskEngine:
         # ===== 关卡0.9: MarketRegime动态仓位上限（FIX P1）=====
         # BEAR→30% / RANGE→60% / BULL→90%
         market_cap, market_desc = self.state_mgr.get_market_position_cap()
+        # FIX(P1-25): 系统性风险降仓上限接入——main.py 传入的 systemic_position_cap
+        # 与 MarketRegime 上限取更严值（原 _new_max 计算后只打日志从未传给下游，为死代码）。
+        if systemic_position_cap is not None and 0 < systemic_position_cap < market_cap:
+            market_cap = systemic_position_cap
+            market_desc = f"{market_desc} + 系统性风险降仓至{systemic_position_cap:.0%}"
         if market_cap < 1.0:
             current_ratio_after = (current_position_ratio * total_capital + amount) / total_capital
             if current_ratio_after > market_cap:
@@ -1319,9 +1644,15 @@ class UnifiedRiskEngine:
                 f"周度熔断: 本周亏损{weekly_loss_ratio:.2%} >= {weekly_limit:.0%}，强制休息"
             )
 
+        # ===== 关卡7.5: 月/年度回撤熔断（FIX P1-19: 此前仅 _do_check_buy 有，
+        # 实证年度回撤34.4%从未触发年度熔断）=====
+        dd_reason = self._check_period_drawdown_fuses()
+        if dd_reason:
+            return self._block_result(dd_reason)
+
         # ===== 关卡8: 持仓数量硬限制 =====
         max_holdings = cfg.get("max_holdings",
-                                getattr(config, 'MAX_HOLDINGS', 7))
+                                getattr(config, 'MAX_HOLDINGS', 8))
         if action == "buy" and code not in positions:
             if len(positions) >= max_holdings:
                 return self._block_result(
@@ -1353,8 +1684,23 @@ class UnifiedRiskEngine:
             max_ratio = cfg.get("flexible_max_ratio",
                                 getattr(config, 'FLEXIBLE_STOCK_MAX_RATIO', 0.08))
         else:
-            max_ratio = cfg.get("stock_max_ratio",
-                                getattr(config, 'LEADER_STOCK_MAX_RATIO', 0.15))
+            # FIX P2-01: 非弹性档按品种权威源分档（ETF 20%/个股 15%）。
+            # 原实现 ETF 也走 stock_max_ratio(15%)，与 instrument.get_max_single_position
+            # 及本文件关卡(line838)的 etf/stock 分档口径不一致。
+            try:
+                from utils.instrument import is_etf as _is_etf_code
+                _is_etf_inst = _is_etf_code(code)
+            except Exception:
+                _is_etf_inst = False
+            if _is_etf_inst:
+                max_ratio = cfg.get("etf_max_ratio", 0.20)
+            else:
+                max_ratio = cfg.get("stock_max_ratio",
+                                    getattr(config, 'LEADER_STOCK_MAX_RATIO', 0.15))
+        # FIX P2-01: 绝对硬顶——max_single_position 作为任何品种/档位的单票上限天花板
+        _abs_cap = cfg.get("max_single_position", None)
+        if _abs_cap and _abs_cap > 0:
+            max_ratio = min(max_ratio, _abs_cap)
         current_stock_amount = 0
         if code in positions:
             pos = positions[code]
@@ -1391,6 +1737,13 @@ class UnifiedRiskEngine:
 
         # ===== 关卡12: 总仓位上限（按行情强度 × 波动率缩放 × 盘中风险）=====
         max_pos_ratio = get_max_position_ratio(market_strength) * vol_scale
+        # FIX(P0-11): vol_scale 相乘后必须钳制全局硬顶，防低波动放大突破上限（0.90×1.3=1.17）
+        _hard_cap = getattr(config, 'FULL_POSITION_THRESHOLD', 0.90)
+        if max_pos_ratio > _hard_cap:
+            logger.warning(
+                f"[总仓位] vol_scale={vol_scale:.2f} 放大后上限{max_pos_ratio:.0%}超硬顶，"
+                f"钳制至{_hard_cap:.0%}")
+            max_pos_ratio = _hard_cap
         # 盘中系统性风险强制降低仓位上限
         intraday_limit = self._get_intraday_position_limit()
         if intraday_limit is not None and intraday_limit < max_pos_ratio:
@@ -1476,6 +1829,11 @@ class UnifiedRiskEngine:
             {"pass": bool, "reason": str, "adjusted_shares": int, "level": str}
         """
         try:
+            # FIX(P0-02): 入口统一归一化键名 —— 生产调用方传 holdings.json 原始键
+            # (buy_price/current_price/stock_type)，引擎内部读 cost/price/type，
+            # 不归一化会导致市值恒为0、六道仓位硬约束静默失效
+            holdings = _normalize_holdings_keys(holdings)
+            signal = _normalize_signal_keys(signal)
             return self._do_check_buy(signal, holdings, market_info)
         except Exception as e:
             logger.exception(f"[UnifiedRiskEngine] 引擎异常: {e}")
@@ -1495,22 +1853,33 @@ class UnifiedRiskEngine:
         price = signal.get("price", 0)
         shares = signal.get("shares", 0)
         sector = signal.get("sector", "")
-        stock_type = signal.get("type", "stock")
+        stock_type = str(signal.get("type", "stock") or "stock").lower()
+        # FIX(P2-02): ETF 用 instrument 权威判定兜底（调用方常不传/误传 type）
+        if stock_type != "etf":
+            try:
+                from utils.instrument import is_etf as _is_etf
+                if _is_etf(code):
+                    stock_type = "etf"
+            except Exception:
+                pass
         risk_reward = signal.get("risk_reward", 0)
         amount = price * shares
+
+        # FIX(P1-19): 年度熔断关卡（annual_halt 此前只写不读）
+        if self.state_mgr.state.get("annual_halt"):
+            return self._block(
+                "年度熔断已触发(annual_halt=True)，全面暂停交易（需手动重置）")
+
+        # FIX(P0-10): 盈亏数据源不可用时 fail-safe（原 fail-open 放行买入）
+        if self.state_mgr.state.get("pnl_data_unavailable"):
+            return self._block(
+                "总资产/盈亏数据源不可用，fail-safe暂停新开仓（请检查持仓与资金数据）")
 
         # 第-1关：盘中风险标记检查（最高优先级）
         self._expire_intraday_flags()  # 每次检查前先清理过期标记
         intraday_block = self._check_intraday_risk_flags_for_buy()
         if intraday_block:
             return intraday_block
-
-        # 第0关：盈亏比硬门槛
-        min_rr = cfg.get("min_risk_reward", 2.5)
-        if risk_reward > 0 and risk_reward < min_rr:
-            return self._block(
-                f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，拦截（宁缺毋滥）"
-            )
 
         # 第0.5关：股票池外拦截
         if self.allowed_pool is not None and code not in self.allowed_pool:
@@ -1583,33 +1952,33 @@ class UnifiedRiskEngine:
                 f"强制降仓+暂停{cfg.get('weekly_loss_pause_days', 3)}天"
             )
 
-        # 第6.5关：月度回撤硬限制（V3.2: 从5%收紧至4%）
-        # FIX P0: 从110万亏到73万(-33.6%)过程中无任何月度熔断，新增此关卡
-        # V3.2回测诊断: 2026年-50.4%亏损证明5%仍过松，收紧至4%
-        monthly_start = self.state_mgr.state.get("monthly_start_capital", self.total_capital)
-        if monthly_start > 0:
-            monthly_dd = (monthly_start - self.total_capital) / monthly_start
-            monthly_dd_limit = cfg.get("monthly_drawdown_limit", 0.04)  # V3.2: 0.05→0.04
-            if monthly_dd >= monthly_dd_limit:
-                return self._block(
-                    f"月度回撤{monthly_dd*100:.1f}%≥{monthly_dd_limit*100:.0f}%，"
-                    f"本月禁止新开仓（防守优先）"
-                )
+        # 第6.5/6.6关：月度/年度回撤硬限制（FIX P1-19: 提取为共用方法，与 _do_check 对齐）
+        dd_reason = self._check_period_drawdown_fuses()
+        if dd_reason:
+            return self._block(dd_reason)
 
-        # 第6.6关：年度回撤硬限制（V3.2新增）
-        # 回测诊断: 2026年最大回撤58.4%，无任何年度熔断触发，新增15%硬限制
-        annual_start = self.state_mgr.state.get("annual_start_capital", self.total_capital)
-        if annual_start > 0:
-            annual_dd = (annual_start - self.total_capital) / annual_start
-            annual_dd_limit = cfg.get("annual_drawdown_limit", 0.15)
-            if annual_dd >= annual_dd_limit:
-                # 年度回撤≥15%: 全面暂停，需手动重置
-                self.state_mgr.state["annual_halt"] = True
-                self.state_mgr.save()
+        # 第6.8关：盈亏比硬门槛
+        # FIX(P0-13): 原 `risk_reward > 0 and < min_rr` 可被 risk_reward=0 无条件绕过
+        # （两个生产调用方都硬编码传0）—— 缺省即拦；位置移到状态关卡之后，
+        # 保证熔断/暂停类拦截优先级更高
+        min_rr = cfg.get("min_risk_reward", 2.5)
+        require_rr = cfg.get("require_risk_reward", True)
+        if risk_reward is None or risk_reward <= 0:
+            # 兜底：尝试用信号自带的 stop_loss/target 推算盈亏比
+            _sl = signal.get("stop_loss", 0) or 0
+            _tgt = signal.get("target", 0) or 0
+            if price and price > 0 and 0 < _sl < price < _tgt:
+                risk_reward = (_tgt - price) / (price - _sl)
+        if risk_reward is None or risk_reward <= 0:
+            if require_rr:
                 return self._block(
-                    f"⚠️年度回撤{annual_dd*100:.1f}%≥{annual_dd_limit*100:.0f}%，"
-                    f"全面暂停交易（需手动重置annual_halt后方可恢复）"
+                    f"盈亏比缺失: 未提供risk_reward且无法由stop_loss/target推算，"
+                    f"无法验证≥{min_rr}，拦截（宁缺毋滥）"
                 )
+        elif risk_reward < min_rr:
+            return self._block(
+                f"盈亏比不达标: {risk_reward:.2f} < {min_rr}，拦截（宁缺毋滥）"
+            )
 
         # 第7关：浮亏加仓绝对拦截
         if cfg.get("block_add_on_loss", True) and code in holdings:
@@ -1624,7 +1993,7 @@ class UnifiedRiskEngine:
                 )
 
         # 第8关：持仓数量限制
-        max_holdings = cfg.get("max_holdings", 7)
+        max_holdings = cfg.get("max_holdings", getattr(config, 'MAX_HOLDINGS', 8))
         if code not in holdings and len(holdings) >= max_holdings:
             return self._block(
                 f"持仓数量{len(holdings)}只已达上限{max_holdings}只，禁止新开仓"
@@ -1709,6 +2078,20 @@ class UnifiedRiskEngine:
             )
             shares = kelly_shares
             amount = shares * price
+
+        # FIX(P2-11): 熔断恢复期半仓试探（get_recovery_scale 此前无任何消费方，
+        # 纯内存重启即失效）
+        _rec_scale = self.fuse_enhancer.get_recovery_scale()
+        if _rec_scale < 1.0 and shares > 0:
+            _scaled = int(shares * _rec_scale // 100) * 100
+            if _scaled < 100:
+                return self._block(
+                    f"熔断恢复期半仓试探: 缩至{_scaled}股不足1手，暂停本次开仓")
+            if _scaled < shares:
+                logger.info(
+                    f"[熔断恢复] {code}: 恢复比例{_rec_scale:.1f}，{shares}→{_scaled}股")
+                shares = _scaled
+                amount = shares * price
 
         # ATR自适应止损计算（V8.3新增）
         adaptive_result = self._try_adaptive_stop_loss(
@@ -1866,6 +2249,37 @@ class UnifiedRiskEngine:
     # --------------------------------------------------------
     # 内部辅助方法
     # --------------------------------------------------------
+    def _check_period_drawdown_fuses(self) -> Optional[str]:
+        """FIX(P1-19): 月/年度回撤熔断共用关卡（_do_check 与 _do_check_buy 均接入）
+
+        返回拦截原因字符串；None=通过。年度回撤≥15%时写入 annual_halt（两入口均读取）。
+        """
+        cfg = self.cfg
+        state = self.state_mgr.state
+        # 月度回撤（V3.2: 4%）
+        monthly_start = state.get("monthly_start_capital", self.total_capital)
+        if monthly_start and monthly_start > 0:
+            monthly_dd = (monthly_start - self.total_capital) / monthly_start
+            monthly_dd_limit = cfg.get("monthly_drawdown_limit", 0.04)
+            if monthly_dd >= monthly_dd_limit:
+                return (
+                    f"月度回撤{monthly_dd*100:.1f}%≥{monthly_dd_limit*100:.0f}%，"
+                    f"本月禁止新开仓（防守优先）"
+                )
+        # 年度回撤（V3.2: 15%，触发后全面暂停需手动重置）
+        annual_start = state.get("annual_start_capital", self.total_capital)
+        if annual_start and annual_start > 0:
+            annual_dd = (annual_start - self.total_capital) / annual_start
+            annual_dd_limit = cfg.get("annual_drawdown_limit", 0.15)
+            if annual_dd >= annual_dd_limit:
+                state["annual_halt"] = True
+                self.state_mgr.save()
+                return (
+                    f"⚠️年度回撤{annual_dd*100:.1f}%≥{annual_dd_limit*100:.0f}%，"
+                    f"全面暂停交易（需手动重置annual_halt后方可恢复）"
+                )
+        return None
+
     def _sync_risk_state(self, risk_state):
         """同步盈亏数据到持久化状态管理器
 
@@ -1879,14 +2293,44 @@ class UnifiedRiskEngine:
     # --------------------------------------------------------
     # FIX: pnl 快照差分法（四级熔断数据源修复）
     # --------------------------------------------------------
+    _realtime_price_cache = {"ts": 0.0, "prices": {}}
+
+    def _fetch_intraday_prices(self, codes: list) -> dict:
+        """FIX(P0-10): 盘中拉取实时价（60秒缓存），使 daily_pnl 反映盘中波动
+
+        原实现持仓 current_price 仅盘后更新 → daily_pnl 盘中恒0 → 日亏2%/3%熔断
+        盘中永不触发（早盘集体跌停仍放行买入）。失败时返回空 dict，回退静态价。
+        """
+        import time as _t
+        now_ts = _t.time()
+        if now_ts - self._realtime_price_cache["ts"] < 60:
+            return self._realtime_price_cache["prices"]
+        prices = {}
+        try:
+            from data.realtime import fetch_realtime_batch
+            quotes = fetch_realtime_batch([str(c) for c in codes]) or {}
+            for c, q in quotes.items():
+                p = (q or {}).get("price") or 0
+                try:
+                    p = float(p)
+                except (TypeError, ValueError):
+                    continue
+                if p > 0:
+                    prices[str(c)] = p
+        except Exception as e:
+            logger.warning(f"[PnL快照] 实时价获取失败，回退静态价: {e}")
+        UnifiedRiskEngine._realtime_price_cache = {"ts": now_ts, "prices": prices}
+        return prices
+
     def _calc_current_total_assets(self, positions: dict = None) -> float:
         """动态计算当前总资产 = 持仓市值 + 可用资金
 
         口径说明:
           - 持仓市值: 优先用传入持仓，否则读取 config.get_holdings_file()，
-            价格取 current_price/price/buy_price/cost 中首个可用值
+            价格取 current_price/price/buy_price/cost 中首个可用值；
+            FIX(P0-10): 盘中交易时段用实时价覆盖静态 current_price（60秒缓存）
           - 可用资金: config.AVAILABLE_CASH（手动与券商同步的静态值）
-          - 返回 0 表示数据不可用（由调用方兜底降级）
+          - 返回 0 表示数据不可用（由调用方 fail-safe 处置）
         """
         try:
             if not positions:
@@ -1896,6 +2340,18 @@ class UnifiedRiskEngine:
                         raw = json.load(f)
                     positions = {k: v for k, v in raw.items()
                                  if isinstance(v, dict)}
+            # FIX(P0-10): 盘中时段（工作日 09:15-15:05）用实时价刷新持仓市值
+            _now = datetime.datetime.now()
+            if positions and _now.weekday() < 5 and \
+                    "09:15" <= _now.strftime("%H:%M") <= "15:05":
+                rt_prices = self._fetch_intraday_prices(list(positions.keys()))
+                if rt_prices:
+                    positions = {k: dict(v) for k, v in positions.items()}
+                    for k, v in positions.items():
+                        rp = rt_prices.get(str(k).split(".")[0])
+                        if rp:
+                            v["current_price"] = rp
+                            v["price"] = rp
             market_value = 0.0
             for pos in (positions or {}).values():
                 shares = pos.get("shares", 0) or 0
@@ -1907,7 +2363,7 @@ class UnifiedRiskEngine:
             cash = getattr(config, 'AVAILABLE_CASH', 0) or 0
             return market_value + cash
         except Exception as e:
-            logger.warning(f"[PnL快照] 总资产计算失败，降级为不熔断: {e}")
+            logger.warning(f"[PnL快照] 总资产计算失败: {e}")
             return 0.0
 
     def refresh_pnl_snapshot(self, positions: dict = None):
@@ -1930,9 +2386,16 @@ class UnifiedRiskEngine:
             state = self.state_mgr.state
             current_total = self._calc_current_total_assets(positions)
             if current_total <= 0:
-                # 数据不可用：降级为不熔断，保留既有值
-                logger.warning("[PnL快照] 持仓/资金数据不可用，跳过快照刷新（降级为不熔断）")
+                # FIX(P0-10): 数据不可用不再 fail-open —— 置标志使买入路径 fail-safe 禁止新开仓
+                logger.critical(
+                    "[PnL快照] 持仓/资金数据不可用，fail-safe：新开仓将被暂停直至数据恢复")
+                if not state.get("pnl_data_unavailable"):
+                    state["pnl_data_unavailable"] = True
+                    self.state_mgr.save()
                 return
+            if state.get("pnl_data_unavailable"):
+                logger.info("[PnL快照] 持仓/资金数据已恢复，解除 fail-safe 新开仓限制")
+                state["pnl_data_unavailable"] = False
 
             today = datetime.date.today()
             iso = today.isocalendar()
@@ -2022,19 +2485,49 @@ class UnifiedRiskEngine:
 
     def _get_dynamic_total_limit(self, market_info: dict = None) -> float:
         cfg = self.cfg
+        upper = cfg.get("total_above_ma20", 0.80)
         if not market_info:
-            return cfg.get("total_above_ma20", 0.80)
+            # FIX(P1-26): 缺市场数据不再返回最宽松档0.80（两个生产调用方都不传）——
+            # 改与 MarketRegime 仓位上限取小（regime过期60%/熊市30%）
+            regime_cap, _desc = self.state_mgr.get_market_position_cap()
+            return min(upper, regime_cap) if regime_cap and regime_cap > 0 else upper
         index_price = market_info.get("index_price", 0)
         index_ma20 = market_info.get("index_ma20", 0)
         index_ma60 = market_info.get("index_ma60", 0)
         if index_price <= 0 or index_ma20 <= 0:
-            return cfg.get("total_above_ma20", 0.80)
+            regime_cap, _desc = self.state_mgr.get_market_position_cap()
+            return min(upper, regime_cap) if regime_cap and regime_cap > 0 else upper
         if index_price < index_ma60:
             return cfg.get("total_below_ma60", 0.30)
         elif index_price < index_ma20:
             return cfg.get("total_below_ma20", 0.50)
         else:
             return cfg.get("total_above_ma20", 0.80)
+
+    def get_position_limits(self, market_info: dict = None) -> dict:
+        """FIX P1-02: 对外暴露风控引擎的权威仓位上限（之前全库零定义，
+        regime_playbook.position_limits() 调用报 AttributeError 被 `except: pass` 吞，
+        “与风控引擎取更严值”从未生效）。
+
+        返回:
+            {max_total, min_total, max_single, etf_max_single, sector_max,
+             max_single_hard}
+            max_total 与大盘/regime 动态挂钩（复用 _get_dynamic_total_limit）。
+        """
+        cfg = self.cfg
+        try:
+            max_total = self._get_dynamic_total_limit(market_info)
+        except Exception:
+            max_total = cfg.get("total_above_ma20", 0.80)
+        return {
+            "max_total": max_total,
+            "min_total": cfg.get("min_total_position", 0.0),
+            # 个股操作性上限 15%（ETF 20%）；max_single_position 25% 仅为硬顶
+            "max_single": cfg.get("stock_max_ratio", 0.15),
+            "etf_max_single": cfg.get("etf_max_ratio", 0.20),
+            "sector_max": cfg.get("sector_max_ratio", 0.40),
+            "max_single_hard": cfg.get("max_single_position", 0.25),
+        }
 
     # --------------------------------------------------------
     # ATR自适应止损辅助方法
@@ -2387,8 +2880,6 @@ import datetime
 import logging
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -2498,7 +2989,8 @@ def get_max_position_ratio(market_strength: str) -> float:
 
 def risk_check(trade_plan: dict, risk_state: RiskState,
                market_strength: str = "normal",
-               vol_scale: float = 1.0) -> dict:
+               vol_scale: float = 1.0,
+               systemic_position_cap: float = None) -> dict:
     """
     交易信号风控校验（向后兼容包装器）
     
@@ -2511,7 +3003,8 @@ def risk_check(trade_plan: dict, risk_state: RiskState,
     engine = _get_unified_engine()
     # 同步资金信息
     engine.total_capital = getattr(risk_state, 'total_capital', config.TOTAL_CAPITAL)
-    return engine.check(trade_plan, risk_state, market_strength, vol_scale=vol_scale)
+    return engine.check(trade_plan, risk_state, market_strength, vol_scale=vol_scale,
+                        systemic_position_cap=systemic_position_cap)
 
 
 def _in_no_trade_zone(current_time: str) -> bool:

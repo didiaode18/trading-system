@@ -26,8 +26,6 @@ from scipy import stats
 import logging
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -190,3 +188,105 @@ class DeflatedSharpe:
                 f"在{n_trials}次测试中选出最佳只是运气，"
                 f"不建议实盘使用"
             )
+
+    def compute_pbo(self, returns_matrix, n_splits: int = None) -> dict:
+        """P2-2(路线图): PBO 门面方法，转发到模块级 compute_pbo。"""
+        return compute_pbo(returns_matrix, n_splits=n_splits)
+
+
+# ============================================================
+# P2-2(路线图): PBO — 组合对称交叉验证（CSCV）
+# ============================================================
+def compute_pbo(returns_matrix, n_splits: int = None) -> dict:
+    """过拟合概率 PBO（Probability of Backtest Overfitting），CSCV 算法。
+
+    López de Prado《AFML》第11章：把 T 期收益切成 S 个等长块（S 偶数），
+    对每一种 "S/2 块作样本内(IS) + 其余作样本外(OS)" 的组合：
+      1) 在 IS 上选出累计表现最好的配置（模拟"回测选参"）；
+      2) 看该配置在 OS 上的相对排名 ω = rank/(N+1)（rank 为升序名次，1=最差）；
+      3) 若 ω <= 0.5（IS 最优在 OS 落到后半段）→ 记为一次"过拟合命中"。
+    PBO = 命中次数 / 组合总数。PBO>0.5 说明"回测最优"在样本外多半垫底，过拟合。
+
+    参数:
+        returns_matrix: 形如 (T, N) 的二维收益矩阵——T=时间期数(行), N=配置/trial 数(列)。
+                        每列是一个参数配置在同一时间轴上的逐期收益。
+        n_splits: 块数 S（偶数）。默认按 T 自适应（<=16 的最大偶数，且每块>=2 期）。
+
+    返回:
+        {status, pbo, n_splits, n_configs, n_periods, n_combinations,
+         lambda_mean, interpretation}
+        status ∈ {"ok", "insufficient"}
+    """
+    from itertools import combinations
+
+    M = np.asarray(returns_matrix, dtype=float)
+    if M.ndim != 2:
+        return {"status": "insufficient", "reason": "returns_matrix 必须是二维 (T,N)",
+                "pbo": None}
+    T, N = M.shape
+    if N < 2:
+        return {"status": "insufficient", "reason": f"配置数不足(N={N}<2)，无法计算 PBO",
+                "pbo": None, "n_configs": int(N)}
+
+    # 自适应块数：<=16 的最大偶数，且保证每块>=2 期、组合数可控
+    if n_splits is None:
+        n_splits = min(16, T // 2)
+        n_splits -= n_splits % 2  # 取偶
+    n_splits = int(n_splits)
+    n_splits -= n_splits % 2
+    if n_splits < 4:
+        return {"status": "insufficient",
+                "reason": f"期数过短(T={T})，块数不足(S={n_splits}<4)",
+                "pbo": None, "n_configs": int(N), "n_periods": int(T)}
+
+    block = T // n_splits
+    if block < 1:
+        return {"status": "insufficient", "reason": "每块期数<1",
+                "pbo": None, "n_configs": int(N)}
+    use_rows = block * n_splits
+    # 每块累计收益（对数近似：块内简单求和，避免 cumprod 溢出）
+    Mtrim = np.nan_to_num(M[:use_rows, :], nan=0.0)
+    block_perf = Mtrim.reshape(n_splits, block, N).sum(axis=1)  # (S, N)
+
+    half = n_splits // 2
+    all_idx = list(range(n_splits))
+    n_hit = 0
+    n_combo = 0
+    lambdas = []
+    for is_blocks in combinations(all_idx, half):
+        os_blocks = [i for i in all_idx if i not in set(is_blocks)]
+        is_perf = block_perf[list(is_blocks), :].sum(axis=0)   # (N,)
+        os_perf = block_perf[os_blocks, :].sum(axis=0)         # (N,)
+        is_best = int(np.argmax(is_perf))
+        # OS 升序名次（1=最差, N=最好）；并列取平均名次
+        order = np.argsort(np.argsort(os_perf)) + 1            # 0-based→1-based 升序名次
+        rank = float(order[is_best])
+        omega = rank / (N + 1.0)
+        omega = min(max(omega, 1e-6), 1 - 1e-6)
+        lam = float(np.log(omega / (1 - omega)))
+        lambdas.append(lam)
+        if omega <= 0.5:
+            n_hit += 1
+        n_combo += 1
+
+    pbo = n_hit / n_combo if n_combo else None
+    if pbo is None:
+        return {"status": "insufficient", "reason": "无有效组合", "pbo": None}
+
+    if pbo > 0.5:
+        interp = f"✗ PBO={pbo:.2f}>0.5：回测最优配置在样本外多半垫底，存在明显过拟合"
+    elif pbo > 0.3:
+        interp = f"⚠️ PBO={pbo:.2f}：有一定过拟合风险，建议缩小搜索空间/加强正则"
+    else:
+        interp = f"✓ PBO={pbo:.2f}<0.3：回测选择在样本外较稳健，过拟合概率低"
+
+    return {
+        "status": "ok",
+        "pbo": round(float(pbo), 4),
+        "n_splits": n_splits,
+        "n_configs": int(N),
+        "n_periods": int(use_rows),
+        "n_combinations": int(n_combo),
+        "lambda_mean": round(float(np.mean(lambdas)), 4) if lambdas else None,
+        "interpretation": interp,
+    }

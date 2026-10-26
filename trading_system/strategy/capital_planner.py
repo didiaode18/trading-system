@@ -293,7 +293,12 @@ def check_buy_feasibility(levels: list, dashboard: dict,
         stop = lv.get("stop_loss", 0) or 0
         if base <= 0 or shares <= 0:
             continue
-        cap = etf_cap if code.startswith(_ETF_PREFIXES) else stock_cap
+        # V28: 使用instrument统一入口获取仓位上限（ETF按子类型差异化）
+        try:
+            from utils.instrument import get_max_single_position
+            cap = get_max_single_position(code)
+        except ImportError:
+            cap = etf_cap if code.startswith(_ETF_PREFIXES) else stock_cap
         cap_amount = total * cap
 
         verdict, status, note = "⛔禁止买入", "ban", ""
@@ -327,6 +332,25 @@ def check_buy_feasibility(levels: list, dashboard: dict,
             verdict, status = "✅可买", "ok"
             note = f"建议{shares}股/{_fmt(amount)}元，止损{stop:.2f}"
             remaining -= amount
+
+        # ===== V28 ETF换仓风险拦截（宽基ETF跳过，行业/主题ETF仍检查集中度） =====
+        if status in ("ok", "trial"):
+            try:
+                from strategy.etf_risk_tracker import ETFRiskTracker
+                _etf_tracker = ETFRiskTracker(total_capital=total)
+                _etf_tracker.cleanup_expired()
+                _risk_result = _etf_tracker.check_buy_risk(
+                    buy_code=code, buy_name=name,
+                    buy_amount=amount,
+                    current_holdings=holdings_raw,
+                )
+                if _risk_result["risk_level"] == "blocked":
+                    verdict, status = "⛔ETF换仓拦截", "etf_blocked"
+                    note = f"[换仓拦截] {_risk_result['reason']}"
+                elif _risk_result["risk_level"] in ("critical", "warning"):
+                    note += f" | ⚠️{_risk_result['reason']}"
+            except Exception as _e:
+                logger.debug(f"ETF换仓风险检查异常(不阻断): {_e}")
 
         rows.append({
             "code": code, "name": name, "price": base,

@@ -118,6 +118,34 @@ ETF_STRATEGY_PARAMS = {
     },
 }
 
+# FIX(2026-10-09): ETF支撑/压力位差异化参数——不同波动特性品种使用不同MA周期与回看窗口
+# 根因: 原 _calc_support_resistance() 对所有品种使用固定MA20/MA60+60日回看，
+#   宽基ETF(日波0.5%)用MA20太远、主题ETF(日波2%)用MA20反应过慢
+ETF_SR_PARAMS = {
+    "宽基ETF": {"ma_short": 10, "ma_long": 30, "lookback": 30},
+    "行业ETF": {"ma_short": 20, "ma_long": 60, "lookback": 60},
+    "主题ETF": {"ma_short": 15, "ma_long": 40, "lookback": 40},
+    "stock":   {"ma_short": 20, "ma_long": 60, "lookback": 60},  # 个股保持原值
+}
+
+# FIX(2026-10-09): ETF止损距稳健买点下限——宽基ETF低波动，5%过宽失去止损意义
+# 根因: 原 _STOP_MIN_GAP_RATIO=0.05 源自个股/永辉超市实证，一刀切致宽基ETF止损过紧
+ETF_STOP_GAP = {
+    "宽基ETF": 0.03,   # 3% (≈6倍日波动，足够缓冲)
+    "行业ETF": 0.05,   # 5% (≈3.3倍日波动)
+    "主题ETF": 0.05,   # 5% (≈2.5倍日波动)
+    "stock":   0.05,   # 5% (维持原值)
+}
+
+# FIX(2026-10-09): ETF买点三档差异化梯度——当支撑位锚定不可用时回退到此固定梯度
+# 根因: 原 buy_tier_moderate_pct=1.5% 对宽基ETF过近(在日内噪声范围内)
+ETF_BUY_TIER = {
+    "宽基ETF": {"moderate_pct": 0.02, "conservative_pct": 0.04},   # 2%/4%
+    "行业ETF": {"moderate_pct": 0.015, "conservative_pct": 0.03},  # 1.5%/3%
+    "主题ETF": {"moderate_pct": 0.02, "conservative_pct": 0.04},   # 2%/4%
+    "stock":   {"moderate_pct": 0.015, "conservative_pct": 0.03},  # 1.5%/3% 维持原值
+}
+
 # ETF分类规则（代码前缀→类型映射）
 ETF_TYPE_MAP = {
     # 宽基ETF
@@ -686,6 +714,27 @@ BACKTEST_EXTRA_POOL = {
     "300760": {"名称": "迈瑞医疗", "赛道": "医疗器械", "类型": "龙头"},
 }
 
+# ============================================================
+# V11.2 P2-1: 退市/ST摘牌标的池（缓解幸存者偏差）
+# ============================================================
+# 背景：当前回测宇宙(STOCK_POOL + BACKTEST_EXTRA_POOL)均为"存活至今"的标的，
+#   不含回测区间内已退市/已ST摘牌个股 → 历史收益被系统性高估（幸存者偏差）。
+# 使用：一旦本地 DB 补充了退市标的的历史日K，将其代码登记到此池，
+#   master_backtest 的回测宇宙与 data_audit 会自动纳入并据实调整偏差声明。
+# 现状：DB 尚未包含退市标的数据，故此池默认为空——data_audit 会如实声明
+#   "存在幸存者偏差"，绝不因池为空而谎报"无偏差"。
+# P1-3(路线图): 经 scripts/register_delisted_pool.py 扫描本地 DB daily_kline 真实 last_date，
+#   确认以下 2 只标的的历史数据在回测区间内提前终止（非存活宇宙成员），据实登记以缓解幸存者偏差。
+#   证据字段 evidence_last_date/evidence_gap_days 均来自 DB 真实扫描，非推断；
+#   名称取自 config.get_stock_info，标注"名称待确认"者请人工复核（不影响回测，回测按代码取 DB 数据）。
+BACKTEST_DELISTED_POOL = {
+    # 数据 2020-01-02~2025-09-04（距全库最大交易日 391 天），1350 根可交易K线，疑似被吸收合并退市
+    "601989": {"名称": "601989(名称待确认)", "赛道": "其他", "类型": "退市", "delisted": True,
+               "evidence_last_date": "2025-09-04", "evidence_gap_days": 391},
+    # 000939（数据 2020-01-02~2020-12-17，gap 2113 天）为强退市候选，但退市前长期停牌，
+    #   volume>0 的可交易日仅 30 天（<load_data_dict 的 >100 阈值），无法进回测，故不登记（如实排除）。
+}
+
 # 选股引擎配置
 SCREENER_CONFIG = {
     "max_stocks_per_sector": 3,     # 每个行业最多入选3只
@@ -838,11 +887,26 @@ OVERNIGHT_CACHE_HOURS = 12                # 数据缓存有效期（避免重复
 
 
 # ============================================================
-# 二'''、统一股票名称/信息查找（修复名称显示为代码的Bug）
+# 二'''、统一股票名称/信息查找（四级回退链）
 # ============================================================
+# 回退链: STOCK_POOL → SECTOR_CANDIDATES → baostock动态查询 → _FALLBACK_NAME_CACHE静态兜底
+# FIX P0(2026-10-09): 原仅查前两级，不在配置中的股票名称显示为代码（如"603268"）。
+#   修复后新增baostock运行时查询+静态兜底缓存，确保所有扫描标的均显示中文名称。
+# 注意: baostock返回的中文名称为Unicode编码，终端GBK环境可能显示乱码，但HTML报告中正常。
+_FALLBACK_NAME_CACHE = {
+    "600150": "中国船舶",  # 吸收合并中国重工
+    "601872": "招商轮船",
+    "002074": "国轩高科",
+    "003006": "百亚股份",  # FIX(2026-10-10): baostock实际返回百亚股份(非百迈技术)
+    "600577": "精功科技",
+    "002913": "奥士康",
+    "603268": "松发股份",  # FIX(2026-10-10): baostock实际返回松发股份(非松炀资源)
+}
+
+
 def get_stock_name(code: str) -> str:
     """
-    统一股票名称查找（优先STOCK_POOL，其次SECTOR_CANDIDATES）
+    统一股票名称查找（优先STOCK_POOL，其次SECTOR_CANDIDATES，再baostock动态查询，最后兜底缓存）
     解决：信号明细/选股结果中股票名称显示为代码的问题
     """
     # 1. 从核心股票池查找
@@ -853,14 +917,31 @@ def get_stock_name(code: str) -> str:
         stocks = sector_info.get("stocks", {})
         if code in stocks:
             return stocks[code].get("名称", code)
-    # 3. 未找到，返回代码
+    # 3. FIX P0(2026-10-09): baostock 动态查询（运行时补全名称）
+    try:
+        import baostock as bs
+        _lg = bs.login()
+        _prefix = 'sh' if code.startswith('6') else 'sz'
+        _rs = bs.query_stock_basic(code=f'{_prefix}.{code}')
+        bs.logout()
+        if _rs.data:
+            _name = _rs.data[0][1]
+            if _name and not _name.startswith('\u9000'):
+                _FALLBACK_NAME_CACHE[code] = _name  # 缓存供后续使用
+                return _name
+    except Exception:
+        pass
+    # 4. 静态兜底缓存
+    if code in _FALLBACK_NAME_CACHE:
+        return _FALLBACK_NAME_CACHE[code]
+    # 5. 未找到，返回代码
     return code
 
 
 def get_stock_info(code: str) -> dict:
     """
     统一股票信息查找（返回 {"名称", "赛道", "类型"} 格式）
-    优先STOCK_POOL，其次SECTOR_CANDIDATES
+    优先STOCK_POOL，其次SECTOR_CANDIDATES，最后兜底缓存+baostock
     """
     # 1. 从核心股票池查找
     if code in STOCK_POOL:
@@ -875,8 +956,9 @@ def get_stock_info(code: str) -> dict:
                 "赛道": info.get("细分", sector_name),
                 "类型": info.get("类型", "龙头"),
             }
-    # 3. 未找到
-    return {"名称": code, "赛道": "其他", "类型": "弹性"}
+    # 3. FIX P0(2026-10-09): 通过 get_stock_name() 动态获取名称（含baostock+兜底缓存）
+    _name = get_stock_name(code)
+    return {"名称": _name, "赛道": "其他", "类型": "弹性"}
 
 # ============================================================
 # 三、趋势与均线参数（中线趋势跟踪 V2.0）
@@ -924,12 +1006,12 @@ BREAKOUT_HOLD_PCT = 0.99         # 回踩不破突破位（收盘>=突破日收�
 # 买入排除条件
 REJECT_DROP_PCT = -0.03          # 当日跌幅>3%且放量 → 排除
 REJECT_VOLUME_RATIO = 1.5        # 放量下跌的量能阈值
-MIN_SIGNAL_QUALITY_LIVE = 62     # P0-2: 实盘信号质量硬门槛（回测55→62，减少假信号30%+）
+MIN_SIGNAL_QUALITY_LIVE = 68     # V11.1 P1-1: 62→68（提高实盘信号硬门槛，减少低质量交易）
 # V6.1: 信号质量分市场环境（回测50万验证: 57.2%胜率/盈亏比1.00，提高门槛过滤低质量信号）
-MIN_SIGNAL_QUALITY_BEAR = 75     # V6.2: 熊市门槛70→75（回测熊市命中率仅33.2%，提高拦截）
-MIN_SIGNAL_QUALITY_NON_BEAR = 65 # V6.1: 非熊市从60提升至65（预期减少15%假信号，胜率+2-3%）
+MIN_SIGNAL_QUALITY_BEAR = 78     # V11.1 P1-1: 75→78（熊市命中率仅 33.2%，进一步收紧）
+MIN_SIGNAL_QUALITY_NON_BEAR = 68 # V11.1 P1-1: 65→68（非熊市同步提高，与实盘门槛对齐）
 # V5.2: 三档差异化信号质量门槛
-MIN_SIGNAL_QUALITY_BULL = 70     # V5.2: 牛市门槛70（减少假信号，但不过严）
+MIN_SIGNAL_QUALITY_BULL = 72     # V11.1 P1-1: 70→72（牛市适度提高，防追高）
 
 # V7(A2): 多因子信号增强权重（0=关闭，v5引擎通过config读取，v6引擎通过params传入）
 FACTOR_WEIGHT_SMF = 0.0          # 聪明钱因子权重（建议值: 8~12）
@@ -955,6 +1037,10 @@ MIN_PROFIT_TO_ADD = 0.03         # 浮盈>=3%才允许加第二批
 # [P0-#1修复] 止损参数统一引用RISK_UNIFIED_CONFIG，消除多处独立定义的矛盾
 INITIAL_STOP_LOSS_PCT = 0.10  # 默认值，RISK_UNIFIED_CONFIG定义后自动覆盖
 INITIAL_STOP_LOSS_LOW = INITIAL_STOP_LOSS_PCT  # 稳健龙头止损与主止损对齐
+
+# V11.1 P1-2: 止损确认机制—深度穿破缓冲（low < stop_price*(1-STOP_HARD_BUFFER) → 立即触发）
+# 目的：减少日内假破位触发的无效止损（回测显示止损占卖出60%但胜率仅21%）
+STOP_HARD_BUFFER = 0.02  # 2% 缓冲，防跳空/黑天鹅同时避免噪声触发
 
 # 移动止损档位（浮盈 -> 止损上移到的位置）
 # V6.0优化: 保本线从5%降至3%（更早保护本金），锁定从+2%降至+1%
@@ -1058,7 +1144,7 @@ MARKET_WEAK_MAX = 0.30           # 弱势行情最大仓位30%
 RISK_UNIFIED_CONFIG = {
     # --- 持仓与仓位 ---
     "max_holdings": MAX_HOLDINGS,     # [P1-#4修复] 统一引用全局MAX_HOLDINGS(8)
-    "max_single_position": 0.25,      # 单只最大仓位25%（ETF 20%/个股15%的保守上限）
+    "max_single_position": MAX_SINGLE_ETF_RATIO,  # FIX P2-01: 单只最大仓位绝对硬顶=各品种上限的最大值(ETF 20%)；原0.25高于所有实际硬约束且无消费方(配置漂移)，现对齐为ETF上限并被风控读取作为天花板
     "etf_max_ratio": 0.20,            # 单只ETF仓位上限20%
     "stock_max_ratio": 0.15,          # 单只个股仓位上限15%
     "flexible_max_ratio": FLEXIBLE_STOCK_MAX_RATIO,  # [P1-#6修复] 统一引用全局配置(0.15)
@@ -1140,17 +1226,86 @@ SFD_CONFIG = {
 # 八''''、Walk-Forward防过拟合配置（V6.1: 从walk_forward.py提取到config）
 # ============================================================
 # 回测问题: 过拟合度2886.7%，根因是训练窗口太短+参数网格维度太高
+# V11.1 P0-1: 降过拟合—参数网格 240→9 组合（仅 2 轴），训练窗扩大 200→250 天
 WF_CONFIG = {
-    "train_days": 200,                # V6.1: 训练窗口150→200天（覆盖完整牛熊周期）
-    "test_days": 60,                  # V6.1: 验证窗口40→60天（增加统计显著性）
-    "max_windows": 20,                # FIX(G2): 10→20个窗口，覆盖约80%数据（原10窗口仅覆盖40%）
+    "train_days": 250,                # V11.1 P0-1: 200→250（多一个完整市场周期）
+    "test_days": 120,                 # V11.2 P0-1: 60→120——验证窗太短导致样本外交易过少（甚至0），
+                                       #   加长一倍使 OOS 有足够成交样本可统计（预热期已修复）
+    "max_windows": 15,                # V11.1: 20→15（训练窗变大后总窗口数下降，保留覆盖度）
+    "min_oos_trades": 3,              # V11.2 P0-1: 样本外交易<此值的窗口视为"无有效样本"，不计入 oos_sharpe 均值
+    # V11.1 P0-1: 参数网格从 4轴×多值(240) → 2轴×3值(9) 组合，大幅降过拟合维度
+    # V11.2 P0-2: 原 initial_stop_loss 在 atr_mode=True 下完全失效（永不触达固定止损分支）、
+    #   min_signal_quality 被 max(min_quality_non_bear, x) 支配 → 9 组合夏普全同（G5 假绿）。
+    #   改扫真正生效的两轴: 非熊入场质量门槛 + 龙头回落止盈。
     "param_grid": {
-        "initial_stop_loss": [0.05, 0.06, 0.07, 0.08],  # V7: 2→4值
-        "min_signal_quality": [55, 60, 65, 70, 75],      # V7: 3→5值
-        "drawdown_leader": [0.05, 0.06, 0.07, 0.08],     # V7: 新增4值
-        "vol_shrink_ratio": [0.60, 0.70, 0.80],           # V7: 新增3值
-    },  # V7: 6组合→4×5×4×3=240组合（WF会采样 grid_max_trials 个）
-    "grid_max_trials": 80,  # V7: 240组合中采样80个（平衡计算时间与搜索质量）
+        "min_quality_non_bear": [62, 68, 74],  # 非熊入场质量门槛（v6 直接生效）
+        "drawdown_leader": [0.05, 0.07, 0.09],  # 龙头回落止盈（v6 直接生效）
+    },  # 9组合，全部遍历不采样，避免采样偏差
+    "grid_max_trials": 9,             # V11.1 P0-1: 全遍历（原80采样导致DSR n_trials虚高）
+    # V11.1 P0-1: 正则化参数—WF 目标函数对偏离 config 默认值的惩罚系数
+    # P0-3(路线图): 0.15→0.25，加大对偏离先验参数的惩罚，抑制样本内挑到极端门槛
+    "regularization_lambda": 0.25,    # 越大越倾向靠近先验（防局部最优）
+    # P0-3 根因B: 训练集单参数组合成交数下限——低于此值按占比线性降权（防"1-2笔撑高夏普"）
+    "min_train_trades": 8,
+    # P0-3 根因A: 门槛类参数(min_quality_non_bear/min_signal_quality)训练集可选上界=先验+N档
+    "train_param_cap_steps": 1,
+}
+
+# ============================================================
+# P1-2(路线图): 市场状态手册调优（RegimePlaybook 覆盖层）
+# ============================================================
+# 背景：回测确认 RANGE 环境为最大拖累（被动口径 735 天仅 +10.83%、夏普 0.140、
+#   回撤 27.95%）。本块对 regime_playbook.py 的三态配置做增量覆盖（仅覆盖出现的键），
+#   默认强化 RANGE：降总仓位上限 60%→40%、提高现金比例、启用均值回归子逻辑（布林带高抛低吸）。
+# A/B 归因：将本块置空 {} 即回退到 regime_playbook 原始配置（基线），
+#   便于用 scripts/ab_backtest.py 对比 RANGE 区间主动策略净值。目标值均为方向性，须回测确认。
+REGIME_PLAYBOOK_TUNING = {
+    "RANGE": {
+        "position_limits": {
+            "max_total": 0.40,   # 60%→40%：震荡市降总仓位上限，提高现金比例
+            "min_total": 0.20,   # 30%→20%：下沿同步下移，弱震荡可更低仓
+            "max_single": 0.12,  # 15%→12%：单票更分散，降低个股黑天鹅暴露
+        },
+        "risk_rules": {
+            "stop_loss_pct": 0.05,   # 6%→5%：震荡市止损更紧，控制单次回撤
+            "allow_chase": False,     # 维持禁追涨
+            "allow_add_position": False,
+        },
+        # 均值回归子逻辑（复用现有布林带/反转因子，不新建引擎）
+        "mean_reversion": {
+            "enabled": True,
+            "bollinger_window": 20,     # 布林带中轨 MA20
+            "bollinger_std": 2.0,       # ±2σ 上下轨
+            "upper_reduce_pct": 0.5,    # 触及上轨减仓比例
+            "lower_add_pct": 0.5,       # 触及下轨加仓比例（受 allow_add_position 约束时仅提示）
+            "prefer_reversal_factor": "improved_reversal",  # 复用 registry 已注册反转因子
+        },
+    },
+}
+
+# ============================================================
+# P2-1(路线图): 仓位管理与执行优化（波动率目标 + regime 联动 + 组合熔断）
+# ============================================================
+# 复用 position/vol_target.py(VolTargetManager) 与 strategy/regime_playbook.py，
+#   在 recommend/执行输出层叠加，不改撮合。红线：最终总仓位目标永不超过 regime 上限
+#   （而 regime 上限已与风控引擎取更严），风控硬约束零删除、只增不减。
+# 背景：MC 历史情景 2022 暴跌回放实际 -22.90%、2024 微盘 -6.12%，尾部保护不足。
+POSITION_OVERLAY_CONFIG = {
+    "enabled": True,
+    "target_vol": 0.15,          # 组合目标年化波动率
+    "vol_lookback": 20,          # 已实现波动率回看天数
+    "max_scale": 1.3,            # 波动率仓位缩放上限
+    "min_scale": 0.3,            # 波动率仓位缩放下限
+    "regime_cap_enabled": True,  # BEAR/RANGE 总仓位上限随 regime 自动收缩
+    # 组合级回撤熔断（基于主动策略净值曲线峰谷回撤）
+    "circuit_breaker": {
+        "enabled": True,
+        "warn_drawdown": 0.10,   # 回撤≥10% → 降仓至 warn_scale
+        "warn_scale": 0.6,
+        "trip_drawdown": 0.18,   # 回撤≥18% → 熔断全平（scale=0）
+        "trip_scale": 0.0,
+        "cooldown_days": 5,      # 熔断后冷静期（交易日），期内不新开仓
+    },
 }
 
 # ============================================================
@@ -1307,7 +1462,7 @@ SYSTEMIC_RISK_LEVELS = {
 # 敏感信息外部化: 授权码优先级 = config_local.py(文件末尾加载，最高) > 系统环境变量/.env > 空
 # 迁移到新机器时: 设置环境变量 EMAIL_AUTH_CODE 或填写 config_local.py
 EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.qq.com")  # QQ邮箱SMTP服务器
-EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", 465))       # SMTP端口（SSL）
+EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", 587))       # SMTP端口（587=STARTTLS, 465=SSL）
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "")                    # 发件人QQ邮箱 → 请在config_local.py中填写
 # FIX: 修复邮箱授权码明文硬编码，改为环境变量/config_local.py读取
 EMAIL_AUTH_CODE = os.environ.get("EMAIL_AUTH_CODE", "")             # QQ邮箱授权码（勿提交到仓库）
@@ -1389,6 +1544,87 @@ ANTI_WASH_CONFIG = {
 }
 
 # ============================================================
+# 十五'·1、V28 ETF反洗盘参数（按波动率缩放，宽基0.5%/行业1.5%/主题2%日波差）
+# ============================================================
+ETF_ANTI_WASH_CONFIG = {
+    "宽基ETF": {
+        "buffer_minutes": 5,          # 个股15min → 宽基5min（波动小，确认快）
+        "buffer_confirm_pct": 0.005,   # 个股1% → 宽基0.5%
+        "v_reversal_pct": 0.02,        # 个股5% → 宽基2%
+        "volume_spike_ratio": 1.5,     # 个股2x → 宽基1.5x（ETF量变含义不同）
+    },
+    "行业ETF": {
+        "buffer_minutes": 10,
+        "buffer_confirm_pct": 0.008,
+        "v_reversal_pct": 0.03,
+        "volume_spike_ratio": 1.8,
+    },
+    "主题ETF": {
+        "buffer_minutes": 12,
+        "buffer_confirm_pct": 0.008,
+        "v_reversal_pct": 0.04,
+        "volume_spike_ratio": 1.8,
+    },
+}
+
+# ============================================================
+# 十五'·2、V28 ETF子类型仓位上限（替代统一MAX_SINGLE_ETF_RATIO=0.20）
+# ============================================================
+ETF_MAX_RATIO_BY_SUBTYPE = {
+    "宽基ETF": 0.25,    # 低波动，可放宽
+    "行业ETF": 0.15,    # 中波动，与个股持平
+    "主题ETF": 0.12,    # 高波动，更严格
+}
+
+# ============================================================
+# 十五'·3、V28 ETF专用梯度减仓阈值（按波动率缩放）
+# ============================================================
+ETF_GRADIENT_REDUCE_CONFIG = {
+    "宽基ETF": {
+        "levels": [
+            {"loss_pct": -0.05, "reduce_ratio": 0.25, "level": "high",      "label": "宽基ETF浮亏5%减仓1/4"},
+            {"loss_pct": -0.08, "reduce_ratio": 0.50, "level": "critical",  "label": "宽基ETF浮亏8%减仓1/2"},
+            {"loss_pct": -0.12, "reduce_ratio": 1.0,  "level": "emergency", "label": "宽基ETF浮亏12%清仓"},
+        ],
+    },
+    "行业ETF": {
+        "levels": [
+            {"loss_pct": -0.07, "reduce_ratio": 0.25, "level": "high",      "label": "行业ETF浮亏7%减仓1/4"},
+            {"loss_pct": -0.10, "reduce_ratio": 0.50, "level": "critical",  "label": "行业ETF浮亏10%减仓1/2"},
+            {"loss_pct": -0.15, "reduce_ratio": 1.0,  "level": "emergency", "label": "行业ETF浮亏15%清仓"},
+        ],
+    },
+    "主题ETF": {
+        "levels": [
+            {"loss_pct": -0.08, "reduce_ratio": 0.25, "level": "high",      "label": "主题ETF浮亏8%减仓1/4"},
+            {"loss_pct": -0.12, "reduce_ratio": 0.50, "level": "critical",  "label": "主题ETF浮亏12%减仓1/2"},
+            {"loss_pct": -0.15, "reduce_ratio": 1.0,  "level": "emergency", "label": "主题ETF浮亏15%清仓"},
+        ],
+    },
+}
+
+# ============================================================
+# 十五'·4、V28 市场环境下的ETF/个股资产配置建议
+# ============================================================
+REGIME_ETF_ALLOCATION = {
+    "BULL": {
+        "etf_target_ratio": 0.20,     # 牛市：ETF占比20%
+        "stock_target_ratio": 0.70,
+        "strategy_hint": "趋势跟踪，个股为主",
+    },
+    "RANGE": {
+        "etf_target_ratio": 0.40,     # 震荡：ETF提升到40%
+        "stock_target_ratio": 0.50,
+        "strategy_hint": "高抛低吸，增加ETF配置降低选股风险",
+    },
+    "BEAR": {
+        "etf_target_ratio": 0.60,     # 熊市：ETF为主60%
+        "stock_target_ratio": 0.30,
+        "strategy_hint": "防守为主，ETF替代个股降低非系统性风险",
+    },
+}
+
+# ============================================================
 # 十五''、盘中梯度减仓预警配置（P0-1: 浮亏加速扩大时强制预警+条件单）
 # ============================================================
 GRADIENT_REDUCE_CONFIG = {
@@ -1443,10 +1679,14 @@ INTRADAY_ESCALATION_CONFIG = {
     # 降级条件（连续N次扫描无异常则降回正常）
     "downgrade_after_clear": 3,    # 连续3次无异常 → 降回正常频率
     # V10.3: 紧急级别最大持续时长（防止因止损价持续低于而锁定emergency）
-    "emergency_max_duration_min": 20,  # emergency持续超过N分钟 → 自动降为warning
+    "emergency_max_duration_min": 15,  # FIX P1(2026-10-09): 20→15min，10-08实证emergency锁定全天4h+
     # FIX(2026-08-24): 降级后抑制窗口（防乒乓回升）——窗口内仅止损价停滞不再升emergency，
     # 跌>5%/大盘暴跌等新恶化可突破（风控不丢）
     "emergency_suppress_after_downgrade_min": 30,
+    # FIX P1(2026-10-09): 新增 warning 级别最大持续时长——原无 warning 超时降级，
+    # 10-08实证 warning 级同样可锁定数小时不降回 normal
+    "warning_max_duration_min": 30,    # warning持续超过30分钟且无新恶化 → 降回normal
+    "warning_downgrade_after_clear": 5,  # warning级连续5次无异常 → 降回normal
     # V10.3: 标的级全局冷却（同一标的多类型预警合并，防轰炸）
     "code_global_cooldown_min": 15,   # 同一标的任意预警触发后，N分钟内不再发其他类型（critical/emergency除外）
 }
@@ -1504,8 +1744,8 @@ BACKTEST_CONFIG = {
     "initial_capital": TOTAL_CAPITAL,   # 回测初始资金
     "buy_slippage": 0.001,              # 买入滑点 0.1%
     "sell_slippage": 0.001,             # 卖出滑点 0.1%
-    "commission_rate": COMMISSION_RATE,     # [P1-#3修复] 统一引用全局佣金费率(万3)
-    "stamp_tax_rate": 0.0005,            # 印花税万5（2023-08-28起减半）
+    "commission_rate": COMMISSION_RATE,     # [P0-2] 统一引用全局佣金费率
+    "stamp_tax_rate": STAMP_TAX_RATE,        # [P0-2] 统一引用全局印花税费率
     "benchmark": "000300",              # 基准指数
     "walk_forward_train": 60,           # Walk-Forward训练窗口
     "walk_forward_test": 20,            # Walk-Forward验证窗口
@@ -1549,6 +1789,64 @@ DISCIPLINE_CONFIG = {
     # max_holdings_hard → RISK_UNIFIED_CONFIG.max_holdings (=7)
     # max_single_etf_ratio → RISK_UNIFIED_CONFIG.etf_max_ratio (=0.20)
     # cooldown_days → RISK_UNIFIED_CONFIG.cool_down_days (=2)
+}
+
+# ============================================================
+# 二十点五、CANSLIM V3+ 策略参数（架构决策 2026-10-06）
+# ============================================================
+# 决策依据：
+#   V1(+7.3%, Sharpe 0.09) → V2(-30.1%, Sharpe -0.34) → V3(+17.4%, Sharpe 0.14)
+#   → V4 Best(SL15/P5/F3: +28.2%, Sharpe 0.24, DD 29.9%, WR 48.2%)
+# 最终方案：V3 架构 + V4 最优参数 + 选择性保留 V2 有效组件
+CANSLIM_V3PLUS_CONFIG = {
+    # ═══ 因子评分满分 ═══
+    "factor_max_scores": {
+        "N": 25,    # 20(原) + 5(120日新高)
+        "S": 20,    # V1满分（V2缩到10区分度不足）
+        "L": 25,    # 20(原) + 5(60日相对强度)
+        "CAI": 10,  # V2动态化(4-10分)
+        "P": 23,    # 20(V1均值回归) + 3(MACD金叉确认)
+        "W": 5,     # ±5 大盘方向
+    },
+    # 理论满分: 25+20+25+10+23+5 = 108
+
+    # ═══ 买入门槛 ═══
+    "min_score_bull": 55,        # 牛市: 总分≥55 (51%得分率)
+    "min_score_range": 50,       # 震荡: 总分≥50 (46%得分率)
+    "min_score_bear": -1,        # 熊市: 闸门关闭，不买入
+    "ma60_decline_filter": True, # MA60下行5日不买
+
+    # ═══ 仓位管理 ═══
+    "max_positions": 5,          # V4最优: 5只（集中持仓提高单笔质量）
+    "position_size_divisor": 7,  # 统一 7 分仓（不再按 regime 动态调整）
+    "scan_interval": 3,          # V4最优: 3天扫描（原5天，更快响应）
+    "max_buy_per_scan": 2,       # 每次扫描最多买入2只
+
+    # ═══ 止损 ═══
+    "initial_stop_loss": 0.15,   # V4最优: 15%（原10%太紧→频繁止损）
+    # TODO CS-17(2026-10-11): 原著《笑傲股市》要求-8%无条件硬止损兆底
+    #   当前15%是V4回测优化结果，直接改为8%需先回测验证对夏普/最大回撤的影响
+    #   CS-17实施方案: 新增 hard_stop_floor=0.08 作为最终兆底层，
+    #   ATR/移动止损只能更紧不能更宽，与 initial_stop_loss 并存不冲突
+    "stop_confirmation": True,   # 收盘确认（非日内触碰）
+    "stop_hard_buffer": 0.02,    # 深度穿破2%立即触发（防黑天鹅）
+
+    # ═══ 止盈（移动止盈 + 阶梯止盈） ═══
+    "trailing_activate": 0.15,   # 浮盈>15%启动移动止盈
+    "trailing_drawdown": 0.05,   # 回落5%止盈（第一档）
+    "tiered_2_activate": 0.25,   # 浮盈>25%进入第二档
+    "tiered_2_drawdown": 0.07,   # 回落7%止盈（第二档）
+
+    # ═══ 时间止损（重做） ═══
+    "time_stop_days": 25,        # 原 V2 的15天→25天（给趋势更多时间）
+    "time_stop_profit": 0.0,     # 原 V2 的<3%→<0%（仅清理明确失败）
+
+    # ═══ 熊市闸门 ═══
+    "bear_gate": True,           # BEAR市场完全暂停买入
+
+    # ═══ 调仓参数 ═══
+    "rebalance_gap": 10,         # 持仓vs候选分差>=10触发调仓
+    "rebalance_sell_ratio": 0.3, # 调仓时最多卖出30%仓位
 }
 
 # ============================================================
@@ -1606,20 +1904,20 @@ MASTER_BACKTEST_CONFIG = {
     },
     "full": {
         "mc_simulations": 1000,
-        "wf_max_windows": 20,             # FIX(G2): 与 WF_CONFIG 对齐，20窗口
-        "grid_max_trials": 120,            # V7: 75→120，容纳 WF 扩展网格采样
+        "wf_max_windows": 15,             # V11.1 P0-1: 20→15，与 WF_CONFIG 对齐（训练窗变大）
+        "grid_max_trials": 9,              # V11.1 P0-1: 120→9，全遍历，避免多重检验虚高
     },
     # --- Stage 3 全池引擎回测（进程内有界采样：控 30min 预算、规避 run() 邮件副作用）---
     "stage3": {
         "max_codes": 10,                # 采样标的数（优先 STOCK_POOL）；全池×3年×MC 达小时级
         "window_days": 200,             # 回测窗口（交易日），取采样标的公共日期尾部 N 根
     },
-    # --- Stage 5 参数网格（V7: 扩展至4参数，含 vol_shrink_ratio）---
+    # --- Stage 5 参数网格（V11.2 P0-2: 改扫真正生效的参数轴，与 WF_CONFIG 对齐）---
+    #   initial_stop_loss 在 atr_mode=True 下失效、min_signal_quality 被 max() 支配，
+    #   旧网格 9 组合结果全同导致 G5 高原判定为假绿灯。
     "param_grid": {
-        "initial_stop_loss": [0.04, 0.05, 0.06, 0.07, 0.08],
-        "min_signal_quality": [55, 60, 65, 70, 75],
-        "drawdown_leader": [0.05, 0.06, 0.07],
-        "vol_shrink_ratio": [0.60, 0.70, 0.80],  # V7: 新增缩量阈值
+        "min_quality_non_bear": [62, 68, 74],  # 非熊入场质量门槛（v6 直接生效）
+        "drawdown_leader": [0.05, 0.07, 0.09],  # 龙头回落止盈（v6 直接生效）
     },
     # --- Stage 9 多基准（DB 无对应指数时静默降级并标注 missing）---
     "benchmarks": {
@@ -1634,13 +1932,28 @@ MASTER_BACKTEST_CONFIG = {
         "n_groups": 5,                  # 按月分 5 组
         "forward_days": 20,             # 前瞻收益窗口
         "rebalance_freq": 20,           # 调仓频率（交易日，约每月）
-        "factors": ["mom_20d", "mom_60d", "ma20_bias", "vol_ratio", "turnover_rate"],
+        "factors": ["return_20d", "return_60d", "ma20_bias", "volume_ratio_20",
+                    "turnover_proxy", "smf_proxy", "improved_reversal", "low_volatility"],
+        # P1-1(路线图): 原名 mom_20d/mom_60d/vol_ratio 在 factors.registry 未注册（Stage12 全跳过），
+        #   对齐为真实注册名：return_20d/return_60d(momentum)、volume_ratio_20(volume)、
+        #   turnover_proxy(volume，替代缺换手率字段的 turnover_rate)，并接入已注册的
+        #   smf_proxy(聪明钱)/improved_reversal(改进反转)/low_volatility(低波动)。
     },
     # --- 七道准入门阈值（默认值，SKILL.md 表格）---
     "gates": {
         "G2_oos_sharpe_min": 0.8,       # Walk-Forward 样本外平均夏普 >
+        # P0-2(路线图): G2 判定改用 pooled OOS 夏普（汇总有效窗逐笔），规避"每窗夏普求均值"被灾难窗绑架
+        "G2_use_pooled": True,
+        # P0-2(路线图): 新增 G2b 门——OOS 夏普中位数 > 0 且有效窗占比 >= 60%（泛化稳健性双保险）
+        "G2b_oos_median_min": 0.0,
+        "G2b_valid_ratio_min": 0.6,
         "G3_dsr_min": 0.95,             # Deflated Sharpe >
         "G3_pbo_max": 0.5,              # PBO <（若实现）
+        # P0-2(路线图): DSR 的 observed_sharpe 改用 Stage6 OOS 夏普（而非 Stage5 样本内），杜绝 G3 误导性 PASS
+        "G3_dsr_observed_from_oos": True,
+        # P2-2(路线图): DSR 多重检验次数下限——反映累计实验量（0=仅用当次网格 trial 数，不编造）。
+        #   若建立实验台账 output/experiment_ledger.json，则取台账累计值与此下限的较大者。
+        "G3_dsr_n_trials_floor": 0,
         "G4_cost_degradation_max": 0.30,# 成本×2 后夏普退化 <
         "G5_plateau_degradation_max": 0.15,  # 高原：邻域退化 <
         "G5_isolated_degradation": 0.30,     # 孤点：邻域退化 >
@@ -1708,8 +2021,8 @@ CAOPAN_CONFIG = {
 
     # --- 回测参数 ---
     "backtest_years": 3,
-    "backtest_commission": 0.0003,
-    "backtest_stamp_tax": 0.0005,
+    "backtest_commission": COMMISSION_RATE,      # [P0-2] 统一引用全局佣金费率
+    "backtest_stamp_tax": STAMP_TAX_RATE,        # [P0-2] 统一引用全局印花税费率
     "backtest_slippage": 0.001,
     "backtest_train_ratio": 0.70,      # 训练集70% / 验证集30%
 

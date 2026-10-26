@@ -202,7 +202,6 @@ def load_data_from_db(stock_codes: list, start_date: str, end_date: str,
     """
     import sys
     import os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     import config
     from data.data_loader import load_daily_data
 

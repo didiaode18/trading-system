@@ -29,8 +29,6 @@ from typing import Optional
 
 import pandas as pd
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -81,16 +79,6 @@ def _load_cache() -> dict:
     except Exception as e:
         logger.debug(f"融资融券缓存读取失败: {e}")
         return {}
-
-
-def _save_cache(cache: dict) -> None:
-    """将缓存写回本地 JSON 文件"""
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(MARGIN_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.debug(f"融资融券缓存写入失败: {e}")
 
 
 def _is_cache_fresh(cache: dict, key: str) -> bool:
@@ -314,7 +302,8 @@ class MarginMonitor:
 
     def _prune_cache(self):
         """FIX(perf): daily_*日期key超过最近30个时删除多余旧key；
-        修剪前把原缓存文件备份为 margin_monitor_cache_backup_<YYYYMMDD>.json（已存在则跳过）"""
+        修剪前把原缓存文件备份为 margin_monitor_cache_backup_<YYYYMMDD>.json（已存在则跳过）
+        P1-2: 备份后自动轮转，只保留最近 MAX_BACKUP_COUNT 个备份文件"""
         daily_keys = sorted(
             (k for k in self._cache if k.startswith("daily_") and k[6:].isdigit()),
             reverse=True)
@@ -328,12 +317,28 @@ class MarginMonitor:
                 import shutil
                 shutil.copyfile(MARGIN_CACHE_FILE, backup_path)
                 logger.info(f"融资融券缓存修剪前备份: {backup_path}")
+                # P1-2: 轮转清理——只保留最近 MAX_BACKUP_COUNT 个备份
+                self._rotate_backups()
         except Exception as e:
             logger.warning(f"融资融券缓存备份失败(继续修剪): {e}")
         _drop = daily_keys[CACHE_PRUNE_KEEP_DAYS:]
         for k in _drop:
             del self._cache[k]
         logger.info(f"融资融券缓存修剪: 保留最近{CACHE_PRUNE_KEEP_DAYS}天, 删除{len(_drop)}个旧daily_*key")
+
+    @staticmethod
+    def _rotate_backups(max_count: int = 7):
+        """P1-2: 备份文件轮转——删除最旧的备份，只保留最近 max_count 个"""
+        import glob
+        pattern = os.path.join(CACHE_DIR, "margin_monitor_cache_backup_*.json")
+        backups = sorted(glob.glob(pattern))
+        if len(backups) > max_count:
+            for old in backups[:-max_count]:
+                try:
+                    os.remove(old)
+                    logger.debug(f"轮转删除旧备份: {old}")
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # 内部：获取指定交易日列表

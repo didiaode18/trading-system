@@ -26,8 +26,6 @@ import logging
 import datetime
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -75,8 +73,8 @@ class TrendForecaster:
         # ---- 2. 动量分析 ----
         momentum_result = self._analyze_momentum(df)
 
-        # ---- 3. 支撑压力位（V10.1: regime修正） ----
-        levels_result = self._calc_support_resistance(df, _regime=_regime)
+        # ---- 3. 支撑压力位（V10.1: regime修正 + FIX P0-2026-10-09: ETF差异化） ----
+        levels_result = self._calc_support_resistance(df, _regime=_regime, code=code)
 
         # ---- 4. 波动率分析 ----
         volatility_result = self._analyze_volatility(df)
@@ -386,13 +384,18 @@ class TrendForecaster:
     # 四、支撑压力位计算
     # ============================================================
 
-    def _calc_support_resistance(self, df: pd.DataFrame, _regime: str = None) -> dict:
+    def _calc_support_resistance(self, df: pd.DataFrame, _regime: str = None,
+                                  code: str = None) -> dict:
         """计算关键支撑位和压力位
 
         V10.1多维度增强:
           1. 成交量加权筹码峰(简易版): 高成交量价位形成真实阻力/支撑
           2. Regime修正: BULL模式压力位上调5%，BEAR模式支撑位下调5%
           3. 突破确认: 近期放量突破关键阻力时，标记为"已突破"
+
+        FIX(2026-10-09) ETF差异化 + 枢轴点:
+          4. ETF品种差异化MA周期/回看窗口 (宽基MA10/30+30日, 行业MA20/60+60日, 主题MA15/40+40日)
+          5. 经典枢轴点Pivot Points: (H+L+C)/3 及 R1/S1/R2/S2
         """
         latest = df.iloc[-1]
         close = df["close"].values
@@ -401,26 +404,40 @@ class TrendForecaster:
         volume = df["volume"].values if "volume" in df.columns else None
         current = close[-1]
 
+        # FIX(2026-10-09): ETF差异化参数——不同品种使用不同MA周期与回看窗口
+        from utils.instrument import is_etf as _is_etf_fn, get_etf_subtype
+        _is_etf = _is_etf_fn(code) if code else False
+        _etf_type = get_etf_subtype(code) if _is_etf else ""
+        _sr_params = getattr(config, 'ETF_SR_PARAMS', {}).get(
+            _etf_type if _is_etf else "stock",
+            {"ma_short": 20, "ma_long": 60, "lookback": 60}
+        )
+        _lookback = min(_sr_params["lookback"], len(df))
+
         # 布林带
         boll_upper = latest.get("boll_upper", current * 1.1)
         boll_lower = latest.get("boll_lower", current * 0.9)
         boll_mid = latest.get("boll_mid", current)
 
-        # 近期高低点
-        lookback = min(60, len(df))
-        recent_high = max(high[-lookback:])
-        recent_low = min(low[-lookback:])
+        # 近期高低点 (ETF差异化回看窗口)
+        recent_high = max(high[-_lookback:])
+        recent_low = min(low[-_lookback:])
 
-        # MA支撑/压力
-        ma20 = latest.get("ma20", current)
-        ma60 = latest.get("ma60", current)
+        # MA支撑/压力 (ETF差异化周期)
+        _ma_short_col = f"ma{_sr_params['ma_short']}"
+        _ma_long_col = f"ma{_sr_params['ma_long']}"
+        _ma_short_label = f"MA{_sr_params['ma_short']}"
+        _ma_long_label = f"MA{_sr_params['ma_long']}"
+        # 优先从 df 取预计算均线，回退到 ma20/ma60 兼容
+        ma_short = latest.get(_ma_short_col, latest.get("ma20", current))
+        ma_long = latest.get(_ma_long_col, latest.get("ma60", current))
 
         # 收集所有支撑位（低于当前价）
         supports = []
-        if ma20 < current:
-            supports.append(("MA20", ma20))
-        if ma60 < current:
-            supports.append(("MA60", ma60))
+        if ma_short < current:
+            supports.append((_ma_short_label, ma_short))
+        if ma_long < current:
+            supports.append((_ma_long_label, ma_long))
         if boll_lower < current:
             supports.append(("布林下轨", boll_lower))
         if recent_low < current:
@@ -428,10 +445,10 @@ class TrendForecaster:
 
         # 收集所有压力位（高于当前价）
         resistances = []
-        if ma20 > current:
-            resistances.append(("MA20", ma20))
-        if ma60 > current:
-            resistances.append(("MA60", ma60))
+        if ma_short > current:
+            resistances.append((_ma_short_label, ma_short))
+        if ma_long > current:
+            resistances.append((_ma_long_label, ma_long))
         if boll_upper > current:
             resistances.append(("布林上轨", boll_upper))
         if recent_high > current:
@@ -453,6 +470,26 @@ class TrendForecaster:
                     resistances.append(("筹码峰压力", chip_center))
                 elif chip_center < current:
                     supports.append(("筹码峰支撑", chip_center))
+
+        # FIX(2026-10-09): 经典枢轴点 Pivot Points —— 机构通用支撑/压力算法
+        # 基于前一交易日 H/L/C 计算，补充到支撑/压力列表中
+        if len(df) >= 2:
+            _prev_h = float(high[-2])
+            _prev_l = float(low[-2])
+            _prev_c = float(close[-2])
+            _pivot = (_prev_h + _prev_l + _prev_c) / 3.0
+            _r1 = 2 * _pivot - _prev_l
+            _s1 = 2 * _pivot - _prev_h
+            _r2 = _pivot + (_prev_h - _prev_l)
+            _s2 = _pivot - (_prev_h - _prev_l)
+            if _s1 > 0 and _s1 < current:
+                supports.append(("枢轴S1", _s1))
+            if _s2 > 0 and _s2 < current:
+                supports.append(("枢轴S2", _s2))
+            if _r1 > current:
+                resistances.append(("枢轴R1", _r1))
+            if _r2 > current:
+                resistances.append(("枢轴R2", _r2))
 
         # 排序：支撑位从高到低，压力位从低到高
         supports.sort(key=lambda x: x[1], reverse=True)
@@ -505,6 +542,9 @@ class TrendForecaster:
             "regime": _regime,
             "breakout_detected": _breakout_detected,
             "regime_adjustment": _regime_adj,
+            # FIX(2026-10-09): ETF差异化标记，供买点计算复用
+            "etf_type": _etf_type,
+            "is_etf": _is_etf,
         }
 
     # ============================================================
@@ -1147,8 +1187,10 @@ if __name__ == "__main__":
     print("  持仓趋势预测分析")
     print("=" * 60)
 
-    # 加载持仓
-    holdings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "holdings.json")
+    # 加载持仓（FIX P0-15: 统一读权威副本 config.get_holdings_file()，
+    # 原直指 trading_system/holdings.json legacy 副本，stop_loss 与权威源漂移）
+    import config as _cfg_mod
+    holdings_file = _cfg_mod.get_holdings_file()
     if os.path.exists(holdings_file):
         with open(holdings_file, "r", encoding="utf-8") as f:
             holdings = json.load(f)

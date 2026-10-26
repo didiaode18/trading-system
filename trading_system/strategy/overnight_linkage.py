@@ -36,8 +36,7 @@ try:
     from trading_system import config
 except ImportError:
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    import config
+import config
 
 
 # ============================================================

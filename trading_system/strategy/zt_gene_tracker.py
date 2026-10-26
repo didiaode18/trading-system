@@ -28,8 +28,6 @@ import sys
 import logging
 import datetime
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from trading_system.utils.board_rules import get_limit_pct as _get_limit_pct
 

@@ -29,8 +29,6 @@ import logging
 import time
 
 import pandas as pd  # noqa: F401 (预留供后续扩展)
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from data.data_loader import init_db
 

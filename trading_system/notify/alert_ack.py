@@ -56,6 +56,15 @@ else:
 
 _ACK_STATE_FILE = os.path.join(_DATA_DIR, "alert_ack_state.json")
 
+# FIX P2-15: ACK 状态文件改原子写（临时文件 + os.replace + fsync）
+try:
+    from utils.file_io import atomic_json_write as _atomic_json_write
+except ImportError:
+    try:
+        from trading_system.utils.file_io import atomic_json_write as _atomic_json_write
+    except Exception:
+        _atomic_json_write = None
+
 # ============================================================
 # 持久化读写
 # ============================================================
@@ -81,8 +90,12 @@ def _save_state(state: dict) -> None:
     """写入ACK状态文件，失败仅记日志"""
     try:
         os.makedirs(os.path.dirname(os.path.abspath(_ACK_STATE_FILE)), exist_ok=True)
-        with open(_ACK_STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        if _atomic_json_write is not None:
+            # FIX P2-15: 原子写
+            _atomic_json_write(_ACK_STATE_FILE, state)
+        else:
+            with open(_ACK_STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"ACK状态写入失败: {e}")
 

@@ -28,9 +28,24 @@
 import logging
 import json
 import os
+import copy
 import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并 override 到 base（返回新字典）：字典逐键递归，非字典直接覆盖。
+
+    仅用于 RegimePlaybook 调优覆盖，保证未覆盖的键沿用基线值。
+    """
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 
 class RegimePlaybook:
@@ -217,12 +232,33 @@ class RegimePlaybook:
         """
         self._raw = regime_result or {}
         self.state = self._resolve_state()
-        self.config = self.CONFIGS.get(self.state, self.CONFIGS[self.DEFAULT_STATE])
+        # P1-2(路线图): 先取基线配置（深拷贝，禁止污染类级 CONFIGS），
+        #   再按 config.REGIME_PLAYBOOK_TUNING 对当前状态做增量覆盖（仅覆盖出现的键）。
+        #   将调优块置空即回退基线，便于 A/B 归因。
+        base = self.CONFIGS.get(self.state, self.CONFIGS[self.DEFAULT_STATE])
+        self.config = copy.deepcopy(base)
+        self._apply_tuning()
         self.confidence = self._raw.get("confidence", 0.5)
         self.detail = self._raw.get("detail", "")
 
         logger.info(f"[Playbook] 市场状态={self.state}, 置信度={self.confidence:.0%}, "
                     f"行动模式={self.config['action_mode_cn']}")
+
+    def _apply_tuning(self):
+        """应用 config.REGIME_PLAYBOOK_TUNING 中当前状态的增量覆盖（仅浅层字典递归合并）。
+
+        任何异常不抛出，降级为基线配置（遵循"任何异常不抛出"设计原则）。
+        """
+        try:
+            import config as _cfg
+            tuning = getattr(_cfg, "REGIME_PLAYBOOK_TUNING", {}) or {}
+            override = tuning.get(self.state)
+            if not isinstance(override, dict):
+                return
+            self.config = _deep_merge(self.config, override)
+            self.config["_tuned"] = True
+        except Exception as e:
+            logger.debug(f"[Playbook] 调优覆盖失败，降级基线: {e}")
 
     def _resolve_state(self) -> str:
         """从regime_result中提取状态，异常时降级为RANGE"""
@@ -254,9 +290,15 @@ class RegimePlaybook:
         返回: {"max_total": float, "min_total": float, "max_single": float}
         """
         base = self.config["position_limits"].copy()
-        # P1-G: 尝试读取风控引擎的仓位限制，取更严格的一方
+        # P1-G / FIX P1-02: 尝试读取风控引擎的仓位限制，取更严格的一方。
+        # 旧实现用宽泛 `except: pass` 吞掉了 get_position_limits() 不存在的
+        # AttributeError → “与风控引擎取更严值”从未生效。现将导入异常与
+        # 调用异常分开：导入失败（ImportError）静默降级；调用异常记日志不静默吞。
         try:
             from risk.risk_control import UnifiedRiskEngine
+        except ImportError:
+            return base  # 风控模块不可用，降级用 playbook 默认值
+        try:
             _engine = UnifiedRiskEngine()
             _risk_limits = _engine.get_position_limits()
             if _risk_limits:
@@ -268,8 +310,9 @@ class RegimePlaybook:
                     base["_risk_constrained"] = True
                 if _risk_max_single < base["max_single"]:
                     base["max_single"] = _risk_max_single
-        except Exception:
-            pass  # 风控引擎不可用时使用playbook默认值
+                    base["_risk_constrained"] = True
+        except Exception as e:
+            logger.warning(f"[Playbook] 读取风控仓位限制失败，降级用 playbook 默认值: {e}")
         return base
 
     def sector_preference(self) -> dict:
@@ -327,6 +370,18 @@ class RegimePlaybook:
     def trailing_stop_enabled(self) -> bool:
         """是否启用移动止盈"""
         return self.config["risk_rules"].get("trailing_stop", False)
+
+    def mean_reversion(self) -> dict:
+        """P1-2(路线图): 获取均值回归子逻辑配置（仅 RANGE 调优时非空）。
+
+        返回 {enabled, bollinger_window, bollinger_std, upper_reduce_pct,
+              lower_add_pct, prefer_reversal_factor}；未启用时 enabled=False。
+        供下游高抛低吸子逻辑复用（布林带上下轨），不新建引擎。
+        """
+        mr = self.config.get("mean_reversion", {})
+        if not isinstance(mr, dict):
+            return {"enabled": False}
+        return mr
 
     def discipline_extra(self) -> list:
         """获取额外纪律锁条目"""

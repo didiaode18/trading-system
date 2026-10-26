@@ -18,8 +18,6 @@ import numpy as np
 import logging
 import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 try:
@@ -744,6 +742,21 @@ def compute_trailing_stop(buy_price: float, current_price: float) -> float:
     - 浮盈 15%-30%: 止损上移到盈利12%的位置
     - 浮盈 > 30%: 止损上移到盈利22%的位置
     """
+    # FIX P2-13: 内部守卫 buy_price 非法值（None/NaN/≤0）。
+    # 调用方多用 truthy 检查（如 `if holding.get("buy_price")`）拦不住 NaN，
+    # 而 profit_pct=(current-buy)/buy 在 buy=0 时抛 ZeroDivisionError、buy=NaN 时
+    # 静默传播 NaN 止损价 → 后续比较全部失真。非法输入返回 0.0（“无有效止损”，
+    # 由调用方 fail-safe 处理），不做任何乐观假设。
+    try:
+        if buy_price is None or pd.isna(buy_price) or float(buy_price) <= 0:
+            return 0.0
+        if current_price is None or pd.isna(current_price):
+            return 0.0
+        buy_price = float(buy_price)
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        return 0.0
+
     profit_pct = (current_price - buy_price) / buy_price
     initial_stop = buy_price * (1 - config.INITIAL_STOP_LOSS_PCT)
 

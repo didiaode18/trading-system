@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from collections import deque
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -109,19 +108,37 @@ class ModelMonitor:
         return correct / total if total > 0 else 0.5
 
     def needs_retrain(self) -> bool:
-        """判断是否需要重训练"""
+        """判断是否需要重训练（FIX(BUG-07): 按自然日窗口而非记录条数判定）"""
         verified = [p for p in self.predictions if p["verified"]]
-        if len(verified) < self.window_days:
+        if not verified:
             return False
 
-        # 检查最近window_days天的准确率
-        recent = verified[-self.window_days:]
-        correct = sum(1 for p in recent if self._is_correct(p))
-        accuracy = correct / len(recent)
+        # FIX(BUG-07): 按自然日分组，取最近 window_days 天
+        from collections import defaultdict
+        daily_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+        for p in verified:
+            day = p.get("date", "")
+            if not day:
+                continue
+            daily_stats[day]["total"] += 1
+            if self._is_correct(p):
+                daily_stats[day]["correct"] += 1
 
+        if len(daily_stats) < self.window_days:
+            return False  # 自然日数不足窗口，不触发判定
+
+        # 取最近 window_days 个自然日
+        sorted_days = sorted(daily_stats.keys())[-self.window_days:]
+        total_correct = sum(daily_stats[d]["correct"] for d in sorted_days)
+        total_count = sum(daily_stats[d]["total"] for d in sorted_days)
+
+        if total_count == 0:
+            return False
+
+        accuracy = total_correct / total_count
         if accuracy < self.accuracy_threshold:
-            logger.warning(f"模型漂移预警: 最近{self.window_days}天准确率"
-                         f"{accuracy:.1%} < {self.accuracy_threshold:.0%}")
+            logger.warning(f"模型漂移预警: 最近{self.window_days}天({sorted_days[0]}~{sorted_days[-1]})"
+                         f"准确率{accuracy:.1%} < {self.accuracy_threshold:.0%}")
             return True
         return False
 
@@ -159,15 +176,33 @@ class ModelMonitor:
                 pass
 
     def _auto_disable_check(self):
-        """连续10天准确率<55%时标记降级，<45%时立即降级"""
+        """连续10天准确率<55%时标记降级，<45%时立即降级（FIX(BUG-07): 按自然日窗口）"""
         verified = [p for p in self.predictions if p.get('verified')]
-        if len(verified) < 10:
+        if not verified:
             return
-        recent_10 = list(verified)[-10:]
-        correct = sum(
-            1 for p in recent_10 if self._is_correct(p)
-        )
-        accuracy = correct / len(recent_10)
+
+        # FIX(BUG-07): 按自然日分组，与 needs_retrain 保持一致
+        from collections import defaultdict
+        daily_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+        for p in verified:
+            day = p.get("date", "")
+            if not day:
+                continue
+            daily_stats[day]["total"] += 1
+            if self._is_correct(p):
+                daily_stats[day]["correct"] += 1
+
+        if len(daily_stats) < 10:
+            return  # 自然日数不足，不触发判定
+
+        sorted_days = sorted(daily_stats.keys())[-10:]
+        total_correct = sum(daily_stats[d]["correct"] for d in sorted_days)
+        total_count = sum(daily_stats[d]["total"] for d in sorted_days)
+
+        if total_count == 0:
+            return
+
+        accuracy = total_correct / total_count
         if accuracy < 0.45:
             if not self.is_degraded:
                 self.is_degraded = True
@@ -240,13 +275,23 @@ class ModelMonitor:
         }
 
     def save(self):
-        """保存监控日志"""
+        """保存监控日志（FIX(BUG-06): 改用原子写，防止进程中断导致monitor_log.json损坏）"""
         os.makedirs(os.path.dirname(MONITOR_FILE), exist_ok=True)
+        _data = {
+            'predictions': list(self.predictions),
+            'is_degraded': self.is_degraded,
+        }
+        # FIX(BUG-06): 优先使用 atomic_json_write（临时文件+os.replace）
+        try:
+            from utils.file_io import atomic_json_write
+            atomic_json_write(MONITOR_FILE, _data)
+            return
+        except ImportError:
+            pass  # 工具不可用，回退裸写
+        except Exception as e:
+            logger.warning(f"[ModelMonitor] 原子写失败，回退裸写: {e}")
         with open(MONITOR_FILE, "w") as f:
-            json.dump({
-                'predictions': list(self.predictions),
-                'is_degraded': self.is_degraded,
-            }, f, ensure_ascii=False)
+            json.dump(_data, f, ensure_ascii=False)
 
     def auto_retrain_if_needed(self, prepare_data_fn=None) -> bool:
         """V9.2: 检测到模型漂移时自动触发重训练

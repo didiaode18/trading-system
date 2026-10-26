@@ -26,8 +26,6 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -445,7 +443,7 @@ class FundamentalAnalyzer:
         返回:
             {
                 "eps_growth_q": float,      # 单季度净利润增速(%)
-                "eps_growth_3y": float,     # 3年复合增速(%)
+                "eps_growth_3y": float|None, # 3年复合增速(%) — FIX CS-06: 无真实数据时返回None
                 "has_institution": bool,    # 机构资金流入
                 "roe": float|None,          # ROE(%)
                 "gross_margin": float|None, # 毛利率(%)
@@ -463,7 +461,11 @@ class FundamentalAnalyzer:
         return {
             # 现有字段（向后兼容）
             "eps_growth_q": fin.get("net_profit_growth", 0) or 0,
-            "eps_growth_3y": fin.get("revenue_growth", 0) or 0,  # 近似
+            # FIX CS-06(2026-10-11): 3年EPS复合增速必须用真实数据，禁止用营收增速近似
+            # 原逻辑: eps_growth_3y = revenue_growth（错误近似，营收增速≠EPS增速）
+            # 修复后: 无真实3年EPS数据时返回None，让canslim_score的A因子给中性分
+            # 待实施: 从多年财报数据计算真实3年EPS复合增速（需PIT多年数据支持）
+            "eps_growth_3y": None,  # TODO CS-06: 待接入多年EPS复合增速计算
             "has_institution": flow.get("signal") == "inflow",
             # V10.2 新增字段（财报深度分析用）
             "roe": fin.get("roe"),

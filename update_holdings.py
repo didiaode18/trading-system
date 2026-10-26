@@ -47,6 +47,15 @@ sys.path.insert(0, TRADING_SYSTEM_DIR)
 import config
 
 
+class _NullCtx:
+    """空上下文管理器（FIX P0-16: FileLock 不可用时的降级占位）"""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 def get_holdings_paths():
     """获取所有需要同步的holdings.json路径"""
     paths = []
@@ -84,31 +93,91 @@ def save_holdings(holdings: dict):
         print(f"  ⚠️ 持仓数{active_count}超过MAX_HOLDINGS={max_h}上限，请检查是否异常！")
     paths = get_holdings_paths()
     ok_count = 0
-    for path in paths:
-        try:
-            from utils.file_io import atomic_json_write
-            if atomic_json_write(path, holdings):
-                ok_count += 1
-            else:
-                print(f"  ⚠️ {path} 原子写入失败")
-        except ImportError:
-            # 降级: utils 模块不可用时回退到直接写入
+    # FIX(P0-16): 跨进程文件锁——与 scheduler 盘中巡检 / risk_control.sync_authoritative_stop_loss
+    # 并发写入时防止 lost update（锁文件 = holdings.json.lock，超时降级不阻断）
+    try:
+        from utils.file_io import FileLock as _FileLock, atomic_json_write
+    except ImportError:
+        _FileLock = None
+        atomic_json_write = None
+    primary_lock = _FileLock(paths[0], timeout=8.0) if (_FileLock and paths) else None
+    ctx = primary_lock if primary_lock is not None else _NullCtx()
+    with ctx:
+        for path in paths:
             try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(holdings, f, ensure_ascii=False, indent=2)
-                ok_count += 1
-            except Exception as e2:
-                print(f"  ⚠️ {path} 降级写入也失败: {e2}")
+                if atomic_json_write is not None:
+                    if atomic_json_write(path, holdings):
+                        ok_count += 1
+                    else:
+                        print(f"  ⚠️ {path} 原子写入失败")
+                else:
+                    raise ImportError("utils.file_io 不可用")
+            except ImportError:
+                # 降级: utils 模块不可用时回退到直接写入
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(holdings, f, ensure_ascii=False, indent=2)
+                    ok_count += 1
+                except Exception as e2:
+                    print(f"  ⚠️ {path} 降级写入也失败: {e2}")
     print(f"  ✅ holdings.json 已更新 ({ok_count}/{len(paths)}个路径同步)")
 
 
-def update_config_runtime(total_capital: float, available_cash: float):
-    """运行时覆盖config中的资金参数（不修改config.py文件）"""
+def update_config_runtime(total_capital: float, available_cash: float, force: bool = False):
+    """运行时覆盖config中的资金参数（不修改config.py文件）
+
+    FIX(P1-29):
+      1. 盘中守卫 —— 交易日09:15-15:00 改写 TOTAL_CAPITAL/AVAILABLE_CASH 会使四级熔断
+         分母（daily_pnl = 当前总资产 - daily_start_total 快照）产生虚假跳变，误触发/
+         误解除熔断；非 --force 时拒绝改写资金参数（持仓本身已在 main 流程被盘中保护拦截）。
+      2. 改写后重置风控引擎单例（UnifiedRiskEngine.reset_instance）并重设 PnL 快照基准
+         （daily/weekly/monthly/annual_start_total），使新资金口径成为当日基准，避免虚假盈亏。
+    """
+    # ---- 1. 盘中守卫 ----
+    _now_dt = datetime.datetime.now()
+    _intraday = (_now_dt.weekday() < 5
+                 and datetime.time(9, 15) <= _now_dt.time() <= datetime.time(15, 0))
+    if _intraday and not force:
+        print("  ⛔ 盘中保护: 交易时段拒绝改写 config.TOTAL_CAPITAL/AVAILABLE_CASH")
+        print("     （避免四级熔断分母虚假跳变）；确需盘中改写请加 --force。")
+        return False
+
     config.TOTAL_CAPITAL = total_capital
     config.AVAILABLE_CASH = available_cash
     print(f"  ✅ config.TOTAL_CAPITAL = {total_capital:,.2f}")
     print(f"  ✅ config.AVAILABLE_CASH = {available_cash:,.2f}")
+
+    # ---- 2. 重置风控引擎单例 + 重设 PnL 快照基准（防止资金口径变更引发虚假 daily_pnl）----
+    try:
+        from risk.risk_control import UnifiedRiskEngine
+        UnifiedRiskEngine.reset_instance()
+        engine = UnifiedRiskEngine()  # 新建单例（__init__ 默认读取已更新的 config.TOTAL_CAPITAL）
+        state = engine.state_mgr.state
+        # 以新总资产口径重设各周期起始快照（当日基准），使 daily_pnl 归零重新计
+        new_total = float(total_capital) if total_capital and total_capital > 0 else \
+            (state.get("daily_start_total", 0.0) or 0.0)
+        if new_total > 0:
+            today = datetime.date.today()
+            iso = today.isocalendar()
+            state["snapshot_date"] = today.isoformat()
+            state["daily_start_total"] = new_total
+            state["snapshot_week"] = f"{iso[0]}-W{iso[1]:02d}"
+            state["weekly_start_total"] = new_total
+            state["snapshot_month"] = today.strftime("%Y-%m")
+            state["monthly_start_capital"] = new_total
+            state["snapshot_year"] = str(today.year)
+            state["annual_start_capital"] = new_total
+            state["daily_pnl"] = 0.0
+            state["weekly_pnl"] = 0.0
+            state["monthly_pnl"] = 0.0
+            # 资金口径已重置为可信基准，清除 fail-safe 数据不可用标志
+            state["pnl_data_unavailable"] = False
+            engine.state_mgr.save()
+            print("  ✅ 风控引擎已重置，PnL 快照基准已按新资金口径重设")
+    except Exception as e:
+        print(f"  ⚠️ 风控引擎/快照基准重置异常（不阻断更新）: {e}")
+    return True
 
 
 # ============================================================
@@ -203,6 +272,23 @@ def merge_holding(existing: dict, parsed: dict, source: str,
     merged = dict(existing)
     old_shares = existing.get("shares", 0)
 
+    # FIX P1-08: 除权除息(送转)导致价格基准下移——券商同步股数按比例增加
+    # 且现价等比例下降时，按复权因子下调 highest/stop_loss 至新基准，避免 Ratchet
+    # 卡死除权前高位（10送10 除权日 drawdown≈-50% 误触发回落止盈）。
+    # 严格区分“送转”与“加仓”：送转=股数×R 且 现价≈旧价/R；加仓=股数增但价格不变。
+    _xr_scale = 1.0
+    if old_shares and parsed["shares"] > old_shares * 1.05:
+        _share_ratio = parsed["shares"] / old_shares
+        _old_ref = existing.get("current_price", 0) or existing.get("buy_price", 0)
+        _new_px = parsed.get("current_price", 0)
+        if _old_ref > 0 and _new_px > 0 and _share_ratio > 1.05:
+            _expected = _old_ref / _share_ratio  # 除权后理论参考价
+            if 0.8 * _expected <= _new_px <= 1.25 * _expected:
+                _xr_scale = 1.0 / _share_ratio
+                warnings.append(
+                    f"ℹ️ {code} 检测到除权送转（股数{old_shares}→{parsed['shares']}、"
+                    f"现价等比例下移），按复权因子{_xr_scale:.4f}下调 highest/stop_loss 至新基准")
+
     # 股数: 有真实交易才变更
     if parsed["shares"] != old_shares:
         merged["shares"] = parsed["shares"]
@@ -231,7 +317,8 @@ def merge_holding(existing: dict, parsed: dict, source: str,
                             f"（确需人工修正请加 --force）")
 
     # 止损: Ratchet 只升不降；输入0视为未提供，保留现值绝不置0
-    old_stop = existing.get("stop_loss", 0)
+    # FIX P1-08: 除权送转日先将旧止损按复权因子下调至新基准，再做 Ratchet 比较
+    old_stop = existing.get("stop_loss", 0) * _xr_scale
     in_stop = parsed.get("stop_loss", 0) or 0
     if in_stop > 0:
         if in_stop < old_stop:
@@ -243,7 +330,8 @@ def merge_holding(existing: dict, parsed: dict, source: str,
 
     # 每日可更新字段
     merged["current_price"] = parsed["current_price"]
-    merged["highest"] = max(existing.get("highest", 0), parsed["current_price"])
+    # FIX P1-08: highest 棘轮前先按复权因子下调旧基准（除权送转日），避免卡死高位
+    merged["highest"] = max(existing.get("highest", 0) * _xr_scale, parsed["current_price"])
 
     # 审计字段
     merged["updated_at"] = now_str
@@ -699,7 +787,7 @@ def main():
 
     # 保存
     save_holdings(holdings)
-    update_config_runtime(total_capital, available_cash)
+    update_config_runtime(total_capital, available_cash, force=args.force)
 
     # 打印摘要
     print_summary(holdings, total_capital, available_cash, total_mv)

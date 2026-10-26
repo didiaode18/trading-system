@@ -43,9 +43,14 @@ import datetime
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+
+# FIX P2-15: 状态文件统一走原子写（临时文件 + os.replace + fsync），
+# 避免崩溃/并发读到半成品 JSON。
+try:
+    from utils.file_io import atomic_json_write as _atomic_json_write
+except ImportError:  # pragma: no cover
+    from trading_system.utils.file_io import atomic_json_write as _atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -117,11 +122,11 @@ class MarketRegimeDetector:
         """保存当前regime状态（防抖用）"""
         try:
             os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
-            with open(self._state_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "state": state,
-                    "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }, f, ensure_ascii=False)
+            # FIX P2-15: 原子写
+            _atomic_json_write(self._state_file, {
+                "state": state,
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
         except Exception as e:
             logger.warning(f"[防抖] 保存状态失败: {e}")
 
@@ -129,11 +134,11 @@ class MarketRegimeDetector:
         """保存待确认状态（防抖用）"""
         try:
             pending_file = self._state_file.replace(".json", "_pending.json")
-            with open(pending_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "pending_state": state,
-                    "pending_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }, f, ensure_ascii=False)
+            # FIX P2-15: 原子写
+            _atomic_json_write(pending_file, {
+                "pending_state": state,
+                "pending_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
         except Exception:
             pass
 
@@ -1373,8 +1378,8 @@ def record_regime_detection(regime: str, confidence: float, scores: dict = None)
         history.append(entry)
         history = history[-120:]  # 保留最近120天
 
-        with open(_REGIME_HISTORY_PATH, 'w', encoding='utf-8') as f:
-            _json.dump(history, f, ensure_ascii=False, indent=2)
+        # FIX P2-15: 原子写
+        _atomic_json_write(_REGIME_HISTORY_PATH, history)
     except Exception as e:
         logger.warning(f"[Regime追踪] 记录失败: {e}")
 

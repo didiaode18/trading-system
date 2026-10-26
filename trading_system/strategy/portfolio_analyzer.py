@@ -22,8 +22,6 @@ import datetime
 from collections import defaultdict
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -757,9 +755,10 @@ if __name__ == "__main__":
     print("  仓位管理分析 - 测试")
     print("=" * 50)
 
-    # 加载持仓
+    # 加载持仓（FIX P0-15: 统一读权威副本，原直指 legacy 副本致止损口径漂移）
     import json
-    holdings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "holdings.json")
+    import config as _cfg_mod
+    holdings_file = _cfg_mod.get_holdings_file()
     with open(holdings_file, "r") as f:
         holdings = json.load(f)
 

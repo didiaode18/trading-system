@@ -19,9 +19,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from .decile_backtest import DecileBacktest
@@ -108,6 +106,31 @@ def _summarize_result(name: str, res) -> dict:
     }
 
 
+def _govern_factor(rec: dict) -> dict:
+    """P1-3: 单因子 IC 治理判定。
+
+    基于业界常用阈值将原始 IC 指标转为可执行的保留/剔除建议：
+      effective : |IC|>=0.03 且 |ICIR|>=0.3 且 |t|>=2（显著且稳定）
+      weak      : |IC|>=0.02（方向性弱，需观察）
+      ineffective: 其余（无预测力，建议剔除）
+    另标注 IC 符号：负 IC 说明因子方向应反转使用。
+    """
+    ic = abs(float(rec.get("ic_mean", 0) or 0))
+    icir = abs(float(rec.get("icir", 0) or 0))
+    t = abs(float(rec.get("t_stat", 0) or 0))
+    if ic >= 0.03 and icir >= 0.3 and t >= 2.0:
+        verdict = "effective"
+    elif ic >= 0.02:
+        verdict = "weak"
+    else:
+        verdict = "ineffective"
+    sign = "negative" if float(rec.get("ic_mean", 0) or 0) < 0 else "positive"
+    return {"ic_verdict": verdict, "ic_sign": sign,
+            "suggest": "keep" if verdict == "effective" else (
+                "watch" if verdict == "weak" else "drop"),
+            "invert_if_used": sign == "negative"}
+
+
 def run_factor_layering(data_dict: dict) -> dict:
     """因子分层回测主入口。
 
@@ -145,11 +168,26 @@ def run_factor_layering(data_dict: dict) -> dict:
                 skipped.append({"factor": name, "reason": "分层回测无有效分组（日期/标的不足）"})
                 continue
             results[name] = _summarize_result(name, res)
+            # P1-3: 附加 IC 治理判定
+            results[name].update(_govern_factor(results[name]))
         except Exception as e:
             skipped.append({"factor": name, "reason": f"计算异常: {e}"})
             logger.debug(f"[Stage12] 因子 {name} 分层失败: {e}")
 
     n_ok = len(results)
+    # P1-3: IC 治理汇总——有效/观察/剔除清单，供报告与后续因子库决策
+    keep = [k for k, v in results.items() if v.get("suggest") == "keep"]
+    watch = [k for k, v in results.items() if v.get("suggest") == "watch"]
+    drop = [k for k, v in results.items() if v.get("suggest") == "drop"]
+    governance = {
+        "effective": keep, "weak": watch, "ineffective": drop,
+        "n_effective": len(keep), "n_total": n_ok,
+        "effective_ratio": round(len(keep) / n_ok, 4) if n_ok else 0.0,
+        "verdict": ("因子体系有效" if n_ok and len(keep) / n_ok >= 0.5
+                    else "因子体系覆盖不足：多数因子无预测力，需扩充/替换"),
+        "note": ("negative IC 因子应反转使用；ineffective 因子建议从选股模型剔除。"
+                 if results else "无有效因子结果"),
+    }
     return {
         "status": "ok" if n_ok > 0 else "skipped",
         "n_stocks": n_stocks,
@@ -157,6 +195,7 @@ def run_factor_layering(data_dict: dict) -> dict:
         "forward_days": FORWARD_DAYS,
         "rebalance_freq": REBALANCE_FREQ,
         "factors": results,
+        "ic_governance": governance,
         "skipped": skipped,
         "note": ("部分因子因数据/注册不足已跳过并标注。"
                  if skipped else "全部配置因子分层完成。"),

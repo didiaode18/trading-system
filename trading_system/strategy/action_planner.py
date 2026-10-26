@@ -328,12 +328,40 @@ class ActionPlanner:
                     "amount": amount,
                     "shares": info.get("shares", 0),
                     "price": price,
-                    "pnl_pct": (price / cost - 1) * 100 if cost > 0 else 0,
+                    "pnl_pct": (price / cost - 1) * 100 if cost > 0 and price > 0 else 0,
+                    "confidence": self._reduce_confidence(reasons),
                 })
 
         # 按优先级排序
         candidates.sort(key=lambda x: x["priority"], reverse=True)
+        # FIX(2026-10-08): priority 排序完成后转成中文标签。此前输出的是 int，
+        # 而报告渲染侧按字符串做 `"必减" in priority` 判断 → TypeError，
+        # 导致 BEAR 模式下整个"今日行动清单"面板被 except 静默丢弃。
+        for c in candidates:
+            c["priority"] = self._priority_label(c["priority"], full=True)
         return candidates
+
+    def _priority_label(self, score, full: bool = False) -> str:
+        """把减仓优先级得分翻译成展示标签（full=True 用三档口径）"""
+        if full:
+            if score >= 5:
+                return "必减"
+            if score >= 3:
+                return "建议减"
+            return "可关注"
+        if score >= 4:
+            return "必减"
+        if score >= 2:
+            return "建议减"
+        return "可关注"
+
+    def _reduce_confidence(self, reasons) -> float:
+        """减仓/弱势建议置信度：随命中理由数递增，并被 regime 置信度缩放"""
+        try:
+            base = float(getattr(self.playbook, "confidence", 0.5) or 0.5)
+        except Exception:
+            base = 0.5
+        return round(min(0.9, base * (0.4 + 0.2 * len(reasons or []))), 2)
 
     def _identify_weak_holdings(self) -> list:
         """识别弱势持仓:
@@ -343,7 +371,9 @@ class ActionPlanner:
 
         V10.1改进: TOP3板块持仓不标记为弱势（板块景气联动）
 
-        返回: [{code, name, reason, priority}] 按优先级排序
+        返回: [{code, name, sector, reason, price, shares, amount,
+                pnl_pct, priority(中文标签), confidence}] —— 与
+                _identify_reduce_candidates 同 schema，供报告渲染侧统一读取
         """
         candidates = []
         top_sectors = self._get_top_sector_names(3)
@@ -372,6 +402,7 @@ class ActionPlanner:
 
             if reasons:
                 price = df["close"].iloc[-1] if df is not None and len(df) > 0 else 0
+                cost = info.get("buy_price", 0)
                 candidates.append({
                     "code": code,
                     "name": info.get("name", code),
@@ -379,6 +410,15 @@ class ActionPlanner:
                     "reason": "；".join(reasons),
                     "price": price,
                     "shares": info.get("shares", 0),
+                    "amount": price * info.get("shares", 0),
+                    # FIX(2026-10-08): 补齐报告渲染侧要读的字段。此前本方法只返回
+                    # code/name/sector/reason/price/shares，而渲染侧按
+                    # _identify_reduce_candidates 的完整 schema 取 pnl_pct/priority/
+                    # confidence，导致 RANGE/BULL 模式减仓清单恒显示
+                    # "浮盈 +0.0% | 置信度 0%"（宝丰能源实际-47%也显示+0.0%）。
+                    "pnl_pct": (price / cost - 1) * 100 if cost > 0 and price > 0 else 0,
+                    "priority": self._priority_label(len(reasons) * 2),
+                    "confidence": self._reduce_confidence(reasons),
                 })
 
         return candidates

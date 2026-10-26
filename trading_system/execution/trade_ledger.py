@@ -122,8 +122,16 @@ class TradeLedger:
     # ---- 内部：连接与建表 ----
     def _conn(self) -> sqlite3.Connection:
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        # FIX P1-22: timeout=30s + WAL + busy_timeout，避免回调线程/主线程/
+        # 对账 daemon 三线程并发写时 "database is locked" 导致成交记录静默丢失。
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as e:
+            logger.debug(f"[台账] PRAGMA 设置失败(降级): {e}")
         return conn
 
     def _init_schema(self):
@@ -210,7 +218,7 @@ class TradeLedger:
             conn.close()
             return True
         except Exception as e:
-            logger.warning(f"[台账] 委托登记失败 order={order_id}: {e}")
+            logger.error(f"[台账] 委托登记失败 order={order_id}: {e}")
             return False
 
     def update_order_status(self, order_id, status, status_msg="",
@@ -252,7 +260,7 @@ class TradeLedger:
             conn.close()
             return True
         except Exception as e:
-            logger.warning(f"[台账] 状态回填失败 order={order_id}: {e}")
+            logger.error(f"[台账] 状态回填失败 order={order_id}: {e}")
             return False
 
     def get_order(self, order_id) -> dict:
@@ -307,30 +315,41 @@ class TradeLedger:
             conn.commit()
             conn.close()
             if inserted:
-                # 成交入账后重算该委托的成交量与均价
-                self._refresh_order_fill(order_id)
+                # 成交入账后重算该委托的成交量与均价（FIX P2-04: 按 trade_date 限定）
+                self._refresh_order_fill(order_id, trade_date=trade_date)
             return inserted
         except Exception as e:
-            logger.warning(f"[台账] 成交入账失败 order={order_id}: {e}")
+            logger.error(f"[台账] 成交入账失败 order={order_id}: {e}")
             return False
 
-    def _refresh_order_fill(self, order_id):
-        """按 trades 表重算委托的 filled_qty 与 avg_price = Σ(价×量)/Σ量。"""
+    def _refresh_order_fill(self, order_id, trade_date=None):
+        """按 trades 表重算委托的 filled_qty 与 avg_price = Σ(价×量)/Σ量。
+
+        FIX P2-04: SUM 按 trade_date 过滤，避免跨日同号委托的历史成交累加误升 FILLED。
+        """
         try:
             conn = self._conn()
             cur = conn.cursor()
-            cur.execute(
-                "SELECT SUM(traded_price*traded_volume) AS amt, "
-                "SUM(traded_volume) AS vol FROM trades WHERE order_id=?",
-                (str(order_id),))
+            cur.execute("SELECT order_qty, status, trade_date FROM orders WHERE order_id=?",
+                        (str(order_id),))
+            orow = cur.fetchone()
+            _odate = trade_date or (orow["trade_date"] if orow else None)
+            if _odate:
+                cur.execute(
+                    "SELECT SUM(traded_price*traded_volume) AS amt, "
+                    "SUM(traded_volume) AS vol FROM trades "
+                    "WHERE order_id=? AND trade_date=?",
+                    (str(order_id), _odate))
+            else:
+                cur.execute(
+                    "SELECT SUM(traded_price*traded_volume) AS amt, "
+                    "SUM(traded_volume) AS vol FROM trades WHERE order_id=?",
+                    (str(order_id),))
             row = cur.fetchone()
             total_amt = float(row["amt"] or 0)
             total_vol = int(row["vol"] or 0)
             avg = (total_amt / total_vol) if total_vol > 0 else 0.0
             # 依据委托量推断状态（仅在非终态时升级，撤单/拒单由状态回填决定）
-            cur.execute("SELECT order_qty, status FROM orders WHERE order_id=?",
-                        (str(order_id),))
-            orow = cur.fetchone()
             new_status = None
             if orow:
                 oqty = int(orow["order_qty"] or 0)
@@ -351,7 +370,7 @@ class TradeLedger:
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.warning(f"[台账] 成交量重算失败 order={order_id}: {e}")
+            logger.error(f"[台账] 成交量重算失败 order={order_id}: {e}")
 
     def get_order_trades(self, order_id) -> list:
         """读取某委托的全部逐笔成交。"""
@@ -383,18 +402,67 @@ class TradeLedger:
             return []
 
     # ---- 对账台账（差异去重）----
-    def record_diff(self, recon_type, code, diff_detail, recon_date=None) -> bool:
-        """记录一条对账差异，同日同类型同内容去重。
+    @staticmethod
+    def _diff_hash(code, diff_detail) -> str:
+        """差异指纹（不含 recon_date，供跨日去重）。"""
+        return hashlib.md5(f"{code}|{diff_detail}".encode("utf-8")).hexdigest()[:16]
 
-        返回 True=新差异（应告警）, False=重复（已告警，跳过）。
+    def is_new_diff(self, recon_type, code, diff_detail, recon_date=None,
+                    dedup_window_days=5) -> bool:
+        """FIX P2-19/P1-12: 判断差异在近 N 日窗口内是否首次出现。
+
+        跨日去重消除“同一假差异每天重发”告警疲劳。查询失败时保守视为新增。
         """
         recon_date = recon_date or datetime.date.today().isoformat()
-        diff_hash = hashlib.md5(
-            f"{code}|{diff_detail}".encode("utf-8")).hexdigest()[:16]
+        dh = self._diff_hash(code, diff_detail)
+        _d0 = recon_date
+        if dedup_window_days and dedup_window_days > 0:
+            try:
+                _d0 = (datetime.date.fromisoformat(recon_date)
+                       - datetime.timedelta(days=dedup_window_days)).isoformat()
+            except Exception:
+                _d0 = recon_date
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM reconcile_ledger "
+                "WHERE recon_type=? AND diff_hash=? AND recon_date>=? AND recon_date<=?",
+                (recon_type, dh, _d0, recon_date))
+            row = cur.fetchone()
+            conn.close()
+            return (row["c"] if row else 0) == 0
+        except Exception as e:
+            logger.warning(f"[台账] 差异去重查询失败(保守视为新增): {e}")
+            return True
+
+    def record_diff(self, recon_type, code, diff_detail, recon_date=None,
+                    dedup_window_days=5) -> bool:
+        """记录一条对账差异（总是落库留痕）。
+
+        返回 True=应告警（当日首插且近 N 日窗口内首次出现）, False=重复/跨日已告警。
+        FIX P2-19: 同一 (recon_type,diff_hash) 在近 N 日内已记录则不再重复告警。
+        """
+        recon_date = recon_date or datetime.date.today().isoformat()
+        diff_hash = self._diff_hash(code, diff_detail)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             conn = self._conn()
             cur = conn.cursor()
+            # FIX P2-19: 先查跨日窗口是否已有同差异（未处理）
+            _prior_alerted = False
+            if dedup_window_days and dedup_window_days > 0:
+                try:
+                    _d0 = (datetime.date.fromisoformat(recon_date)
+                           - datetime.timedelta(days=dedup_window_days)).isoformat()
+                except Exception:
+                    _d0 = recon_date
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM reconcile_ledger "
+                    "WHERE recon_type=? AND diff_hash=? AND recon_date>=? AND recon_date<?",
+                    (recon_type, diff_hash, _d0, recon_date))
+                _r = cur.fetchone()
+                _prior_alerted = (_r["c"] if _r else 0) > 0
             cur.execute(
                 """INSERT OR IGNORE INTO reconcile_ledger
                        (recon_date, recon_type, code, diff_detail, diff_hash,
@@ -404,10 +472,45 @@ class TradeLedger:
             inserted = cur.rowcount > 0
             conn.commit()
             conn.close()
-            return inserted
+            # 当日首插且非跨日重复 → 应告警
+            return inserted and not _prior_alerted
         except Exception as e:
-            logger.warning(f"[台账] 差异记录失败: {e}")
+            logger.error(f"[台账] 差异记录失败: {e}")
             return False
+
+    def mark_diff_handled(self, recon_date=None, recon_type=None, code=None,
+                          diff_detail=None, diff_hash=None) -> int:
+        """FIX P2-19: 差异确认闭环——将匹配的差异标记为已处理(handled=1)。返回更新行数。
+
+        可按 (recon_date + recon_type + code) 或 (diff_detail/diff_hash) 定位；未传条件则不更新。
+        """
+        if diff_detail and not diff_hash:
+            diff_hash = self._diff_hash(code or "", diff_detail)
+        conds, params = [], []
+        if recon_date:
+            conds.append("recon_date=?"); params.append(recon_date)
+        if recon_type:
+            conds.append("recon_type=?"); params.append(recon_type)
+        if code:
+            conds.append("code=?"); params.append(code)
+        if diff_hash:
+            conds.append("diff_hash=?"); params.append(diff_hash)
+        if not conds:
+            return 0
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE reconcile_ledger SET handled=1, created_at=? WHERE {' AND '.join(conds)}",
+                [now] + params)
+            n = cur.rowcount
+            conn.commit()
+            conn.close()
+            return n
+        except Exception as e:
+            logger.error(f"[台账] 差异标记处理失败: {e}")
+            return 0
 
     def get_day_diffs(self, recon_date=None) -> list:
         """读取指定日全部对账差异。"""

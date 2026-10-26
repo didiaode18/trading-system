@@ -19,9 +19,7 @@ Stage 4 · 双引擎交叉验证（full-history-backtest 新增）
 import logging
 import os
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from . import master_common

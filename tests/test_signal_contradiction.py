@@ -27,6 +27,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'trading_system
 class TestPullbackAddBuyBlock(unittest.TestCase):
     """回调加仓被buy_block拦截"""
 
+    # FIX(P0-20): check_pullback_add_risk 新增引擎级熔断校验（暂停期/连亏/冷却），
+    # 需隔离真实 output/risk_state.json（否则生产熔断状态会先于 buy_block 拦截，
+    # 使本用例断言的"禁加仓"reason 被"风控暂停期"覆盖）。unittest.TestCase 无法用
+    # pytest fixture，故在 setUp/tearDown 手动 patch 模块级 STATE_FILE。
+    def setUp(self):
+        import risk.risk_control as _rc
+        self._rc = _rc
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_state_file = _rc.STATE_FILE
+        _rc.STATE_FILE = os.path.join(self._tmpdir, "risk_state.json")
+
+    def tearDown(self):
+        import shutil
+        self._rc.STATE_FILE = self._orig_state_file
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
     def _make_df(self, n=60):
         """构造满足回调加仓条件的K线数据"""
         np.random.seed(42)

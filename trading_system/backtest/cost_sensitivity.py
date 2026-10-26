@@ -18,9 +18,7 @@ import os
 import sys
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from . import master_common
@@ -103,16 +101,31 @@ def _run_tier(data_dict: dict, codes: list, params: dict,
     rets = master_common.trades_to_return_series(all_trades)
     if len(rets) < 2:
         return {"sharpe": 0.0, "annual": 0.0, "n_trades": len(all_trades),
-                "win_rate": 0.0, "total_return": 0.0, "note": "样本不足"}
+                "win_rate": 0.0, "total_return": 0.0, "sortino": 0.0,
+                "profit_factor": 0.0, "avg_hold_days": 0.0, "note": "样本不足"}
     avg_hold = float(np.mean([t.get("hold_days", 5) for t in all_trades])) if all_trades else 5.0
     sharpe = master_common.sharpe_from_trade_returns(rets, avg_hold)
     wins = int((rets > 0).sum())
+    # P2-2: 补全报告缺失指标——盈亏比 / Sortino / 平均持仓天数
+    win_rets = rets[rets > 0]
+    loss_rets = rets[rets < 0]
+    avg_win = float(win_rets.mean()) if len(win_rets) > 0 else 0.0
+    avg_loss = float(abs(loss_rets.mean())) if len(loss_rets) > 0 else 0.0
+    profit_factor = round(avg_win / avg_loss, 4) if avg_loss > 1e-12 else 0.0
+    ann = np.sqrt(252.0 / max(1.0, avg_hold))
+    rf_per_trade = 0.03 * (avg_hold / 252.0)
+    downside_std = float(np.std(loss_rets)) if len(loss_rets) > 1 else 0.0
+    sortino = round(float((np.mean(rets) - rf_per_trade) / downside_std * ann), 4) \
+        if downside_std > 1e-12 else 0.0
     return {
         "sharpe": round(float(sharpe), 4),
         "annual": round(float(np.mean(rets) * (252.0 / max(1.0, avg_hold))), 4),
         "n_trades": len(all_trades),
         "win_rate": round(wins / len(rets), 4),
         "total_return": round(float(np.sum(rets)), 4),
+        "sortino": sortino,
+        "profit_factor": profit_factor,
+        "avg_hold_days": round(avg_hold, 1),
     }
 
 

@@ -31,8 +31,6 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -207,9 +205,30 @@ class TradeJournal:
         conn.commit()
         conn.close()
 
-    # ============================================================
-    # 二、绩效指标计算
-    # ============================================================
+    def get_nav_series(self, days: int = 120) -> list:
+        """FIX P1-03: 返回归一化净值序列（起点=1.0），供组合级回撤熔断消费。
+
+        读 daily_nav 表最近 days 个交易日的 total_value，按日期升序归一。
+        无数据/异常时返回空列表（上层熔断会判 insufficient 而降级为不降仓）。
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT total_value FROM daily_nav ORDER BY date DESC LIMIT ?",
+                (int(days),))
+            rows = [r[0] for r in cursor.fetchall() if r and r[0]]
+            conn.close()
+            if not rows:
+                return []
+            rows = rows[::-1]  # 转为时间升序
+            base = rows[0]
+            if base <= 0:
+                return []
+            return [float(v) / float(base) for v in rows]
+        except Exception as e:
+            logger.debug(f"[日志] 读取净值序列失败(降级空): {e}")
+            return []
 
     def performance_report(self, days: int = 90) -> dict:
         """

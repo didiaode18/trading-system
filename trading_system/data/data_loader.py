@@ -38,7 +38,6 @@ except ImportError:
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 
@@ -266,13 +265,52 @@ def get_last_update_date(conn: sqlite3.Connection, code: str) -> str:
 
 _bs_session = {"logged_in": False}
 
+# FIX P1-14: baostock 源健康度熔断 + 会话锁（比照 realtime.py:48-59 的指数退避正例）。
+# 旧实现：_bs_login 每次请求重试、失败静默 → 全量测试数百次 "you don't login." 刷屏；
+# 且模块级会话非线程安全（ThreadPoolExecutor 并发登录竞争）。
+import threading as _bs_threading
+_bs_lock = _bs_threading.Lock()
+_BS_HEALTH = {"failures": 0, "cooldown_until": None}
+_BS_COOLDOWN_BASE = 60      # 首次冷却秒数
+_BS_COOLDOWN_MAX = 600      # 冷却上限
+_BS_MAX_FAILURES = 3        # 触发冷却的连续失败阈值
+
+
+def _bs_healthy() -> bool:
+    """baostock 是否可用（冷却期内视为不健康）。"""
+    cu = _BS_HEALTH.get("cooldown_until")
+    return not (cu and datetime.datetime.now() < cu)
+
+
+def _bs_mark_failure():
+    """记一次失败；达阈值后按指数退避进入冷却。"""
+    _BS_HEALTH["failures"] += 1
+    if _BS_HEALTH["failures"] >= _BS_MAX_FAILURES:
+        n = _BS_HEALTH["failures"] - _BS_MAX_FAILURES + 1
+        secs = min(_BS_COOLDOWN_BASE * (2 ** (n - 1)), _BS_COOLDOWN_MAX)
+        _BS_HEALTH["cooldown_until"] = datetime.datetime.now() + datetime.timedelta(seconds=secs)
+        logger.warning(f"[baostock] 连续{_BS_HEALTH['failures']}次失败，冷却{secs}s内跳过该源")
+
+
+def _bs_mark_success():
+    """记一次成功，清零失败计数与冷却。"""
+    if _BS_HEALTH["failures"] or _BS_HEALTH["cooldown_until"]:
+        _BS_HEALTH["failures"] = 0
+        _BS_HEALTH["cooldown_until"] = None
+
+
 def _bs_login():
-    """确保 baostock 已登录（含断线重连机制）"""
-    if not _bs_session["logged_in"]:
-        lg = bs.login()
-        if lg.error_code != '0':
-            raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
-        _bs_session["logged_in"] = True
+    """确保 baostock 已登录（线程安全 + 冷却熔断 + 失败显式抛错）。"""
+    with _bs_lock:
+        if not _bs_healthy():
+            # 冷却期内显式抛错，上层 fetch_stock_daily 捕获后切换到 akshare/腾讯
+            raise RuntimeError("baostock 处于冷却期（连续失败熔断），跳过本次请求")
+        if not _bs_session["logged_in"]:
+            lg = bs.login()
+            if lg.error_code != '0':
+                _bs_mark_failure()
+                raise RuntimeError(f"baostock 登录失败: {lg.error_msg}")
+            _bs_session["logged_in"] = True
 
 
 def _bs_reconnect():
@@ -334,6 +372,7 @@ def fetch_stock_daily_baostock(code: str, start_date: str = None,
         )
 
     if rs.error_code != '0':
+        _bs_mark_failure()
         raise RuntimeError(f"baostock 查询失败 [{code}]: {rs.error_msg}")
 
     data = []
@@ -348,6 +387,7 @@ def fetch_stock_daily_baostock(code: str, start_date: str = None,
     for col in ["open", "close", "high", "low", "volume", "amount"]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df = df.dropna(subset=["close"])
+    _bs_mark_success()  # FIX P1-14: 成功拉取→清零失败计数/解除冷却
     return df
 
 
@@ -472,13 +512,32 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
 
     last_error = None
 
+    # FIX P2(2026-10-09): 数据新鲜度检查——baostock可能返回非空但陈旧的数据（如盘中返回昨日数据），
+    # 原逻辑直接return导致下游用过期价格生成交易信号。增加新鲜度校验：最新日期距今>3自然日视为陈旧，
+    # 自动尝试下一个数据源。仅对盘中实时决策场景生效（end_date=None时）。
+    def _is_fresh(df_check: pd.DataFrame) -> bool:
+        """检查DataFrame最新日期是否新鲜（3自然日内）"""
+        if df_check.empty or "date" not in df_check.columns:
+            return True  # 无date列无法判定，假设新鲜（交给调用方检查is_stale）
+        try:
+            _last = pd.to_datetime(df_check["date"].iloc[-1])
+            _age = (datetime.datetime.now() - _last).days
+            return _age <= 3
+        except Exception:
+            return True
+
     for attempt in range(1, retry_times + 1):
         # 先试 baostock
         if HAS_BAOSTOCK:
             try:
                 df = fetch_stock_daily_baostock(code, start_date, end_date)
                 if not df.empty:
-                    return df
+                    # FIX P2: 盘中新鲜度校验——返回空数据或陈旧数据均视为“失败”
+                    if end_date is None and not _is_fresh(df):
+                        logger.warning(f"[{code}] baostock 返回数据陈旧(最新"
+                                       f"{df['date'].iloc[-1]}，>3自然日)，尝试下一数据源")
+                    else:
+                        return df
             except Exception as e:
                 last_error = e
                 logger.warning(f"[{code}] baostock 第{attempt}次失败: {e}")
@@ -513,6 +572,19 @@ def fetch_stock_daily(code: str, start_date: str = None, end_date: str = None,
         df = load_daily_data(code, days=120)
         if df is not None and not df.empty and len(df) >= 30:
             logger.warning(f"[{code}] 网络数据源均失败，已回退到本地数据库({len(df)}条)")
+            # FIX P1-16: DB 兜底数据可能陈旧，附 stale 标识（对照 market_scanner.py
+            # from_cache=True 正例）。调用方应据此拒绝生成交易信号/止损，避免用
+            # 过期价格下单。
+            try:
+                df.attrs["is_stale"] = True
+                df.attrs["from_cache"] = True
+                df.attrs["source"] = "local_db"
+                _last_date = None
+                if "date" in df.columns and len(df) > 0:
+                    _last_date = str(df["date"].iloc[-1])
+                df.attrs["data_date"] = _last_date
+            except Exception:
+                pass
             return df
     except Exception as db_err:
         logger.debug(f"[{code}] 本地数据库兜底也失败: {db_err}")
@@ -1150,7 +1222,11 @@ def batch_load_daily_data(codes: list, days: int = 120,
 
     def _load_one(code):
         try:
-            df = load_daily_data(code, conn=conn, days=days)
+            # FIX P0(2026-10-12): 不传递共享conn到工作线程，每个线程创建独立连接
+            # 避免 "SQLite objects created in a thread can only be used in that same thread"
+            # 原实现将主线程conn传入ThreadPoolExecutor → 工作线程使用该conn触发线程安全错误
+            # → 10/9晚间全量数据加载 0/112 只成功
+            df = load_daily_data(code, conn=None, days=days)
             return code, df
         except Exception as e:
             logger.warning(f"[{code}] 数据加载失败: {e}")

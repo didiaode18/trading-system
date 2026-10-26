@@ -34,6 +34,15 @@ V10.0新增: 大盘分析模块拆分(market_analysis) | 盘中监控拆分(intr
     setup.py                  环境初始化
 """
 
+# P0-7: 统一路径配置——确保 trading_system/ 在 sys.path 中，
+# 子模块可直接 import config，无需各自 sys.path.insert
+import os as _os
+import sys as _sys
+_pkg_dir = _os.path.dirname(_os.path.abspath(__file__))
+if _pkg_dir not in _sys.path:
+    _sys.path.insert(0, _pkg_dir)
+del _os, _sys, _pkg_dir
+
 __version__ = "10.0.0"
 SYSTEM_VERSION = "V10.0"  # 报告/邮件中统一引用的版本标识
 __author__ = "Trading System"

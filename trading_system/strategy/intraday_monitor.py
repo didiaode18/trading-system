@@ -38,8 +38,6 @@ import datetime
 from typing import Callable
 
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -132,6 +130,8 @@ class IntradayMonitor:
         self.alert_level = "normal"  # normal / warning / emergency
         self._clear_count = 0        # 连续无异常计数
         self._emergency_since = None  # V10.3: emergency开始时间（防锁定）
+        # FIX P1(2026-10-09): warning级别起始时间——与emergency同理，防止warning锁定数小时不降回normal
+        self._warning_since = None
         self._emergency_suppressed_until = None  # V10.3 FIX: 降级后抑制窗口（防乒乓回升）
         self._code_last_alert_time = {}  # V10.3→FIX: {code: {level: datetime}} 按级别分层冷却，info不阻塞warning/critical
         self._code_type_last_alert = {}  # FIX: {code: {alert_type: datetime}} 同标的同类型去重（15min不重复推送）
@@ -169,7 +169,10 @@ class IntradayMonitor:
         # V26: 急跌预警30min确认等待 + 反弹过滤（诊断显示急跌预警T+3 SNR=0.71，误报率46%）
         self._rapid_drop_pending = {}    # {code: {"first_detected": datetime, "change_pct": float}}
         self._rapid_drop_alert_price = {} # {code: float} 急跌预警触发时的价格（反弹过滤用）
-        self.RAPID_DROP_CONFIRM_MINUTES = 30  # 急跌持续N分钟后再触发预警（V26新增）
+        # FIX(EDGE-03): 累计急跌计时器——间歇性急跌场景下不会因短暂恢复而清零
+        self._rapid_drop_cumulative_sec = {}  # {code: float} 累计急跌秒数
+        self._rapid_drop_last_check = {}      # {code: datetime} 上次检测到急跌的时间
+        self.RAPID_DROP_CONFIRM_MINUTES = 30  # 急跌累计N分钟后再触发预警（V26新增）
         self.RAPID_DROP_BOUNCE_PCT = 0.02     # 预警后反弹>2%抑制后续预警（V26新增）
 
         # V9.3: warning级预警邮件冷却与升级追踪
@@ -260,6 +263,24 @@ class IntradayMonitor:
                 except (TypeError, ValueError, KeyError):
                     continue
             self._rapid_drop_alert_price = {c: float(v) for c, v in data.get("rapid_drop_alert_price", {}).items() if v > 0}
+            # FIX(EDGE-02): 加载缓冲封顶计数字段，防止盘中重启后缓冲保护失效
+            self._stop_buffer_reset_count = {
+                c: int(v) for c, v in data.get("stop_buffer_reset_count", {}).items()
+            }
+            for c, v in data.get("stop_buffer_total_start", {}).items():
+                try:
+                    self._stop_buffer_total_start[c] = datetime.datetime.fromisoformat(v)
+                except (TypeError, ValueError):
+                    continue
+            # FIX(EDGE-06): 加载系统性风险预警冷却状态
+            _cooldown_data = data.get("systemic_risk_cooldown", {})
+            if _cooldown_data:
+                self._systemic_risk_cooldown = {}
+                for k, v in _cooldown_data.items():
+                    try:
+                        self._systemic_risk_cooldown[k] = datetime.datetime.fromisoformat(v)
+                    except (TypeError, ValueError):
+                        continue
             self._state_date = data.get("date", self._state_date)
             logger.info(f"[盘中监控] 已恢复当日状态: 已发预警{len(self.alerts_sent)}条, "
                         f"缓冲计时{len(self.stop_loss_first_touch)}只, "
@@ -293,10 +314,36 @@ class IntradayMonitor:
                     for c, v in self._rapid_drop_pending.items()
                 },
                 "rapid_drop_alert_price": dict(self._rapid_drop_alert_price),
+                # FIX(EDGE-02): 持久化缓冲封顶计数字段，防止盘中重启后缓冲保护失效
+                "stop_buffer_reset_count": dict(self._stop_buffer_reset_count),
+                "stop_buffer_total_start": {
+                    c: v.isoformat() for c, v in self._stop_buffer_total_start.items()
+                },
+                # FIX(EDGE-06): 持久化系统性风险预警冷却状态，防止盘中重启后重复触发
+                "systemic_risk_cooldown": {
+                    k: v.isoformat()
+                    for k, v in getattr(self, '_systemic_risk_cooldown', {}).items()
+                },
             }
+            # FIX(P1-20): 读-改-写合并——intraday_state.json 是竞价监控(auction_monitor)
+            # 与本模块的共享文件，原实现全量覆盖会抹除 auction_result/auction_time，
+            # 导致开盘决策依据丢失。合并时保留本模块不管理的键。
+            _preserve_keys = ("auction_result", "auction_time")
             try:
-                from utils.file_io import atomic_json_write
-                atomic_json_write(_INTRADAY_STATE_FILE, data, indent=None)
+                if os.path.exists(_INTRADAY_STATE_FILE):
+                    with open(_INTRADAY_STATE_FILE, "r", encoding="utf-8") as f:
+                        _existing = json.load(f)
+                    if isinstance(_existing, dict) and _existing.get("date") == data["date"]:
+                        for _k in _preserve_keys:
+                            if _k in _existing and _k not in data:
+                                data[_k] = _existing[_k]
+            except Exception as _e:
+                logger.debug(f"[盘中监控] 状态合并读取失败，按全量写入: {_e}")
+            try:
+                from utils.file_io import atomic_json_write, FileLock
+                # FIX(P0-16): 加锁写入，与 auction_monitor 共享文件防并发覆盖
+                with FileLock(_INTRADAY_STATE_FILE, timeout=5.0):
+                    atomic_json_write(_INTRADAY_STATE_FILE, data, indent=None)
             except ImportError:
                 os.makedirs(os.path.dirname(_INTRADAY_STATE_FILE), exist_ok=True)
                 with open(_INTRADAY_STATE_FILE, "w", encoding="utf-8") as f:
@@ -338,6 +385,10 @@ class IntradayMonitor:
         # FIX P1-#7: 同步清理缓冲封顶计数，避免跨日残留导致新交易日首次触发即封顶
         self._stop_buffer_reset_count.clear()
         self._stop_buffer_total_start.clear()
+        # FIX(EDGE-03): 跨日清理急跌累计计时器，防止前一日残留影响新交易日
+        self._rapid_drop_pending.clear()
+        self._rapid_drop_cumulative_sec.clear()
+        self._rapid_drop_last_check.clear()
 
         # 重置标记
         self.opening_phase_done = False
@@ -452,6 +503,8 @@ class IntradayMonitor:
                 self.stop_touch_prices.pop(code, None)
                 self.price_history.pop(code, None)
                 self.last_prices.pop(code, None)
+                # FIX(BUG-03): 同步清理梯度触发记录，防止内存泄漏 + 重新买入时跳过判定
+                self.gradient_triggered.pop(code, None)
 
             if added or removed:
                 logger.info(f"[盘中监控] 持仓刷新完成: 新增{len(added)}只{list(added)}, "
@@ -507,8 +560,11 @@ class IntradayMonitor:
         # 大盘急跌/极端下跌时压制或延迟个股预警，避免"情绪冰点"发出不可靠信号
         gate_state = self._market_gate_check(market_quote)
         if gate_state == "suppress":
-            logger.info("[大盘门控] 大盘极端下跌中，压制个股预警（避免情绪极值误报）")
-            return alerts
+            # FIX(P0-03): 不再直接 return —— suppress 仅压制 info 级噪音，
+            # critical/emergency 硬止损与梯度减仓必须穿透门控。原实现在大盘极端
+            # 下跌时直接返回，导致个股硬止损确认/梯度减仓/急跌/止盈全部停摆，
+            # 止损缓冲计时冻结——系统性风险最高、最需止损的时刻监控形同关闭。
+            logger.warning("[大盘门控] 大盘极端下跌中：压制 info 级噪音，critical/emergency 止损与减仓穿透门控")
         elif gate_state == "delay":
             # 大盘急跌中: warning/critical/emergency 风控信号立即发送，
             # 仅 info 级预警入队列延迟等待企稳后补发
@@ -516,6 +572,7 @@ class IntradayMonitor:
 
         # ---- V27: 大盘系统性风险硬止损触发器 ----
         # 大盘跌幅超阈值时直接生成预警，不等统一预警扫描的15分钟间隔
+        # FIX(P0-03): 移到 suppress 早返回之前——系统性风险告警在 suppress 分支同样必须可达
         if gate_state in ("delay", "suppress") and market_quote:
             _sr_alerts = self._check_systemic_risk_alert(market_quote, gate_state)
             alerts.extend(_sr_alerts)
@@ -532,7 +589,8 @@ class IntradayMonitor:
             self._gate_log_counter = 0
 
         # V9.1: 门控从 delay→pass 转换时，补发延迟队列中的预警
-        if gate_state == "pass" and self._prev_gate_state == "delay" and self._pending_alerts_queue:
+        # FIX(P0-03): suppress 同样入队 info 级预警，故 suppress→pass 也需补发
+        if gate_state == "pass" and self._prev_gate_state in ("delay", "suppress") and self._pending_alerts_queue:
             self._dispatch_pending_alerts(quotes, today)
         self._prev_gate_state = gate_state
 
@@ -546,10 +604,77 @@ class IntradayMonitor:
                 continue
 
             buy_price = holding.get("buy_price", current_price)
-            stop_loss = holding.get("stop_loss", buy_price * (1 - config.INITIAL_STOP_LOSS_PCT))
+            # V28: ETF止损参数差异化——宽基ETF用12%、行业ETF用8%，而非个股的INITIAL_STOP_LOSS_PCT
+            try:
+                from utils.instrument import is_etf as _is_etf_sl, get_etf_subtype as _get_subtype_sl
+                if _is_etf_sl(code):
+                    _subtype = _get_subtype_sl(code)
+                    _default_sl_pct = config.ETF_STRATEGY_PARAMS.get(
+                        _subtype, {}
+                    ).get("stop_loss_pct", config.INITIAL_STOP_LOSS_PCT)
+                else:
+                    _default_sl_pct = config.INITIAL_STOP_LOSS_PCT
+            except ImportError:
+                _default_sl_pct = config.INITIAL_STOP_LOSS_PCT
+            stop_loss = holding.get("stop_loss", buy_price * (1 - _default_sl_pct))
             name = holding.get("name", self._get_stock_name(code))
             # FIX P1-1: shares原仅在止损确认深分支赋值，止盈分支引用会NameError，循环顶部统一补齐
             shares = holding.get("shares", 0)
+
+            # V28: ETF反洗盘参数差异化——按品种波动率缩放
+            try:
+                from utils.instrument import is_etf as _is_etf_aw, get_etf_subtype as _get_subtype_aw
+                if _is_etf_aw(code):
+                    _etf_aw = getattr(config, 'ETF_ANTI_WASH_CONFIG', {}).get(_get_subtype_aw(code), {})
+                    _vol_spike_ratio = _etf_aw.get("volume_spike_ratio", self.VOLUME_SPIKE_RATIO)
+                    _v_reversal_pct = _etf_aw.get("v_reversal_pct", self.V_REVERSAL_PCT)
+                    _buffer_min_override = _etf_aw.get("buffer_minutes", None)
+                else:
+                    _vol_spike_ratio = self.VOLUME_SPIKE_RATIO
+                    _v_reversal_pct = self.V_REVERSAL_PCT
+                    _buffer_min_override = None
+            except ImportError:
+                _vol_spike_ratio = self.VOLUME_SPIKE_RATIO
+                _v_reversal_pct = self.V_REVERSAL_PCT
+                _buffer_min_override = None
+
+            # FIX P1-08: 除权日复权调整——holdings 的 highest/stop_loss/buy_price 冻结在
+            # 除权前旧基准，除权日现价/prev_close 为新基准；不复权调整会导致 10送10
+            # 除权日 drawdown≈-50% 误触发回落止盈、且现价远低于旧止损位误触发止损清仓。
+            _xr_factor, _xr_suspect = self._detect_ex_rights(code, name, quote, holding)
+            if _xr_factor and 0 < _xr_factor < 1:
+                buy_price = buy_price * _xr_factor
+                stop_loss = stop_loss * _xr_factor
+                # 同步 in-memory holding：令 highest 棘轮从新基准续接、并防本轮重复调整
+                holding["buy_price"] = buy_price
+                holding["stop_loss"] = stop_loss
+                if holding.get("highest"):
+                    holding["highest"] = float(holding["highest"]) * _xr_factor
+                holding["_xr_adjusted_date"] = today
+                logger.warning(
+                    f"[除权复权] {code}({name}) 今日除权，按复权因子{_xr_factor:.4f}"
+                    f"下调 buy_price/stop_loss/highest 至新基准（避免假回落止盈/假止损）")
+            elif _xr_suspect:
+                # 无可靠复权因子：fail-safe——本日暂缓该标的止盈/止损自动触发，
+                # 避免用错基准产生假 -50% 回落止盈 / 假止损清仓；发提示人工核对除权。
+                _xr_key = f"{today}_{code}_ex_rights_suspend"
+                if _xr_key not in self.alerts_sent:
+                    alert = {
+                        "level": "warning",
+                        "type": "除权日风控暂缓",
+                        "code": code,
+                        "name": name,
+                        "current_price": current_price,
+                        "message": f"🔧 {name}({code}) 疑似除权除息日：持仓最高价/止损价仍为除权前基准，"
+                                   f"现价{current_price:.2f} 与旧基准不可比。已暂缓本日止盈/止损自动触发，"
+                                   f"请人工核对除权并更新 holdings 的 highest/stop_loss/buy_price。",
+                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                    }
+                    alerts.append(alert)
+                    alert["_alert_key"] = _xr_key
+                    self.alerts_sent.add(_xr_key)
+                    self._send_alert(alert)
+                continue
 
             # 更新价格记录
             self.last_prices[code] = {
@@ -564,13 +689,17 @@ class IntradayMonitor:
                 self.day_lows[code] = day_low
 
             # ---- 检查1: 止损位触发（V7.2: 反洗盘保护增强版）----
-            if self.STOP_LOSS_ALERT and current_price <= stop_loss:
+            # FIX(P1-27): 补日内最低价通道——插针穿越止损价后又收回时（轮询瞬时价
+            # 已回升到止损上方），仍须进入止损确认流程，与买点侧"日内最低价补触发"
+            # 能力对齐，防止插针漏检。进入后仍由 V反/假突破等保护区分真跌与洗盘。
+            _effective_stop_price = min(current_price, day_low) if day_low > 0 else current_price
+            if self.STOP_LOSS_ALERT and _effective_stop_price <= stop_loss:
                 now = datetime.datetime.now()
 
                 # V7.2 保护1: 放量急跌检测（主力洗盘概率大）
                 volume = quote.get("volume", 0)
                 avg_volume = holding.get("avg_volume", 0)
-                is_volume_spike = (avg_volume > 0 and volume > avg_volume * self.VOLUME_SPIKE_RATIO)
+                is_volume_spike = (avg_volume > 0 and volume > avg_volume * _vol_spike_ratio)
 
                 if is_volume_spike:
                     # 放量急跌: 放宽止损线
@@ -598,7 +727,7 @@ class IntradayMonitor:
                 # V7.2 保护2: V型反转保护（阈值降低到3%更敏感）
                 if code in self.day_lows and self.day_lows[code] > 0:
                     rebound_pct = (current_price - self.day_lows[code]) / self.day_lows[code]
-                    if rebound_pct > self.V_REVERSAL_PCT:
+                    if rebound_pct > _v_reversal_pct:
                         alert_key = f"{today}_{code}_v_reversal"
                         if alert_key not in self.alerts_sent:
                             alert = {
@@ -687,6 +816,9 @@ class IntradayMonitor:
                     dynamic_buffer = self._get_dynamic_buffer_minutes(
                         code, quote, holding, market_quote
                     )
+                    # V28: ETF缓冲时间覆盖（宽基5min/行业10min替代个股默认值）
+                    if _buffer_min_override is not None:
+                        dynamic_buffer = _buffer_min_override
                     alert_key = f"{today}_{code}_stop_pending"
                     if alert_key not in self.alerts_sent:
                         scenario = self._classify_decline_scenario(
@@ -721,6 +853,9 @@ class IntradayMonitor:
                 dynamic_buffer = self._get_dynamic_buffer_minutes(
                     code, quote, holding, market_quote
                 )
+                # V28: ETF缓冲时间覆盖
+                if _buffer_min_override is not None:
+                    dynamic_buffer = _buffer_min_override
 
                 if elapsed_minutes >= dynamic_buffer:
                     # V9.1: 均值回归过滤器（方案1）
@@ -803,7 +938,8 @@ class IntradayMonitor:
                             # V8.0 P1-3: 止损确认时自动生成卖出条件单+紧急邮件
                             self._generate_reduce_condition_order(
                                 code, name, current_price, shares,
-                                f"盘中止损确认(持续{elapsed_minutes:.0f}分钟低于止损线)"
+                                f"盘中止损确认(持续{elapsed_minutes:.0f}分钟低于止损线)",
+                                pre_close=quote.get("prev_close", 0)
                             )
                             self._send_stop_loss_email(alert)
                         # 确认后清理缓冲计数（本日不再重复进入缓冲循环）
@@ -873,20 +1009,30 @@ class IntradayMonitor:
             _is_rapid_dropping = change_pct and change_pct < _rapid_drop_threshold
             
             if _is_rapid_dropping:
-                # 记录首次检测到急跌的时间
+                # FIX(EDGE-03): 累计急跌计时——间歇性急跌场景下不会因短暂恢复而永久清零
+                _last_check = self._rapid_drop_last_check.get(code)
+                if _last_check:
+                    _delta_sec = (_now - _last_check).total_seconds()
+                    # 仅当两次检测间隔合理（<5min）时累加，避免隔夜/长时间中断后误累加
+                    if 0 < _delta_sec < 300:
+                        self._rapid_drop_cumulative_sec[code] = (
+                            self._rapid_drop_cumulative_sec.get(code, 0) + _delta_sec
+                        )
+                self._rapid_drop_last_check[code] = _now
+
+                # 记录首次检测到急跌的时间（用于日志跟踪）
                 if code not in self._rapid_drop_pending:
                     self._rapid_drop_pending[code] = {
                         "first_detected": _now,
                         "change_pct": change_pct,
                     }
-                    logger.debug(f"[急跌确认] {code} 首次检测到急跌{change_pct:.1f}%，开始{self.RAPID_DROP_CONFIRM_MINUTES}min确认等待")
+                    logger.debug(f"[急跌确认] {code} 首次检测到急跌{change_pct:.1f}%，开始{self.RAPID_DROP_CONFIRM_MINUTES}min累计确认等待")
             
-                _pending_info = self._rapid_drop_pending[code]
-                _elapsed_min = (_now - _pending_info["first_detected"]).total_seconds() / 60
+                _cumulative_min = self._rapid_drop_cumulative_sec.get(code, 0) / 60
             
-                # 条件1: 急跌必须持续超过确认时间（30min）
-                if _elapsed_min < self.RAPID_DROP_CONFIRM_MINUTES:
-                    pass  # 等待中，不触发预警
+                # 条件1: 急跌累计时间必须超过确认时间（30min）
+                if _cumulative_min < self.RAPID_DROP_CONFIRM_MINUTES:
+                    pass  # 累计等待中，不触发预警
                 else:
                     # 条件2: 反弹过滤 —— 预警后反弹>2%则抑制
                     _alert_price = self._rapid_drop_alert_price.get(code)
@@ -920,10 +1066,12 @@ class IntradayMonitor:
                             # 记录预警时价格（供后续反弹过滤）
                             self._rapid_drop_alert_price[code] = current_price
             else:
-                # 急跌条件恢复 → 清除确认等待状态
+                # 急跌条件恢复 → 清除确认等待状态，但保留累计计时器（FIX(EDGE-03)）
                 if code in self._rapid_drop_pending:
-                    logger.debug(f"[急跌确认] {code} 急跌条件恢复，清除确认等待")
+                    logger.debug(f"[急跌确认] {code} 急跌条件恢复，清除确认等待"
+                                f"（累计计时{self._rapid_drop_cumulative_sec.get(code, 0)/60:.1f}min保留）")
                     del self._rapid_drop_pending[code]
+                # 不重置 _rapid_drop_cumulative_sec，间歇性急跌场景下累计计时器持续累加
 
             # ---- 检查3: 止盈位到达（V6.2: 阈值提高，回测10%/20%提醒过早）----
             if self.PROFIT_TARGET_ALERT and buy_price > 0:
@@ -1139,6 +1287,103 @@ class IntradayMonitor:
                     self.alerts_sent.add(alert_key)
                     self._send_alert(alert)
 
+        # ---- FIX P1(2026-10-09): 检查14: 行为预警——仓位失控/现金安全垫 ----
+        # 背景: 10-08用户全天反向操作，无视5次卖出信号继续买入，仓位从70%升至93%，
+        # 现金仅剩7%。系统缺少仓位/现金行为级预警，导致风险累积无告警。
+        try:
+            _total_capital = getattr(config, 'TOTAL_CAPITAL', 1000000)
+            _total_mkt_val = sum(
+                quotes.get(c, {}).get("price", 0) * h.get("shares", 0)
+                for c, h in self.holdings.items()
+                if c in quotes
+            )
+            _position_ratio = _total_mkt_val / _total_capital if _total_capital > 0 else 0
+            _cash_ratio = 1.0 - _position_ratio
+            _min_cash = getattr(config, 'RISK_UNIFIED_CONFIG', {}).get('min_cash_ratio', 0.10)
+            _max_holdings = getattr(config, 'RISK_UNIFIED_CONFIG', {}).get('max_holdings', 7)
+            _n_holdings = len([c for c, h in self.holdings.items() if h.get("shares", 0) > 0])
+
+            # 现金安全垫预警: 现金<10% → critical，<15% → warning
+            if _cash_ratio < _min_cash:
+                _cash_key = f"{today}_cash_safety"
+                if _cash_key not in self.alerts_sent:
+                    _cash_level = "critical" if _cash_ratio < _min_cash * 0.7 else "warning"
+                    alert = {
+                        "level": _cash_level,
+                        "type": "现金安全垫预警",
+                        "code": "PORTFOLIO",
+                        "name": "组合",
+                        "current_price": 0,
+                        "message": f"🚨 现金仅剩{_cash_ratio:.1%}（安全垫要求≥{_min_cash:.0%}）！"
+                                   f"总仓位{_position_ratio:.1%}，持仓{_n_holdings}只，"
+                                   f"禁止任何新增买入，评估是否需要减仓释放现金",
+                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "urgency_score": 85 if _cash_level == "critical" else 65,
+                    }
+                    alerts.append(alert)
+                    alert["_alert_key"] = _cash_key
+                    self.alerts_sent.add(_cash_key)
+                    self._send_alert(alert)
+
+            # 持仓数超限预警: 超过max_holdings → warning
+            if _n_holdings > _max_holdings:
+                _holdings_key = f"{today}_max_holdings"
+                if _holdings_key not in self.alerts_sent:
+                    alert = {
+                        "level": "warning",
+                        "type": "持仓数超限预警",
+                        "code": "PORTFOLIO",
+                        "name": "组合",
+                        "current_price": 0,
+                        "message": f"⚠️ 持仓{_n_holdings}只超过上限{_max_holdings}只！"
+                                   f"分散度过高，禁止新开仓，评估是否需要合并/减仓",
+                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "urgency_score": 60,
+                    }
+                    alerts.append(alert)
+                    alert["_alert_key"] = _holdings_key
+                    self.alerts_sent.add(_holdings_key)
+                    self._send_alert(alert)
+
+            # 单只仓位超限预警（盘中实时检测，而非仅盘后）
+            from utils.instrument import is_etf as _is_etf
+            _stock_max = getattr(config, 'RISK_UNIFIED_CONFIG', {}).get('stock_max_ratio', 0.15)
+            _etf_max = getattr(config, 'RISK_UNIFIED_CONFIG', {}).get('etf_max_ratio', 0.20)
+            for _chk_code, _chk_h in self.holdings.items():
+                if _chk_code not in quotes:
+                    continue
+                _chk_shares = _chk_h.get("shares", 0)
+                if _chk_shares <= 0:
+                    continue
+                _chk_price = quotes[_chk_code].get("price", 0)
+                if _chk_price <= 0:
+                    continue
+                _chk_ratio = _chk_price * _chk_shares / _total_capital
+                _chk_is_etf = _is_etf(_chk_code)
+                _chk_limit = _etf_max if _chk_is_etf else _stock_max
+                if _chk_ratio > _chk_limit:
+                    _chk_name = _chk_h.get("name", _chk_code)
+                    _chk_key = f"{today}_pos_over_{_chk_code}"
+                    if _chk_key not in self.alerts_sent:
+                        alert = {
+                            "level": "warning",
+                            "type": "单只仓位超限预警",
+                            "code": _chk_code,
+                            "name": _chk_name,
+                            "current_price": _chk_price,
+                            "message": f"⚠️ {_chk_name}({_chk_code}) 仓位{_chk_ratio:.1%}"
+                                       f"超过{'ETF' if _chk_is_etf else '个股'}上限"
+                                       f"{_chk_limit:.0%}，评估是否需要减仓",
+                            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                            "urgency_score": 60,
+                        }
+                        alerts.append(alert)
+                        alert["_alert_key"] = _chk_key
+                        self.alerts_sent.add(_chk_key)
+                        self._send_alert(alert)
+        except Exception as _behav_e:
+            logger.debug(f"[行为预警] 仓位/现金检查异常(不阻断): {_behav_e}")
+
         # ---- V9.3: 多因子联合评分（贝叶斯融合近似）----
         # 同一标的同一轮触发≥2个不同类型warning → 信号共振 → 升级为critical
         fusion_alerts = self._fuse_alerts(alerts, today)
@@ -1231,10 +1476,18 @@ class IntradayMonitor:
         # FIX(2026-08-19): 原 level!="critical" 误将 warning(梯度减仓-5%)
         # 也延迟发送，导致风控预警被门控吞掉。修正为仅 info 级延迟，
         # warning/critical/emergency 均为风控信号，必须穿透门控立即发送。
-        if (self._prev_gate_state == "delay" and level == "info"
+        if (self._prev_gate_state in ("delay", "suppress") and level == "info"
                 and not message.startswith("[延迟补发]")):
             alert_key = alert.get("_alert_key", "")
             if alert_key and alert_key not in self._queued_alert_keys:
+                # FIX(EDGE-01): 队列上限 50 条，防止股灾级行情下内存无限增长 + 补发时通知风暴
+                _MAX_PENDING_QUEUE = 50
+                if len(self._pending_alerts_queue) >= _MAX_PENDING_QUEUE:
+                    # 丢弃最旧的 info 级预警
+                    _oldest_alert, _oldest_key = self._pending_alerts_queue.pop(0)
+                    self._queued_alert_keys.discard(_oldest_key)
+                    logger.debug(f"[大盘门控] 队列已满({_MAX_PENDING_QUEUE})，丢弃最旧预警: "
+                                f"{_oldest_alert.get('name','')}({_oldest_alert.get('code','')})")
                 self._pending_alerts_queue.append((alert, alert_key))
                 self._queued_alert_keys.add(alert_key)
                 logger.info(f"[大盘门控] 大盘急跌中，{alert.get('type','')}预警延迟: "
@@ -1323,7 +1576,9 @@ class IntradayMonitor:
                 pass
 
         # V9.3: 预警效果在线评估记录（warning+级别）
-        if level in ("warning", "critical", "emergency"):
+        # FIX P2(2026-10-09): 补录"high"级别——10-08复盘发现回落止盈/紧急卖出/大盘风险等
+        # high级预警全部未入台账，覆盖率仅38%(5/13)。high级同样有评估价值。
+        if level in ("warning", "high", "critical", "emergency"):
             try:
                 if self._alert_evaluator is None:
                     from monitor.alert_evaluator import AlertEvaluator
@@ -1590,6 +1845,110 @@ class IntradayMonitor:
                 return sector_info["stocks"][code].get("名称", code)
         return code
 
+    # ------------------------------------------------------------
+    # FIX P1-08: 除权日复权调整
+    # ------------------------------------------------------------
+    def _get_ex_rights_factor(self, code: str, today_str: str):
+        """从 adjust_factor 复权因子表读取当日除权因子（若已入库）。
+
+        返回 price-scale 因子 f（0<f<1，旧基准价 × f = 今日除权后基准），
+        无记录/不可靠返回 None。表结构: 代码/除权日/复权因子/送股比例/转增比例。
+        """
+        try:
+            import sqlite3
+            conn = sqlite3.connect(config.DB_PATH, timeout=10)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT 复权因子, 送股比例, 转增比例 FROM adjust_factor "
+                    "WHERE 代码=? AND 除权日=?", (str(code).zfill(6), today_str))
+                row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return None
+            f = row[0]
+            if f and 0 < float(f) < 1:
+                return float(f)
+            # 复权因子缺失时用送转比例推算（10送10 → 1/(1+1)=0.5）
+            bonus = float(row[1] or 0) + float(row[2] or 0)
+            if bonus > 0:
+                return 1.0 / (1.0 + bonus)
+            return None
+        except Exception:
+            return None
+
+    def _detect_ex_rights(self, code: str, name: str, quote: dict, holding: dict):
+        """判定今日是否为该标的除权除息日，返回 (factor|None, suspected)。
+
+        背景：holdings 的 highest/stop_loss/buy_price 冻结在除权前旧基准，而
+        quote.prev_close 是交易所公布的今日除权参考价（新基准）。正常交易日
+        highest 不会超过 prev_close 一个涨停幅度以上；若超过则为除权跳空特征。
+
+        - factor: 可靠复权因子（仅来自 adjust_factor 表）；0<f<1；
+        - suspected: 疑似除权但因子不可靠（需 fail-safe 抑制误触发）。
+        """
+        today_str = datetime.date.today().isoformat()
+        # 本轮已调整过，不重复判定
+        if holding.get("_xr_adjusted_date") == today_str:
+            return None, False
+        # 1) 优先用复权因子表（可靠因子）
+        f = self._get_ex_rights_factor(code, today_str)
+        if f:
+            return f, False
+        # FIX(EDGE-05): 次新股上市前10日跳过启发式检测——次新股跳空开盘属正常现象
+        try:
+            from data.data_loader import get_stock_info
+            _info = get_stock_info(code)
+            _ipo_date_str = _info.get("ipo_date", "") if _info else ""
+            if _ipo_date_str:
+                _ipo_date = datetime.date.fromisoformat(_ipo_date_str)
+                _days_since_ipo = (datetime.date.today() - _ipo_date).days
+                if _days_since_ipo < 10:
+                    logger.debug(f"[除权检测] {code}({name}) 次新股(上市{_days_since_ipo}天)，跳过启发式检测")
+                    return None, False
+        except Exception:
+            pass  # 获取上市日期失败，不阻断后续检测
+        # 2) 启发式：“不可能跳空”检测（无可靠因子，仅标记疑似）
+        try:
+            prev_close = float(quote.get("prev_close", 0) or 0)
+        except Exception:
+            prev_close = 0.0
+        if prev_close <= 0:
+            return None, False
+        try:
+            from utils.board_rules import get_limit_pct
+            limit_pct = get_limit_pct(code, name or "")
+        except Exception:
+            limit_pct = 0.10
+        try:
+            highest = float(holding.get("highest", 0) or 0)
+            stop_loss = float(holding.get("stop_loss", 0) or 0)
+        except Exception:
+            return None, False
+        ref_old = max(highest, stop_loss)
+        if ref_old <= 0:
+            return None, False
+        # FIX P0(2026-10-09): 除权误报防护——若现价与 prev_close 偏差<2%，
+        # 说明并无实际除权跳空（最高价/止损价超过 prev_close 是因为 holdings
+        # 基准长期未更新，而非今日除权）。此时不应触发“疑似除权”抑制止损。
+        try:
+            current_price = float(quote.get("price", 0) or 0)
+        except Exception:
+            current_price = 0.0
+        if current_price > 0 and prev_close > 0:
+            _gap_pct = abs(current_price - prev_close) / prev_close
+            if _gap_pct < 0.02:
+                # 现价与昨收无明显缺口→非除权日，旧基准过高仅说明 holdings 需更新
+                logger.debug(f"[除权检测] {code}({name}) 现价{current_price:.2f}与昨收"
+                             f"{prev_close:.2f}偏差仅{_gap_pct:.1%}，排除除权可能")
+                return None, False
+        # 旧基准参考价超过今日除权参考价一个涨停以上 → 除权跳空（非真实暴跌，
+        # 因真实跌幅不可能超涨停幅度）。无可靠因子，标记疑似交上层 fail-safe 处理。
+        if ref_old > prev_close * (1 + limit_pct + 0.02):
+            return None, True
+        return None, False
+
     def update_holdings(self, holdings: dict):
         """更新持仓数据"""
         self.holdings = holdings
@@ -1632,7 +1991,20 @@ class IntradayMonitor:
         # 可在holdings.json对该标的设 "ack_deep_loss": true 完全豁免提醒
         change_pct = quote.get("change_pct", 0) or 0
         deep_cfg = self.gradient_cfg.get("deep_loss", {})
-        if (deep_cfg.get("enabled", True) and loss_pct <= deep_cfg.get("threshold", -0.30)
+        _deep_enabled = deep_cfg.get("enabled", True)
+        _deep_threshold = deep_cfg.get("threshold", -0.30)
+
+        # FIX(P1-09): ack_deep_loss=true 语义修正——用户已确认该深亏标的，应"完全豁免提醒"。
+        # 原实现 `and not holding.get("ack_deep_loss")` 使 ack 命中时反而跳过深亏汇总块、
+        # 落入下方正常三档梯度循环 → 深亏标的每天遭"清仓建议+3张条件单"轰炸（语义反转）。
+        # 修正：深亏区命中 ack 后直接 return（真豁免），并标记全档已触发防当日再走三档。
+        if _deep_enabled and loss_pct <= _deep_threshold and holding.get("ack_deep_loss"):
+            self.gradient_triggered[code].update(
+                lv["level"] for lv in self.gradient_cfg.get("levels", []))
+            logger.info(f"[深亏豁免] {name}({code}) 已设 ack_deep_loss，深亏{loss_pct*100:.1f}%，完全豁免梯度减仓提醒")
+            return alerts
+
+        if (_deep_enabled and loss_pct <= _deep_threshold
                 and not holding.get("ack_deep_loss")):
             dl_key = f"{today}_{code}_deep_loss_digest"
             if dl_key not in self.alerts_sent:
@@ -1766,7 +2138,8 @@ class IntradayMonitor:
                 # 自动生成条件单
                 if self.gradient_cfg.get("generate_condition_order", True):
                     self._generate_reduce_condition_order(
-                        code, name, current_price, reduce_shares, label
+                        code, name, current_price, reduce_shares, label,
+                        pre_close=quote.get("prev_close", 0)
                     )
 
         # 盘中放量暴跌检查（不等收盘）
@@ -1824,7 +2197,8 @@ class IntradayMonitor:
                 self._send_alert(alert)
                 if self.gradient_cfg.get("generate_condition_order", True):
                     self._generate_reduce_condition_order(
-                        code, name, current_price, reduce_shares, "盘中放量暴跌紧急减仓"
+                        code, name, current_price, reduce_shares, "盘中放量暴跌紧急减仓",
+                        pre_close=quote.get("prev_close", 0)
                     )
 
         return alerts
@@ -1878,8 +2252,13 @@ class IntradayMonitor:
         return 0.025  # 默认回退: 2.5%
 
     def _generate_reduce_condition_order(self, code: str, name: str,
-                                          price: float, shares: int, reason: str):
-        """生成东方财富条件单（减仓卖出）"""
+                                          price: float, shares: int, reason: str,
+                                          pre_close: float = 0):
+        """生成东方财富条件单（减仓卖出）
+
+        FIX(P1-10): 标的级当日累计委托量跨路径封顶（止损清仓单与梯度减仓单共用本入口与同一文件）。
+        FIX(P1-28): 跌停时卖出价钳制至跌停价（price×0.995 低于跌停价无法申报）+专项告警。
+        """
         try:
             output_dir = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1895,6 +2274,29 @@ class IntradayMonitor:
                 with open(order_file, "r", encoding="utf-8") as f:
                     orders = json.load(f)
 
+            # FIX(P1-10): 跨路径超卖封顶——以文件中该标的当日已有卖出委托量为基准，
+            # 将新单封顶到剩余可卖持仓（文件为跨路径共享存储，重启后仍准确）。
+            # 原实现止损清仓单与梯度减仓单去重键互不覆盖，同日合计可超持仓→照单执行即超卖。
+            _total_shares = int(self.holdings.get(code, {}).get("shares", 0) or 0)
+            if _total_shares > 0:
+                _committed = sum(int(o.get("数量", 0) or 0) for o in orders
+                                 if o.get("证券代码") == code and o.get("方向") == "卖出")
+                _remaining = _total_shares - _committed
+                if _remaining <= 0:
+                    logger.warning(f"[超卖封顶] {name}({code}) 当日卖出委托已累计{_committed}股"
+                                   f"≥持仓{_total_shares}股，跳过新条件单({reason})")
+                    return
+                if shares > _remaining:
+                    logger.warning(f"[超卖封顶] {name}({code}) 委托{shares}股超剩余可卖{_remaining}股，"
+                                   f"封顶至{_remaining}股({reason})")
+                    shares = int(_remaining / 100) * 100
+                    if shares <= 0:
+                        # 不足一手时保留剩余零股（清仓场景允许卖零股）
+                        shares = _remaining
+                    if shares <= 0:
+                        logger.warning(f"[超卖封顶] {name}({code}) 封顶后无可卖股数，跳过({reason})")
+                        return
+
             # 避免重复
             # FIX P3-#18: 去重键加入 reason 前缀——同日先触发“梯度一档 300股”后触发
             # “暴跌减仓 300股”时，原仅比较 (code, shares) 会漏发第二张单。
@@ -1909,6 +2311,36 @@ class IntradayMonitor:
 
             # 卖出价: 现价下方0.5%确保成交
             sell_price = round(price * 0.995, 2)
+            # FIX(P1-28): 跌停价格钳制——跌停时 price×0.995 低于跌停价无法申报，
+            # 钳制到跌停价（当日可申报的最低卖价），并发专项告警提示“跌停封单、成交不确定”。
+            try:
+                from utils.board_rules import get_limit_pct
+                if pre_close and pre_close > 0:
+                    _limit_pct = get_limit_pct(code, name)
+                    _limit_down_price = round(pre_close * (1 - _limit_pct), 2)
+                    if sell_price < _limit_down_price:
+                        sell_price = _limit_down_price
+                    if price <= _limit_down_price * 1.002:
+                        _ld_key = f"{today}_{code}_limit_down_sell"
+                        logger.critical(
+                            f"[跌停专项] {name}({code}) 已跌停(现价{price:.2f}≈跌停价{_limit_down_price:.2f})，"
+                            f"卖出条件单价钳制至跌停价{sell_price:.2f}，封单量大时成交不确定，请人工盯盘")
+                        if _ld_key not in self.alerts_sent:
+                            self.alerts_sent.add(_ld_key)
+                            self._send_alert({
+                                "level": "emergency",
+                                "type": "跌停封单告警",
+                                "code": code,
+                                "name": name,
+                                "current_price": price,
+                                "_alert_key": _ld_key,
+                                "message": f"⛔ {name}({code}) 已跌停(跌停价{_limit_down_price:.2f})，"
+                                          f"卖出单已钳制至跌停价排队，成交不确定，请人工盯盘处置",
+                                "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                            })
+            except Exception as _e:
+                logger.debug(f"[跌停钳制] {code} 计算失败: {_e}")
+
             orders.append({
                 "证券代码": code,
                 "证券名称": name,
@@ -2228,15 +2660,22 @@ class IntradayMonitor:
             self._clear_count = 0
             self._emergency_suppressed_until = None  # FIX: 新恶化突破抑制，清除窗口
         elif is_warning:
+            if self.alert_level != "warning" or self._warning_since is None:
+                self._warning_since = datetime.datetime.now()
             self.alert_level = "warning"
             self._clear_count = 0
             self._emergency_since = None
         else:
             self._clear_count += 1
-            downgrade_n = esc_cfg.get("downgrade_after_clear", 3)
+            # FIX P1(2026-10-09): 分级降级——warning级用更宽松的阈值
+            if self.alert_level == "warning":
+                downgrade_n = esc_cfg.get("warning_downgrade_after_clear", 5)
+            else:
+                downgrade_n = esc_cfg.get("downgrade_after_clear", 3)
             if self._clear_count >= downgrade_n:
                 self.alert_level = "normal"
             self._emergency_since = None
+            self._warning_since = None
 
         # V10.3: 紧急级别最大持续时长保护（防止因止损价持续低于而锁定emergency）
         if self.alert_level == "emergency" and self._emergency_since is not None:
@@ -2262,6 +2701,26 @@ class IntradayMonitor:
                     self._emergency_suppressed_until = datetime.datetime.now() + \
                         datetime.timedelta(minutes=_suppress_min)
                     self._emergency_since = None
+
+        # FIX P1(2026-10-09): warning级别最大持续时长保护（与emergency同理，防止warning锁定数小时）
+        if self.alert_level == "warning" and self._warning_since is not None:
+            max_dur_w = esc_cfg.get("warning_max_duration_min", 30)
+            elapsed_w = (datetime.datetime.now() - self._warning_since).total_seconds() / 60
+            if elapsed_w > max_dur_w:
+                has_new_warning = False
+                for code, holding in self.holdings.items():
+                    if code not in quotes:
+                        continue
+                    quote = quotes[code]
+                    change_pct = quote.get("change_pct", 0)
+                    if change_pct < esc_cfg.get("warning_triggers", {}).get("holding_drop_pct", -3.0):
+                        has_new_warning = True
+                        break
+                if not has_new_warning:
+                    logger.info(f"[变频降级] warning持续{elapsed_w:.0f}分钟且无新恶化，自动降为normal")
+                    self.alert_level = "normal"
+                    self._warning_since = None
+                    self._clear_count = 0
 
     def get_alert_level(self) -> str:
         """获取当前监控级别（供scheduler读取）"""
@@ -3239,7 +3698,19 @@ def main():
     for code, pos in holdings.items():
         pos["name"] = config.get_stock_name(code)
         if "stop_loss" not in pos:
-            pos["stop_loss"] = pos["buy_price"] * (1 - config.INITIAL_STOP_LOSS_PCT)
+            # V28: ETF止损参数差异化
+            try:
+                from utils.instrument import is_etf as _is_etf_init, get_etf_subtype as _get_subtype_init
+                if _is_etf_init(code):
+                    _subtype = _get_subtype_init(code)
+                    _sl_pct = config.ETF_STRATEGY_PARAMS.get(
+                        _subtype, {}
+                    ).get("stop_loss_pct", config.INITIAL_STOP_LOSS_PCT)
+                else:
+                    _sl_pct = config.INITIAL_STOP_LOSS_PCT
+            except ImportError:
+                _sl_pct = config.INITIAL_STOP_LOSS_PCT
+            pos["stop_loss"] = pos["buy_price"] * (1 - _sl_pct)
 
     monitor = IntradayMonitor(holdings)
 

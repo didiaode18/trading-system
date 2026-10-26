@@ -19,9 +19,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from . import master_common, metrics
@@ -37,18 +35,73 @@ BENCHMARKS = MBC.get("benchmarks", {
 })
 
 
+def _fetch_index_daily(code: str) -> pd.DataFrame:
+    """P2-3: 指数专用日线兼底。
+
+    fetch_stock_daily 对指数码（如 932000 中证2000）会误路由到个股接口
+    stock_zh_a_hist → 必败。此处直接走 akshare 指数端点，多接口依次尝试。
+    全部失败时返回空 DataFrame，由调用方如实标注 missing（不编造）。
+    """
+    try:
+        import akshare as ak
+    except Exception:
+        return pd.DataFrame()
+    import datetime as _dt
+    # 交易所前缀（em 端点需要）: 中证系 000xxx/932xxx 多为 sh，深证 399xxx 为 sz
+    if code.startswith("399"):
+        em_symbol = f"sz{code}"
+    else:
+        em_symbol = f"sh{code}"
+    _end = _dt.date.today().strftime("%Y%m%d")
+    # 端点优先级: csindex 官网(中证系权威源，932000 中证2000 仅此有) →
+    #   index_zh_a_hist(直用数字码) → stock_zh_index_daily_em/_daily(带前缀)
+    attempts = [
+        lambda: ak.stock_zh_index_hist_csindex(
+            symbol=code, start_date="20150101", end_date=_end),
+        lambda: ak.index_zh_a_hist(symbol=code, period="daily"),
+        lambda: ak.stock_zh_index_daily_em(symbol=em_symbol),
+        lambda: ak.stock_zh_index_daily(symbol=em_symbol),
+    ]
+    for fn in attempts:
+        for _ in range(2):  # 每端点重试 2 次（缓解 RemoteDisconnected 瞬时故障）
+            try:
+                raw = fn()
+                if raw is None or raw.empty:
+                    break
+                df = raw.rename(columns={
+                    "日期": "date", "开盘": "open", "收盘": "close",
+                    "最高": "high", "最低": "low", "成交量": "volume",
+                })
+                if "date" in df.columns and "close" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+                    return df[["date", "close"]].dropna()
+                break
+            except Exception as e:
+                logger.debug(f"[Stage9] 指数 {code} 端点重试失败: {e}")
+    return pd.DataFrame()
+
+
 def _benchmark_returns(code: str, data_dict: dict, allow_fetch: bool) -> pd.Series:
-    """获取基准日收益序列：data_dict 优先，缺失时可尝试数据层兜底。"""
+    """获取基准日收益序列：data_dict 优先，缺失时可尝试数据层兼底。"""
     df = data_dict.get(code)
     if df is None and allow_fetch:
+        # P2-3: 指数码优先走专用指数接口，避开个股接口误路由
         try:
-            from data.data_loader import fetch_stock_daily
-            raw = fetch_stock_daily(code)
-            if raw is not None and len(raw) >= 30:
-                df = raw.copy()
+            idx_df = _fetch_index_daily(code)
+            if idx_df is not None and len(idx_df) >= 30:
+                df = idx_df
         except Exception as e:
-            logger.debug(f"[Stage9] 基准 {code} 数据层获取失败: {e}")
+            logger.debug(f"[Stage9] 指数 {code} 专用接口失败: {e}")
             df = None
+        if df is None:
+            try:
+                from data.data_loader import fetch_stock_daily
+                raw = fetch_stock_daily(code)
+                if raw is not None and len(raw) >= 30:
+                    df = raw.copy()
+            except Exception as e:
+                logger.debug(f"[Stage9] 基准 {code} 数据层获取失败: {e}")
+                df = None
     if df is None or len(df) < 2 or "close" not in df.columns or "date" not in df.columns:
         return pd.Series(dtype=float)
     s = df.copy()

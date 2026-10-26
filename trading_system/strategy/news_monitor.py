@@ -23,8 +23,6 @@ import sys
 import logging
 import datetime
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -443,10 +441,10 @@ if __name__ == "__main__":
         print("[ERROR] akshare未安装")
         sys.exit(1)
     
-    # 测试持仓股新闻扫描
+    # 测试持仓股新闻扫描（FIX P0-15: 统一读权威副本 config.get_holdings_file()）
     import json
-    holdings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                 "..", "holdings.json")
+    import config as _cfg_mod
+    holdings_file = _cfg_mod.get_holdings_file()
     holdings = {}
     if os.path.exists(holdings_file):
         with open(holdings_file, "r", encoding="utf-8") as f:

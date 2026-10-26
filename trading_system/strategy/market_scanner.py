@@ -34,6 +34,15 @@ except ImportError:
     except ImportError:
         _config = None
 
+# FIX P2-15: scan_cache 落盘改原子写（临时文件 + os.replace + fsync）
+try:
+    from utils.file_io import atomic_json_write as _atomic_json_write
+except ImportError:
+    try:
+        from trading_system.utils.file_io import atomic_json_write as _atomic_json_write
+    except Exception:
+        _atomic_json_write = None
+
 try:
     import akshare as ak
     HAS_AKSHARE = True
@@ -537,9 +546,13 @@ def _set_scan_cache(result: dict):
     if _SCAN_CACHE_FILE:
         try:
             os.makedirs(os.path.dirname(_SCAN_CACHE_FILE), exist_ok=True)
-            with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"saved_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-                           "data": result}, f, ensure_ascii=False)
+            _payload = {"saved_at": now.strftime("%Y-%m-%d %H:%M:%S"), "data": result}
+            if _atomic_json_write is not None:
+                # FIX P2-15: 原子写
+                _atomic_json_write(_SCAN_CACHE_FILE, _payload, indent=None)
+            else:
+                with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(_payload, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"[市场扫描] 磁盘缓存写入失败: {e}")
 

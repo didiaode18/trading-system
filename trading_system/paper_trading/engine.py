@@ -18,9 +18,6 @@ import os
 import sys
 import logging
 import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
     from ..backtest.data_feed import DataFeed
     from ..backtest.broker import Order, CostConfig, MatchMode

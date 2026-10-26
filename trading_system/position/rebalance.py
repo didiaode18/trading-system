@@ -1,4 +1,5 @@
-# NOTE: 仅供 validate_v8.py/tests 引用，未接入生产链路
+# NOTE: 已接入生产链路——daily_orders.py:873（V9.0 P1-1 风险平价再平衡）与
+# validate_v8.py/tests 均引用 RebalanceTrigger。（FIX P2-20：原“未接入生产”已过期）
 """
 自动再平衡触发器
 ================

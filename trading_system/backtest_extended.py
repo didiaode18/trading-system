@@ -19,8 +19,6 @@ from collections import defaultdict
 
 import pandas as pd
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from backtest_real import (
     fetch_history_data, compute_indicators, backtest_stock_v5,

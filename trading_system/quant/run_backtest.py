@@ -26,8 +26,6 @@ import datetime
 
 # 确保项目根目录在path中
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
-
 import config
 from quant.universe import UniverseManager
 from quant.factors import FactorEngine

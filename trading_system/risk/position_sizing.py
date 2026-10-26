@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 SIZING_CONFIG = {
     "total_capital": 750000,       # 总资金(元)
     "max_risk_per_trade": 0.02,    # 单笔最大风险(2%)
-    "max_position_pct": 0.25,      # 单只最大仓位(25%)
+    # FIX P1-06: 单票上限对齐风控硬约束——个股15%/ETF20%（原25%超所有风控硬约束）
+    "max_position_pct": 0.15,      # 单只个股最大仓位(15%)
+    "etf_max_position_pct": 0.20,  # 单只ETF最大仓位(20%)
     "min_position_pct": 0.05,      # 单只最小仓位(5%)
     "max_same_sector": 3,          # 同板块最多持仓数
     "max_total_positions": 6,      # 最大持仓数
@@ -44,7 +46,7 @@ SIZING_CONFIG = {
     "volatility_reduce": 0.5,      # 高波动仓位缩减比例
 }
 
-# 板块映射
+# 板块映射（FIX P1-06: 仅作兜底，优先从 config.get_stock_info 的“赛道”动态取）
 STOCK_SECTOR = {
     "002415": "电子", "600036": "银行", "000858": "食品饮料",
     "603501": "电子", "601012": "电力设备", "002185": "电子",
@@ -52,6 +54,29 @@ STOCK_SECTOR = {
     "159205": "金融ETF", "688234": "电子", "002409": "电子",
     "600276": "医药", "603993": "有色资源",
 }
+
+
+def _resolve_sector(code: str, result: dict = None) -> str:
+    """FIX P1-06: 板块动态取。硬编码 STOCK_SECTOR 仅14只 → 绝大多数标的
+    落“其他”使板块集中度失效。优先级：result 自带赛道/sector >
+    config.get_stock_info(code)["赛道"] > 硬编码 STOCK_SECTOR > "其他"。
+    """
+    try:
+        if result:
+            sec = result.get("赛道") or result.get("sector") or result.get("行业")
+            if sec:
+                return str(sec)
+    except Exception:
+        pass
+    try:
+        import config as _cfg
+        info = _cfg.get_stock_info(code) or {}
+        sec = info.get("赛道") or info.get("行业") or info.get("sector")
+        if sec:
+            return str(sec)
+    except Exception:
+        pass
+    return STOCK_SECTOR.get(code, "其他")
 
 
 class PositionSizer:
@@ -240,7 +265,15 @@ class PositionSizer:
             suggested_shares = int(suggested_shares * 0.5)  # K点减半
 
         # === 仓位上下限 ===
-        max_shares = int(capital * self.cfg["max_position_pct"] / close)
+        # FIX P1-06: 单票上限按标的类型对齐风控硬约束（ETF 20% / 个股 15%），
+        # 不再统一用超约束的 25%。
+        try:
+            from utils.instrument import is_etf as _is_etf
+            _cap_pct = (self.cfg.get("etf_max_position_pct", 0.20) if _is_etf(code)
+                        else self.cfg.get("max_position_pct", 0.15))
+        except Exception:
+            _cap_pct = self.cfg.get("max_position_pct", 0.15)
+        max_shares = int(capital * _cap_pct / close)
         min_shares = int(capital * self.cfg["min_position_pct"] / close)
         suggested_shares = max(0, min(suggested_shares, max_shares))
 
@@ -292,12 +325,12 @@ class PositionSizer:
         }
 
     def _apply_sector_limit(self, candidates: List[dict]) -> List[dict]:
-        """板块限制: 同板块最多N只"""
+        """板块限制: 同板块最多N只（FIX P1-06: 板块动态取）"""
         sector_count = {}
         filtered = []
         for r in candidates:
             code = r.get("code", "")
-            sector = STOCK_SECTOR.get(code, "其他")
+            sector = _resolve_sector(code, r)
             count = sector_count.get(sector, 0)
             if count < self.cfg["max_same_sector"]:
                 filtered.append(r)
@@ -567,7 +600,13 @@ def calc_add_position(code, price, current_shares, capital,
     # 4. 加仓上限钳位
     current_shares = current_shares or 0
     add_cap_by_holding = int(current_shares * 0.5)  # 单次加仓不超过现持仓50%
-    max_position_pct = SIZING_CONFIG.get("max_position_pct", 0.25)  # 单票市值上限25%
+    # FIX P1-06: 单票市值上限按标的类型对齐风控硬约束（ETF 20% / 个股 15%）
+    try:
+        from utils.instrument import is_etf as _is_etf
+        max_position_pct = (SIZING_CONFIG.get("etf_max_position_pct", 0.20) if _is_etf(code)
+                            else SIZING_CONFIG.get("max_position_pct", 0.15))
+    except Exception:
+        max_position_pct = SIZING_CONFIG.get("max_position_pct", 0.15)
     add_cap_by_total = int(capital * max_position_pct / price)
     add_shares = min(add_shares, add_cap_by_holding, add_cap_by_total)
     add_shares = max(0, add_shares)

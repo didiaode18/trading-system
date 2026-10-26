@@ -182,11 +182,6 @@ class QuantReportEnhancer:
         # ---- 主判据: 沪深300基准检测器(进程内当日缓存，无额外拉库开销) ----
         regime = None
         try:
-            import sys as _sys
-            import os as _os
-            _ts_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-            if _ts_dir not in _sys.path:
-                _sys.path.insert(0, _ts_dir)
             from strategy.market_regime import detect_market_regime
             _det = detect_market_regime()
             _r = (_det or {}).get("regime", "")

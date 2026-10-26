@@ -137,6 +137,35 @@ def is_bond(code: str) -> bool:
 
 
 # ============================================================
+# T+0 / T+1 回转交易判定（FIX P2-17）
+# ============================================================
+# A股 T+0 品种（当日买入可当日卖出）：
+#   可转债(BOND)、跨境/QDII ETF(513)、货币/债券 ETF(511)、商品/黄金 ETF(518)
+# T+1 品种：个股、普通股票型 ETF(510/512/515/560/588/159 等)
+# 注意：511/513/518 虽以 5 开头，但属 T+0，需先于通用 ETF 判定。
+T0_PREFIXES = ("511", "513", "518")
+
+
+def is_t0(code: str) -> bool:
+    """判断品种是否 T+0（当日可回转交易）
+
+    T+0: 可转债 / 跨境 ETF(513) / 货币、债券 ETF(511) / 商品 ETF(518)
+    T+1: 个股、普通股票型 ETF
+
+    回测/模拟盘据此决定是否施加 T+1 冻结；原实现统一 T+1，
+    对 T+0 品种偏保守失真。
+    """
+    if not code:
+        return False
+    if is_bond(code):
+        return True
+    for prefix in T0_PREFIXES:
+        if code.startswith(prefix):
+            return True
+    return False
+
+
+# ============================================================
 # 品种属性查询（费率、仓位限制等）
 # ============================================================
 
@@ -167,7 +196,7 @@ def get_commission_rate(code: str) -> float:
 def get_max_single_position(code: str) -> float:
     """获取品种的单只最大仓位上限
 
-    ETF: 20% (波动低、免印花税)
+    V28: ETF按子类型差异化——宽基25%/行业15%/主题12%
     个股: 15%
     可转债: 10% (T+0但波动大)
     """
@@ -175,6 +204,11 @@ def get_max_single_position(code: str) -> float:
     try:
         import config
         if inst_type == InstrumentType.ETF:
+            # V28: 按ETF子类型差异化仓位上限
+            _subtype = get_etf_subtype(code)
+            _by_subtype = getattr(config, 'ETF_MAX_RATIO_BY_SUBTYPE', {})
+            if _subtype and _subtype in _by_subtype:
+                return _by_subtype[_subtype]
             return getattr(config, 'MAX_SINGLE_ETF_RATIO', 0.20)
         elif inst_type == InstrumentType.BOND:
             return getattr(config, 'MAX_SINGLE_BOND_RATIO', 0.10)

@@ -33,7 +33,6 @@ from email.header import Header
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -83,9 +82,18 @@ def send_email(subject: str, html_content: str,
     _retry_wait_seconds = [15, 30]
     for attempt in range(1, max_retries + 1):
         try:
-            # FIX: SMTP连接增加超时参数，避免网络异常时长时间挂起
-            with smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT,
-                                  timeout=getattr(config, "EMAIL_SMTP_TIMEOUT", 30)) as smtp:
+            # FIX P0(2026-10-13): 支持SSL(465)和STARTTLS(587)双模式
+            # 根因: 部分网络环境拦截465端口SSL握手(WRONG_VERSION_NUMBER)，
+            #       而587端口STARTTLS正常工作
+            _smtp_port = config.EMAIL_SMTP_PORT
+            _smtp_timeout = getattr(config, "EMAIL_SMTP_TIMEOUT", 30)
+            if _smtp_port == 465:
+                _smtp = smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, _smtp_port, timeout=_smtp_timeout)
+            else:
+                _smtp = smtplib.SMTP(config.EMAIL_SMTP_HOST, _smtp_port, timeout=_smtp_timeout)
+                _smtp.ehlo()
+                _smtp.starttls()
+            with _smtp as smtp:
                 smtp.login(config.EMAIL_SENDER, config.EMAIL_AUTH_CODE)
                 smtp.sendmail(config.EMAIL_SENDER, [receiver], msg.as_string())
             logger.info(f"邮件发送成功: {subject} -> {receiver}")

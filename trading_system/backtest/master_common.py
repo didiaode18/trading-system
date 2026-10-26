@@ -19,9 +19,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from . import metrics
@@ -145,3 +143,67 @@ def align_returns(strat: pd.Series, bench: pd.Series):
         return pd.Series(dtype=float), pd.Series(dtype=float)
     common = strat.index.intersection(bench.index)
     return strat.loc[common], bench.loc[common]
+
+
+def default_position_ratio() -> float:
+    """单笔仓位占比默认值 = 1 / MAX_HOLDINGS（缺省 8 → 0.125）。
+
+    与 monte_carlo / backtest_optimizer BUG-047 的仓位折算口径对齐，
+    使"主动成交口径"净值与逐笔 PnL 折算一致。
+    """
+    try:
+        mh = int(getattr(config, "MAX_HOLDINGS", 8) or 8)
+    except Exception:
+        mh = 8
+    return 1.0 / max(1, mh)
+
+
+def active_strategy_daily_returns(trades: list, position_ratio: float = None) -> pd.Series:
+    """P0-2: 从 v5/v6 逐笔交易构造"主动成交口径"日收益序列。
+
+    口径（与 equal_weight 被动篮子严格区分，报告中显式标注）:
+      - 每笔交易按其平仓日 sell_date 归集；
+      - 单笔贡献 = net_profit(百分比×100)/100 × position_ratio（仓位折算，
+        对齐 monte_carlo 口径，避免"满仓单票"高估）；
+      - 无交易的日期收益为 0（持仓期浮盈不逐日 mark，故为"平仓实现"口径的近似）。
+
+    返回: pd.Series(index=sell_date_str 升序, values=当日主动收益)；无交易返回空 Series。
+    """
+    if not trades:
+        return pd.Series(dtype=float)
+    if position_ratio is None:
+        position_ratio = default_position_ratio()
+    bucket = {}
+    for t in trades:
+        d = str(t.get("sell_date", "") or "")[:10]
+        if not d:
+            continue
+        pnl = float(t.get("net_profit", 0)) / 100.0 * float(position_ratio)
+        bucket[d] = bucket.get(d, 0.0) + pnl
+    if not bucket:
+        return pd.Series(dtype=float)
+    s = pd.Series(bucket).sort_index()
+    return s.astype(float)
+
+
+def summarize_active_strategy(trades: list, position_ratio: float = None) -> dict:
+    """P0-2: 主动成交口径绩效摘要（复用 summarize_daily_returns，不重写指标）。
+
+    额外给出主动口径的累计收益/年化/夏普/最大回撤，供报告与被动等权并列展示，
+    杜绝"封面 318% 是被动篮子却被当作策略能力"的口径混淆。
+    """
+    daily = active_strategy_daily_returns(trades, position_ratio)
+    n_trades = len(trades) if trades else 0
+    if daily is None or len(daily) < 2:
+        return {"status": "insufficient", "n_trades": n_trades,
+                "note": "主动成交口径：有效平仓日不足，无法构造净值"}
+    summary = summarize_daily_returns(daily)
+    wins = [t for t in (trades or []) if float(t.get("net_profit", 0)) > 0]
+    summary.update({
+        "basis": "active_trades",
+        "n_trades": n_trades,
+        "win_rate": round(len(wins) / n_trades * 100, 2) if n_trades else 0.0,
+        "position_ratio": round(float(position_ratio if position_ratio is not None
+                                        else default_position_ratio()), 4),
+    })
+    return summary

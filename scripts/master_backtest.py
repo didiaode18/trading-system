@@ -95,7 +95,7 @@ def stage0_data_audit(ctx):
     """数据质量审计（新增 backtest/data_audit.py）。"""
     try:
         from backtest.data_audit import audit_dataset
-        return audit_dataset(ctx["data_dict"])
+        return audit_dataset(ctx["data_dict"], ctx.get("codes"))
     except ImportError:
         return {"status": "skipped", "reason": "backtest/data_audit.py 待实现（见 SKILL.md Stage 0）"}
     except Exception as e:
@@ -122,13 +122,21 @@ def stage1_single(ctx):
         # Phase 2: 逐股交易统计——诊断哪些标的产生交易、策略覆盖是否充分
         active = {c: n for c, n in per_stock.items() if n > 0}
         inactive = [c for c, n in per_stock.items() if n == 0]
+        # P0-2(路线图): 主动成交口径净值摘要——与封面被动等权篮子并列，杜绝口径混淆。
+        active_summary = {}
+        try:
+            from backtest import master_common
+            active_summary = master_common.summarize_active_strategy(all_trades)
+        except Exception as _e:
+            active_summary = {"status": "fail", "error": str(_e)}
         return {"status": "ok", "n_stocks": len(per_stock),
                 "n_trades": len(all_trades), "trades": all_trades,
                 "per_stock": per_stock,
                 "active_stocks": len(active),
                 "inactive_stocks": len(inactive),
                 "active_detail": active,
-                "inactive_codes": inactive}
+                "inactive_codes": inactive,
+                "active_strategy": active_summary}
     except Exception as e:
         return {"status": "fail", "error": str(e), "tb": traceback.format_exc()}
 
@@ -315,17 +323,50 @@ def stage8_dsr(ctx):
         from backtest import master_common
         daily = master_common.equal_weight_daily_returns(ctx["data_dict"], ctx["codes"])
         trec = int(len(daily)) if daily is not None and len(daily) > 0 else 252
-        best = grid.get("best_sharpe") if grid.get("status") == "ok" else None
-        if best is None:
-            s = master_common.summarize_daily_returns(daily)
-            best = s.get("sharpe", 0.0)
+        grid_best = grid.get("best_sharpe") if grid.get("status") == "ok" else None
+        if grid_best is None:
+            grid_best = master_common.summarize_daily_returns(daily).get("sharpe", 0.0)
+        grid_best = float(grid_best)
+        gates_cfg = getattr(config, "MASTER_BACKTEST_CONFIG", {}).get("gates", {})
+        # P2-2(路线图): n_trials 真实化——除 Stage5 网格 trial 数外，可取实验台账累计值作下限。
+        #   台账文件 output/experiment_ledger.json {"cumulative_trials": int} 存在则取 max；
+        #   不编造，缺省仍用真实网格 trial 数。
         n_trials = max(len(sharpes), 1)
-        # FIX(G3-P1): 传入真实日收益序列，让 DSR 计算使用实际 skew/kurt，
-        # 而非回退到 skew=0/kurt=0/sr_std=1 的简化路径。
-        result = DeflatedSharpe().evaluate(float(best), n_trials, returns=daily,
+        try:
+            _led = os.path.join(OUTPUT_DIR, "experiment_ledger.json")
+            if os.path.exists(_led):
+                with open(_led, "r", encoding="utf-8") as _lf:
+                    _cum = int(json.load(_lf).get("cumulative_trials", 0) or 0)
+                if _cum > n_trials:
+                    n_trials = _cum
+        except Exception:
+            pass
+        _n_trials_floor = gates_cfg.get("G3_dsr_n_trials_floor", 0)
+        if isinstance(_n_trials_floor, int) and _n_trials_floor > n_trials:
+            n_trials = _n_trials_floor
+        # P0-2(路线图): observed_sharpe 优先用 Stage6 Walk-Forward 样本外夏普（pooled 优先），
+        #   而非 Stage5 样本内网格最优。旧口径用样本内 2.03 使 DSR=0.9988 误导性 PASS；
+        #   OOS 为负/None 时如实反映（不为通过而回退到样本内）。
+        use_oos = gates_cfg.get("G3_dsr_observed_from_oos", False)
+        wf = ctx.get("stage6", {}).get("result", {}) if ctx.get("stage6", {}).get("status") == "ok" else {}
+        oos_used = wf.get("oos_sharpe_pooled")
+        if not isinstance(oos_used, (int, float)):
+            oos_used = wf.get("oos_sharpe")
+        observed, obs_basis = grid_best, "in_sample_grid"
+        if use_oos and isinstance(oos_used, (int, float)):
+            observed, obs_basis = float(oos_used), "oos_walkforward"
+        # FIX(G3-P1): 传入真实日收益序列，让 DSR 计算使用实际 skew/kurt。
+        result = DeflatedSharpe().evaluate(float(observed), n_trials, returns=daily,
                                            track_record_length=trec)
-        return {"status": "ok", "result": _jsonable(result),
-                "note": "传入真实日收益序列，skew/kurt 基于实际分布计算"}
+        result["observed_basis"] = obs_basis
+        result["in_sample_sharpe"] = round(grid_best, 4)
+        result["oos_sharpe_used"] = round(float(oos_used), 4) if isinstance(oos_used, (int, float)) else None
+        # P2-2(路线图): 携带 Stage5 网格上算出的 PBO(CSCV)，供 G3 与报告展示。
+        result["pbo"] = _jsonable(grid.get("pbo", {})) if isinstance(grid.get("pbo"), dict) else None
+        note = ("observed_sharpe 取自 Stage6 OOS(pooled)夏普——诚实反映泛化能力"
+                if obs_basis == "oos_walkforward" else
+                "OOS 夏普不可用，回退样本内网格夏普（已在 observed_basis 标注，G3 需谨慎解读）")
+        return {"status": "ok", "result": _jsonable(result), "note": note}
     except Exception as e:
         return {"status": "fail", "error": str(e)}
 
@@ -518,18 +559,41 @@ def evaluate_gates(ctx):
     """返回七道门的 green/yellow/red 判定。新增 Stage 未实现时为 yellow。"""
     gates = {}
 
+    gates_cfg = getattr(config, "MASTER_BACKTEST_CONFIG", {}).get("gates", {})
+
     s0 = ctx.get("stage0", {})
     gates["G1_data"] = "green" if s0.get("status") == "ok" and not s0.get("blocking_errors") \
         else ("red" if s0.get("blocking_errors") else "yellow")
 
     wf = ctx.get("stage6", {}).get("result", {})
-    oos = wf.get("oos_sharpe")
-    gates["G2_oos"] = "green" if isinstance(oos, (int, float)) and oos > 0.8 \
+    # P0-2(路线图): G2 优先用 pooled OOS 夏普（汇总有效窗逐笔），pooled 不可用时回退均值。
+    oos = wf.get("oos_sharpe_pooled") if gates_cfg.get("G2_use_pooled", False) else wf.get("oos_sharpe")
+    if not isinstance(oos, (int, float)):
+        oos = wf.get("oos_sharpe")
+    g2_min = gates_cfg.get("G2_oos_sharpe_min", 0.8)
+    gates["G2_oos"] = "green" if isinstance(oos, (int, float)) and oos > g2_min \
         else ("red" if isinstance(oos, (int, float)) else "yellow")
+
+    # P0-2(路线图): 新增 G2b——OOS 夏普中位数 > 阈值 且 有效窗占比 >= 阈值（泛化稳健性双保险）。
+    med = wf.get("oos_sharpe_median")
+    vr = wf.get("valid_ratio")
+    med_min = gates_cfg.get("G2b_oos_median_min", 0.0)
+    vr_min = gates_cfg.get("G2b_valid_ratio_min", 0.6)
+    if isinstance(med, (int, float)) and isinstance(vr, (int, float)):
+        gates["G2b_oos_robust"] = "green" if (med > med_min and vr >= vr_min) else "red"
+    else:
+        gates["G2b_oos_robust"] = "yellow"
 
     dsr = ctx.get("stage8", {}).get("result", {}).get("dsr")
     gates["G3_dsr"] = "green" if isinstance(dsr, (int, float)) and dsr > 0.95 \
         else ("red" if isinstance(dsr, (int, float)) else "yellow")
+    # P2-2(路线图): G3 叠加 PBO 约束——DSR 绿但 PBO>G3_pbo_max 时降为 red（过拟合）；
+    #   PBO 不可用时不改变 DSR 判定（不编造，仅如实附加）。
+    _s8 = ctx.get("stage8", {}).get("result", {})
+    _pbo = (_s8.get("pbo") or {}).get("pbo") if isinstance(_s8.get("pbo"), dict) else None
+    _pbo_max = gates_cfg.get("G3_pbo_max", 0.5)
+    if gates["G3_dsr"] == "green" and isinstance(_pbo, (int, float)) and _pbo > _pbo_max:
+        gates["G3_dsr"] = "red"
 
     cost = ctx.get("stage10", {})
     deg = cost.get("sharpe_degradation_x2")
@@ -639,11 +703,12 @@ def main():
     if not data_dict:
         return
     # Phase 2: 回测宇宙 = STOCK_POOL + BACKTEST_EXTRA_POOL（扩展标的覆盖）
+    # V11.2 P2-1: + BACKTEST_DELISTED_POOL（退市/ST摘牌标的，有数据则纳入以缓解幸存者偏差）
     _pool_codes = list(getattr(config, "STOCK_POOL", {}).keys())
-    _extra = getattr(config, "BACKTEST_EXTRA_POOL", {})
-    for _c in _extra:
-        if _c not in _pool_codes:
-            _pool_codes.append(_c)
+    for _extra_name in ("BACKTEST_EXTRA_POOL", "BACKTEST_DELISTED_POOL"):
+        for _c in getattr(config, _extra_name, {}):
+            if _c not in _pool_codes:
+                _pool_codes.append(_c)
     codes = [c for c in _pool_codes if c in data_dict and c != "000300"]
     if args.quick:
         codes = codes[:8]

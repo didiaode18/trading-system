@@ -21,7 +21,6 @@ from typing import Callable, Optional
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 # FIX: 双模式导入，支持 backtest 与 trading_system.backtest 两种包路径
@@ -84,6 +83,32 @@ class WalkForwardAnalyzer:
             "min_signal_quality": [60, 65, 70],
         })
         self.initial_capital = initial_capital or config.TOTAL_CAPITAL
+        # V11.2 P0-1: 样本外交易低于此值的窗口视为"无有效样本"，不计入 oos_sharpe 均值
+        self.min_oos_trades = wf_cfg.get('min_oos_trades', 3)
+        # V11.1 P0-1: 正则化系数（越大越倾向靠近 config 先验参数，防局部最优）
+        # P0-3: 0.15→由 config 控制（默认上调），加大对偏离先验参数的惩罚
+        self.reg_lambda = wf_cfg.get('regularization_lambda', 0.15)
+        # P0-3 根因B: 训练集成交数下限——低于此值的参数组合其夏普不可信，线性降权
+        self.min_train_trades = wf_cfg.get('min_train_trades', 8)
+        # P0-3 根因A: 门槛类参数训练集可选上界（≤先验+cap_steps档），防挑到极端高门槛孤点
+        self.train_cap_steps = wf_cfg.get('train_param_cap_steps', 1)
+        # V11.1 P0-1: 先验参数（config 默认值，正则化中心）
+        self.reg_priors = {
+            "initial_stop_loss": float(getattr(config, 'INITIAL_STOP_LOSS_PCT', 0.07)),
+            "min_signal_quality": float(getattr(config, 'MIN_SIGNAL_QUALITY_NON_BEAR', 65)),
+            # P0-2: 新网格轴的先验（对齐 backtest_optimizer.DEFAULT_PARAMS）
+            "min_quality_non_bear": 68.0,
+            "drawdown_leader": 0.06,
+            "vol_shrink_ratio": 0.70,
+        }
+        # 参数典型变动范围（用于归一化惩罚）
+        self.reg_scales = {
+            "initial_stop_loss": 0.04,   # 5%~9% 之间变动 4%
+            "min_signal_quality": 10.0,  # 60~70 之间变动 10
+            "min_quality_non_bear": 6.0,  # P0-2: 62~74 半幅约 6
+            "drawdown_leader": 0.04,
+            "vol_shrink_ratio": 0.20,
+        }
 
     def run(self, data_dict: dict, stock_codes: list = None) -> dict:
         """
@@ -189,10 +214,15 @@ class WalkForwardAnalyzer:
             "test_period": (test_start, test_end),
             "best_params": best_params,
             "train_sharpe": train_report.get("sharpe_ratio", 0),
+            "train_trades": train_report.get("total_trades", 0),
             "test_sharpe": test_report.get("sharpe_ratio", 0),
+            "test_trades": test_report.get("total_trades", 0),
             "test_return": test_report.get("total_return", 0),
             "test_win_rate": test_report.get("win_rate", 0),
             "test_max_dd": test_report.get("max_drawdown", 0),
+            # P0-2: 保留验证窗逐笔收益与持仓天数，供跨窗池化 OOS 夏普
+            "test_trade_rets": test_report.get("trade_rets", []),
+            "test_avg_hold": test_report.get("avg_hold", 5.0),
         }
 
     def _optimize_on_train_v5(self, data_dict: dict, stock_codes: list,
@@ -208,6 +238,30 @@ class WalkForwardAnalyzer:
         keys = list(self.param_grid.keys())
         values = list(self.param_grid.values())
         combinations = list(product(*values))
+
+        # P0-3 根因A: 训练集可选参数上界——对"越大越严"的门槛类参数，
+        #   排除偏离 config 先验超过 train_cap_steps 档的极端高门槛组合，
+        #   防止 WF 在训练集挑到"高门槛→极少成交→虚高夏普"的孤点（样本外无法复现）。
+        if self.train_cap_steps and self.train_cap_steps > 0:
+            _capped = []
+            for combo in combinations:
+                p = dict(zip(keys, combo))
+                ok = True
+                for k, v in p.items():
+                    if k not in ("min_quality_non_bear", "min_signal_quality"):
+                        continue
+                    prior = self.reg_priors.get(k)
+                    scale = self.reg_scales.get(k, 0)
+                    if prior is not None and scale and v > prior + self.train_cap_steps * scale + 1e-9:
+                        ok = False
+                        break
+                if ok:
+                    _capped.append(combo)
+            # 全部被过滤时退回原集合（避免空网格），并记录告警
+            if _capped:
+                if len(_capped) != len(combinations):
+                    logger.debug(f"P0-3 门槛上界过滤: {len(combinations)}→{len(_capped)} 组合")
+                combinations = _capped
 
         # V7(A3): 网格采样（避免240+组合全量遍历）
         import config as _cfg
@@ -239,7 +293,20 @@ class WalkForwardAnalyzer:
                 n_trades = report.get("total_trades", 0)
                 win_rate = report.get("win_rate", 0) / 100.0
                 # 综合评分：期望收益 × 样本量 × 胜率调整
-                score = expectancy * np.sqrt(max(n_trades, 1)) * (0.5 + 0.5 * win_rate)
+                raw_score = expectancy * np.sqrt(max(n_trades, 1)) * (0.5 + 0.5 * win_rate)
+                # P0-3 根因B: 成交数下限惩罚——训练集成交过少的组合其夏普不可信，
+                #   按 n_trades/min_train_trades 线性降权，杜绝"1-2 笔交易撑起高夏普"被选为最优。
+                if self.min_train_trades and n_trades < self.min_train_trades:
+                    raw_score *= (n_trades / float(self.min_train_trades))
+                # V11.1 P0-1: 正则化惩罚—参数偏离 config 先验越远惩罚越大
+                # penalty = lambda * sum((p - prior)^2 / scale^2)  (L2 正则化)
+                penalty = 0.0
+                for k, v in params.items():
+                    prior = self.reg_priors.get(k)
+                    scale = self.reg_scales.get(k, 1.0)
+                    if prior is not None and scale > 0:
+                        penalty += ((v - prior) / scale) ** 2
+                score = raw_score * (1.0 - self.reg_lambda * penalty)
 
                 if score > best_score:
                     best_score = score
@@ -275,14 +342,28 @@ class WalkForwardAnalyzer:
         """
         
         all_trades = []
+        # P0-1 修复: 验证窗仅 test_days(60) 根，旧代码把数据严格截断到
+        # [start_date, end_date] → df_window≈60 根 < 80，被下方 len<80 全部跳过；
+        # 即便通过，v6 回测循环 range(60, len) 在 60 根内亦为空。
+        # 双重作用使样本外恒 0 交易、oos_sharpe=0、overfit_ratio=1.0（G2 假红）。
+        # 解决: 窗口数据向前多取 warmup_days 根预热期供指标计算；
+        # 交易仍只统计 sell_date ∈ [start_date, end_date]（下方已过滤），
+        # 预热期开/平仓的交易被排除，不污染样本外口径。
+        warmup_days = 80
         for code in stock_codes:
             if code not in data_dict or code == "000300":
                 continue
             df = data_dict[code]
-            # 截取窗口内数据（含前置预热期）
-            # 修复BUG-010: 同时用start_date和end_date双端截断，防止训练集从数据起点开始
-            mask = (df["date"] >= start_date) & (df["date"] <= end_date)
-            df_window = df[mask].copy()
+            # 修复BUG-010: 双端截断——先截到 end_date，再向前补预热期
+            df_upto = df[df["date"] <= end_date]
+            if df_upto.empty:
+                continue
+            dates_arr = df_upto["date"].astype(str).values
+            in_win_pos = np.where(dates_arr >= str(start_date))[0]
+            if len(in_win_pos) == 0:
+                continue
+            warm_start = max(0, int(in_win_pos[0]) - warmup_days)
+            df_window = df_upto.iloc[warm_start:].reset_index(drop=True)
             if len(df_window) < 80:
                 continue
             
@@ -297,9 +378,14 @@ class WalkForwardAnalyzer:
                 # 而非像之前调 v5 那样 params 被静默丢弃。
                 # Phase 2: regime 调整——震荡/熊市提高信号质量门槛
                 adj_params = params.copy()
-                if regime_adj != 0 and "min_signal_quality" in adj_params:
-                    adj_params["min_signal_quality"] = min(
-                        adj_params["min_signal_quality"] + regime_adj, 85)
+                # P0-2: regime_adj 同时作用于新旧两种质量门槛参数
+                if regime_adj != 0:
+                    if "min_quality_non_bear" in adj_params:
+                        adj_params["min_quality_non_bear"] = min(
+                            adj_params["min_quality_non_bear"] + regime_adj, 85)
+                    if "min_signal_quality" in adj_params:
+                        adj_params["min_signal_quality"] = min(
+                            adj_params["min_signal_quality"] + regime_adj, 85)
                 trades = backtest_stock_v6(df_window, code, info, adj_params)
                 # 过滤日期范围内的交易
                 for t in trades:
@@ -311,7 +397,8 @@ class WalkForwardAnalyzer:
         # 统计
         if not all_trades:
             return {"total_trades": 0, "win_rate": 0, "expectancy": 0,
-                    "sharpe_ratio": 0, "total_return": 0, "max_drawdown": 0}
+                    "sharpe_ratio": 0, "total_return": 0, "max_drawdown": 0,
+                    "trade_rets": [], "avg_hold": 0.0}
         
         # FIX(G2): v5/v6 交易记录用 net_profit（含成本，百分比），并无 profit_pct 键；
         # 旧代码读 profit_pct 恒取默认0，会把胜率/期望/夏普全算成0。改用 net_profit。
@@ -332,8 +419,11 @@ class WalkForwardAnalyzer:
         
         returns = [t.get("net_profit", 0) for t in all_trades]
         # 修复BUG-007: max_drawdown改为净值曲线峰谷回撤，而非单笔最小收益
-        if returns:
-            cum = (1 + pd.Series(returns)).cumprod()
+        # P1 修复: net_profit 为百分比×100（3.5=3.5%），旧代码直接把原值塞进
+        # (1 + returns) → 亏损单如 -95 变成 (1-95)=-94，cumprod 滚成巨额负数，
+        # 回撤失真到 -84995。改用已归一化为小数的 trade_rets（/100）算净值回撤。
+        if len(trade_rets) > 0:
+            cum = (1 + pd.Series(trade_rets)).cumprod()
             running_max = cum.cummax()
             drawdowns = (cum - running_max) / running_max
             max_dd = round(float(drawdowns.min()), 4)
@@ -348,14 +438,47 @@ class WalkForwardAnalyzer:
             "sharpe_ratio": round(sharpe, 2),
             "total_return": round(sum(returns), 2),
             "max_drawdown": max_dd,
+            # P0-2: 保留逐笔归一化收益与平均持仓天数，供 _summarize 跨窗池化夏普
+            #   （_jsonable 会剔除 windows 键，故不会污染存档 JSON）。
+            "trade_rets": [float(x) for x in trade_rets],
+            "avg_hold": round(float(avg_hold), 2),
         }
 
     def _summarize(self, results: list) -> dict:
-        """汇总所有窗口结果"""
-        oos_sharpes = [r["test_sharpe"] for r in results]
-        oos_returns = [r["test_return"] for r in results]
-        oos_win_rates = [r["test_win_rate"] for r in results]
-        oos_max_dds = [r["test_max_dd"] for r in results]
+        """汇总所有窗口结果
+
+        V11.2 P0-1: 只统计"有效样本外窗口"（test_trades >= min_oos_trades）。
+        0成交窗口不是"零表现"而是"无样本"，归入 sharpe=0 会错误拉低均值（造成假失败）；
+        若全部窗口均无有效样本，oos_sharpe 返回 None（G2 判黄而非假红），并如实说明。
+        """
+        min_tr = self.min_oos_trades
+        valid = [r for r in results if r.get("test_trades", 0) >= min_tr]
+        n_valid = len(valid)
+        # 统计口径基于有效窗口；若无有效窗口，降级到全部（仅供展示）
+        stat_src = valid if n_valid > 0 else results
+        oos_sharpes = [r["test_sharpe"] for r in stat_src]
+        oos_returns = [r["test_return"] for r in stat_src]
+        oos_win_rates = [r["test_win_rate"] for r in stat_src]
+        oos_max_dds = [r["test_max_dd"] for r in stat_src]
+
+        # P0-2: 稳健 OOS 夏普估计器——"每窗夏普求均值"(旧)易被少数灾难窗绑架
+        #   （当前 oos_return=+28.53 与 oos_sharpe=-5.35 方向相反即此因）。
+        #   补两个稳健口径：
+        #     pooled = 汇总所有有效窗逐笔收益算单一年化夏普（按成交加权，不被窗数平均）；
+        #     median = 各有效窗夏普中位数（抗极端值）。
+        pooled_rets, holds = [], []
+        for r in stat_src:
+            tr = r.get("test_trade_rets") or []
+            pooled_rets.extend(tr)
+            if tr:
+                holds.append(float(r.get("test_avg_hold", 5.0) or 5.0))
+        oos_sharpe_pooled = None
+        if len(pooled_rets) >= 2:
+            _ah = float(np.mean(holds)) if holds else 5.0
+            oos_sharpe_pooled = round(float(
+                master_common.sharpe_from_trade_returns(np.array(pooled_rets), _ah)), 2)
+        oos_sharpe_median = round(float(np.median(oos_sharpes)), 2) if oos_sharpes else None
+        valid_ratio = round(n_valid / len(results), 4) if results else 0.0
 
         # 参数稳定性：最优参数在各窗口的一致性
         param_keys = list(results[0]["best_params"].keys())
@@ -372,7 +495,30 @@ class WalkForwardAnalyzer:
         # V2.0: 过拟合检测（修正公式，避免分母接近0导致2886.7%虚高）
         train_sharpes = [r["train_sharpe"] for r in results]
         mean_train = np.mean(train_sharpes)
-        mean_oos = np.mean(oos_sharpes)
+
+        if n_valid == 0:
+            # 无任何有效样本外窗口：不编造夏普，返回 None + 如实说明
+            return {
+                "windows": results,
+                "num_windows": len(results),
+                "num_valid_windows": 0,
+                "valid_ratio": 0.0,
+                "min_oos_trades": min_tr,
+                "oos_sharpe": None,
+                "oos_sharpe_std": None,
+                "oos_sharpe_pooled": None,
+                "oos_sharpe_median": None,
+                "oos_return": round(float(np.mean(oos_returns)), 4) if oos_returns else 0.0,
+                "oos_win_rate": 0.0,
+                "oos_max_dd": 0.0,
+                "best_params_history": [r["best_params"] for r in results],
+                "stability_score": round(float(avg_stability), 2),
+                "overfit_ratio": None,
+                "verdict": (f"⚠️ 样本外无有效窗口：{len(results)}个窗口均<{min_tr}笔成交，"
+                            "无法衡量泛化能力（非零表现，而系无样本）"),
+            }
+
+        mean_oos = float(np.mean(oos_sharpes))
         # 修正：分母取max(|train|, |oos|, 1.0)，避免极小分母
         denominator = max(abs(mean_train), abs(mean_oos), 1.0)
         overfit_ratio = (mean_train - mean_oos) / denominator
@@ -380,15 +526,20 @@ class WalkForwardAnalyzer:
         return {
             "windows": results,
             "num_windows": len(results),
-            "oos_sharpe": round(np.mean(oos_sharpes), 2),
-            "oos_sharpe_std": round(np.std(oos_sharpes), 2),
-            "oos_return": round(np.mean(oos_returns), 4),
-            "oos_win_rate": round(np.mean(oos_win_rates), 4),
-            "oos_max_dd": round(np.mean(oos_max_dds), 4),
+            "num_valid_windows": n_valid,
+            "valid_ratio": valid_ratio,
+            "min_oos_trades": min_tr,
+            "oos_sharpe": round(mean_oos, 2),
+            "oos_sharpe_std": round(float(np.std(oos_sharpes)), 2),
+            "oos_sharpe_pooled": oos_sharpe_pooled,
+            "oos_sharpe_median": oos_sharpe_median,
+            "oos_return": round(float(np.mean(oos_returns)), 4),
+            "oos_win_rate": round(float(np.mean(oos_win_rates)), 4),
+            "oos_max_dd": round(float(np.mean(oos_max_dds)), 4),
             "best_params_history": [r["best_params"] for r in results],
-            "stability_score": round(avg_stability, 2),
-            "overfit_ratio": round(overfit_ratio, 4),
-            "verdict": self._judge(overfit_ratio, avg_stability, np.mean(oos_sharpes)),
+            "stability_score": round(float(avg_stability), 2),
+            "overfit_ratio": round(float(overfit_ratio), 4),
+            "verdict": self._judge(overfit_ratio, avg_stability, mean_oos),
         }
 
     @staticmethod
@@ -462,22 +613,30 @@ def format_walk_forward_report(result: dict, train_days: int = 200, test_days: i
     if "error" in result:
         return f"Walk-Forward失败: {result['error']}"
 
+    # V11.2 P0-1: oos_sharpe/oos_sharpe_std/overfit_ratio 可能为 None（无有效样本外窗口）
+    def _f2(v, spec=".2f"):
+        return format(v, spec) if isinstance(v, (int, float)) else "N/A"
+    _oos_sharpe = result.get('oos_sharpe')
+    _oos_std = result.get('oos_sharpe_std')
+    _overfit = result.get('overfit_ratio')
+    _n_valid = result.get('num_valid_windows', result.get('num_windows'))
+
     lines = [
         "=" * 60,
         "  Walk-Forward 滚动窗口分析报告",
         "=" * 60,
-        f"  窗口数量:     {result['num_windows']}",
+        f"  窗口数量:     {result['num_windows']}（有效样本外 {_n_valid}）",
         f"  训练/验证:    {train_days}天/{test_days}天",
         "",
         "  ─── 样本外表现 ───",
-        f"  平均夏普:     {result['oos_sharpe']:.2f} ± {result['oos_sharpe_std']:.2f}",
-        f"  平均收益:     {result['oos_return']:.2%}",
-        f"  平均胜率:     {result['oos_win_rate']:.1%}",
-        f"  平均回撤:     {result['oos_max_dd']:.2%}",
+        f"  平均夏普:     {_f2(_oos_sharpe)} ± {_f2(_oos_std)}",
+        f"  平均收益:     {_f2(result.get('oos_return'), '.2%')}",
+        f"  平均胜率:     {_f2(result.get('oos_win_rate'), '.1%')}",
+        f"  平均回撤:     {_f2(result.get('oos_max_dd'), '.2%')}",
         "",
         "  ─── 稳健性评估 ───",
-        f"  参数稳定性:   {result['stability_score']:.0%}",
-        f"  过拟合程度:   {result['overfit_ratio']:.1%}",
+        f"  参数稳定性:   {_f2(result.get('stability_score'), '.0%')}",
+        f"  过拟合程度:   {_f2(_overfit, '.1%')}",
         f"  综合判定:     {result['verdict']}",
         "",
         "  ─── 各窗口详情 ───",
@@ -486,7 +645,8 @@ def format_walk_forward_report(result: dict, train_days: int = 200, test_days: i
     for i, w in enumerate(result["windows"]):
         lines.append(
             f"  窗口{i+1}: 验证[{w['test_period'][0]}~{w['test_period'][1]}] "
-            f"夏普={w['test_sharpe']:.2f} 收益={w['test_return']:.2%} "
+            f"成交={w.get('test_trades', 'NA')}笔 "
+            f"夏普={_f2(w.get('test_sharpe'))} 收益={_f2(w.get('test_return'), '.2%')} "
             f"参数={w['best_params']}"
         )
 

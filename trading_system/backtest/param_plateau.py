@@ -19,9 +19,7 @@ import os
 import sys
 
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 try:
     from . import master_common
@@ -156,15 +154,21 @@ def run_grid_with_plateau(data_dict: dict, codes: list, quick: bool = False,
     values = [grid[a] for a in axes]
     combos = list(itertools.product(*values))
 
+    # P2-2(路线图): 为支持 PBO(CSCV) 需要 per-trial 的时间序列收益，
+    #   而非仅每 trial 一个标量夏普。故同时收集每 trial 的日度收益序列。
+    date_index = _common_date_index(data_dict, codes)
+
     # 逐 trial 回测，记录夏普（按坐标索引存储，便于找邻居）
     sharpes = {}
     all_sharpes = []
+    trial_daily = []   # P2-2: 每 trial 一条对齐 date_index 的日收益序列
     for pos, combo in enumerate(combos):
         params = dict(zip(axes, combo))
         trades = _run_trial(data_dict, codes, params)
         sh = _trial_sharpe(trades)
         sharpes[pos] = sh
         all_sharpes.append(sh)
+        trial_daily.append(_trial_daily_returns(trades, date_index))
 
     if not all_sharpes or max(all_sharpes) <= -1e9:
         return {"status": "fail", "error": "网格无任何有效夏普（可能全程无交易）",
@@ -201,6 +205,17 @@ def run_grid_with_plateau(data_dict: dict, codes: list, quick: bool = False,
     # 二维热力图切片（取前两轴，其余固定为最优）
     heatmap = _build_heatmap(axes, values, combos, sharpes, best_coord)
 
+    # P2-2(路线图): 计算 PBO(CSCV)——把每 trial 的日收益拼成 (T,N) 矩阵。
+    pbo_result = {"status": "skipped", "reason": "无有效交易日收益序列"}
+    try:
+        if date_index and len(date_index) >= 8 and len(trial_daily) >= 2:
+            mat = np.column_stack([np.asarray(s, dtype=float) for s in trial_daily])
+            if mat.shape[0] >= 8 and np.isfinite(mat).any():
+                from backtest.deflated_sharpe import compute_pbo
+                pbo_result = compute_pbo(mat)
+    except Exception as e:
+        pbo_result = {"status": "fail", "error": str(e)}
+
     return {
         "status": "ok",
         "axes": axes,
@@ -213,7 +228,42 @@ def run_grid_with_plateau(data_dict: dict, codes: list, quick: bool = False,
         "verdict": plateau["verdict"],
         "neighbors": neighbors,
         "heatmap": heatmap,
+        "pbo": pbo_result,
     }
+
+
+def _common_date_index(data_dict: dict, codes: list) -> list:
+    """构造回测宇宙内所有标的交易日的并集（升序），作为 PBO 收益矩阵的时间轴。"""
+    dates = set()
+    for code in codes:
+        df = data_dict.get(code)
+        if df is None or len(df) == 0 or "date" not in df.columns:
+            continue
+        try:
+            dates.update(str(x)[:10] for x in df["date"].tolist())
+        except Exception:
+            continue
+    return sorted(dates)
+
+
+def _trial_daily_returns(trades: list, date_index: list) -> np.ndarray:
+    """把一个 trial 的逐笔交易转为对齐 date_index 的日收益序列（主动成交口径）。
+
+    复用 master_common.active_strategy_daily_returns（net_profit/100×单笔仓位占比，
+    按 sell_date 归集），再 reindex 到公共交易日轴、缺口填 0（空仓日零收益）。
+    """
+    if not date_index:
+        return np.zeros(0)
+    import pandas as pd
+    try:
+        s = master_common.active_strategy_daily_returns(trades)
+    except Exception:
+        s = None
+    idx = pd.Index([str(d)[:10] for d in date_index])
+    if s is None or len(s) == 0:
+        return np.zeros(len(idx))
+    s.index = [str(i)[:10] for i in s.index]
+    return s.reindex(idx, fill_value=0.0).astype(float).values
 
 
 def _build_heatmap(axes, values, combos, sharpes, best_coord) -> dict:

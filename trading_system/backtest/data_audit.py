@@ -21,8 +21,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
 
 try:
     from utils.trading_calendar import is_trading_day
@@ -32,7 +31,7 @@ except ImportError:  # pragma: no cover
 try:
     from utils.board_rules import get_limit_pct
 except ImportError:  # pragma: no cover
-    def get_limit_pct(code):
+    def get_limit_pct(code, name=""):
         return 0.095
 
 logger = logging.getLogger(__name__)
@@ -121,7 +120,12 @@ def audit_one_stock(code: str, df: pd.DataFrame, expected_days: list) -> dict:
     if "close" in d.columns and len(d) > 1:
         close = pd.to_numeric(d["close"], errors="coerce")
         pct = close.pct_change().abs()
-        limit = get_limit_pct(code)
+        # FIX P1-17: 传 name 以正确识别主板 ST（±5%）——名称从 config 解析
+        try:
+            _nm = config.get_stock_info(code).get("名称", "") or ""
+        except Exception:
+            _nm = ""
+        limit = get_limit_pct(code, _nm)
         abnormal = int((pct > limit + GAP_THRESHOLD_EXTRA).sum())
         if abnormal > 0:
             res["issues"].append(f"异常跳空{abnormal}天(|涨跌|>{limit + GAP_THRESHOLD_EXTRA:.0%})")
@@ -188,12 +192,21 @@ def audit_dataset(data_dict: dict, codes: list = None) -> dict:
         if not r["blocking"]:
             n_ok += 1
 
-    # 幸存者偏差声明：无法从数据集本身识别退市/ST 摘牌标的，
-    # 除非池中含已退市代码，否则一律显式声明存在偏差（SKILL 要求）。
-    survivorship = (
-        "股票池以当前可交易标的为主，未包含回测区间内已退市/已ST摘牌标的，"
-        "结果存在幸存者偏差，历史收益可能被高估。"
-    )
+    # 幸存者偏差声明：P2-1——检测回测宇宙是否已纳入退市/ST摘牌标的。
+    # 无法从数据集本身识别退市股，故以 config.BACKTEST_DELISTED_POOL 登记为准：
+    #   池为空或池内标的均无数据 → 一律显式声明存在偏差（SKILL 要求，禁止谎报无偏）。
+    delisted_pool = set(getattr(config, "BACKTEST_DELISTED_POOL", {}).keys())
+    n_delisted_included = len([c for c in codes if c in delisted_pool])
+    if n_delisted_included > 0:
+        survivorship = (
+            f"回测宇宙已纳入 {n_delisted_included} 只退市/ST摘牌标的，"
+            "幸存者偏差已部分缓解；但退市池覆盖仍不完整，历史收益可能小幅高估。"
+        )
+    else:
+        survivorship = (
+            "股票池以当前可交易标的为主，未包含回测区间内已退市/已ST摘牌标的，"
+            "结果存在幸存者偏差，历史收益可能被高估。"
+        )
 
     # 结论分级
     if not codes or n_ok == 0:
@@ -229,6 +242,7 @@ def audit_dataset(data_dict: dict, codes: list = None) -> dict:
         "summary": summary,
         "per_stock": problem_stocks,
         "survivorship_bias": survivorship,
+        "n_delisted_included": n_delisted_included,
         "adjustment_note": "数据层统一使用前复权价（adjustflag=2）计算收益，成交以真实价为基准。",
         "conclusion": conclusion,
     }

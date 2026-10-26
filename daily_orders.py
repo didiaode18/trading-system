@@ -37,6 +37,9 @@ from strategy.recommend_engine import run_recommendation, generate_trading_plan
 # V4.0(G4): 新增 pre_trade_check_orders 条件单下单前硬校验
 from risk.risk_control import UnifiedRiskEngine, RISK_CONFIG, pre_trade_check_orders
 from utils.board_rules import is_limit_up as _board_is_limit_up, get_limit_pct
+# FIX P2-02: ETF 判定统一走权威源 instrument.is_etf（按代码前缀，含56x/588/159），
+# 消除“赛道==指数ETF”与前两位硬编码（漏判 56 开头）的口径分歧。
+from utils.instrument import is_etf as _is_etf_code
 
 today = datetime.date.today().strftime("%Y-%m-%d")
 now = datetime.datetime.now().strftime("%H:%M:%S")
@@ -419,7 +422,7 @@ def health_inspection(holdings_with_price, all_data, _playbook=None):
         df = all_data.get(code)
         ma20 = df["ma20"].iloc[-1] if df is not None and not pd.isna(df["ma20"].iloc[-1]) else h["price"]
         ma60 = df["ma60"].iloc[-1] if df is not None and not pd.isna(df["ma60"].iloc[-1]) else h["price"]
-        stock_type = "etf" if h.get("赛道") == "指数ETF" else "stock"
+        stock_type = "etf" if _is_etf_code(code) else "stock"
         holdings_dict[code] = {
             "name": h["名称"],
             "cost": h["成本"],
@@ -572,18 +575,46 @@ for r in health_results:
         print(f"     ⚠️ 仓位{r['position_ratio']:.1f}%超标，建议减仓{r['reduce_shares']}股")
 
 # 5. 生成条件单
-# FIX P0-D: 熔断状态约束——检查是否处于熔断状态，熔断时禁止生成加仓/买入类条件单
+# FIX P0-D / FIX(P0-07): 熔断状态约束——原调用不存在的 check_all()（幽灵 API），
+# AttributeError 被 except 吞掉后打印"继续正常生成"→ _circuit_breaker_active 恒 False，
+# 制造"熔断已生效"的虚假安全感。改调真实 API（state_mgr.is_paused + 连亏/日亏/年熔断组合），
+# 异常时 fail-safe 按熔断处理（仅过滤买入类，卖出/止损单不受影响）。
 _circuit_breaker_active = False
 try:
     from trading_system.risk.risk_control import UnifiedRiskEngine
     _risk_engine = UnifiedRiskEngine()
-    _risk_status = _risk_engine.check_all()
-    if _risk_status.get("circuit_breaker_triggered", False):
+    _sm = _risk_engine.state_mgr
+    _st = _sm.state
+    _rc_cfg = getattr(config, "RISK_UNIFIED_CONFIG", {}) or {}
+    _triggered = []
+    # 暂停期
+    _paused, _pause_reason = _sm.is_paused()
+    if _paused:
+        _triggered.append(_pause_reason or "暂停开仓")
+    # 年度回撤熔断
+    if _st.get("annual_halt"):
+        _triggered.append("年度回撤熔断(annual_halt)")
+    # 连亏熔断
+    _consec = int(_st.get("consecutive_losses", 0) or 0)
+    _consec_limit = int(_rc_cfg.get("consecutive_loss_block", 3))
+    if _consec >= _consec_limit:
+        _triggered.append(f"连续亏损{_consec}笔≥{_consec_limit}")
+    # 日亏熔断（总资产快照差分口径，阀值 2%）
+    _tc = float(_st.get("total_capital", 0) or 0)
+    _daily_pnl = float(_st.get("daily_pnl", 0) or 0)
+    _daily_loss_limit = float(getattr(config, "DAILY_LOSS_LIMIT", 0.02) or 0.02)
+    if _tc > 0 and _daily_pnl < 0 and abs(_daily_pnl / _tc) >= _daily_loss_limit:
+        _triggered.append(f"当日亏损{abs(_daily_pnl/_tc)*100:.1f}%≥{_daily_loss_limit*100:.0f}%")
+    if _triggered:
         _circuit_breaker_active = True
-        _triggered_levels = [k for k, v in _risk_status.get("levels", {}).items() if v.get("triggered")]
-        print(f"\n[风控] ⛔ 熔断状态生效: {', '.join(_triggered_levels)}，禁止生成加仓/买入类条件单")
+        print(f"\n[风控] ⛔ 熔断状态生效: {', '.join(_triggered)}，禁止生成加仓/买入类条件单")
+    else:
+        print(f"\n[风控] ✅ 无熔断状态，正常生成条件单")
 except Exception as _e:
-    print(f"\n[风控] 熔断检查失败: {_e}，继续正常生成")
+    # FIX(P0-07): fail-safe —— 风控状态读取异常时按熔断处理（过滤买入类），
+    # 绝不"继续正常生成"制造虚假安全感。卖出/止损单不受影响（下方仅过滤买入）。
+    _circuit_breaker_active = True
+    print(f"\n[风控] ⚠️ 熔断检查异常: {_e}，fail-safe 按熔断处理（禁生成买入类条件单，卖出不受影响）")
 
 print(f"\n[条件单] 生成次日操作计划...")
 all_orders = []
@@ -894,7 +925,7 @@ _positions_snapshot = {
     h["code"]: {
         "market_value": h["市值"],
         "sector": h["赛道"],
-        "is_etf": ("ETF" in h["赛道"]) or h["code"][:2] in ("51", "58", "15"),
+        "is_etf": _is_etf_code(h["code"]),
     }
     for h in holdings_with_price
 }
@@ -1115,8 +1146,12 @@ print(f"\n[保存] {filepath}")
 
 # 输出JSON文件（供QMT执行器读取）
 import json
+# FIX(P2-06): 文件名=执行日（次日）——系统约定 orders_YYYYMMDD.json 的 YYYYMMDD 为执行日
+# （对照 scheduler.py 正确实现），原用 today 会导致晚间计划送不到次日执行器。
+_exec_date = datetime.date.today() + datetime.timedelta(days=1)
+exec_date_str = _exec_date.strftime("%Y%m%d")
 orders_json = {
-    "date": today,
+    "date": tomorrow,
     "generated_at": f"{today} {now}",
     "total_capital": TOTAL_CAPITAL,
     "max_daily_trades": MAX_DAILY_TRADES,
@@ -1127,17 +1162,47 @@ for idx, order in enumerate(all_orders, 1):
     if order.get("blocked"):
         continue
     orders_json["orders"].append({
-        "order_id": f"ORD_{date_str}_{idx:03d}",
+        "order_id": f"ORD_{exec_date_str}_{idx:03d}",
         # V4.2(P0-3): 生命周期初始态，盘后由 execution/order_lifecycle.reconcile_daily_orders
         # 回写为 已成交/未触发，补齐G4/G6闭环最后一环
         "status": "已生成",
         **order,
     })
 
-json_path = os.path.join(output_dir, f"orders_{date_str}.json")
-with open(json_path, "w", encoding="utf-8") as f:
-    json.dump(orders_json, f, ensure_ascii=False, indent=2)
-print(f"[保存] QMT执行文件: {json_path}")
+json_path = os.path.join(output_dir, f"orders_{exec_date_str}.json")
+# FIX(P2-06): 合并写入——原 open(w) 截断会抹掉同日已追加的盘中止损单（对照 scheduler）。
+# 保留已有 orders，按 (证券代码,方向,触发价) 去重后追加新计划单。
+_existing_orders = []
+if os.path.exists(json_path):
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            _existing_data = json.load(f)
+        _existing_orders = _existing_data.get("orders", []) if isinstance(_existing_data, dict) else []
+    except Exception as _e:
+        print(f"[保存] ⚠️ 读取已有执行文件失败，将仅写新计划单: {_e}")
+
+
+def _order_key(o):
+    return (o.get("证券代码"), o.get("方向"), o.get("触发价"))
+
+
+_seen_keys = {_order_key(o) for o in _existing_orders}
+_merged_orders = list(_existing_orders)
+_added = 0
+for o in orders_json["orders"]:
+    if _order_key(o) not in _seen_keys:
+        _merged_orders.append(o)
+        _seen_keys.add(_order_key(o))
+        _added += 1
+orders_json["orders"] = _merged_orders
+try:
+    from utils.file_io import atomic_json_write
+    if not atomic_json_write(json_path, orders_json):
+        raise IOError("atomic_json_write 返回 False")
+except Exception:
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(orders_json, f, ensure_ascii=False, indent=2)
+print(f"[保存] QMT执行文件: {json_path}（保留已有{len(_existing_orders)}条，新增{_added}条，合计{len(_merged_orders)}条）")
 
 # 发送邮件
 subject = f"[条件单] {tomorrow}操作计划 | {len(all_orders)}条(必挂{len(must_orders)}条) | {today}"

@@ -20,11 +20,24 @@ from enum import Enum
 from typing import Optional
 
 import os, sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from ..utils.board_rules import is_limit_up as _board_is_limit_up, is_limit_down as _board_is_limit_down
 except ImportError:
     from utils.board_rules import is_limit_up as _board_is_limit_up, is_limit_down as _board_is_limit_down
+
+# FIX P2-03: 成本参数统一以 config 为准，避免 backtest/broker.py 的 DEFAULT_COST
+# 与 config.COMMISSION_RATE 漂移（旧值佣金万2.5 < config 万3 → 回测收益虚高）。
+try:
+    try:
+        from .. import config as _cost_cfg
+    except ImportError:
+        import config as _cost_cfg
+    _CFG_COMMISSION = float(getattr(_cost_cfg, "COMMISSION_RATE", 0.0003))
+    _CFG_MIN_COMMISSION = float(getattr(_cost_cfg, "MIN_COMMISSION", 5.0))
+    _CFG_STAMP_TAX = float(getattr(_cost_cfg, "STAMP_TAX_RATE", 0.0005))
+    _CFG_TRANSFER_FEE = float(getattr(_cost_cfg, "TRANSFER_FEE_RATE", 0.00001))
+except Exception:  # pragma: no cover - config 不可用时用与 config 一致的默认值
+    _CFG_COMMISSION, _CFG_MIN_COMMISSION, _CFG_STAMP_TAX, _CFG_TRANSFER_FEE = 0.0003, 5.0, 0.0005, 0.00001
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +62,7 @@ class RejectReason(Enum):
     NO_POSITION = "NO_POSITION"                  # 无持仓
     T1_RESTRICTION = "T1_RESTRICTION"            # T+1限制
     ZERO_TARGET = "ZERO_TARGET"                  # 目标股数为0
+    RISK_GATE = "RISK_GATE"                      # FIX P2-16: 撮合层风控钩子否决（单票/赛道/总仓/熔断）
 
 
 # ============================================================
@@ -59,10 +73,10 @@ class CostConfig:
     """交易成本配置"""
     buy_slippage: float = 0.001       # 买入滑点 0.1%
     sell_slippage: float = 0.001      # 卖出滑点 0.1%
-    commission_rate: float = 0.00025  # 佣金费率 万2.5
-    min_commission: float = 5.0       # 最低佣金 5元
-    stamp_tax_rate: float = 0.0005    # 印花税 万5（仅卖出，2023-08-28起减半）
-    transfer_fee_rate: float = 0.00001  # 过户费 十万分之一
+    commission_rate: float = _CFG_COMMISSION      # 佣金费率（对齐 config.COMMISSION_RATE，万3）
+    min_commission: float = _CFG_MIN_COMMISSION   # 最低佣金（对齐 config.MIN_COMMISSION）
+    stamp_tax_rate: float = _CFG_STAMP_TAX        # 印花税（对齐 config.STAMP_TAX_RATE，仅卖出，2023-08-28起减半）
+    transfer_fee_rate: float = _CFG_TRANSFER_FEE  # 过户费（对齐 config.TRANSFER_FEE_RATE）
     # V3.2: 市场冲击成本（基于订单量/日成交量比例）
     impact_cost_enabled: bool = True   # 是否启用冲击成本
     impact_cost_coeff: float = 0.1    # 冲击系数: impact = coeff * sqrt(order_value / daily_volume)
@@ -111,7 +125,16 @@ class Position:
         V4.1 修复: 支持跨日加仓多批次冻结
         - frozen_date == current_date: 当日有买入，仅 prev_day_available 可卖
         - frozen_date != current_date: 无当日买入，prev_day_available + frozen_shares 均可卖
+
+        FIX P2-17: T+0 品种（可转债/跨境/货币/债券/商品 ETF）当日买入可当日卖，
+        不施加 T+1 冻结（原统一 T+1 → 回测对 T+0 品种偏保守失真）。
         """
+        try:
+            from utils.instrument import is_t0
+            if is_t0(self.code):
+                return self.prev_day_available + self.frozen_shares
+        except Exception:
+            pass  # 导入失败时降级为 T+1（保守）
         if self.frozen_date == current_date:
             return self.prev_day_available
         return self.prev_day_available + self.frozen_shares
@@ -180,7 +203,7 @@ class SimBroker:
 
     def __init__(self, initial_capital: float, cost_config: CostConfig = None,
                  match_mode: MatchMode = MatchMode.REALISTIC,
-                 match_price: str = "next_open"):
+                 match_price: str = "next_open", risk_gate=None):
         """
         参数:
             initial_capital: 初始资金
@@ -190,6 +213,11 @@ class SimBroker:
                 "next_open" = 使用次日开盘价（V10.5默认，消除隐性前视）
                 "signal_price" = 使用信号价（向后兼容，不得作为默认）
                 "next_vwap" = 使用次日VWAP
+            risk_gate: FIX P2-16 撮合层防御纵深风控钩子（可选，默认 None=不改变已验证行为）。
+                签名 fn(order: Order, broker: SimBroker, market_data: dict) -> Optional[str]，
+                返回非空字符串表示否决原因（如单票/赛道/总仓/熔断超限），None 表示放行。
+                接入与实盘同一套 quick_risk_check 后，回测/模拟盘撮合层不再“零风控”，
+                回测结果可外推到实盘。钩子必须只用截至当日已知信息（禁止未来函数）。
         """
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -202,6 +230,8 @@ class SimBroker:
         self.total_transfer_fee = 0.0
         self.match_mode = match_mode
         self.match_price = match_price
+        # FIX P2-16: 可选撮合层风控钩子（默认关闭，保持现有回测口径不变）
+        self.risk_gate = risk_gate
         # V10: 公司行动注册表（延迟导入避免循环依赖）
         self._ca_registry = None
         # V10: signal vs realistic 双模式对照统计
@@ -316,24 +346,41 @@ class SimBroker:
     # ----------------------------------------------------------
     @staticmethod
     def _is_limit_up(row: dict, code: str = "", name: str = "") -> bool:
-        """判断是否涨停（V2: 区分板块 — 主板10%/创业板20%/ST 5%/科创板20%）"""
-        if "pre_close" in row and row["pre_close"] > 0:
+        """判断是否涨停（V2: 区分板块 — 主板10%/创业板20%/ST 5%/科创板20%）
+
+        FIX P1-18: pre_close 缺失/≤0 时无法确认涨停状态，采取 fail-safe —— 视为涨停
+        （拒绝买入），避免在不可成交价上产生乐观回测收益。data_feed 正常会补齐
+        pre_close，此路径仅覆盖异常数据。
+        """
+        pre_close = row.get("pre_close") if isinstance(row, dict) else None
+        close = row.get("close") if isinstance(row, dict) else None
+        if pre_close is not None and pre_close > 0 and close is not None:
             if code:
-                return _board_is_limit_up(code, row["close"], row["pre_close"], name=name)
-            # 无code时回退旧逻辑（兼容无code调用）
-            change_pct = (row["close"] - row["pre_close"]) / row["pre_close"]
+                return _board_is_limit_up(code, close, pre_close, name=name)
+            # 无code时回退旧逻辑（兼容无code调用）——按主板±9.8%阈值
+            change_pct = (close - pre_close) / pre_close
             return change_pct >= 0.098
-        return False
+        # pre_close 缺失/非法：fail-safe 保守拒单（视为涨停，拒绝买入）
+        logger.warning(f"[{code or '?'}] pre_close 缺失/≤0，涨停检测保守判定为涨停（拒绝买入）")
+        return True
 
     @staticmethod
     def _is_limit_down(row: dict, code: str = "", name: str = "") -> bool:
-        """判断是否跌停（V2: 区分板块）"""
-        if "pre_close" in row and row["pre_close"] > 0:
+        """判断是否跌停（V2: 区分板块）
+
+        FIX P1-18: pre_close 缺失/≤0 时 fail-safe 视为跌停（拒绝卖出），
+        避免用不可成交价 booked 出乐观的离场收益。
+        """
+        pre_close = row.get("pre_close") if isinstance(row, dict) else None
+        close = row.get("close") if isinstance(row, dict) else None
+        if pre_close is not None and pre_close > 0 and close is not None:
             if code:
-                return _board_is_limit_down(code, row["close"], row["pre_close"], name=name)
-            change_pct = (row["close"] - row["pre_close"]) / row["pre_close"]
+                return _board_is_limit_down(code, close, pre_close, name=name)
+            change_pct = (close - pre_close) / pre_close
             return change_pct <= -0.098
-        return False
+        # pre_close 缺失/非法：fail-safe 保守拒单（视为跌停，拒绝卖出）
+        logger.warning(f"[{code or '?'}] pre_close 缺失/≤0，跌停检测保守判定为跌停（拒绝卖出）")
+        return True
 
     # ----------------------------------------------------------
     # V10: 成交量参与率限制
@@ -434,6 +481,24 @@ class SimBroker:
                 reason=order.reason,
             ))
             return None
+
+        # FIX P2-16: 撮合层防御纵深风控钩子（默认 None 时跳过，行为与旧版一致）。
+        # 仅拦买入方向（卖出/止损不得被风控钩子阻断，否则止损失效）。
+        if self.risk_gate is not None:
+            try:
+                _veto = self.risk_gate(order, self, market_data)
+            except Exception as _e:
+                # fail-safe：钩子异常时拒单（宁缺毋滥，与实盘风控 fail-safe 一致）
+                logger.warning(f"[risk_gate] 异常，fail-safe 拒买 {order.code}: {_e}")
+                _veto = f"风控钩子异常({_e})"
+            if _veto:
+                logger.debug(f"{order.code} 买入被风控钩子否决: {_veto}")
+                self.rejected_orders.append(RejectedOrder(
+                    code=order.code, direction="buy", target_shares=order.target_shares,
+                    price=order.price, date=order.date, reject_reason=RejectReason.RISK_GATE,
+                    detail=str(_veto), reason=order.reason,
+                ))
+                return None
 
         # V10: 确定执行参考价
         ref_price = self._get_exec_price(order.price, market_data, "buy")
@@ -662,11 +727,18 @@ class SimBroker:
         pos.realized_pnl += pnl
 
         # 更新持仓（V4.1 FIX: 卖出时先扣减 prev_day_available，再扣 frozen_shares）
-        if pos.frozen_date == order.date:
-            # 当日有买入冻结：只能卖 prev_day_available（已在上面 checked）
+        # FIX P2-17: T+0 品种当日买入可当日卖，卖出量应从 frozen_shares（当日买入）扣，
+        # 而非 prev_day_available（否则会把 prev_day_available 扣成负数、frozen 不减）。
+        try:
+            from utils.instrument import is_t0 as _is_t0_code
+            _t0 = _is_t0_code(order.code)
+        except Exception:
+            _t0 = False
+        if pos.frozen_date == order.date and not _t0:
+            # T+1 品种当日有买入冻结：只能卖 prev_day_available（已在上面 checked）
             pos.prev_day_available -= sell_shares
         else:
-            # 当日无买入：先卖 prev_day_available，不足部分从 frozen_shares 扣
+            # 当日无买入 或 T+0 品种：先卖 prev_day_available，不足部分从 frozen_shares 扣
             if sell_shares <= pos.prev_day_available:
                 pos.prev_day_available -= sell_shares
             else:
@@ -790,15 +862,31 @@ class SimBroker:
             return
         
         pos = self.positions[code]
+        _old_shares = pos.shares
+        _old_cost = pos.avg_cost
         new_shares, new_cost, new_price = self._ca_registry.adjust_for_ex_rights(
             code, date, pos.shares, pos.avg_cost, pos.avg_cost  # 用成本价作为价格参考
         )
-        if new_shares != pos.shares:
+        if new_shares != _old_shares or new_cost != _old_cost:
+            _bonus = new_shares - _old_shares
             pos.shares = new_shares
             pos.avg_cost = new_cost
+            # FIX P2-17: 送股/转增到账股份可用量建模——到账新股按 T+1 冻结
+            # （除权日当日不可卖、次日起可卖），避免回测在除权当日超卖到账新股。
+            # 复用买入侧冻结语义：先把更早的 frozen 归并入 prev_day_available，再记新冻结。
+            if _bonus > 0:
+                if pos.frozen_date and pos.frozen_date < date:
+                    pos.prev_day_available += pos.frozen_shares
+                    pos.frozen_shares = _bonus
+                    pos.frozen_date = date
+                elif pos.frozen_date == date:
+                    pos.frozen_shares += _bonus
+                else:
+                    pos.frozen_shares = _bonus
+                    pos.frozen_date = date
             logger.info(
                 f"[SimBroker] {code} {date} 除权调整: "
-                f"股数{pos.shares}→{new_shares}, 成本{pos.avg_cost:.3f}→{new_cost:.3f}"
+                f"股数{_old_shares}→{new_shares}, 成本{_old_cost:.3f}→{new_cost:.3f}"
             )
 
     # ----------------------------------------------------------

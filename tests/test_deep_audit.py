@@ -48,13 +48,19 @@ class TestRecoveryPositionCap:
         # 实际返回 0.45 (因为 monthly_pnl=0 >= 0)
         assert cap2 == 0.45 or cap2 == 1.00  # 取决于是否修复
 
-    def test_recovery_fields_missing_in_default_state(self):
-        """验证 default state 中缺少关键字段"""
-        from risk.risk_control import RiskStateManager
-        mgr = RiskStateManager()
-        # 这两个字段不在 _load_state 的 default dict 中
-        assert "monthly_pnl" not in mgr.state or mgr.state.get("monthly_pnl", 0) == 0
-        assert "consecutive_profit_weeks" not in mgr.state or mgr.state.get("consecutive_profit_weeks", 0) == 0
+    def test_recovery_fields_present_in_default_state(self, tmp_path, monkeypatch):
+        """FIX P0-1(G2): get_recovery_position_cap 依赖的关键字段已纳入 default state。
+
+        隔离生产 output/risk_state.json（含真实盈亏）后，验证纯默认状态下
+        monthly_pnl / consecutive_profit_weeks 存在且为 0，防止 KeyError 导致
+        恢复机制失效（原缺陷：字段不在 default dict 中）。
+        """
+        import risk.risk_control as rc
+        # 隔离磁盘状态文件，令 _load_state 返回纯默认值
+        monkeypatch.setattr(rc, "STATE_FILE", str(tmp_path / "risk_state.json"))
+        mgr = rc.RiskStateManager()
+        assert "monthly_pnl" in mgr.state and mgr.state.get("monthly_pnl", -1) == 0
+        assert "consecutive_profit_weeks" in mgr.state and mgr.state.get("consecutive_profit_weeks", -1) == 0
 
 
 # ============================================================
@@ -78,7 +84,7 @@ class TestBrokerT1CrossDayBug:
         broker.new_day("2026-01-02")
         order_buy1 = Order(code="000001", direction="buy", target_shares=500,
                            price=10.0, date="2026-01-02")
-        fill1 = broker.execute_buy(order_buy1, {"close": 10.0, "volume": 1000000})
+        fill1 = broker.execute_buy(order_buy1, {"close": 10.0, "pre_close": 10.0, "volume": 1000000})
         assert fill1 is not None
         assert broker.positions["000001"].shares == 500
 
@@ -90,7 +96,7 @@ class TestBrokerT1CrossDayBug:
         # 但 sell_shares = min(600, 500) = 500，然后 (500//100)*100 = 500
         # 所以实际上这里只会卖500股。让我修正测试...
         # 真正的问题是：如果先买再卖呢？
-        fill_sell = broker.execute_sell(order_sell, {"close": 10.0, "volume": 1000000})
+        fill_sell = broker.execute_sell(order_sell, {"close": 10.0, "pre_close": 10.0, "volume": 1000000})
         # 实际卖出500股（被 available_shares 限制）
         if fill_sell:
             assert fill_sell.shares <= 500  # 不应超过500
@@ -111,7 +117,7 @@ class TestBrokerT1CrossDayBug:
         broker.execute_buy(
             Order(code="000001", direction="buy", target_shares=500,
                   price=10.0, date="2026-01-02"),
-            {"close": 10.0, "volume": 1000000}
+            {"close": 10.0, "pre_close": 10.0, "volume": 1000000}
         )
 
         # Day 3: 先买300股
@@ -119,7 +125,7 @@ class TestBrokerT1CrossDayBug:
         broker.execute_buy(
             Order(code="000001", direction="buy", target_shares=300,
                   price=10.0, date="2026-01-06"),
-            {"close": 10.0, "volume": 1000000}
+            {"close": 10.0, "pre_close": 10.0, "volume": 1000000}
         )
 
         # 此时: shares=800, prev_day_available=500, frozen_shares=300, frozen_date="2026-01-06"
@@ -132,7 +138,7 @@ class TestBrokerT1CrossDayBug:
         fill_sell = broker.execute_sell(
             Order(code="000001", direction="sell", target_shares=600,
                   price=10.0, date="2026-01-06"),
-            {"close": 10.0, "volume": 1000000}
+            {"close": 10.0, "pre_close": 10.0, "volume": 1000000}
         )
         # 验证: sell_shares = min(600, available=500) = 500
         # 然后 (500//100)*100 = 500
@@ -497,7 +503,7 @@ class TestSimBrokerEdgeCases:
         fill = broker.execute_buy(
             Order(code="000001", direction="buy", target_shares=100,
                   price=10.0, date="2026-01-02"),
-            {"close": 10.0}
+            {"close": 10.0, "pre_close": 10.0}
         )
         assert fill is not None
         assert fill.commission == 0

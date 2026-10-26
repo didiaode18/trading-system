@@ -108,9 +108,13 @@ def generate_condition_sheet(signals, **kwargs):
 
         for code, sig in signals:
             name = config.get_stock_name(code)
-            if sig.get("buy_signal"):
+            # FIX(P0-19): 双重守卫——风控拒绝(risk_rejected/pass_risk=False)或 shares<=0 的信号
+            # 不得输出为"买入"行（main.py 已将 FAIL 降级为 buy_signal=False，此处再防御一道）。
+            if sig.get("buy_signal") and not sig.get("risk_rejected") and sig.get("pass_risk", True) is not False:
                 price = sig.get("buy_price", 0)
                 shares = sig.get("position", {}).get("shares", 0)
+                if shares <= 0:
+                    continue
                 stop = sig.get("stop_loss_initial", price * 0.9)
                 reason = sig.get("signal_reason", "").replace("|", "/")
                 lines.append(f"{code}|{name}|买入|{price:.2f}|{shares}|{stop:.2f}|{reason}")

@@ -222,8 +222,9 @@ def test_daily_reconcile_position_diff_and_dedup(ledger, tmp_path, monkeypatch):
     recon = DailyReconciler(ledger=ledger, holdings_path=hpath, notify=True,
                             config={"asset_tolerance_pct": 0.005})
     alerts = []
+    # P1-12: _send_alert 现返回 bool（True=至少一通道发送成功），mock 需返回 True
     monkeypatch.setattr(recon, "_send_alert",
-                        lambda diffs, n, d: alerts.append((diffs, n, d)))
+                        lambda diffs, n, d: (alerts.append((diffs, n, d)), True)[1])
 
     broker_positions = [{"code": "600989", "volume": 3600, "available": 3600,
                          "cost": 24.618, "market_value": 81288}]

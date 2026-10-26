@@ -39,8 +39,6 @@ import numpy as np
 import pandas as pd
 
 warnings.filterwarnings('ignore')
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 # 配置日志

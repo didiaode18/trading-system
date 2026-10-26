@@ -15,7 +15,10 @@
   - 断线只置标记，恢复后由 sync_from_trader 主动补全，不臆造成交
 """
 
+import os
+import json
 import logging
+import datetime
 
 from .trade_ledger import (
     TradeLedger, canonical_status, canonical_direction,
@@ -23,6 +26,39 @@ from .trade_ledger import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _repo_root() -> str:
+    """仓库根（trades_today.json 位于项目根，非 trading_system/）。"""
+    # 本文件位于 trading_system/execution/ → 上溯两级到仓库根
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _trades_today_path() -> str:
+    """trades_today.json 写入路径（仓库根，与 order_lifecycle 读取位置一致）。"""
+    root = _repo_root()
+    cand = os.path.join(root, "trades_today.json")
+    if os.path.exists(cand):
+        return cand
+    inner = os.path.join(root, "trading_system", "trades_today.json")
+    if os.path.exists(inner):
+        return inner
+    return cand
+
+
+def _norm_time(raw) -> str:
+    """traded_time 归一为 HH:MM:SS：兼容 epoch 秒(int/数字串) 与已是时间串。"""
+    try:
+        s = str(raw or "").strip()
+        if not s:
+            return datetime.datetime.now().strftime("%H:%M:%S")
+        if s.isdigit():
+            return datetime.datetime.fromtimestamp(int(s)).strftime("%H:%M:%S")
+        if ":" in s:
+            return s.split(" ")[-1][:8]
+        return s[:8]
+    except Exception:
+        return datetime.datetime.now().strftime("%H:%M:%S")
 
 
 def _field(obj, *names, default=None):
@@ -55,6 +91,73 @@ class FillCallback:
         self.order_events = 0    # 收到的委托回报计数
         self.trade_events = 0    # 收到的成交回报计数
         self.rejected_orders = []  # 拒单/废单 order_id 列表（供上层清除执行标志）
+
+    # ---- FIX P1-21: trades_today.json 写入方 ----
+    def _append_trades_today(self, code, name, direction, qty, price,
+                             traded_time):
+        """将一笔真实成交追写入 trades_today.json（order_lifecycle 回填数据源）。
+
+        以前全库零写入方 → 文件过期2个月 → executed 恒空 → 条件单被写死
+        "未触发"。现由成交回报/流水回填接通。全程 try/except 降级，绝不阻断主流程。
+        去重键 (time, code, direction, qty, price)，原子写，自动重算 summary。
+        仅真实回报触发（on_stock_trade / sync_trades），不污染模拟。
+        """
+        try:
+            if not code or not qty or not price:
+                return
+            path = _trades_today_path()
+            today = datetime.date.today().isoformat()
+            t_time = _norm_time(traded_time)
+            payload = {"date": today, "trades": [], "summary": {}}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        old = json.load(f)
+                    if isinstance(old, dict):
+                        # 跨日重置：旧文件日期非今日则开新一天的 trades
+                        if old.get("date") == today and isinstance(old.get("trades"), list):
+                            payload["trades"] = old["trades"]
+                except Exception:
+                    pass  # 旧文件损坏则以空重建
+            # 去重：同 (time, code, direction, qty, price) 不重复追写
+            for t in payload["trades"]:
+                if (str(t.get("time")) == t_time and str(t.get("code")) == str(code)
+                        and t.get("direction") == direction
+                        and int(t.get("qty", 0) or 0) == int(qty)
+                        and abs(float(t.get("price", 0) or 0) - float(price)) < 1e-6):
+                    return
+            payload["trades"].append({
+                "time": t_time, "code": str(code), "name": name or "",
+                "direction": direction, "qty": int(qty),
+                "price": round(float(price), 4),
+                "amount": round(float(price) * int(qty), 2), "status": "已成",
+            })
+            payload["trades"].sort(key=lambda x: str(x.get("time", "")), reverse=True)
+            payload["summary"] = self._summarize(payload["trades"])
+            # 原子写
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"[回调] 追写 trades_today.json 失败(降级): {e}")
+
+    @staticmethod
+    def _summarize(trades: list) -> dict:
+        """重算 trades_today.json 的 summary 块。"""
+        buy_amt = sum(float(t.get("amount", 0) or 0) for t in trades
+                      if t.get("direction") == "买入")
+        sell_amt = sum(float(t.get("amount", 0) or 0) for t in trades
+                       if t.get("direction") == "卖出")
+        buy_cnt = sum(1 for t in trades if t.get("direction") == "买入")
+        sell_cnt = sum(1 for t in trades if t.get("direction") == "卖出")
+        return {
+            "total_trades": len(trades),
+            "buy_count": buy_cnt, "sell_count": sell_cnt,
+            "buy_amount": round(buy_amt, 2), "sell_amount": round(sell_amt, 2),
+            "net_flow": round(buy_amt - sell_amt, 2),
+        }
 
     # ---- 委托状态回报 ----
     def on_stock_order(self, order):
@@ -125,6 +228,10 @@ class FillCallback:
             if inserted:
                 logger.info(f"[回调] 💰 成交 order={order_id} {code} "
                             f"{direction} {volume}股 @ {price}")
+                # FIX P1-21: 接通 trades_today.json 写入（供盘后回填/对账消费）
+                name = _field(trade, "stock_name", "name", default="")
+                self._append_trades_today(code, name, direction, volume,
+                                          price, traded_time)
         except Exception as e:
             logger.warning(f"[回调] on_stock_trade 处理异常(降级): {e}")
 
@@ -148,14 +255,22 @@ class FillCallback:
         pass
 
     def on_cancel_error(self, cancel_error):
+        """FIX P1-13: 撤单【失败】回报——委托仍活，绝不能写成 CANCELLED（活单记死单）。
+        仅在 status_msg 追加 cancel_failed 标记，保持台账原有状态。"""
         try:
             order_id = _field(cancel_error, "order_id")
             msg = _field(cancel_error, "error_msg", "msg", default="")
             if order_id:
-                self.ledger.update_order_status(order_id, STATUS_CANCELLED,
-                                                status_msg=f"撤单失败:{msg}")
-        except Exception:
-            pass
+                row = self.ledger.get_order(order_id)
+                cur_status = row.get("status") if row else None
+                # 不改状态，只留痕撤单失败
+                self.ledger.update_order_status(
+                    order_id, cur_status or STATUS_SUBMITTED,
+                    status_msg=f"cancel_failed:{msg}")
+                logger.warning(
+                    f"[回调] ⚠️ 撤单失败 order={order_id} | {msg}（保持原状态{cur_status}）")
+        except Exception as e:
+            logger.debug(f"[回调] on_cancel_error 处理异常(降级): {e}")
 
     def on_order_error(self, order_error):
         """下单失败回报：标记拒单，供上层清除执行标志。"""
@@ -209,17 +324,23 @@ class FillCallback:
                 order_id = _field(td, "order_id", "orderId")
                 if order_id is None or order_id == "":
                     continue
+                code = _field(td, "stock_code", "code", default="")
+                direction = canonical_direction(
+                    _field(td, "order_type", "direction", default=""))
+                price = float(_field(td, "traded_price", "price", default=0) or 0)
+                volume = int(_field(td, "traded_volume", "volume", default=0) or 0)
+                traded_time = str(_field(td, "traded_time", "time", default="") or "")
                 inserted = self.ledger.record_trade(
                     traded_id=_field(td, "traded_id", "trade_id", default=""),
-                    order_id=order_id,
-                    code=_field(td, "stock_code", "code", default=""),
-                    direction=canonical_direction(
-                        _field(td, "order_type", "direction", default="")),
-                    traded_price=float(_field(td, "traded_price", "price", default=0) or 0),
-                    traded_volume=int(_field(td, "traded_volume", "volume", default=0) or 0),
-                    traded_time=str(_field(td, "traded_time", "time", default="") or ""))
+                    order_id=order_id, code=code, direction=direction,
+                    traded_price=price, traded_volume=volume,
+                    traded_time=traded_time)
                 if inserted:
                     n += 1
+                    # FIX P1-21: 流水回填的成交同步追写 trades_today.json
+                    name = _field(td, "stock_name", "name", default="")
+                    self._append_trades_today(code, name, direction, volume,
+                                              price, traded_time)
         except Exception as e:
             logger.warning(f"[回调] 成交流水回填异常(降级): {e}")
         return n

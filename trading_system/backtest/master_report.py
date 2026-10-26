@@ -18,9 +18,7 @@ import html
 import logging
 import os
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import config  # noqa: E402
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +27,14 @@ OUTPUT_DIR = getattr(config, "OUTPUT_DIR", os.path.join(
 
 GATE_META = [
     ("G1_data", "G1 数据质量", "无阻断级数据错误，警告项已声明"),
-    ("G2_oos", "G2 样本外", "Walk-Forward 样本外平均夏普 > 0.8"),
-    ("G3_dsr", "G3 DSR", "Deflated Sharpe > 0.95（PBO < 0.5）"),
+    ("G2_oos", "G2 样本外", "Walk-Forward 样本外(pooled)夏普 > 0.8"),
+    ("G2b_oos_robust", "G2b 样本外稳健", "OOS夏普中位数>0 且 有效窗占比≥60%"),
+    ("G3_dsr", "G3 DSR", "Deflated Sharpe > 0.95（observed 取 OOS 夏普）"),
     ("G4_cost", "G4 成本稳健", "成本×2 后夏普退化 < 30%"),
     ("G5_plateau", "G5 参数高原", "最优参数邻域退化 < 15%，非孤点"),
     ("G6_stress", "G6 压力存活", "五个历史情景均存活（不腰斩）"),
     ("G7_cross", "G7 双引擎一致", "总收益差 < 3%、夏普差 < 0.3"),
+    ("G8_probe", "G8 红队探针", "对抗性探针套件全绿"),
 ]
 
 _COLOR = {"green": "#c0392b", "yellow": "#d4a017", "red": "#1e8449"}  # A股:红=好/涨,绿=差/跌
@@ -87,7 +87,19 @@ def _build_equity_series(ctx: dict):
             return {}
         out = {}
         eq = (1.0 + daily).cumprod()
-        out["策略(等权)"] = list(zip([str(i) for i in eq.index], [float(v) for v in eq.values]))
+        out["策略(等权被动)"] = list(zip([str(i) for i in eq.index], [float(v) for v in eq.values]))
+        # P0-2(路线图): 叠加"主动成交口径"净值（v5 逐笔按平仓日归集+仓位折算），
+        #   与被动等权篮子并列，杜绝把被动 318% 当作策略能力。
+        try:
+            trades = ctx.get("stage1", {}).get("trades", []) or []
+            if trades:
+                adaily = master_common.active_strategy_daily_returns(trades)
+                if adaily is not None and len(adaily) >= 1:
+                    adaily = adaily.reindex(eq.index, fill_value=0.0)
+                    aeq = (1.0 + adaily).cumprod()
+                    out["主动策略(成交)"] = list(zip([str(i) for i in aeq.index], [float(v) for v in aeq.values]))
+        except Exception as _e:
+            logger.debug(f"主动净值构造失败: {_e}")
         dd = ctx.get("data_dict", {})
         if "000300" in dd:
             bdf = dd["000300"].copy()
@@ -113,7 +125,7 @@ def _svg_line(series: dict, width=880, height=260) -> str:
     vmin, vmax = min(all_vals), max(all_vals)
     span = (vmax - vmin) or 1.0
     n_max = max(len(pts) for pts in series.values())
-    colors = {"策略(等权)": "#c0392b", "沪深300": "#2c3e50"}
+    colors = {"策略(等权被动)": "#7f8c8d", "主动策略(成交)": "#c0392b", "沪深300": "#2c3e50"}
     pad_l, pad_b, pad_t = 40, 24, 12
     plot_w = width - pad_l - 10
     plot_h = height - pad_b - pad_t
@@ -241,9 +253,17 @@ def _sec_data_audit(ctx: dict) -> str:
 
 def _sec_equity(ctx: dict) -> str:
     series = _build_equity_series(ctx)
-    return (f'<section><h2>四、净值曲线（策略 vs 基准）与月度收益</h2>'
-            f'{_svg_line(series)}<h3>月度收益热力图（%）</h3>{_monthly_heatmap(ctx)}'
-            f'<p class="note">策略口径：等权买入持有日收益（详见附录）。红=上涨/正收益，绿=下跌/负收益。</p></section>')
+    a = ctx.get("stage1", {}).get("active_strategy", {}) or {}
+    active_note = ""
+    if isinstance(a, dict) and a.get("status") == "ok":
+        active_note = (f'<p class="note">主动成交口径（v5 逐笔，仓位折算 {_pct(a.get("position_ratio"), 1)}）：'
+                       f'累计 {_pct(a.get("total_return"))}、年化 {_pct(a.get("annual_return"))}、'
+                       f'夏普 {_num(a.get("sharpe"), 3)}、最大回撤 {_pct(a.get("max_drawdown"))}、'
+                       f'成交 {_e(a.get("n_trades"))} 笔、胜率 {_pct(a.get("win_rate"), 1)}。</p>')
+    return (f'<section><h2>四、净值曲线（主动成交 vs 被动等权 vs 基准）与月度收益</h2>'
+            f'{_svg_line(series)}{active_note}<h3>月度收益热力图（%）</h3>{_monthly_heatmap(ctx)}'
+            f'<p class="note">口径声明：<b>主动策略(成交)</b>=v5 逐笔成交按平仓日归集+仓位折算；'
+            f'<b>策略(等权被动)</b>=等权买入持有日收益（月度热力图同此口径）；两者不可直接混比（详见附录）。红=上涨/正收益，绿=下跌/负收益。</p></section>')
 
 
 def _sec_param(ctx: dict) -> str:
@@ -294,7 +314,11 @@ def _sec_walkforward(ctx: dict) -> str:
                    for k, v in res.items() if not isinstance(v, (dict, list)))
     oos = res.get("oos_sharpe")
     return (f'<section><h2>六、Walk-Forward 滚动验证</h2>'
-            f'<p>样本外平均夏普：<b>{_num(oos)}</b>（G2 门限 &gt; 0.8）。</p>'
+            f'<p>样本外夏普——均值 <b>{_num(oos)}</b> · 池化(pooled) <b>{_num(res.get("oos_sharpe_pooled"))}</b>'
+            f' · 中位数 <b>{_num(res.get("oos_sharpe_median"))}</b>（G2 门限 &gt; 0.8，取 pooled）。</p>'
+            f'<p class="note">有效窗 {_e(res.get("num_valid_windows"))}/{_e(res.get("num_windows"))}'
+            f'（占比 {_pct(res.get("valid_ratio"), 1)}，G2b 要求 ≥ 60% 且中位数 &gt; 0）。'
+            f'均值易被少数灾难窗绑架，pooled/median 为稳健口径。</p>'
             f'<table class="kv">{rows}</table></section>')
 
 
@@ -353,8 +377,23 @@ def _sec_dsr(ctx: dict) -> str:
     rows = "".join(f"<tr><td>{_e(k)}</td><td>{_e(v)}</td></tr>"
                    for k, v in res.items() if not isinstance(v, (dict, list)))
     dsr = res.get("dsr")
+    basis = res.get("observed_basis", "")
+    basis_txt = {"oos_walkforward": "Stage6 样本外(OOS)夏普", "in_sample_grid": "Stage5 样本内网格夏普"}.get(basis, basis)
+    # P2-2(路线图): PBO 已落地（CSCV），结构化展示其值/判定/说明
+    pbo = res.get("pbo")
+    if isinstance(pbo, dict) and pbo.get("status") == "ok":
+        pbo_txt = (f'<b>{_num(pbo.get("pbo"))}</b>（门限 &lt; 0.5，S={_e(pbo.get("n_splits"))} 块、'
+                   f'N={_e(pbo.get("n_configs"))} 配置、{_e(pbo.get("n_combinations"))} 组合）'
+                   f'：{_e(pbo.get("interpretation", ""))}')
+    elif isinstance(pbo, dict):
+        pbo_txt = f'不可用（{_e(pbo.get("reason", pbo.get("error", pbo.get("status", "未知"))))}）'
+    else:
+        pbo_txt = '未实现/可选'
     return (f'<section><h2>八、Deflated Sharpe / PBO</h2>'
-            f'<p>DSR：<b>{_num(dsr)}</b>（G3 门限 &gt; 0.95）。PBO：{_e(res.get("pbo", "未实现/可选"))}。</p>'
+            f'<p>DSR：<b>{_num(dsr)}</b>（G3 门限 &gt; 0.95）。observed_sharpe 口径：<b>{_e(basis_txt)}</b>'
+            f' = {_num(res.get("observed_sharpe"))}（样本内 {_num(res.get("in_sample_sharpe"))} / '
+            f'OOS {_num(res.get("oos_sharpe_used"))}）。</p>'
+            f'<p>PBO（CSCV 过拟合概率）：{pbo_txt}。</p>'
             f'<table class="kv">{rows}</table></section>')
 
 
@@ -394,16 +433,20 @@ def _sec_cost(ctx: dict) -> str:
     for t in order:
         d = tiers.get(t, {})
         if "error" in d:
-            rows.append(f"<tr><td>{label.get(t, t)}</td><td colspan='4' class='na'>{_e(d['error'])}</td></tr>")
+            rows.append(f"<tr><td>{label.get(t, t)}</td><td colspan='7' class='na'>{_e(d['error'])}</td></tr>")
             continue
         rows.append(f"<tr><td>{label.get(t, t)}</td><td>{_num(d.get('sharpe'), 3)}</td>"
                     f"<td>{_pct(d.get('annual'))}</td><td>{_e(d.get('n_trades'))}</td>"
-                    f"<td>{_pct(d.get('win_rate'), 1)}</td></tr>")
+                    f"<td>{_pct(d.get('win_rate'), 1)}</td>"
+                    f"<td>{_num(d.get('sortino'), 3)}</td>"
+                    f"<td>{_num(d.get('profit_factor'), 2)}</td>"
+                    f"<td>{_num(d.get('avg_hold_days'), 1)}</td></tr>")
     vmap = {"robust": "稳健", "fragile": "脆弱", "degenerate": "严重退化", "insufficient": "样本不足"}
     return (f'<section><h2>十、成本敏感性</h2>'
             f'<p>成本×2 后夏普退化 <b>{_pct(s10.get("sharpe_degradation_x2"))}</b>'
             f'（G4 门限 &lt; {_pct(s10.get("threshold", 0.30))}）→ 判定 <b>{_e(vmap.get(s10.get("verdict"), s10.get("verdict")))}</b>。</p>'
-            f'<table class="grid"><tr><th>成本档</th><th>夏普</th><th>年化</th><th>交易数</th><th>胜率</th></tr>'
+            f'<table class="grid"><tr><th>成本档</th><th>夏普</th><th>年化</th><th>交易数</th><th>胜率</th>'
+            f'<th>Sortino</th><th>盈亏比</th><th>平均持仓(天)</th></tr>'
             f'{"".join(rows)}</table></section>')
 
 
@@ -453,18 +496,33 @@ def _sec_factor(ctx: dict) -> str:
     if s12.get("status") != "ok":
         return f'<section><h2>十二、因子分层回测</h2>{_skipped_block(s12, "Stage12")}</section>'
     rows = []
+    _vmap = {"effective": "✅有效", "weak": "⚠弱", "ineffective": "❌失效"}
+    _smap = {"keep": "保留", "watch": "观察", "drop": "剔除"}
     for name, f in (s12.get("factors") or {}).items():
+        verdict = f.get("ic_verdict", "")
+        sign = "(-)" if f.get("ic_sign") == "negative" else ""
         rows.append(
             f"<tr><td>{_e(name)}</td><td>{_pct(f.get('long_short_return'))}</td>"
-            f"<td>{_num(f.get('long_short_sharpe'), 3)}</td><td>{_num(f.get('ic_mean'), 4)}</td>"
-            f"<td>{_num(f.get('icir'), 3)}</td><td>{_num(f.get('monotonicity_score'), 3)}</td></tr>")
+            f"<td>{_num(f.get('long_short_sharpe'), 3)}</td><td>{_num(f.get('ic_mean'), 4)}{sign}</td>"
+            f"<td>{_num(f.get('icir'), 3)}</td><td>{_num(f.get('monotonicity_score'), 3)}</td>"
+            f"<td>{_e(_vmap.get(verdict, verdict))}</td>"
+            f"<td>{_e(_smap.get(f.get('suggest'), f.get('suggest')))}</td></tr>")
+    gov = s12.get("ic_governance") or {}
+    gov_block = ""
+    if gov:
+        gov_block = (
+            f'<p>IC 治理：有效 <b>{_e(gov.get("n_effective"))}</b>/{_e(gov.get("n_total"))} 个'
+            f'（有效率 {_pct(gov.get("effective_ratio"))}）→ <b>{_e(gov.get("verdict"))}</b>。'
+            f'保留：{_e(gov.get("effective"))}；观察：{_e(gov.get("weak"))}；剔除：{_e(gov.get("ineffective"))}。</p>')
     skipped = s12.get("skipped") or []
     sk = "".join(f"<li>{_e(x.get('factor'))}：{_e(x.get('reason'))}</li>" for x in skipped)
     return (f'<section><h2>十二、因子分层回测</h2>'
             f'<p class="note">{_e(s12.get("n_stocks"))} 只标的 · {s12.get("n_groups")} 组 · '
             f'前瞻 {s12.get("forward_days")} 日 · 调仓 {s12.get("rebalance_freq")} 日</p>'
             f'<table class="grid"><tr><th>因子</th><th>多空收益</th><th>多空夏普</th><th>IC均值</th>'
-            f'<th>ICIR</th><th>单调性</th></tr>{"".join(rows) or "<tr><td colspan=6 class=na>无有效因子</td></tr>"}</table>'
+            f'<th>ICIR</th><th>单调性</th><th>IC治理</th><th>建议</th></tr>'
+            f'{"".join(rows) or "<tr><td colspan=8 class=na>无有效因子</td></tr>"}</table>'
+            f'{gov_block}'
             f'{f"<h3>跳过的因子</h3><ul>{sk}</ul>" if sk else ""}'
             f'<p class="note">{_e(s12.get("note"))}</p></section>')
 
@@ -502,10 +560,19 @@ def _sec_appendix(ctx: dict, record: dict) -> str:
         s3_note = _e(s3.get("reason", "本次未执行"))
     else:
         s3_note = "见执行状态"
+    # P0-1: 动态生成成本口径声明（从 config 读取，消除硬编码）
+    comm_wan = config.COMMISSION_RATE * 10000
+    stamp_wan = config.STAMP_TAX_RATE * 10000
+    transfer_wan = config.TRANSFER_FEE_RATE * 100000
+    min_comm = config.MIN_COMMISSION
+    cost_statement = (f"佣金万{comm_wan:g}（最低{min_comm:g}元）、"
+                      f"印花税万{stamp_wan:g}（卖出）、"
+                      f"过户费十万{transfer_wan:g}（买卖双边）、"
+                      f"滑点、冲击成本，全部计入；Stage10 另给零成本对照。")
     return f'''<section><h2>十四、附录：口径、假设与已知限制</h2>
 <ul class="appx">
 <li><b>成交口径</b>：信号当日决策、次日开盘价成交；禁止未来函数；财报数据披露日后方可用。</li>
-<li><b>成本口径</b>：佣金万2.5（最低5元）、印花税千1（卖出）、过户费、滑点、冲击成本，全部计入；Stage10 另给零成本对照。</li>
+<li><b>成本口径</b>：{cost_statement}</li>
 <li><b>组合口径</b>：Stage4/7-bootstrap/9/11 采用"等权买入持有日收益"作为策略序列（透明、可复现、可与指数对齐）；Stage1/5/6 为逐笔 v5/v6 口径。两者不可直接混比。</li>
 <li><b>Stage3 口径</b>：进程内有界复用 run_full_backtest 事件驱动引擎（同一 BacktestEngineV2+CostConfig+趋势跟踪V2.0）；为控 30min 预算并规避 run() 邮件副作用，限定采样与窗口——{s3_note}；代表采样池表现，非全池逐笔。</li>
 <li><b>G7 双引擎对齐</b>：Stage4 两侧使用"共同窗口内全程有数据"的同一标的集（≤6 只）与同一区间，消除阶梯上市/首建仓日/整数手现金拖累造成的长历史口径差；残差应回落到成本+成交时点量级（&lt;3%）。</li>

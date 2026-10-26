@@ -16,8 +16,6 @@ import datetime
 import glob
 import streamlit as st
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from dashboard import data_loader as dl
 from dashboard.theme import PLOTLY_LAYOUT
 

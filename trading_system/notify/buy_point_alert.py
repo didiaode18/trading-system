@@ -48,8 +48,6 @@ import sys
 import json
 import logging
 import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -216,19 +214,19 @@ def save_buy_alert_levels(result: dict) -> int:
                 continue
 
         # 有效日判定: 交易日15:00前生成→当日盘中生效；收盘后/非交易日生成→下一交易日生效
+        # FIX(2026-10-08): 改用 utils.trading_calendar.effective_trading_day 统一口径，
+        # 与选股报告标题/正文的"适用日期"同源，避免一份报告出现两个生效日。
         now = datetime.datetime.now()
         today = now.date()
-        # FIX(review): weekday()<5改用公共交易日历(含节假日/调休)，修复调休交易日
-        # (如周六补班)买点提醒失效一天的问题；日历异常时降级到原周末判定
         try:
-            from utils.trading_calendar import is_trading_day as _is_trading_day
-            _today_is_trading = _is_trading_day(today)
+            from utils.trading_calendar import effective_trading_day
+            valid_date = effective_trading_day(now)
         except Exception:
-            _today_is_trading = today.weekday() < 5
-        if _today_is_trading and now.hour < 15:
-            valid_date = today
-        else:
-            valid_date = _next_trading_day(today)
+            # 降级：原跳周末逻辑 + weekday()<5 判定
+            if today.weekday() < 5 and now.hour < 15:
+                valid_date = today
+            else:
+                valid_date = _next_trading_day(today)
 
         _save_json(LEVELS_FILE, {
             "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -527,9 +525,15 @@ def add_buy_block(code: str, name: str = "", reason: str = "", days: int = 1) ->
 def _load_held_shares() -> dict:
     """加载当前持仓 {code: shares}，口径与 intraday_decision.load_holdings 一致"""
     try:
-        holdings_file = getattr(config, "HOLDINGS_FILE", None)
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # FIX(P0-15): fallback 改走 config.get_holdings_file()（含 legacy 兜底逻辑），
+        # 原直指 trading_system/holdings.json legacy 副本，stop_loss/shares 与权威源漂移
+        try:
+            import config as _cfg_mod
+            holdings_file = _cfg_mod.get_holdings_file()
+        except Exception:
+            holdings_file = getattr(config, "HOLDINGS_FILE", None)
         if not holdings_file or not os.path.exists(holdings_file):
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             holdings_file = os.path.join(base_dir, "holdings.json")
         if not os.path.exists(holdings_file):
             return {}
@@ -1035,6 +1039,14 @@ def check_buy_point_alerts(skip_codes=None) -> list:
                 if not reached:
                     continue
 
+                # FIX P2(2026-10-09): 下跌趋势过滤——大盘走弱(L1)且标的日内跌>3%时，
+                # 说明该股处于明颢下跌趋势，买点信号命中率极低（10-08实证：603259两次到价后继续下跌）。
+                # 此时跳过推送，避免“越跌越买”。
+                if gate_level >= 1 and change_pct <= -3.0:
+                    logger.info(f"  [买点提醒] ⬇️ {code} 大盘走弱+标的跌{change_pct:.1f}%"
+                                f"处于下跌趋势，买点信号跳过（防接飞刀）")
+                    continue
+
                 # 一轮击穿多档时只推最深一档（价格最低），成功后全部登记防后续轰炸
                 hit_price, hit_label, low_fill = reached[-1]
 
@@ -1136,6 +1148,9 @@ def _record_signal(alert: dict):
             "held_shares": int(alert.get("held_shares", 0)),
             "r1": None, "r3": None, "r5": None, "settled": False,
         })
+        # P1-6: 条目数上限，防止文件无限增长
+        if len(signals) > 500:
+            data["signals"] = signals[-500:]
         data["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _save_json(HISTORY_FILE, data)
         logger.debug(f"[买点提醒] 信号已登记结算队列: {alert.get('code')} "

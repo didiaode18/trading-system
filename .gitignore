@@ -195,5 +195,8 @@ trading_system/data/*_backup_*
 # === 独立子项目 ===
 horse_race_sim/
 
+# === 锁文件 ===
+*.lock
+
 # === pytest缓存 ===
 .pytest_cache/

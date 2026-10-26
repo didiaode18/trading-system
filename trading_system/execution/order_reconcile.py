@@ -41,13 +41,18 @@ def _cfg(config=None):
     return buy_th, sell_th
 
 
-def compute_slippage(direction: str, avg_price: float, expected_price: float):
-    """计算滑点及是否超标。返回 (slippage, exceeded)。价格无效时返回 (None, False)。"""
+def compute_slippage(direction: str, avg_price: float, expected_price: float,
+                     config=None):
+    """计算滑点及是否超标。返回 (slippage, exceeded)。价格无效时返回 (None, False)。
+
+    FIX P2-19: 新增 config 参数并传递给 _cfg，使调用方传入的滑点阈值生效
+    （原永读全局 config，阈值配置形同虚设）。
+    """
     try:
         if not avg_price or not expected_price or expected_price <= 0:
             return None, False
         slip = (avg_price - expected_price) / expected_price
-        buy_th, sell_th = _cfg()
+        buy_th, sell_th = _cfg(config)
         if direction == "买入":
             exceeded = slip > buy_th
         elif direction == "卖出":
@@ -92,7 +97,9 @@ def reconcile_order(order_id, ledger: TradeLedger = None, expected_price=None,
 
         unfilled = max(order_qty - filled_qty, 0)
         fill_ratio = (filled_qty / order_qty) if order_qty > 0 else 0.0
-        slip, exceeded = compute_slippage(direction, avg_price, exp)
+        slip, exceeded = compute_slippage(direction, avg_price, exp, config=config)
+        # FIX P2-19: 阀值显示取实际生效配置（非写死默认值）
+        _buy_th, _sell_th = _cfg(config)
 
         res.update({
             "ok": True,
@@ -126,7 +133,7 @@ def reconcile_order(order_id, ledger: TradeLedger = None, expected_price=None,
             res["flags"].append(
                 f"滑点超标: {slip*100:+.3f}%（{direction}阈值"
                 f"{'+' if direction=='买入' else ''}"
-                f"{(DEFAULT_BUY_SLIPPAGE if direction=='买入' else DEFAULT_SELL_SLIPPAGE)*100:.1f}%）")
+                f"{(_buy_th if direction=='买入' else _sell_th)*100:.1f}%）")
         return res
     except Exception as e:
         logger.warning(f"[订单对账] order={order_id} 异常(降级): {e}")

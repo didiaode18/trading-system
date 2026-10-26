@@ -738,16 +738,42 @@ def save_risk_reduce_orders(reduce_orders: list) -> str:
         except Exception:
             pass
 
+    # FIX(P0-06): 按 (code, 方向) 去重后追加——原 existing_orders + reduce_orders 无去重，
+    # scheduler 每10分钟调一次 → 实证 orders_20260924.json 123→615→1312 条累积暴涨。
+    def _dedup_key(o):
+        # 兼容中英 schema（code/证券代码, action/方向）
+        _code = o.get("code") or o.get("证券代码")
+        _action = o.get("action") or o.get("方向")
+        return (_code, _action)
+
+    _seen = {_dedup_key(o) for o in existing_orders}
+    _merged = list(existing_orders)
+    _added = 0
+    for o in reduce_orders:
+        o = dict(o)
+        o.setdefault("source", "systemic_risk_auto_reduce")
+        _k = _dedup_key(o)
+        if _k in _seen:
+            continue
+        _merged.append(o)
+        _seen.add(_k)
+        _added += 1
+
     orders_json = {
         "date": datetime.date.today().strftime("%Y-%m-%d"),
         "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "systemic_risk_auto_reduce",
         "total_capital": getattr(config, 'TOTAL_CAPITAL', 0),
         "max_daily_trades": 10,
-        "orders": existing_orders + reduce_orders,
+        "orders": _merged,
     }
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(orders_json, f, ensure_ascii=False, indent=2)
+    try:
+        from utils.file_io import atomic_json_write
+        if not atomic_json_write(json_path, orders_json):
+            raise IOError("atomic_json_write 返回 False")
+    except Exception:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(orders_json, f, ensure_ascii=False, indent=2)
 
-    logger.warning(f"  [系统性风险] 减仓条件单已生成: {len(reduce_orders)}条 → {json_path}")
+    logger.warning(f"  [系统性风险] 减仓条件单: 新增{_added}条(去重后)，合计{len(_merged)}条 → {json_path}")
     return json_path

@@ -30,8 +30,6 @@ import sys
 import json
 import logging
 import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
@@ -216,18 +214,20 @@ class PredictionTracker:
         """判断预测是否正确
         
         V9.2: 收紧判定标准（原为宽松判定，中性预测不判错）
-        新规则:
-        - 看多/偏多 预测: 实际收益>0.5%才算正确
-        - 看空/偏空 预测: 实际收益<-0.5%才算正确
-        - 中性 预测: 实际收益在±0.5%内才算正确
+        规则:
+        - 看多/偏多 预测: 实际方向为"看多"或"偏多"算正确
+        - 看空/偏空 预测: 实际方向为"看空"或"偏空"算正确
+        - 中性 预测: 实际方向也为"中性"才算正确
+        
+        注意: actual_direction 在 verify_all 中已用 >1% / <-1% 阈值计算，
+        此处仅做方向字符串匹配，不再重复应用阈值（FIX(BUG-04/05): 消除文档/实现断裂）
         """
-        actual_ret = 0  # 简化: 无实际收益时用方向判定
         pred_bull = "多" in predicted_dir
         pred_bear = "空" in predicted_dir
         actual_bull = "多" in actual_dir
         actual_bear = "空" in actual_dir
 
-        # 方向一致即正确（保留基本逻辑，但中性不再无条件正确）
+        # 方向一致即正确（中性预测仅在中性实际时才正确）
         if pred_bull and actual_bull:
             return True
         if pred_bear and actual_bear:

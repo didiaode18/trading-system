@@ -297,6 +297,12 @@ class TestHardFilterV35:
 class TestPullbackAddRisk:
     """回调加仓风控检查 check_pullback_add_risk 测试"""
 
+    # FIX(P0-20): check_pullback_add_risk 新增引擎级熔断状态校验（暂停期/连亏/冷却），
+    # 需隔离真实 output/risk_state.json（否则生产熔断状态会干扰回调逻辑断言）
+    def _isolate_risk_state(self, monkeypatch, tmp_path):
+        import risk.risk_control as _rc
+        monkeypatch.setattr(_rc, "STATE_FILE", str(tmp_path / "risk_state.json"))
+
     def _mk_df(self, closes, volumes=None, ma20=None, ma60=None, ma20_slope=None):
         """构造测试用DataFrame"""
         import pandas as pd
@@ -326,8 +332,9 @@ class TestPullbackAddRisk:
         df["boll_lower"] = [c * 0.95 for c in closes]
         return df
 
-    def test_pullback_pass_basic(self):
+    def test_pullback_pass_basic(self, monkeypatch, tmp_path):
         """正常回调企稳应通过: 回调5%+缩量+触及MA20"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         # 构造: 先涨到12，再回调到11.4（回调约5%），缩量
         closes = [10.0] * 10 + [11.0] * 5 + [12.0] * 10 + [11.6, 11.5, 11.4]
@@ -341,8 +348,9 @@ class TestPullbackAddRisk:
         assert result["add_shares"] > 0
         assert "回调" in result["reason"]
 
-    def test_pullback_rejected_deep_loss(self):
+    def test_pullback_rejected_deep_loss(self, monkeypatch, tmp_path):
         """浮亏>8%应拒绝"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         closes = [10.0] * 25 + [9.0, 8.5, 8.0]  # 大跌，确保>=25行
         df = self._mk_df(closes)
@@ -351,8 +359,9 @@ class TestPullbackAddRisk:
         assert result["pass"] is False
         assert "浮亏" in result["reason"]
 
-    def test_pullback_rejected_market_weak(self):
+    def test_pullback_rejected_market_weak(self, monkeypatch, tmp_path):
         """大盘弱势应拒绝"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         closes = [10.0] * 20 + [9.5, 9.4, 9.3]
         df = self._mk_df(closes)
@@ -361,8 +370,9 @@ class TestPullbackAddRisk:
         assert result["pass"] is False
         assert "大盘" in result["reason"]
 
-    def test_pullback_rejected_no_volume_shrink(self):
+    def test_pullback_rejected_no_volume_shrink(self, monkeypatch, tmp_path):
         """未缩量应拒绝"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         closes = [10.0] * 10 + [11.0] * 5 + [12.0] * 10 + [11.6, 11.5, 11.4]
         volumes = [5e7] * len(closes)  # 全程未缩量
@@ -375,23 +385,26 @@ class TestPullbackAddRisk:
         assert result["pass"] is False
         assert "缩量" in result["reason"] or "未缩量" in result["reason"] or "量比" in result["reason"]
 
-    def test_pullback_rejected_too_deep(self):
+    def test_pullback_rejected_too_deep(self, monkeypatch, tmp_path):
         """回调>12%应拒绝（趋势可能反转）"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         closes = [10.0] * 10 + [12.0] * 15 + [10.0, 9.5, 9.0]  # 从12回调到9=-25%
         volumes = [5e7] * len(closes)  # 确保长度一致
         ma20 = [11.5] * len(closes)
         ma60 = [10.5] * len(closes)
-        # buy_price=9.2 → 浮亏=(9.0/9.2-1)=-2.2%<8%，通过步骤4
+        # FIX(P0-20): 铁律对齐后任何浮亏均禁止加仓，改用浮盈场景验证回调过深拦截：
+        # buy_price=8.5 → 浮盈=(9.0/8.5-1)=+5.9%≥0，通过步骤4
         # 回调深度=(9.0/12.24-1)≈-26.5%>12%，命中步骤6
         df = self._mk_df(closes, volumes, ma20=ma20, ma60=ma60, ma20_slope=[0.01] * len(closes))
-        holdings = {"600001": {"shares": 1000, "buy_price": 9.2}}
+        holdings = {"600001": {"shares": 1000, "buy_price": 8.5}}
         result = check_pullback_add_risk("600001", holdings, df, market_state="neutral")
         assert result["pass"] is False
         assert "过深" in result["reason"]
 
-    def test_pullback_rejected_not_holding(self):
+    def test_pullback_rejected_not_holding(self, monkeypatch, tmp_path):
         """非持仓股应拒绝"""
+        self._isolate_risk_state(monkeypatch, tmp_path)
         from risk.risk_control import check_pullback_add_risk
         closes = [10.0] * 20 + [9.5, 9.4, 9.3]
         df = self._mk_df(closes)
